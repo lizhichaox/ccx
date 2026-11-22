@@ -8,9 +8,9 @@ import Testing
 @Suite("SnipOverlayView")
 @MainActor
 struct SnipOverlayViewTests {
-    private func makeSnapshot(scale: CGFloat = 2) throws -> DisplaySnapshot {
-        let width = Int(200 * scale)
-        let height = Int(100 * scale)
+    private func makeSnapshot(scale: CGFloat = 2, size: CGSize = CGSize(width: 200, height: 100)) throws -> DisplaySnapshot {
+        let width = Int(size.width * scale)
+        let height = Int(size.height * scale)
         let context = try #require(CGContext(
             data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
             space: CGColorSpace(name: CGColorSpace.sRGB)!,
@@ -21,7 +21,7 @@ struct SnipOverlayViewTests {
         let image = try #require(context.makeImage())
         return DisplaySnapshot(
             displayID: 1,
-            screenFrame: CGRect(x: 0, y: 0, width: 200, height: 100),
+            screenFrame: CGRect(origin: .zero, size: size),
             backingScaleFactor: scale,
             image: image
         )
@@ -46,7 +46,7 @@ struct SnipOverlayViewTests {
         ))
     }
 
-    private func makeMouseEvent(type: NSEvent.EventType, at point: CGPoint) throws -> NSEvent {
+    private func makeMouseEvent(type: NSEvent.EventType, at point: CGPoint, clickCount: Int = 1) throws -> NSEvent {
         try #require(NSEvent.mouseEvent(
             with: type,
             location: point,
@@ -55,7 +55,7 @@ struct SnipOverlayViewTests {
             windowNumber: 0,
             context: nil,
             eventNumber: 0,
-            clickCount: 1,
+            clickCount: clickCount,
             pressure: 1
         ))
     }
@@ -322,5 +322,89 @@ struct SnipOverlayViewTests {
 
         view.rightMouseDown(with: rightClick)
         #expect(actions == [.ocr(CGRect(x: 0, y: 0, width: 200, height: 100)), .cancel])
+    }
+
+    @Test func draggableToolbarMovesClampsPersistsAcrossToolsAndResets() throws {
+        let bounds = CGSize(width: 1200, height: 800)
+        let view = SnipOverlayView(snapshot: try makeSnapshot(size: bounds), topInset: 32)
+        let selection = CGRect(x: 300, y: 200, width: 400, height: 300)
+        try selectRect(selection, on: view)
+        view.layoutSubtreeIfNeeded()
+
+        let autoFrame = view.toolbar.frame
+        #expect(autoFrame.size == SnipActionToolbar.preferredSize)
+        #expect(view.customToolbarTopLeft == nil)
+
+        let grip = view.toolbar.dragHandleView
+        let gripCenterInOverlay = grip.convert(CGPoint(x: grip.bounds.midX, y: grip.bounds.midY), to: view)
+        let gripCenterInToolbar = grip.convert(CGPoint(x: grip.bounds.midX, y: grip.bounds.midY), to: view.toolbar)
+        #expect(view.toolbar.hitTest(gripCenterInOverlay) === grip)
+        #expect(view.toolbar.hitsDragRegion(gripCenterInToolbar))
+
+        let firstToolButtonPointInToolbar = CGPoint(x: gripCenterInToolbar.x + 25, y: gripCenterInToolbar.y)
+        let firstToolButtonPointInOverlay = view.toolbar.convert(firstToolButtonPointInToolbar, to: view)
+        #expect(!view.toolbar.hitsDragRegion(firstToolButtonPointInToolbar))
+        #expect(view.toolbar.hitTest(firstToolButtonPointInOverlay) is NSButton)
+
+        // Single-click without >= 1pt movement must not detach auto-positioning.
+        grip.mouseDown(with: try makeMouseEvent(type: .leftMouseDown, at: gripCenterInOverlay))
+        grip.mouseDragged(with: try makeMouseEvent(type: .leftMouseDragged, at: CGPoint(x: gripCenterInOverlay.x + 0.4, y: gripCenterInOverlay.y + 0.3)))
+        grip.mouseUp(with: try makeMouseEvent(type: .leftMouseUp, at: CGPoint(x: gripCenterInOverlay.x + 0.4, y: gripCenterInOverlay.y + 0.3)))
+        #expect(view.customToolbarTopLeft == nil)
+        #expect(view.toolbar.frame == autoFrame)
+        #expect(!view.toolbar.isDragging)
+
+        // Dragging the grip moves the toolbar smoothly in superview coordinates.
+        let dragEnd = CGPoint(x: gripCenterInOverlay.x + 140, y: gripCenterInOverlay.y + 220)
+        grip.mouseDown(with: try makeMouseEvent(type: .leftMouseDown, at: gripCenterInOverlay))
+        #expect(view.toolbar.isDragging)
+        grip.mouseDragged(with: try makeMouseEvent(type: .leftMouseDragged, at: dragEnd))
+        #expect(view.toolbar.frame.origin == CGPoint(x: autoFrame.minX + 140, y: autoFrame.minY + 220))
+        grip.mouseUp(with: try makeMouseEvent(type: .leftMouseUp, at: dragEnd))
+        #expect(!view.toolbar.isDragging)
+        #expect(view.customToolbarTopLeft == CGPoint(x: autoFrame.minX + 140, y: autoFrame.minY + 220 + SnipActionToolbar.preferredSize.height))
+
+        // Dragging far top-right clamps to display bounds and topInset (800 - 32 = 768).
+        let clampedHandleCenter = grip.convert(CGPoint(x: grip.bounds.midX, y: grip.bounds.midY), to: view)
+        grip.mouseDown(with: try makeMouseEvent(type: .leftMouseDown, at: clampedHandleCenter))
+        grip.mouseDragged(with: try makeMouseEvent(type: .leftMouseDragged, at: CGPoint(x: 2000, y: 2000)))
+        grip.mouseUp(with: try makeMouseEvent(type: .leftMouseUp, at: CGPoint(x: 2000, y: 2000)))
+        #expect(view.toolbar.frame.maxX == 1200)
+        #expect(view.toolbar.frame.maxY == 768)
+
+        // Enabling a drawing tool expands the style bar while keeping the primary bar's top anchored at 768.
+        view.keyDown(with: try makeKeyEvent(characters: "1", modifiers: [], keyCode: 18))
+        #expect(view.activeTool == .rectangle)
+        #expect(view.toolbar.frame.size == SnipActionToolbar.expandedSize)
+        #expect(view.toolbar.frame.maxX == 1200)
+        #expect(view.toolbar.frame.maxY == 768)
+
+        // Nudging the selection keeps the user-parked toolbar position.
+        view.keyDown(with: try makeKeyEvent(characters: "", modifiers: [], keyCode: 124))
+        #expect(view.toolbar.frame.maxX == 1200)
+        #expect(view.toolbar.frame.maxY == 768)
+
+        // Double-clicking the grip resets back to auto-anchored placement.
+        let dockedHandleCenter = grip.convert(CGPoint(x: grip.bounds.midX, y: grip.bounds.midY), to: view)
+        grip.mouseDown(with: try makeMouseEvent(type: .leftMouseDown, at: dockedHandleCenter, clickCount: 2))
+        #expect(view.customToolbarTopLeft == nil)
+        let nudgedSelection = try #require(view.machine.selectionRect)
+        #expect(view.toolbar.frame == SnipActionToolbar.frame(
+            for: nudgedSelection,
+            in: view.bounds,
+            topInset: 32,
+            showsStyleBar: true
+        ))
+
+        // Drag again, then switch back to Select ("v") and draw a brand-new selection -> resets custom position.
+        let resetHandleCenter = grip.convert(CGPoint(x: grip.bounds.midX, y: grip.bounds.midY), to: view)
+        grip.mouseDown(with: try makeMouseEvent(type: .leftMouseDown, at: resetHandleCenter))
+        grip.mouseDragged(with: try makeMouseEvent(type: .leftMouseDragged, at: CGPoint(x: resetHandleCenter.x + 80, y: resetHandleCenter.y + 80)))
+        grip.mouseUp(with: try makeMouseEvent(type: .leftMouseUp, at: CGPoint(x: resetHandleCenter.x + 80, y: resetHandleCenter.y + 80)))
+        #expect(view.customToolbarTopLeft != nil)
+
+        view.keyDown(with: try makeKeyEvent(characters: "v", modifiers: [], keyCode: 9))
+        try selectRect(CGRect(x: 40, y: 520, width: 220, height: 120), on: view)
+        #expect(view.customToolbarTopLeft == nil)
     }
 }

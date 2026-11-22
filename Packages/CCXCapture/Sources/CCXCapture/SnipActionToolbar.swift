@@ -13,12 +13,15 @@ final class SnipActionToolbar: NSView {
     static let primaryHeight: CGFloat = 40
     static let styleBarHeight: CGFloat = 34
     static let barGap: CGFloat = 6
-    static let preferredSize = CGSize(width: 520, height: primaryHeight)
-    static let expandedSize = CGSize(width: 520, height: primaryHeight + barGap + styleBarHeight)
+    static let preferredSize = CGSize(width: 536, height: primaryHeight)
+    static let expandedSize = CGSize(width: 536, height: primaryHeight + barGap + styleBarHeight)
 
     var onAction: ((SnipToolbarAction) -> Void)?
     var onToolSelected: ((AnnotationTool) -> Void)?
     var onStyleChanged: ((AnnotationStyle) -> Void)?
+    var onDragMoved: ((CGPoint) -> Void)?
+    var onDragStateChanged: ((Bool, CGPoint) -> Void)?
+    var onResetPosition: (() -> Void)?
 
     private struct RenderedState: Equatable {
         let activeTool: AnnotationTool
@@ -31,12 +34,18 @@ final class SnipActionToolbar: NSView {
 
     private var activeTool: AnnotationTool = .select
     private var currentStyle = AnnotationStyle()
-    private var isStyleBarVisible = false
+    private(set) var isStyleBarVisible = false
+    private(set) var isDragging = false
+    private var dragDidMove = false
+    private var dragStartInSuperview: CGPoint = .zero
+    private var dragInitialTopLeft: CGPoint = .zero
     private var lastRenderedState: RenderedState?
 
     private let primarySurface: NSView
     private let styleSurface: NSView
 
+    private var dragHandle: ToolbarDragHandleView!
+    var dragHandleView: NSView { dragHandle }
     private var toolButtons: [AnnotationTool: ToolToggleButton] = [:]
     private var undoButton: ToolbarIconButton!
     private var redoButton: ToolbarIconButton!
@@ -83,13 +92,31 @@ final class SnipActionToolbar: NSView {
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
-    override func mouseDown(with event: NSEvent) {}
+
+    override func mouseDown(with event: NSEvent) {
+        beginDrag(with: event)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        continueDrag(with: event)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        endDrag(with: event)
+    }
 
     override func hitTest(_ point: NSPoint) -> NSView? {
         guard !isHidden else { return nil }
         let local = convert(point, from: superview)
         guard hitsInteractiveArea(local) else { return nil }
-        return super.hitTest(point)
+        let hit = super.hitTest(point)
+        if hit === dragHandle {
+            return dragHandle
+        }
+        if let button = hit as? NSButton, button.isEnabled {
+            return button
+        }
+        return self
     }
 
     /// Whether a point in toolbar-local coordinates falls on either visible pill surface.
@@ -97,6 +124,58 @@ final class SnipActionToolbar: NSView {
         if primarySurface.frame.contains(localPoint) { return true }
         if !styleSurface.isHidden, styleSurface.frame.contains(localPoint) { return true }
         return false
+    }
+
+    /// Whether a point in toolbar-local coordinates hits the drag grip or pill background
+    /// rather than an enabled control button.
+    func hitsDragRegion(_ localPoint: CGPoint) -> Bool {
+        guard !isHidden, hitsInteractiveArea(localPoint) else { return false }
+        let pointInSuperview = superview.map { convert(localPoint, to: $0) }
+            ?? CGPoint(x: frame.minX + localPoint.x, y: frame.minY + localPoint.y)
+        let hit = hitTest(pointInSuperview)
+        return hit === self || hit === dragHandle
+    }
+
+    private func superviewPoint(for event: NSEvent) -> CGPoint {
+        superview?.convert(event.locationInWindow, from: nil) ?? event.locationInWindow
+    }
+
+    private func beginDrag(with event: NSEvent) {
+        if event.clickCount >= 2 {
+            isDragging = false
+            dragDidMove = false
+            dragHandle.isDragging = false
+            onResetPosition?()
+            return
+        }
+        let point = superviewPoint(for: event)
+        isDragging = true
+        dragDidMove = false
+        dragStartInSuperview = point
+        dragInitialTopLeft = CGPoint(x: frame.minX, y: frame.maxY)
+        dragHandle.isDragging = true
+        onDragStateChanged?(true, point)
+    }
+
+    private func continueDrag(with event: NSEvent) {
+        guard isDragging else { return }
+        let point = superviewPoint(for: event)
+        let dx = point.x - dragStartInSuperview.x
+        let dy = point.y - dragStartInSuperview.y
+        if !dragDidMove {
+            guard hypot(dx, dy) >= 1 else { return }
+            dragDidMove = true
+        }
+        onDragMoved?(CGPoint(x: dragInitialTopLeft.x + dx, y: dragInitialTopLeft.y + dy))
+    }
+
+    private func endDrag(with event: NSEvent) {
+        guard isDragging else { return }
+        let point = superviewPoint(for: event)
+        isDragging = false
+        dragDidMove = false
+        dragHandle.isDragging = false
+        onDragStateChanged?(false, point)
     }
 
     func update(
@@ -152,6 +231,13 @@ final class SnipActionToolbar: NSView {
     private func setUpPrimaryBar(in container: NSView) {
         var views: [NSView] = []
 
+        let handle = ToolbarDragHandleView()
+        handle.onMouseDown = { [weak self] event in self?.beginDrag(with: event) }
+        handle.onMouseDragged = { [weak self] event in self?.continueDrag(with: event) }
+        handle.onMouseUp = { [weak self] event in self?.endDrag(with: event) }
+        dragHandle = handle
+        views.append(handle)
+
         for tool in AnnotationTool.drawingTools {
             let tip = tool.shortcutHint.map { "\(tool.displayName) (\($0))" } ?? tool.displayName
             let button = ToolToggleButton(tool: tool, symbol: tool.symbolName, tooltip: tip)
@@ -206,7 +292,7 @@ final class SnipActionToolbar: NSView {
         stack.orientation = .horizontal
         stack.alignment = .centerY
         stack.spacing = 2
-        stack.edgeInsets = NSEdgeInsets(top: 2, left: 8, bottom: 2, right: 8)
+        stack.edgeInsets = NSEdgeInsets(top: 2, left: 6, bottom: 2, right: 8)
         stack.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(stack)
         NSLayoutConstraint.activate([
@@ -326,6 +412,22 @@ final class SnipActionToolbar: NSView {
         origin.x = min(max(origin.x, bounds.minX), bounds.maxX - size.width)
         origin.y = min(max(origin.y, bounds.minY), usableMaxY - size.height)
         return CGRect(origin: origin, size: size)
+    }
+
+    /// Clamps a user-positioned toolbar anchored by its top-left corner (`minX`, `maxY`) so
+    /// expanding/collapsing the lower style bar keeps the primary bar visually stationary.
+    static func clampedFrame(
+        anchoredAtTopLeft topLeft: CGPoint,
+        size: CGSize,
+        in bounds: CGRect,
+        topInset: CGFloat
+    ) -> CGRect {
+        let usableMaxY = bounds.maxY - topInset
+        let maxX = max(bounds.minX, bounds.maxX - size.width)
+        let maxY = max(bounds.minY, usableMaxY - size.height)
+        let x = min(max(topLeft.x, bounds.minX), maxX)
+        let y = min(max(topLeft.y - size.height, bounds.minY), maxY)
+        return CGRect(origin: CGPoint(x: x, y: y), size: size)
     }
 
     private static func makeGlassSurface(contentView: NSView, cornerRadius: CGFloat) -> NSView {
@@ -644,6 +746,104 @@ private final class ModePillButton: HoverButton {
             layer?.backgroundColor = NSColor.white.withAlphaComponent(0.14).cgColor
         } else {
             layer?.backgroundColor = NSColor.clear.cgColor
+        }
+    }
+}
+
+private final class ToolbarDragHandleView: NSView {
+    var onMouseDown: ((NSEvent) -> Void)?
+    var onMouseDragged: ((NSEvent) -> Void)?
+    var onMouseUp: ((NSEvent) -> Void)?
+
+    var isHovering = false {
+        didSet {
+            guard oldValue != isHovering else { return }
+            needsDisplay = true
+        }
+    }
+
+    var isDragging = false {
+        didSet {
+            guard oldValue != isDragging else { return }
+            needsDisplay = true
+        }
+    }
+
+    private var hoverArea: NSTrackingArea?
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.cornerRadius = 6
+        toolTip = "Drag to move toolbar (double-click to reset)"
+        translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            widthAnchor.constraint(equalToConstant: 16),
+            heightAnchor.constraint(equalToConstant: 30),
+        ])
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let hoverArea { removeTrackingArea(hoverArea) }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        hoverArea = area
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        isHovering = true
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        isHovering = false
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        onMouseDown?(event)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        onMouseDragged?(event)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        onMouseUp?(event)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        if isDragging || isHovering {
+            let bg = NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 2), xRadius: 6, yRadius: 6)
+            let alpha: CGFloat = isDragging ? 0.18 : 0.12
+            NSColor.white.withAlphaComponent(alpha).setFill()
+            bg.fill()
+        }
+
+        let dotAlpha: CGFloat = isDragging ? 0.95 : (isHovering ? 0.75 : 0.38)
+        NSColor.white.withAlphaComponent(dotAlpha).setFill()
+
+        let dotDiameter: CGFloat = 2.4
+        let radius = dotDiameter / 2
+        let horizontalSpacing: CGFloat = 4.4
+        let verticalSpacing: CGFloat = 4.8
+
+        for col in 0..<2 {
+            let cx = bounds.midX + (CGFloat(col) - 0.5) * horizontalSpacing
+            for row in 0..<3 {
+                let cy = bounds.midY + (CGFloat(row) - 1) * verticalSpacing
+                let dotRect = CGRect(x: cx - radius, y: cy - radius, width: dotDiameter, height: dotDiameter)
+                NSBezierPath(ovalIn: dotRect).fill()
+            }
         }
     }
 }

@@ -130,6 +130,34 @@ struct OverlayGeometryTests {
         #expect(expanded.maxY <= 400)
     }
 
+    @Test @MainActor func toolbarClampedFramePreservesPrimaryTopAndRespectsBoundsAndTopInset() {
+        let compactSize = SnipActionToolbar.preferredSize
+        let expandedSize = SnipActionToolbar.expandedSize
+
+        let freeAnchor = CGPoint(x: 220, y: 640)
+        let compact = SnipActionToolbar.clampedFrame(anchoredAtTopLeft: freeAnchor, size: compactSize, in: bounds, topInset: 32)
+        let expanded = SnipActionToolbar.clampedFrame(anchoredAtTopLeft: freeAnchor, size: expandedSize, in: bounds, topInset: 32)
+        #expect(compact == CGRect(x: 220, y: 640 - compactSize.height, width: compactSize.width, height: compactSize.height))
+        #expect(expanded.minX == compact.minX)
+        #expect(expanded.maxY == compact.maxY)
+        #expect(expanded.size == expandedSize)
+
+        let overflow = SnipActionToolbar.clampedFrame(anchoredAtTopLeft: CGPoint(x: 2000, y: 1200), size: compactSize, in: bounds, topInset: 32)
+        #expect(overflow.maxX == bounds.maxX)
+        #expect(overflow.maxY == bounds.maxY - 32)
+
+        // When anchored near the bottom and expanded, pushes upward so the style bar remains inside bounds.
+        let nearBottomCompact = SnipActionToolbar.clampedFrame(anchoredAtTopLeft: CGPoint(x: 100, y: compactSize.height), size: compactSize, in: bounds, topInset: 32)
+        #expect(nearBottomCompact.minY == 0)
+        let nearBottomExpanded = SnipActionToolbar.clampedFrame(anchoredAtTopLeft: CGPoint(x: 100, y: compactSize.height), size: expandedSize, in: bounds, topInset: 32)
+        #expect(nearBottomExpanded.minY == 0)
+        #expect(nearBottomExpanded.size == expandedSize)
+
+        let narrowBounds = CGRect(x: 0, y: 0, width: 300, height: 200)
+        let narrowClamped = SnipActionToolbar.clampedFrame(anchoredAtTopLeft: CGPoint(x: 80, y: 180), size: compactSize, in: narrowBounds, topInset: 10)
+        #expect(narrowClamped.minX == narrowBounds.minX)
+    }
+
     @Test @MainActor func magnifierStaysInsideAndAvoidsNotch() {
         let topInset: CGFloat = 32
         for cursor in [CGPoint(x: 0, y: 0), CGPoint(x: 1512, y: 982), CGPoint(x: 1500, y: 10), CGPoint(x: 5, y: 970), CGPoint(x: 700, y: 500)] {

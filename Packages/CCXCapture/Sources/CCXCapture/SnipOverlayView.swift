@@ -83,7 +83,8 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
     private let annotationView: AnnotationCanvasView
     private let sizeLabel = NonInteractiveLabel(labelWithString: "")
     private let magnifier = PixelMagnifierView(frame: CGRect(origin: .zero, size: PixelMagnifierView.preferredSize))
-    private let toolbar = SnipActionToolbar(frame: CGRect(origin: .zero, size: SnipActionToolbar.preferredSize))
+    let toolbar = SnipActionToolbar(frame: CGRect(origin: .zero, size: SnipActionToolbar.preferredSize))
+    private(set) var customToolbarTopLeft: CGPoint?
     private var trackingArea: NSTrackingArea?
 
     init(snapshot: DisplaySnapshot, topInset: CGFloat, initialStyle: AnnotationStyle = AnnotationStyle()) {
@@ -189,6 +190,11 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
         toolbar.onAction = { [weak self] action in self?.handleToolbar(action) }
         toolbar.onToolSelected = { [weak self] tool in self?.selectOrToggleTool(tool) }
         toolbar.onStyleChanged = { [weak self] style in self?.applyStyle(style) }
+        toolbar.onDragMoved = { [weak self] topLeft in self?.moveToolbar(toProposedTopLeft: topLeft) }
+        toolbar.onDragStateChanged = { [weak self] dragging, point in
+            self?.handleToolbarDragStateChanged(isDragging: dragging, at: point)
+        }
+        toolbar.onResetPosition = { [weak self] in self?.resetToolbarPosition() }
         addSubview(toolbar)
     }
 
@@ -214,6 +220,7 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
         annotationView.invalidateActiveRegion()
         activeTool = .select
         activeDrag = .none
+        customToolbarTopLeft = nil
         lastTier1LocalRect = nil
         lastRefinedLocalRect = nil
         lastAXQueryPoint = nil
@@ -1129,8 +1136,45 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
         magnifier.isHidden = false
     }
 
+    private func moveToolbar(toProposedTopLeft topLeft: CGPoint) {
+        guard selectedRect != nil else { return }
+        let size = toolbar.isStyleBarVisible ? SnipActionToolbar.expandedSize : SnipActionToolbar.preferredSize
+        let clamped = SnipActionToolbar.clampedFrame(
+            anchoredAtTopLeft: topLeft,
+            size: size,
+            in: bounds,
+            topInset: topInset
+        )
+        customToolbarTopLeft = CGPoint(x: clamped.minX, y: clamped.maxY)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        toolbar.frame = clamped
+        CATransaction.commit()
+    }
+
+    private func handleToolbarDragStateChanged(isDragging: Bool, at point: CGPoint) {
+        lastMousePoint = point
+        if !isDragging {
+            lastCursorKind = nil
+        }
+        updateCursor()
+    }
+
+    private func resetToolbarPosition() {
+        customToolbarTopLeft = nil
+        lastCursorKind = nil
+        updateToolbar()
+        updateCursor()
+    }
+
     private func updateToolbar() {
         guard let rect = selectedRect else {
+            switch machine.state {
+            case .hovering, .dragging:
+                customToolbarTopLeft = nil
+            case .selected, .moving, .resizing:
+                break
+            }
             toolbar.isHidden = true
             return
         }
@@ -1148,12 +1192,23 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
             canRedo: annotations.canRedo
         )
 
-        let nextFrame = SnipActionToolbar.frame(
-            for: rect,
-            in: bounds,
-            topInset: topInset,
-            showsStyleBar: showStyleBar
-        )
+        let size = showStyleBar ? SnipActionToolbar.expandedSize : SnipActionToolbar.preferredSize
+        let nextFrame: CGRect
+        if let anchor = customToolbarTopLeft {
+            nextFrame = SnipActionToolbar.clampedFrame(
+                anchoredAtTopLeft: anchor,
+                size: size,
+                in: bounds,
+                topInset: topInset
+            )
+        } else {
+            nextFrame = SnipActionToolbar.frame(
+                for: rect,
+                in: bounds,
+                topInset: topInset,
+                showsStyleBar: showStyleBar
+            )
+        }
         if toolbar.isHidden || toolbar.frame != nextFrame {
             toolbar.frame = nextFrame
         }
@@ -1176,9 +1231,17 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
             cursor = Self.cursor(for: handle)
         case let .selected(rect):
             let toolbarPoint = toolbar.convert(point, from: self)
-            if !toolbar.isHidden && toolbar.hitsInteractiveArea(toolbarPoint) {
-                kind = .arrow
-                cursor = .arrow
+            if !toolbar.isHidden && toolbar.isDragging {
+                kind = .closedHand
+                cursor = .closedHand
+            } else if !toolbar.isHidden && toolbar.hitsInteractiveArea(toolbarPoint) {
+                if toolbar.hitsDragRegion(toolbarPoint) {
+                    kind = .openHand
+                    cursor = .openHand
+                } else {
+                    kind = .arrow
+                    cursor = .arrow
+                }
             } else if activeTool.isDrawingTool && rect.contains(point) {
                 if activeTool == .text {
                     kind = .iBeam
