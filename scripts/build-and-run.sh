@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Generates CPX.xcodeproj, builds CPX.app with a stable signing identity, and
-# launches it through LaunchServices so TCC grants are tracked by bundle ID.
+# Generates CPX.xcodeproj, builds CPX.app with a stable signing identity,
+# replaces /Applications/CPX.app, and launches it through LaunchServices so
+# TCC grants are tracked cleanly by bundle ID.
 #
-# Usage: scripts/build-and-run.sh [--build-only] [--release]
+# Usage: scripts/build-and-run.sh [--build-only] [--no-install] [--release]
 #
 # Signing (first match wins):
 #   1. DEVELOPMENT_TEAM environment variable.
@@ -10,19 +11,21 @@
 #   3. The OU (Team ID) of the installed "Apple Development" certificate.
 #   4. Ad-hoc signing ("-") with a warning: TCC grants will not persist.
 #
-# Host note: Keychain signing and `open` require an unsandboxed shell.
+# Host note: Keychain signing, /Applications install, and `open` require an unsandboxed shell.
 
 set -euo pipefail
 
 usage() {
-  sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 BUILD_ONLY=0
+INSTALL_APP=1
 CONFIGURATION=Debug
 for arg in "$@"; do
   case "$arg" in
     --build-only) BUILD_ONLY=1 ;;
+    --no-install) INSTALL_APP=0 ;;
     --release) CONFIGURATION=Release ;;
     -h | --help)
       usage
@@ -42,7 +45,10 @@ cd "$ROOT_DIR"
 export DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"
 DERIVED_DATA_PATH=".build/xcode"
 APP_PATH="$DERIVED_DATA_PATH/Build/Products/$CONFIGURATION/CPX.app"
+INSTALL_DIR="${CPX_INSTALL_DIR:-/Applications}"
+INSTALLED_APP="$INSTALL_DIR/CPX.app"
 LOCAL_SIGNING_XCCONFIG="Config/LocalSigning.xcconfig"
+LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Versions/Current/Frameworks/LaunchServices.framework/Versions/Current/Support/lsregister"
 ARCH="$(uname -m)"
 
 if ! command -v xcodegen >/dev/null 2>&1; then
@@ -96,7 +102,7 @@ if [[ "$BUILD_ONLY" -eq 1 ]]; then
   exit 0
 fi
 
-# Quit a running instance so the fresh build (and its TCC state) is loaded.
+# Quit any running instance before replacing or launching the app bundle.
 if pgrep -x CPX >/dev/null 2>&1; then
   echo "==> Quitting running CPX"
   osascript -e 'tell application id "com.lizhichaox.cpx" to quit' >/dev/null 2>&1 || pkill -x CPX || true
@@ -106,5 +112,22 @@ if pgrep -x CPX >/dev/null 2>&1; then
   done
 fi
 
-echo "==> Launching CPX"
-open "$APP_PATH"
+LAUNCH_APP="$APP_PATH"
+if [[ "$INSTALL_APP" -eq 1 ]]; then
+  mkdir -p "$INSTALL_DIR"
+  STAGING_APP="$INSTALL_DIR/.CPX.app.staging.$$"
+  trap 'rm -rf "$STAGING_APP"' EXIT
+  rm -rf "$STAGING_APP"
+  echo "==> Installing to $INSTALLED_APP"
+  ditto "$APP_PATH" "$STAGING_APP"
+  rm -rf "$INSTALLED_APP"
+  mv "$STAGING_APP" "$INSTALLED_APP"
+  trap - EXIT
+  if [[ -x "$LSREGISTER" ]]; then
+    "$LSREGISTER" -f "$INSTALLED_APP" >/dev/null 2>&1 || true
+  fi
+  LAUNCH_APP="$INSTALLED_APP"
+fi
+
+echo "==> Launching $LAUNCH_APP"
+open "$LAUNCH_APP"

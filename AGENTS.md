@@ -51,17 +51,14 @@ Full `.app` generation, `MetalToolchain` shader compilation (`~/Library/Develope
 
    *(Alternative: `CODE_SIGN_STYLE: Automatic` with `DEVELOPMENT_TEAM` set and without overriding `CODE_SIGN_IDENTITY`. Never commit a personal `DEVELOPMENT_TEAM` into `project.yml`; pass it via `DEVELOPMENT_TEAM`, untracked `Config/LocalSigning.xcconfig`, or `scripts/build-and-run.sh` auto-detection. For external release distribution, sign with a `Developer ID Application` certificate + Hardened Runtime + `com.apple.security.device.audio-input`.)*
 
-3. **Generate, build, and launch via LaunchServices** (launch as a real `.app` bundle so macOS tracks TCC grants by `CFBundleIdentifier`):
+3. **Generate, build, install to `/Applications/CPX.app`, and launch via LaunchServices** (launch as a real `.app` bundle in `/Applications` so macOS tracks TCC grants by `CFBundleIdentifier` and displays CPX in System Settings):
 
    ```bash
-   xcodegen generate
-   DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcodebuild \
-     -project CPX.xcodeproj -scheme CPX -configuration Debug \
-     -destination 'platform=macOS,arch=arm64' \
-     -derivedDataPath .build/xcode \
-     build
-   open .build/xcode/Build/Products/Debug/CPX.app
+   ./scripts/build-and-run.sh
+   # Optional flags: --build-only (compile without replacing/launching), --no-install (run from .build/xcode), --release
    ```
+
+   Under the hood, `scripts/build-and-run.sh` runs `xcodegen generate`, builds with `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer`, replaces `/Applications/CPX.app` atomically, registers it with LaunchServices, and launches `/Applications/CPX.app`.
 
 4. **TCC & Bundle Requirements**:
    - **Non-App-Sandbox** (`com.apple.security.app-sandbox` omitted or `false`) — required for cross-app `AXUIElement` inspection and optional `CGEventTap`.

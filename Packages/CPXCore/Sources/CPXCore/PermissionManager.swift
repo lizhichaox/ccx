@@ -2,6 +2,7 @@ import AppKit
 import ApplicationServices
 import CoreGraphics
 import Foundation
+import ScreenCaptureKit
 
 /// Snapshot of the TCC permissions CPX relies on.
 public struct CPXPermissionStatus: Equatable, Sendable {
@@ -29,7 +30,11 @@ public enum PermissionManager {
     @discardableResult
     public static func requestScreenRecording() -> Bool {
         if CGPreflightScreenCaptureAccess() { return true }
-        return CGRequestScreenCaptureAccess()
+        let granted = CGRequestScreenCaptureAccess()
+        Task.detached {
+            _ = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+        }
+        return granted
     }
 
     /// Checks Accessibility trust, optionally showing the system prompt.
