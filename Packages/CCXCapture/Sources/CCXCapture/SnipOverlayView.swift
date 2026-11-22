@@ -51,6 +51,7 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
 
     private var colorFormat: ColorFormat = .hex
     private var lastMousePoint: CGPoint?
+    private var lastSampledPixel: (x: Int, y: Int)?
     private var currentSample: CCXColorSample?
     private var isShiftDown = false
 
@@ -206,11 +207,13 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
     func resetSelection() {
         cancelInlineTextEditor()
         annotations.clear()
+        annotationView.invalidateActiveRegion()
         activeTool = .select
         activeDrag = .none
         lastTier1LocalRect = nil
         lastRefinedLocalRect = nil
         lastAXQueryPoint = nil
+        lastSampledPixel = nil
         machine.reset()
         refresh()
     }
@@ -281,7 +284,7 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
             resizeInlineEditor(editor)
         }
         if annotations.updateSelectedStyle({ $0 = style }) {
-            annotationView.needsDisplay = true
+            annotationView.invalidate(rect: annotations.selectedItem?.boundingBox)
         }
         refresh()
     }
@@ -412,7 +415,7 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
             )
             annotations.commit(badge)
             activeDrag = .none
-            annotationView.needsDisplay = true
+            annotationView.invalidate(rect: badge.boundingBox)
         case .text:
             activeDrag = .none
             let startOrigin = CGPoint(
@@ -455,7 +458,7 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
         case let .drawing(tool, origin):
             let clamped = clampToSelection(point)
             updateDraft(tool: tool, origin: origin, current: clamped, constrain: constrain)
-            annotationView.needsDisplay = true
+            annotationView.invalidate(rect: annotations.draft?.boundingBox)
         case let .movingAnnotation(initial, startPoint, didPushUndo):
             let delta = CGSize(width: point.x - startPoint.x, height: point.y - startPoint.y)
             if !didPushUndo && hypot(delta.width, delta.height) >= 1 {
@@ -463,8 +466,9 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
                 activeDrag = .movingAnnotation(initial: initial, startPoint: startPoint, didPushUndo: true)
             }
             if case let .movingAnnotation(_, _, pushed) = activeDrag, pushed {
-                annotations.replaceItem(initial.translated(by: delta), recordUndo: false)
-                annotationView.needsDisplay = true
+                let updated = initial.translated(by: delta)
+                annotations.replaceItem(updated, recordUndo: false)
+                annotationView.invalidate(rect: updated.boundingBox)
             }
         case let .resizingAnnotation(initial, handle, didPushUndo):
             if !didPushUndo {
@@ -472,8 +476,9 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
                 activeDrag = .resizingAnnotation(initial: initial, handle: handle, didPushUndo: true)
             }
             let clamped = clampToSelection(point)
-            annotations.replaceItem(initial.resized(handle: handle, to: clamped, constrain: constrain), recordUndo: false)
-            annotationView.needsDisplay = true
+            let updated = initial.resized(handle: handle, to: clamped, constrain: constrain)
+            annotations.replaceItem(updated, recordUndo: false)
+            annotationView.invalidate(rect: updated.boundingBox)
         }
         refresh()
     }
@@ -488,14 +493,15 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
         case .selectionMachine:
             machine.mouseUp(at: point)
         case let .drawing(tool, _):
+            let rect = annotations.draft?.boundingBox
             if let draft = annotations.draft, Self.isMeaningfulDraft(draft, tool: tool) {
                 annotations.commit(draft)
             } else {
                 annotations.draft = nil
             }
-            annotationView.needsDisplay = true
+            annotationView.invalidate(rect: rect)
         case .movingAnnotation, .resizingAnnotation:
-            annotationView.needsDisplay = true
+            annotationView.invalidate(rect: annotations.selectedItem?.boundingBox)
         }
 
         activeDrag = .none
@@ -652,7 +658,7 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
         editingOriginalItem = existing
         inlineEditor = field
         annotationView.editingTextItemID = existing?.id
-        annotationView.needsDisplay = true
+        annotationView.invalidateActiveRegion()
 
         addSubview(field)
         resizeInlineEditor(field, clampedTo: selection)
@@ -702,7 +708,7 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
         }
 
         window?.makeFirstResponder(self)
-        annotationView.needsDisplay = true
+        annotationView.invalidateActiveRegion()
         refresh()
     }
 
@@ -714,7 +720,7 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
         editingOriginalItem = nil
         annotationView.editingTextItemID = nil
         window?.makeFirstResponder(self)
-        annotationView.needsDisplay = true
+        annotationView.invalidateActiveRegion()
     }
 
     func controlTextDidChange(_ obj: Notification) {
@@ -768,7 +774,7 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
 
         if flags == [.command, .shift], char == "z", selectedRect != nil {
             if annotations.redo() {
-                annotationView.needsDisplay = true
+                annotationView.invalidateActiveRegion()
                 refresh()
             }
             return true
@@ -795,7 +801,7 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
         case "z":
             if selectedRect != nil {
                 if annotations.undo() {
-                    annotationView.needsDisplay = true
+                    annotationView.invalidateActiveRegion()
                     refresh()
                 }
                 return true
@@ -834,7 +840,7 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
             return
         case 51, 117: // Delete, Forward Delete
             if selectedRect != nil, annotations.deleteSelected() {
-                annotationView.needsDisplay = true
+                annotationView.invalidateActiveRegion()
                 refresh()
                 return
             }
@@ -892,13 +898,13 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
         case .undo:
             commitInlineTextEditor()
             if annotations.undo() {
-                annotationView.needsDisplay = true
+                annotationView.invalidateActiveRegion()
                 refresh()
             }
         case .redo:
             commitInlineTextEditor()
             if annotations.redo() {
-                annotationView.needsDisplay = true
+                annotationView.invalidateActiveRegion()
                 refresh()
             }
         case .pin:
@@ -967,7 +973,7 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
             } else {
                 handleLayer.path = nil
             }
-            annotationView.needsDisplay = true
+            annotationView.invalidateActiveRegion()
         }
 
         updateMagnifier(highlight: highlight)
@@ -1015,13 +1021,17 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
         guard visibleState, let point = lastMousePoint, bounds.contains(point) else {
             magnifier.isHidden = true
             currentSample = nil
+            lastSampledPixel = nil
             return
         }
         let image = snapshot.image
         let scale = pixelScale
         let pixelX = min(max(Int((point.x * scale.width).rounded(.down)), 0), image.width - 1)
         let pixelY = min(max(Int(((bounds.height - point.y) * scale.height).rounded(.down)), 0), image.height - 1)
-        currentSample = CCXColorSample.samplePixel(from: image, pixelX: pixelX, pixelY: pixelY)
+        if lastSampledPixel?.x != pixelX || lastSampledPixel?.y != pixelY {
+            lastSampledPixel = (pixelX, pixelY)
+            currentSample = CCXColorSample.samplePixel(from: image, pixelX: pixelX, pixelY: pixelY)
+        }
         magnifier.update(
             image: image,
             pixelX: pixelX,
@@ -1098,10 +1108,10 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
             } else if let handle = SelectionStateMachine.hitTestHandle(at: point, rect: rect, radius: machine.handleHitRadius) {
                 kind = .resize(handle)
                 cursor = Self.cursor(for: handle)
-            } else if annotations.hitTestItem(at: point) != nil {
+            } else if rect.contains(point) {
                 kind = .openHand
                 cursor = .openHand
-            } else if rect.contains(point) {
+            } else if !annotations.items.isEmpty && annotations.hitTestItem(at: point) != nil {
                 kind = .openHand
                 cursor = .openHand
             } else {

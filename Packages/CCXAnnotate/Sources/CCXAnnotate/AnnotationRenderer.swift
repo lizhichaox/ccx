@@ -58,7 +58,33 @@ public enum AnnotationRenderer {
             context.saveGState()
             context.clip(to: rect)
             if let filtered = mosaicImage?(mode, item.style.size) {
-                context.draw(filtered, in: screenBounds)
+                let visible = rect.intersection(screenBounds)
+                if !visible.isNull, !visible.isEmpty,
+                   screenBounds.width > 0, screenBounds.height > 0 {
+                    let scaleX = CGFloat(filtered.width) / screenBounds.width
+                    let scaleY = CGFloat(filtered.height) / screenBounds.height
+                    let pxMinX = max(0, Int(floor((visible.minX - screenBounds.minX) * scaleX)))
+                    let pxMaxX = min(filtered.width, Int(ceil((visible.maxX - screenBounds.minX) * scaleX)))
+                    let pxMinY = max(0, Int(floor((screenBounds.maxY - visible.maxY) * scaleY)))
+                    let pxMaxY = min(filtered.height, Int(ceil((screenBounds.maxY - visible.minY) * scaleY)))
+                    let pixelRect = CGRect(
+                        x: pxMinX,
+                        y: pxMinY,
+                        width: max(0, pxMaxX - pxMinX),
+                        height: max(0, pxMaxY - pxMinY)
+                    )
+                    if !pixelRect.isEmpty, let cropped = filtered.cropping(to: pixelRect) {
+                        let drawRect = CGRect(
+                            x: screenBounds.minX + CGFloat(pxMinX) / scaleX,
+                            y: screenBounds.maxY - CGFloat(pxMaxY) / scaleY,
+                            width: CGFloat(cropped.width) / scaleX,
+                            height: CGFloat(cropped.height) / scaleY
+                        )
+                        context.draw(cropped, in: drawRect)
+                    } else {
+                        context.draw(filtered, in: screenBounds)
+                    }
+                }
             } else {
                 context.setFillColor(NSColor(white: 0.25, alpha: 0.85).cgColor)
                 context.fill(rect)
@@ -207,8 +233,9 @@ public enum AnnotationRenderer {
         in context: CGContext
     ) {
         guard let first = points.first else { return }
-        context.setStrokeColor(color.copy(alpha: alpha) ?? color)
-        context.setFillColor(color.copy(alpha: alpha) ?? color)
+        let resolvedColor = alpha >= 0.999 ? color : (color.copy(alpha: alpha) ?? color)
+        context.setStrokeColor(resolvedColor)
+        context.setFillColor(resolvedColor)
         context.setLineWidth(lineWidth)
         context.setLineCap(.round)
         context.setLineJoin(.round)

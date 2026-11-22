@@ -322,16 +322,20 @@ public struct AnnotationItem: Identifiable, Equatable, Sendable {
 
         case let .arrow(start, end):
             let pad = tolerance + style.size.lineWidth / 2
+            let headPad = max(pad, max(14, style.size.lineWidth * 4.2) * 0.65)
+            guard boundingBox.insetBy(dx: -headPad, dy: -headPad).contains(point) else { return false }
             if Self.distanceToSegment(point, start, end) <= pad { return true }
             let headRadius = max(14, style.size.lineWidth * 4.2) * 0.65
             return hypot(point.x - end.x, point.y - end.y) <= headRadius
 
         case let .pen(points):
             let pad = tolerance + style.size.lineWidth / 2
+            guard boundingBox.insetBy(dx: -pad, dy: -pad).contains(point) else { return false }
             return Self.hitTestPolyline(points, point: point, threshold: pad)
 
         case let .highlighter(points):
             let pad = tolerance + style.size.highlighterWidth / 2
+            guard boundingBox.insetBy(dx: -pad, dy: -pad).contains(point) else { return false }
             return Self.hitTestPolyline(points, point: point, threshold: pad)
 
         case let .mosaic(raw, _):

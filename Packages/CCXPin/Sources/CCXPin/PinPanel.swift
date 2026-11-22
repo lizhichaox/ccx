@@ -51,7 +51,7 @@ public final class PinPanel: NSPanel {
         pinView.panel = self
         pinView.autoresizingMask = [.width, .height]
         contentView = pinView
-        applyState(resizeKeeping: nil)
+        applyState(from: nil, resizeKeeping: nil)
     }
 
     override public var canBecomeKey: Bool { true }
@@ -63,8 +63,9 @@ public final class PinPanel: NSPanel {
     /// frame's top-left corner).
     public func updateState(_ newState: PinState, anchor: CGPoint? = nil) {
         guard newState != state else { return }
+        let previous = state
         state = newState
-        applyState(resizeKeeping: anchor ?? CGPoint(x: frame.minX, y: frame.maxY))
+        applyState(from: previous, resizeKeeping: anchor ?? CGPoint(x: frame.minX, y: frame.maxY))
     }
 
     private func mutateState(anchor: CGPoint? = nil, _ change: (inout PinState) -> Void) {
@@ -73,19 +74,39 @@ public final class PinPanel: NSPanel {
         updateState(newState, anchor: anchor)
     }
 
-    private func applyState(resizeKeeping anchor: CGPoint?) {
+    private func applyState(from previous: PinState?, resizeKeeping anchor: CGPoint?) {
         alphaValue = state.opacity
         hasShadow = state.showsShadow
         ignoresMouseEvents = state.isClickThrough
+
         if let anchor {
             let size = PinLayout.frameSize(baseSize: baseSize, state: state)
             if size != frame.size {
                 setFrame(PinLayout.resizedFrame(frame, to: size, keeping: anchor), display: true)
             }
         }
-        pinView.needsDisplay = true
-        invalidateShadow()
-        onStateChanged?(self)
+
+        let needsContentRedraw = previous == nil
+            || previous?.isThumbnail != state.isThumbnail
+            || previous?.showsBorder != state.showsBorder
+            || previous?.isClickThrough != state.isClickThrough
+            || previous?.rotationDegrees != state.rotationDegrees
+            || previous?.zoom != state.zoom
+        if needsContentRedraw {
+            pinView.needsDisplay = true
+        }
+
+        let needsShadowInvalidation = previous == nil
+            || previous?.showsShadow != state.showsShadow
+            || previous?.isThumbnail != state.isThumbnail
+            || previous?.isQuarterTurned != state.isQuarterTurned
+        if needsShadowInvalidation {
+            invalidateShadow()
+        }
+
+        if previous?.isClickThrough != state.isClickThrough {
+            onStateChanged?(self)
+        }
     }
 
     var frameCenter: CGPoint { CGPoint(x: frame.midX, y: frame.midY) }

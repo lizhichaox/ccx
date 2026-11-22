@@ -20,9 +20,19 @@ final class SnipActionToolbar: NSView {
     var onToolSelected: ((AnnotationTool) -> Void)?
     var onStyleChanged: ((AnnotationStyle) -> Void)?
 
+    private struct RenderedState: Equatable {
+        let activeTool: AnnotationTool
+        let styleTool: AnnotationTool
+        let style: AnnotationStyle
+        let showStyleBar: Bool
+        let canUndo: Bool
+        let canRedo: Bool
+    }
+
     private var activeTool: AnnotationTool = .select
     private var currentStyle = AnnotationStyle()
     private var isStyleBarVisible = false
+    private var lastRenderedState: RenderedState?
 
     private let primarySurface: NSView
     private let styleSurface: NSView
@@ -97,6 +107,18 @@ final class SnipActionToolbar: NSView {
         canUndo: Bool,
         canRedo: Bool
     ) {
+        let effectiveStyleTool = styleTool ?? activeTool
+        let nextState = RenderedState(
+            activeTool: activeTool,
+            styleTool: effectiveStyleTool,
+            style: style,
+            showStyleBar: showStyleBar,
+            canUndo: canUndo,
+            canRedo: canRedo
+        )
+        guard nextState != lastRenderedState else { return }
+        lastRenderedState = nextState
+
         self.activeTool = activeTool
         self.currentStyle = style
         self.isStyleBarVisible = showStyleBar
@@ -110,7 +132,7 @@ final class SnipActionToolbar: NSView {
 
         styleSurface.isHidden = !showStyleBar
         if showStyleBar {
-            let showMosaic = (styleTool ?? activeTool) == .mosaic
+            let showMosaic = effectiveStyleTool == .mosaic
             colorsStack.isHidden = showMosaic
             mosaicModeStack.isHidden = !showMosaic
             for (color, button) in colorButtons {
@@ -352,7 +374,12 @@ final class SnipActionToolbar: NSView {
 // MARK: - Toolbar Button Controls
 
 private class HoverButton: NSButton {
-    var isHovering = false { didSet { updateVisuals() } }
+    var isHovering = false {
+        didSet {
+            guard oldValue != isHovering else { return }
+            updateVisuals()
+        }
+    }
     private var hoverArea: NSTrackingArea?
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
@@ -383,7 +410,12 @@ private class HoverButton: NSButton {
 
 private final class ToolToggleButton: HoverButton {
     let tool: AnnotationTool
-    var isSelectedTool = false { didSet { updateVisuals() } }
+    var isSelectedTool = false {
+        didSet {
+            guard oldValue != isSelectedTool else { return }
+            updateVisuals()
+        }
+    }
 
     init(tool: AnnotationTool, symbol: String, tooltip: String) {
         self.tool = tool
@@ -426,6 +458,7 @@ private final class ToolbarIconButton: HoverButton {
     private let handler: () -> Void
     var isActionAvailable = true {
         didSet {
+            guard oldValue != isActionAvailable else { return }
             isEnabled = isActionAvailable
             updateVisuals()
         }
@@ -471,7 +504,12 @@ private final class ToolbarIconButton: HoverButton {
 
 private final class ColorSwatchButton: HoverButton {
     let annotationColor: AnnotationColor
-    var isChosen = false { didSet { needsDisplay = true } }
+    var isChosen = false {
+        didSet {
+            guard oldValue != isChosen else { return }
+            needsDisplay = true
+        }
+    }
 
     init(color: AnnotationColor) {
         self.annotationColor = color
@@ -517,7 +555,12 @@ private final class ColorSwatchButton: HoverButton {
 
 private final class SizeDotButton: HoverButton {
     let preset: StrokePreset
-    var isChosen = false { didSet { needsDisplay = true } }
+    var isChosen = false {
+        didSet {
+            guard oldValue != isChosen else { return }
+            needsDisplay = true
+        }
+    }
 
     init(preset: StrokePreset) {
         self.preset = preset
@@ -560,7 +603,12 @@ private final class SizeDotButton: HoverButton {
 
 private final class ModePillButton: HoverButton {
     let mosaicMode: MosaicMode
-    var isChosen = false { didSet { updateVisuals() } }
+    var isChosen = false {
+        didSet {
+            guard oldValue != isChosen else { return }
+            updateVisuals()
+        }
+    }
 
     init(mode: MosaicMode) {
         self.mosaicMode = mode

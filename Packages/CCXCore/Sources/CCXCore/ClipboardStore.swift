@@ -223,10 +223,16 @@ public final class ClipboardStore {
             data as CFMutableData, type.identifier as CFString, 1, nil
         ) else { return nil }
         let dpi = 72 * max(scale, 0.01)
-        let properties: [CFString: Any] = [
+        var properties: [CFString: Any] = [
             kCGImagePropertyDPIWidth: dpi,
             kCGImagePropertyDPIHeight: dpi,
         ]
+        if type == .tiff {
+            // Lossless LZW compression keeps Retina clipboard copies small and fast over IPC.
+            properties[kCGImagePropertyTIFFDictionary] = [
+                kCGImagePropertyTIFFCompression: 5,
+            ]
+        }
         CGImageDestinationAddImage(destination, image, properties as CFDictionary)
         guard CGImageDestinationFinalize(destination) else { return nil }
         return data as Data

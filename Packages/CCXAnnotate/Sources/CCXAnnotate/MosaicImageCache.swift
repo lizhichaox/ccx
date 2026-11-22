@@ -12,20 +12,20 @@ public final class MosaicImageCache {
         let preset: StrokePreset
     }
 
+    private static let sharedCIContext: CIContext = {
+        // Prefer Metal 4/GPU context; fall back cleanly to software CIContext in headless sandboxes.
+        if let device = MTLCreateSystemDefaultDevice() {
+            return CIContext(mtlDevice: device, options: [.cacheIntermediates: false])
+        }
+        return CIContext(options: [.cacheIntermediates: false])
+    }()
+
     public let baseImage: CGImage
-    private let ciContext: CIContext
-    private let ciSource: CIImage
+    private lazy var ciSource = CIImage(cgImage: baseImage)
     private var cache: [CacheKey: CGImage] = [:]
 
     public init(baseImage: CGImage) {
         self.baseImage = baseImage
-        // Prefer Metal 4/GPU context; fall back cleanly to software CIContext in headless sandboxes.
-        if let device = MTLCreateSystemDefaultDevice() {
-            self.ciContext = CIContext(mtlDevice: device, options: [.cacheIntermediates: false])
-        } else {
-            self.ciContext = CIContext(options: [.cacheIntermediates: false])
-        }
-        self.ciSource = CIImage(cgImage: baseImage)
     }
 
     public func filteredImage(mode: MosaicMode, preset: StrokePreset, backingScale: CGFloat) -> CGImage? {
@@ -53,7 +53,7 @@ public final class MosaicImageCache {
             output = filter?.outputImage?.cropped(to: extent)
         }
 
-        guard let output, let cgImage = ciContext.createCGImage(output, from: extent) else {
+        guard let output, let cgImage = Self.sharedCIContext.createCGImage(output, from: extent) else {
             return nil
         }
         cache[key] = cgImage
