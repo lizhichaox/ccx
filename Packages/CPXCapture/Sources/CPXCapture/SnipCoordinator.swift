@@ -1,4 +1,5 @@
 import AppKit
+import CPXCore
 import OSLog
 
 /// Entry point for an interactive snip session (freeze screens -> select -> act).
@@ -32,10 +33,18 @@ public final class SnipCoordinator {
             do {
                 let snapshots = try await ScreenSnapshotEngine.captureAllDisplays()
                 guard let self, self.isSessionActive, !Task.isCancelled else { return }
+                PermissionManager.setScreenRecordingVerified(true)
                 self.presentOverlay(snapshots: snapshots, detector: detector)
             } catch {
-                Self.logger.error("Snapshot failed: \(error.localizedDescription)")
-                self?.finish(.cancelled)
+                guard let self, !Task.isCancelled else { return }
+                if ScreenSnapshotEngine.isPermissionDeniedError(error) {
+                    PermissionManager.setScreenRecordingVerified(false)
+                    Self.logger.error("ScreenCaptureKit permission denied: \(error.localizedDescription)")
+                    self.finish(.permissionDenied)
+                } else {
+                    Self.logger.error("Snapshot failed: \(error.localizedDescription)")
+                    self.finish(.failed(error.localizedDescription))
+                }
             }
         }
     }

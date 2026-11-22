@@ -42,6 +42,8 @@ public enum SnipOutcome: Sendable {
     case copy(SnipResult)
     case save(SnipResult)
     case copiedColor(CPXColorSample, ColorFormat)
+    case permissionDenied
+    case failed(String)
     case cancelled
 }
 

@@ -88,11 +88,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func startSnip() {
         guard !snipCoordinator.isSessionActive else { return }
-        guard PermissionManager.currentStatus().screenRecording else {
-            PermissionManager.requestScreenRecording()
-            showOnboarding(startingAt: .permissions)
-            return
-        }
         snipCoordinator.startSnip { [weak self] outcome in
             self?.handle(outcome)
         }
@@ -138,6 +133,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let text = sample.formatted(as: format)
             clipboardStore.copyText(text)
             toast.show("Copied \(text)", symbolName: "eyedropper")
+        case .permissionDenied:
+            menuBarController?.refresh()
+            toast.show("Screen Recording Permission Required", symbolName: "exclamationmark.triangle")
+            showOnboarding(startingAt: .permissions)
+        case .failed(let message):
+            toast.show("Capture Failed: \(message)", symbolName: "exclamationmark.triangle")
         case .cancelled:
             break
         }

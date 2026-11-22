@@ -14,8 +14,9 @@ public enum ScreenSnapshotError: Error, Sendable {
 /// Freezes every connected display using ScreenCaptureKit only.
 ///
 /// - On macOS 26+, uses `SCScreenshotManager.captureScreenshot(contentFilter:configuration:)`
-///   with `SCScreenshotConfiguration` (SDR image in the display's native color space, HDR fallback).
-/// - On macOS 15.x, falls back to `SCScreenshotManager.captureImage(contentFilter:configuration:)`.
+///   with `SCScreenshotConfiguration` (SDR image in the display's native color space, HDR fallback)
+///   and automatically falls back to `captureImage(contentFilter:configuration:)` on non-permission errors.
+/// - On macOS 15.x, uses `SCScreenshotManager.captureImage(contentFilter:configuration:)`.
 public enum ScreenSnapshotEngine {
     /// Geometry of an `NSScreen` captured on the main actor before going async.
     struct ScreenGeometry: Sendable {
@@ -25,6 +26,13 @@ public enum ScreenSnapshotEngine {
     }
 
     private static let logger = Logger(subsystem: "com.lizhichaox.cpx", category: "ScreenSnapshotEngine")
+
+    /// Returns `true` when ScreenCaptureKit reported that the user declined or lacks
+    /// Screen Recording permission (`SCStreamError.userDeclined`, `-3801`).
+    public static func isPermissionDeniedError(_ error: Error) -> Bool {
+        let nsError = error as NSError
+        return nsError.domain == SCStreamErrorDomain && nsError.code == SCStreamError.userDeclined.rawValue
+    }
 
     /// Captures every active display concurrently, excluding CPX's own windows.
     @MainActor
@@ -64,31 +72,46 @@ public enum ScreenSnapshotEngine {
         }
         guard !jobs.isEmpty else { throw ScreenSnapshotError.noDisplays }
 
-        let snapshots = await withTaskGroup(of: DisplaySnapshot?.self) { group in
+        let (snapshots, errors) = await withTaskGroup(of: Result<DisplaySnapshot, Error>.self) { group in
             for (filterBox, geometry) in jobs {
                 group.addTask {
                     do {
                         let image = try await captureImage(filter: filterBox.value, geometry: geometry)
-                        return DisplaySnapshot(
+                        return .success(DisplaySnapshot(
                             displayID: geometry.displayID,
                             screenFrame: geometry.frame,
                             backingScaleFactor: geometry.scale,
                             image: image
-                        )
+                        ))
                     } catch {
                         logger.error("Display \(geometry.displayID) capture failed: \(error.localizedDescription)")
-                        return nil
+                        return .failure(error)
                     }
                 }
             }
             var collected: [DisplaySnapshot] = []
-            for await snapshot in group {
-                if let snapshot { collected.append(snapshot) }
+            var failures: [Error] = []
+            for await result in group {
+                switch result {
+                case .success(let snapshot):
+                    collected.append(snapshot)
+                case .failure(let error):
+                    failures.append(error)
+                }
             }
-            return collected
+            return (collected, failures)
         }
-        guard !snapshots.isEmpty else { throw ScreenSnapshotError.captureFailed }
-        return snapshots
+
+        if !snapshots.isEmpty {
+            return snapshots
+        }
+        if let permissionError = errors.first(where: { isPermissionDeniedError($0) }) {
+            throw permissionError
+        }
+        if let firstError = errors.first {
+            throw firstError
+        }
+        throw ScreenSnapshotError.captureFailed
     }
 
     nonisolated private static func captureImage(filter: SCContentFilter, geometry: ScreenGeometry) async throws -> CGImage {
@@ -96,31 +119,43 @@ public enum ScreenSnapshotEngine {
         let pixelHeight = Int((geometry.frame.height * geometry.scale).rounded())
 
         if #available(macOS 26.0, *) {
-            let configuration = SCScreenshotConfiguration()
-            configuration.width = pixelWidth
-            configuration.height = pixelHeight
-            configuration.showsCursor = false
-            configuration.ignoreShadows = false
-            configuration.displayIntent = .local
-            configuration.dynamicRange = .sdr
-            let output = try await SCScreenshotManager.captureScreenshot(
-                contentFilter: filter,
-                configuration: configuration
-            )
-            if let image = output.sdrImage ?? output.hdrImage {
-                return image
+            do {
+                let configuration = SCScreenshotConfiguration()
+                configuration.width = pixelWidth
+                configuration.height = pixelHeight
+                configuration.showsCursor = false
+                configuration.ignoreShadows = false
+                configuration.displayIntent = .local
+                configuration.dynamicRange = .sdr
+                let output = try await SCScreenshotManager.captureScreenshot(
+                    contentFilter: filter,
+                    configuration: configuration
+                )
+                if let image = output.sdrImage ?? output.hdrImage {
+                    return image
+                }
+            } catch {
+                if isPermissionDeniedError(error) { throw error }
+                logger.warning("macOS 26 captureScreenshot failed, falling back to captureImage: \(error.localizedDescription)")
             }
-            throw ScreenSnapshotError.captureFailed
-        } else {
-            let configuration = SCStreamConfiguration()
-            configuration.width = pixelWidth
-            configuration.height = pixelHeight
-            configuration.showsCursor = false
-            configuration.captureResolution = .best
-            configuration.scalesToFit = false
-            configuration.pixelFormat = kCVPixelFormatType_32BGRA
-            configuration.colorSpaceName = CGColorSpace.displayP3
-            return try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration)
         }
+
+        return try await captureLegacyImage(filter: filter, pixelWidth: pixelWidth, pixelHeight: pixelHeight)
+    }
+
+    nonisolated private static func captureLegacyImage(
+        filter: SCContentFilter,
+        pixelWidth: Int,
+        pixelHeight: Int
+    ) async throws -> CGImage {
+        let configuration = SCStreamConfiguration()
+        configuration.width = pixelWidth
+        configuration.height = pixelHeight
+        configuration.showsCursor = false
+        configuration.captureResolution = .best
+        configuration.scalesToFit = false
+        configuration.pixelFormat = kCVPixelFormatType_32BGRA
+        configuration.colorSpaceName = CGColorSpace.displayP3
+        return try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration)
     }
 }

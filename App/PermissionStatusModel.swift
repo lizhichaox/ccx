@@ -72,13 +72,23 @@ final class PermissionStatusModel: ObservableObject {
         refresh()
     }
 
-    /// Triggers the native Screen Recording prompt and opens System Settings
-    /// directly when access is still not granted.
+    /// Probes ScreenCaptureKit directly and refreshes published permission state.
+    func verifyScreenRecordingLive() {
+        Task { @MainActor [weak self] in
+            _ = await PermissionManager.verifyScreenRecordingLive()
+            self?.refresh()
+        }
+    }
+
+    /// Verifies live ScreenCaptureKit access first, then triggers the native prompt
+    /// and opens System Settings only if access is still not granted.
     func allowScreenRecording() {
-        PermissionManager.requestScreenRecording()
-        refresh()
-        if !status.screenRecording {
-            Task { @MainActor in
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let liveGranted = await PermissionManager.verifyScreenRecordingLive()
+            self.refresh()
+            if !liveGranted {
+                PermissionManager.requestScreenRecording()
                 try? await Task.sleep(for: .milliseconds(150))
                 PermissionManager.openScreenRecordingSettings()
             }

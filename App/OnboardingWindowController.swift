@@ -298,7 +298,10 @@ private struct PermissionsStepView: View {
                     extraFooter: {
                         if !model.status.screenRecording {
                             ScreenRecordingHintStrip(
-                                showRelaunch: flow.requestedScreenRecording
+                                showRelaunch: flow.requestedScreenRecording,
+                                onVerify: {
+                                    model.verifyScreenRecordingLive()
+                                }
                             )
                         }
                     }
@@ -412,6 +415,7 @@ private struct PermissionGrantedPill: View {
 
 private struct ScreenRecordingHintStrip: View {
     let showRelaunch: Bool
+    let onVerify: () -> Void
 
     var body: some View {
         HStack(spacing: 10) {
@@ -433,12 +437,17 @@ private struct ScreenRecordingHintStrip: View {
             .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
             .fixedSize()
 
-            Text("Toggle CPX on in System Settings → Privacy & Security, then relaunch CPX to apply.")
+            Text("Enable CPX under Screen & System Audio Recording (top list, not System Audio Only), then relaunch CPX.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
             Spacer(minLength: 8)
+
+            Button("Verify", action: onVerify)
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .fixedSize()
 
             if showRelaunch {
                 Button("Relaunch Now") {
