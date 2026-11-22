@@ -35,7 +35,6 @@ xcuserdata/
 .build/
 .swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
 .swiftpm/configuration/registries.json
-Packages/
 Package.pins
 
 # General dev / editors / logs / build outputs
