@@ -31,6 +31,12 @@ xcuserdata/
 *.dmg
 *.pkg
 
+# XcodeGen output (regenerate with `xcodegen generate`)
+CPX.xcodeproj/
+
+# Personal signing settings (public repository)
+Config/LocalSigning.xcconfig
+
 # Swift Package Manager
 .build/
 .swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata

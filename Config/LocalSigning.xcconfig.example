@@ -1,0 +1,8 @@
+// Copy this file to Config/LocalSigning.xcconfig (untracked) and fill in the
+// Team ID (the `OU` field) of your installed "Apple Development" certificate:
+//
+//   security find-certificate -c "Apple Development" -p | openssl x509 -noout -subject
+//
+// Do not commit the copied file: this repository is public.
+
+DEVELOPMENT_TEAM = XXXXXXXXXX

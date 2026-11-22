@@ -1,0 +1,70 @@
+# XcodeGen manifest for the CPX macOS app (XcodeGen 2.48.0).
+#
+# Generate the project with `xcodegen generate` (or `scripts/build-and-run.sh`).
+# The generated CPX.xcodeproj is not tracked.
+#
+# Signing: this is a public repository, so no personal Team ID lives here.
+# Provide DEVELOPMENT_TEAM either on the xcodebuild command line
+# (`DEVELOPMENT_TEAM=XXXXXXXXXX`, done automatically by scripts/build-and-run.sh)
+# or through the untracked Config/LocalSigning.xcconfig
+# (copy Config/LocalSigning.xcconfig.example). DEVELOPMENT_TEAM must NOT be set
+# in the target settings below, because target settings override xcconfig values.
+
+name: CPX
+
+options:
+  bundleIdPrefix: com.lizhichaox
+  deploymentTarget:
+    macOS: "15.0"
+  createIntermediateGroups: true
+  developmentLanguage: en
+
+packages:
+  CPXCore:
+    path: Packages/CPXCore
+  CPXCapture:
+    path: Packages/CPXCapture
+  CPXPin:
+    path: Packages/CPXPin
+
+settings:
+  base:
+    MACOSX_DEPLOYMENT_TARGET: "15.0"
+    SWIFT_VERSION: "6.0"
+
+targets:
+  CPX:
+    type: application
+    platform: macOS
+    deploymentTarget: "15.0"
+    configFiles:
+      Debug: Config/CPX.xcconfig
+      Release: Config/CPX.xcconfig
+    sources:
+      - path: App
+    dependencies:
+      - package: CPXCore
+      - package: CPXCapture
+      - package: CPXPin
+    settings:
+      base:
+        PRODUCT_NAME: CPX
+        PRODUCT_BUNDLE_IDENTIFIER: com.lizhichaox.cpx
+        MACOSX_DEPLOYMENT_TARGET: "15.0"
+        SWIFT_VERSION: "6.0"
+        SWIFT_STRICT_CONCURRENCY: complete
+        MARKETING_VERSION: 0.1.0
+        CURRENT_PROJECT_VERSION: 1
+        INFOPLIST_FILE: App/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        CODE_SIGN_ENTITLEMENTS: App/CPX.entitlements
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: "Apple Development"
+        PROVISIONING_PROFILE_SPECIFIER: ""
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        COMBINE_HIDPI_IMAGES: YES
+        ENABLE_PREVIEWS: NO
+        DEAD_CODE_STRIPPING: YES
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/../Frameworks"
+    scheme:
+      gatherCoverageData: false
