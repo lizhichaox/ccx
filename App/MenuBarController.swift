@@ -23,7 +23,7 @@ private final class MenuBarPanel: NSPanel {
 
     init() {
         super.init(
-            contentRect: NSRect(x: 0, y: 0, width: 304, height: 320),
+            contentRect: NSRect(x: 0, y: 0, width: 272, height: 220),
             styleMask: [.borderless, .nonactivatingPanel, .fullSizeContentView],
             backing: .buffered,
             defer: false
