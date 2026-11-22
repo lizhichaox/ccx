@@ -160,11 +160,7 @@ private struct WelcomeStepView: View {
             Spacer(minLength: 0)
 
             VStack(spacing: 8) {
-                Image(nsImage: NSApp.applicationIconImage)
-                    .resizable()
-                    .interpolation(.high)
-                    .aspectRatio(contentMode: .fit)
-                    .frame(width: 78, height: 78)
+                CCXBrandIcon(size: 78)
 
                 VStack(spacing: 4) {
                     Text("Welcome to CCX")
@@ -497,7 +493,13 @@ private struct ReadyStepView: View {
             .padding(.vertical, 4)
             .ccxCardSurface(cornerRadius: 14)
 
-            HStack {
+            HStack(spacing: 12) {
+                Image(systemName: "power")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(.teal)
+                    .frame(width: 28, height: 28)
+                    .background(Color.teal.opacity(0.14), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+
                 Text("Launch CCX at login")
                     .font(.system(size: 13, weight: .medium))
 
@@ -613,8 +615,8 @@ struct KeycapComboView: View {
                 Text(token)
                     .font(.system(size: 12, weight: .semibold, design: .rounded))
                     .foregroundStyle(.primary)
+                    .padding(.horizontal, token.count > 1 ? 6 : 0)
                     .frame(minWidth: 24, minHeight: 24)
-                    .padding(.horizontal, token.count > 1 ? 7 : 4)
                     .background(
                         RoundedRectangle(cornerRadius: 6, style: .continuous)
                             .fill(Color.primary.opacity(0.06))
@@ -745,6 +747,19 @@ private extension View {
                         .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
                 )
         }
+    }
+}
+
+/// Appearance-adaptive CCX brand icon backed by `BrandIcon.imageset`.
+struct CCXBrandIcon: View {
+    let size: CGFloat
+
+    var body: some View {
+        Image("BrandIcon")
+            .resizable()
+            .interpolation(.high)
+            .aspectRatio(contentMode: .fit)
+            .frame(width: size, height: size)
     }
 }
 

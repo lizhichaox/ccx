@@ -25,6 +25,7 @@ import tempfile
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DESIGN_DIR = os.path.join(ROOT, "Design", "Icon")
 APPICON_DIR = os.path.join(ROOT, "App", "Assets.xcassets", "AppIcon.appiconset")
+BRANDICON_DIR = os.path.join(ROOT, "App", "Assets.xcassets", "BrandIcon.imageset")
 
 CHROME_CANDIDATES = [
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -223,8 +224,12 @@ def full_bleed_svg(appearance: str, size: int = 1024) -> str:
 def mac_plate_svg(appearance: str, size: int) -> str:
     small = size <= SMALL_PIXELS
     plate = 'x="100" y="100" width="824" height="824" rx="185"'
-    ground = APPEARANCES[appearance]["ground"]
+    cfg = APPEARANCES[appearance]
+    ground = cfg["ground"]
+    ink = cfg["ink"]
     shadow_opacity = "0.28" if appearance == "light" else "0.45"
+    rim_opacity = "0.18" if appearance == "dark" else "0.08"
+    rim_width = "10" if small else "6"
     return (
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" viewBox="0 0 1024 1024">'
         "<defs>"
@@ -236,7 +241,7 @@ def mac_plate_svg(appearance: str, size: int) -> str:
         f'<rect {plate} fill="{ground}" filter="url(#shadow)"/>'
         '<g clip-path="url(#plate)"><g transform="translate(100 100) scale(0.8046875)">'
         + body(appearance, small=small)
-        + "</g></g></svg>"
+        + f'</g><rect {plate} fill="none" stroke="{ink}" stroke-opacity="{rim_opacity}" stroke-width="{rim_width}"/></g></svg>'
     )
 
 
@@ -251,51 +256,59 @@ def chrome_binary() -> str:
 
 
 def render_svg_to_png(
-    chrome: str, work: str, profile_dir: str, svg: str, out_png: str, width: int, height: int
+    chrome: str, work: str, svg: str, out_png: str, width: int, height: int
 ) -> None:
     html_path = os.path.join(work, os.path.basename(out_png) + ".html")
+    profile_dir = tempfile.mkdtemp(prefix="chrome-", dir=work)
     with open(html_path, "w", encoding="utf-8") as f:
         f.write(f'<!doctype html><html><body style="margin:0;overflow:hidden;background:transparent">{svg}</body></html>')
-    subprocess.run(
-        [
-            chrome,
-            "--headless=new",
-            "--disable-gpu",
-            f"--user-data-dir={profile_dir}",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--hide-scrollbars",
-            "--force-device-scale-factor=1",
-            "--default-background-color=00000000",
-            f"--window-size={width},{height}",
-            f"--screenshot={out_png}",
-            "file://" + html_path,
-        ],
-        check=True,
-        capture_output=True,
-        timeout=60,
-    )
+    try:
+        subprocess.run(
+            [
+                chrome,
+                "--headless=new",
+                "--disable-gpu",
+                f"--user-data-dir={profile_dir}",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--hide-scrollbars",
+                "--force-device-scale-factor=1",
+                "--default-background-color=00000000",
+                f"--window-size={width},{height}",
+                f"--screenshot={out_png}",
+                "file://" + html_path,
+            ],
+            check=True,
+            capture_output=True,
+            timeout=60,
+        )
+    finally:
+        shutil.rmtree(profile_dir, ignore_errors=True)
 
 
-def render_html_to_png(chrome: str, profile_dir: str, html_path: str, out_png: str, width: int, height: int) -> None:
-    subprocess.run(
-        [
-            chrome,
-            "--headless=new",
-            "--disable-gpu",
-            f"--user-data-dir={profile_dir}",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--hide-scrollbars",
-            "--force-device-scale-factor=1",
-            f"--window-size={width},{height}",
-            f"--screenshot={out_png}",
-            "file://" + html_path,
-        ],
-        check=True,
-        capture_output=True,
-        timeout=60,
-    )
+def render_html_to_png(chrome: str, work: str, html_path: str, out_png: str, width: int, height: int) -> None:
+    profile_dir = tempfile.mkdtemp(prefix="chrome-", dir=work)
+    try:
+        subprocess.run(
+            [
+                chrome,
+                "--headless=new",
+                "--disable-gpu",
+                f"--user-data-dir={profile_dir}",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--hide-scrollbars",
+                "--force-device-scale-factor=1",
+                f"--window-size={width},{height}",
+                f"--screenshot={out_png}",
+                "file://" + html_path,
+            ],
+            check=True,
+            capture_output=True,
+            timeout=60,
+        )
+    finally:
+        shutil.rmtree(profile_dir, ignore_errors=True)
 
 
 def write_contents_json() -> None:
@@ -324,7 +337,40 @@ def write_contents_json() -> None:
         f.write("\n")
 
 
-def write_preview_sheet(chrome: str, work: str, profile_dir: str, out_png: str) -> None:
+def write_brand_icon_imageset() -> None:
+    os.makedirs(BRANDICON_DIR, exist_ok=True)
+    copies = [
+        ("icon_256x256.png", "brand_icon@1x.png"),
+        ("icon_256x256@2x.png", "brand_icon@2x.png"),
+        ("icon_256x256-dark.png", "brand_icon-dark@1x.png"),
+        ("icon_256x256@2x-dark.png", "brand_icon-dark@2x.png"),
+    ]
+    for src_name, dst_name in copies:
+        shutil.copyfile(os.path.join(APPICON_DIR, src_name), os.path.join(BRANDICON_DIR, dst_name))
+
+    images = [
+        {"filename": "brand_icon@1x.png", "idiom": "mac", "scale": "1x"},
+        {
+            "appearances": [{"appearance": "luminosity", "value": "dark"}],
+            "filename": "brand_icon-dark@1x.png",
+            "idiom": "mac",
+            "scale": "1x",
+        },
+        {"filename": "brand_icon@2x.png", "idiom": "mac", "scale": "2x"},
+        {
+            "appearances": [{"appearance": "luminosity", "value": "dark"}],
+            "filename": "brand_icon-dark@2x.png",
+            "idiom": "mac",
+            "scale": "2x",
+        },
+    ]
+    payload = {"images": images, "info": {"author": "xcode", "version": 1}}
+    with open(os.path.join(BRANDICON_DIR, "Contents.json"), "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+        f.write("\n")
+
+
+def write_preview_sheet(chrome: str, work: str, out_png: str) -> None:
     html = f"""<!doctype html>
 <html>
 <head>
@@ -380,7 +426,7 @@ def write_preview_sheet(chrome: str, work: str, profile_dir: str, out_png: str) 
     html_path = os.path.join(work, "preview.html")
     with open(html_path, "w", encoding="utf-8") as f:
         f.write(html)
-    render_html_to_png(chrome, profile_dir, html_path, out_png, 920, 620)
+    render_html_to_png(chrome, work, html_path, out_png, 920, 620)
 
 
 def main() -> None:
@@ -398,7 +444,6 @@ def main() -> None:
 
     chrome = chrome_binary()
     with tempfile.TemporaryDirectory() as work:
-        profile_dir = os.path.join(work, "chrome-profile")
         rendered: dict[tuple[str, int], str] = {}
         for points, scale in MAC_SIZES:
             px = points * scale
@@ -411,14 +456,15 @@ def main() -> None:
                 if key in rendered:
                     shutil.copyfile(rendered[key], out_png)
                 else:
-                    render_svg_to_png(chrome, work, profile_dir, mac_plate_svg(appearance, px), out_png, px, px)
+                    render_svg_to_png(chrome, work, mac_plate_svg(appearance, px), out_png, px, px)
                     rendered[key] = out_png
 
         if args.preview:
-            write_preview_sheet(chrome, work, profile_dir, args.preview)
+            write_preview_sheet(chrome, work, args.preview)
 
     write_contents_json()
-    print(f"Generated Design/Icon SVG masters and 20 macOS icons in {os.path.relpath(APPICON_DIR, ROOT)}")
+    write_brand_icon_imageset()
+    print(f"Generated Design/Icon SVG masters, 20 AppIcon PNGs, and BrandIcon imageset")
 
 
 if __name__ == "__main__":

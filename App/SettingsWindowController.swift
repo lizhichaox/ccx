@@ -91,7 +91,7 @@ private struct SettingsView: View {
                     .padding(.top, 2)
             }
             .padding(.horizontal, 20)
-            .padding(.top, 28)
+            .padding(.top, 18)
             .padding(.bottom, 16)
         }
         .frame(width: 440)
@@ -144,17 +144,13 @@ private struct SettingsFooter: View {
 
 private struct SettingsIdentityHeader: View {
     var body: some View {
-        HStack(spacing: 12) {
-            Image(nsImage: NSApp.applicationIconImage)
-                .resizable()
-                .interpolation(.high)
-                .aspectRatio(contentMode: .fit)
-                .frame(width: 46, height: 46)
+        VStack(spacing: 6) {
+            CCXBrandIcon(size: 56)
 
-            VStack(alignment: .leading, spacing: 2) {
+            VStack(spacing: 2) {
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
                     Text("CCX")
-                        .font(.system(size: 17, weight: .bold))
+                        .font(.system(size: 18, weight: .bold))
                     Text("v\(AppVersion.shortDisplay)")
                         .font(.caption.weight(.medium))
                         .foregroundStyle(.secondary)
@@ -163,10 +159,8 @@ private struct SettingsIdentityHeader: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-
-            Spacer()
         }
-        .padding(.horizontal, 2)
+        .frame(maxWidth: .infinity, alignment: .center)
     }
 }
 

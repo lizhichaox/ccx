@@ -115,11 +115,7 @@ private struct HeaderStrip: View {
     var body: some View {
         HStack(spacing: 8) {
             HStack(spacing: 6) {
-                Image(nsImage: NSApp.applicationIconImage)
-                    .resizable()
-                    .interpolation(.high)
-                    .aspectRatio(contentMode: .fit)
-                    .frame(width: 22, height: 22)
+                CCXBrandIcon(size: 22)
 
                 Text("CCX")
                     .font(.system(size: 13.5, weight: .semibold))
