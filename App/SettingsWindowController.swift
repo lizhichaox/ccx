@@ -1,8 +1,9 @@
 import AppKit
 import CPXCore
+import ServiceManagement
 import SwiftUI
 
-/// Hosts the Settings window: global hotkeys, permission status, and version.
+/// Hosts the compact, single-screen Settings window: shortcut, launch at login, and permissions.
 @MainActor
 final class SettingsWindowController: NSObject, NSWindowDelegate {
     typealias ComboProvider = (CPXHotKeyAction) -> HotKeyCombo
@@ -34,11 +35,17 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             currentCombo: currentCombo,
             updateCombo: updateCombo
         )
-        let window = DismissibleWindow(contentViewController: NSHostingController(rootView: view))
+        let hosting = NSHostingController(rootView: view)
+        let window = DismissibleWindow(contentViewController: hosting)
         window.title = "CPX Settings"
-        window.styleMask = [.titled, .closable, .miniaturizable]
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = true
+        window.isMovableByWindowBackground = true
+        window.styleMask = [.titled, .closable, .fullSizeContentView]
         window.isReleasedWhenClosed = false
         window.delegate = self
+        hosting.view.layoutSubtreeIfNeeded()
+        window.setContentSize(hosting.view.fittingSize)
         window.center()
         return window
     }
@@ -54,56 +61,154 @@ private struct SettingsView: View {
     let updateCombo: SettingsWindowController.ComboUpdater
 
     var body: some View {
-        VStack(spacing: 0) {
-            SettingsHeader()
-                .padding([.horizontal, .top], 20)
+        ZStack(alignment: .top) {
+            LinearGradient(
+                colors: [
+                    Color.accentColor.opacity(0.10),
+                    Color.clear,
+                ],
+                startPoint: .top,
+                endPoint: .center
+            )
+            .ignoresSafeArea()
 
-            Form {
-                Section {
-                    ForEach(CPXHotKeyAction.allCases, id: \.self) { action in
-                        HotKeyRow(
-                            action: action,
-                            initialCombo: currentCombo(action),
-                            updateCombo: updateCombo
-                        )
-                    }
-                } header: {
-                    Text("Global Shortcut")
-                } footer: {
-                    Text("Triggers interactive snip from anywhere. Pin actions live in the menu bar popover and pin right-click menus.")
-                        .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 14) {
+                SettingsIdentityHeader()
+
+                SettingsSection("GENERAL") {
+                    SnipShortcutRow(
+                        initialCombo: currentCombo(.snip),
+                        updateCombo: updateCombo
+                    )
+                    Divider().padding(.leading, 48)
+                    LaunchAtLoginRow()
                 }
 
-                Section("Permissions") {
-                    LabeledContent("Screen Recording") {
-                        HStack {
-                            PermissionBadge(granted: permissions.status.screenRecording)
-                            Button("Open…", action: permissions.openScreenRecordingSettings)
-                        }
-                    }
-                    LabeledContent("Accessibility") {
-                        HStack {
-                            PermissionBadge(granted: permissions.status.accessibility)
-                            Button("Open…", action: permissions.openAccessibilitySettings)
-                        }
-                    }
+                SettingsSection("PERMISSIONS") {
+                    PermissionSettingRow(
+                        symbol: "rectangle.dashed.badge.record",
+                        tint: .orange,
+                        title: "Screen Recording",
+                        granted: permissions.status.screenRecording,
+                        openAction: permissions.openScreenRecordingSettings
+                    )
+                    Divider().padding(.leading, 48)
+                    PermissionSettingRow(
+                        symbol: "accessibility",
+                        tint: .indigo,
+                        title: "Accessibility",
+                        granted: permissions.status.accessibility,
+                        openAction: permissions.openAccessibilitySettings
+                    )
                 }
 
-                Section("About") {
-                    LabeledContent("Version", value: AppVersion.shortDisplay)
-                    LabeledContent("Bundle ID", value: Bundle.main.bundleIdentifier ?? "com.lizhichaox.cpx")
-                }
+                Text("\(Bundle.main.bundleIdentifier ?? "com.lizhichaox.cpx") · Local-only · Zero telemetry")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.tertiary)
+                    .frame(maxWidth: .infinity, alignment: .center)
+                    .padding(.top, 2)
             }
-            .formStyle(.grouped)
+            .padding(.horizontal, 20)
+            .padding(.top, 28)
+            .padding(.bottom, 16)
         }
-        .frame(width: 480, height: 470)
+        .frame(width: 440)
+        .fixedSize(horizontal: false, vertical: true)
     }
 }
 
-/// Picker row for one hotkey action. Reverts the selection when registration
-/// fails (for example, when another app already owns the combo).
-private struct HotKeyRow: View {
-    let action: CPXHotKeyAction
+// MARK: - Header & Section Building Blocks
+
+private struct SettingsIdentityHeader: View {
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(nsImage: NSApp.applicationIconImage)
+                .resizable()
+                .interpolation(.high)
+                .aspectRatio(contentMode: .fit)
+                .frame(width: 46, height: 46)
+
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text("CPX")
+                        .font(.system(size: 17, weight: .bold))
+                    Text("v\(AppVersion.shortDisplay)")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.secondary)
+                }
+                Text("Capture · Paste · X")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer()
+        }
+        .padding(.horizontal, 2)
+    }
+}
+
+private struct SettingsSection<Content: View>: View {
+    let title: String
+    @ViewBuilder let content: () -> Content
+
+    init(_ title: String, @ViewBuilder content: @escaping () -> Content) {
+        self.title = title
+        self.content = content
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title)
+                .font(.system(size: 10.5, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .tracking(0.5)
+                .padding(.leading, 4)
+
+            VStack(spacing: 0) {
+                content()
+            }
+            .cpxSettingsCard(cornerRadius: 12)
+        }
+    }
+}
+
+private struct SettingsRow<Trailing: View>: View {
+    let symbol: String
+    let tint: Color
+    let title: String
+    var errorMessage: String? = nil
+    @ViewBuilder let trailing: () -> Trailing
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: symbol)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(tint)
+                .frame(width: 26, height: 26)
+                .background(tint.opacity(0.14), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title)
+                    .font(.system(size: 13, weight: .medium))
+                if let errorMessage {
+                    Text(errorMessage)
+                        .font(.caption2)
+                        .foregroundStyle(.red)
+                }
+            }
+
+            Spacer(minLength: 10)
+
+            trailing()
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+    }
+}
+
+// MARK: - Rows
+
+private struct SnipShortcutRow: View {
     let updateCombo: SettingsWindowController.ComboUpdater
     private let options: [HotKeyCombo]
 
@@ -111,10 +216,9 @@ private struct HotKeyRow: View {
     @State private var committed: HotKeyCombo
     @State private var failed = false
 
-    init(action: CPXHotKeyAction, initialCombo: HotKeyCombo, updateCombo: @escaping SettingsWindowController.ComboUpdater) {
-        self.action = action
+    init(initialCombo: HotKeyCombo, updateCombo: @escaping SettingsWindowController.ComboUpdater) {
         self.updateCombo = updateCombo
-        var options = HotKeyPreferences.presets(for: action)
+        var options = HotKeyPreferences.presets(for: .snip)
         if !options.contains(initialCombo) {
             options.append(initialCombo)
         }
@@ -124,55 +228,107 @@ private struct HotKeyRow: View {
     }
 
     var body: some View {
-        Picker(selection: $selection) {
-            ForEach(options, id: \.self) { combo in
-                Text(combo.displayString).tag(combo)
-            }
-        } label: {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(action.cpxMenuTitle)
-                if failed {
-                    Text("That shortcut is unavailable.")
-                        .font(.caption)
-                        .foregroundStyle(.red)
+        SettingsRow(
+            symbol: "viewfinder",
+            tint: .blue,
+            title: "Snip Shortcut",
+            errorMessage: failed ? "That shortcut is unavailable." : nil
+        ) {
+            Picker("", selection: $selection) {
+                ForEach(options, id: \.self) { combo in
+                    Text(combo.displayString).tag(combo)
                 }
             }
-        }
-        .onChange(of: selection) { _, newValue in
-            guard newValue != committed else { return }
-            if updateCombo(action, newValue) {
-                committed = newValue
-                failed = false
-            } else {
-                failed = true
-                selection = committed
+            .labelsHidden()
+            .pickerStyle(.menu)
+            .fixedSize()
+            .onChange(of: selection) { _, newValue in
+                guard newValue != committed else { return }
+                if updateCombo(.snip, newValue) {
+                    committed = newValue
+                    failed = false
+                } else {
+                    failed = true
+                    selection = committed
+                }
             }
         }
     }
 }
 
-private struct SettingsHeader: View {
-    var body: some View {
-        let content = HStack(spacing: 12) {
-            Image(nsImage: NSApp.applicationIconImage)
-                .resizable()
-                .interpolation(.high)
-                .aspectRatio(contentMode: .fit)
-                .frame(width: 44, height: 44)
-            VStack(alignment: .leading, spacing: 2) {
-                Text("CPX").font(.title3.weight(.semibold))
-                Text("Capture · Paste · X — \(AppVersion.display)")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            Spacer()
-        }
-        .padding(14)
+private struct LaunchAtLoginRow: View {
+    @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
 
+    var body: some View {
+        SettingsRow(symbol: "power", tint: .teal, title: "Launch at Login") {
+            Toggle("", isOn: $launchAtLogin)
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .onChange(of: launchAtLogin) { _, enabled in
+                    apply(enabled)
+                }
+        }
+        .onAppear {
+            launchAtLogin = SMAppService.mainApp.status == .enabled
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            launchAtLogin = SMAppService.mainApp.status == .enabled
+        }
+    }
+
+    private func apply(_ enabled: Bool) {
+        do {
+            if enabled {
+                try SMAppService.mainApp.register()
+            } else {
+                try SMAppService.mainApp.unregister()
+            }
+        } catch {
+            launchAtLogin = SMAppService.mainApp.status == .enabled
+        }
+    }
+}
+
+private struct PermissionSettingRow: View {
+    let symbol: String
+    let tint: Color
+    let title: String
+    let granted: Bool
+    let openAction: () -> Void
+
+    var body: some View {
+        SettingsRow(symbol: symbol, tint: granted ? .green : tint, title: title) {
+            HStack(spacing: 8) {
+                PermissionBadge(granted: granted)
+                Button("Open…", action: openAction)
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .fixedSize()
+            }
+        }
+    }
+}
+
+// MARK: - Surface & Version
+
+private extension View {
+    @ViewBuilder
+    func cpxSettingsCard(cornerRadius: CGFloat = 12) -> some View {
         if #available(macOS 26.0, *) {
-            content.glassEffect(.regular, in: .rect(cornerRadius: 14))
+            self
+                .glassEffect(.regular, in: .rect(cornerRadius: cornerRadius))
+                .overlay(
+                    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                        .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
+                )
         } else {
-            content.background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
+            self
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                        .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
+                )
         }
     }
 }
