@@ -1,4 +1,5 @@
 import AppKit
+import CPXAnnotate
 import CPXCore
 
 /// Borderless, non-activating overlay panel that can still become key for keyboard shortcuts.
@@ -74,7 +75,7 @@ final class SnipOverlayController {
             }
             view.onFinish = { [weak self, weak view] action in
                 guard let self, let view else { return }
-                self.finish(action, from: view.snapshot)
+                self.finish(action, from: view)
             }
             panel.contentView = view
             panels.append(panel)
@@ -107,16 +108,31 @@ final class SnipOverlayController {
         views.removeAll()
     }
 
-    private func finish(_ action: OverlayAction, from snapshot: DisplaySnapshot) {
+    private func finish(_ action: OverlayAction, from view: SnipOverlayView) {
         guard !isFinished else { return }
         let outcome: SnipOutcome
         switch action {
         case let .pin(rect):
-            outcome = Self.makeResult(localRect: rect, snapshot: snapshot).map(SnipOutcome.pin) ?? .cancelled
+            outcome = Self.makeResult(
+                localRect: rect,
+                snapshot: view.snapshot,
+                document: view.annotations,
+                mosaicCache: view.mosaicCache
+            ).map(SnipOutcome.pin) ?? .cancelled
         case let .copy(rect):
-            outcome = Self.makeResult(localRect: rect, snapshot: snapshot).map(SnipOutcome.copy) ?? .cancelled
+            outcome = Self.makeResult(
+                localRect: rect,
+                snapshot: view.snapshot,
+                document: view.annotations,
+                mosaicCache: view.mosaicCache
+            ).map(SnipOutcome.copy) ?? .cancelled
         case let .save(rect):
-            outcome = Self.makeResult(localRect: rect, snapshot: snapshot).map(SnipOutcome.save) ?? .cancelled
+            outcome = Self.makeResult(
+                localRect: rect,
+                snapshot: view.snapshot,
+                document: view.annotations,
+                mosaicCache: view.mosaicCache
+            ).map(SnipOutcome.save) ?? .cancelled
         case let .copyColor(sample, format):
             outcome = .copiedColor(sample, format)
         case .cancel:
@@ -140,5 +156,37 @@ final class SnipOverlayController {
         let scale = snapshot.screenFrame.width > 0 ? imageSize.width / snapshot.screenFrame.width : snapshot.backingScaleFactor
         let screenRect = localRect.offsetBy(dx: snapshot.screenFrame.minX, dy: snapshot.screenFrame.minY)
         return SnipResult(image: cropped, scale: scale, screenRect: screenRect)
+    }
+
+    /// Crops the exact backing pixels and bakes any committed annotations at full Retina resolution.
+    static func makeResult(
+        localRect: CGRect,
+        snapshot: DisplaySnapshot,
+        document: AnnotationDocument?,
+        mosaicCache: MosaicImageCache?
+    ) -> SnipResult? {
+        guard let document, !document.items.isEmpty else {
+            return makeResult(localRect: localRect, snapshot: snapshot)
+        }
+        let imageSize = CGSize(width: snapshot.image.width, height: snapshot.image.height)
+        let pixelRect = CoordinateConverter.appKitLocalRectToImagePixelRect(
+            localRect,
+            screenSize: snapshot.screenFrame.size,
+            imageSize: imageSize
+        ).integral
+        guard pixelRect.width >= 1, pixelRect.height >= 1 else { return nil }
+        guard let baked = AnnotationRenderer.bake(
+            baseImage: snapshot.image,
+            localSelectionRect: localRect,
+            pixelCropRect: pixelRect,
+            screenSize: snapshot.screenFrame.size,
+            document: document,
+            mosaicCache: mosaicCache
+        ) else {
+            return nil
+        }
+        let scale = snapshot.screenFrame.width > 0 ? imageSize.width / snapshot.screenFrame.width : snapshot.backingScaleFactor
+        let screenRect = localRect.offsetBy(dx: snapshot.screenFrame.minX, dy: snapshot.screenFrame.minY)
+        return SnipResult(image: baked, scale: scale, screenRect: screenRect)
     }
 }

@@ -1,5 +1,6 @@
 import AppKit
 import CoreGraphics
+import CPXAnnotate
 import CPXCore
 import Testing
 @testable import CPXCapture
@@ -241,5 +242,33 @@ struct SnipOverlayViewTests {
         try selectRect(CGRect(x: 20, y: 10, width: 80, height: 40), on: view)
         #expect(view.performKeyEquivalent(with: cmdW) == true)
         #expect(actions == [.cancel, .cancel])
+    }
+
+    @Test func annotationToolsDrawUndoRedoAndDeleteInSelectedRegion() throws {
+        let view = SnipOverlayView(snapshot: try makeSnapshot(), topInset: 0)
+        try selectRect(CGRect(x: 10, y: 10, width: 180, height: 80), on: view)
+
+        // Key "1" activates Rectangle tool.
+        view.keyDown(with: try makeKeyEvent(characters: "1", modifiers: [], keyCode: 18))
+        #expect(view.activeTool == .rectangle)
+
+        // Draw rectangle inside selection.
+        view.mouseDown(with: try makeMouseEvent(type: .leftMouseDown, at: CGPoint(x: 30, y: 20)))
+        view.mouseDragged(with: try makeMouseEvent(type: .leftMouseDragged, at: CGPoint(x: 80, y: 60)))
+        view.mouseUp(with: try makeMouseEvent(type: .leftMouseUp, at: CGPoint(x: 80, y: 60)))
+        #expect(view.annotations.items.count == 1)
+        #expect(view.annotations.canUndo)
+
+        // Cmd+Z undoes, Shift+Cmd+Z redoes.
+        #expect(view.performKeyEquivalent(with: try makeKeyEvent(characters: "z", modifiers: [.command], keyCode: 6)))
+        #expect(view.annotations.items.isEmpty)
+        #expect(view.annotations.canRedo)
+
+        #expect(view.performKeyEquivalent(with: try makeKeyEvent(characters: "Z", modifiers: [.command, .shift], keyCode: 6)))
+        #expect(view.annotations.items.count == 1)
+
+        // Delete key removes the selected annotation.
+        view.keyDown(with: try makeKeyEvent(characters: "\u{7F}", modifiers: [], keyCode: 51))
+        #expect(view.annotations.items.isEmpty)
     }
 }

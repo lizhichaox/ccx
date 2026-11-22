@@ -1,4 +1,5 @@
 import CoreGraphics
+import CPXAnnotate
 import CPXCore
 import Testing
 @testable import CPXCapture
@@ -43,5 +44,24 @@ struct CropTests {
     @Test func degenerateRectYieldsNil() throws {
         let snapshot = try makeSnapshot()
         #expect(SnipOverlayController.makeResult(localRect: CGRect(x: 500, y: 500, width: 10, height: 10), snapshot: snapshot) == nil)
+    }
+
+    @Test @MainActor func bakesAnnotationsIntoFinalCropAtRetinaScale() throws {
+        let snapshot = try makeSnapshot()
+        let document = AnnotationDocument()
+        document.commit(AnnotationItem(
+            kind: .rectangle(CGRect(x: 10, y: 30, width: 20, height: 10)),
+            style: AnnotationStyle(color: .green, size: .large)
+        ))
+        let result = try #require(SnipOverlayController.makeResult(
+            localRect: CGRect(x: 10, y: 30, width: 20, height: 10),
+            snapshot: snapshot,
+            document: document,
+            mosaicCache: nil
+        ))
+        #expect(result.image.width == 40 && result.image.height == 20)
+        // Top-left border of selection should contain green pixels from the annotation instead of pure red.
+        let borderPixel = try #require(CPXColorSample.samplePixel(from: result.image, pixelX: 0, pixelY: 10))
+        #expect(borderPixel.green > 150)
     }
 }

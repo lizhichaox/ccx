@@ -124,6 +124,10 @@ struct OverlayGeometryTests {
         #expect(bounds.contains(inside) && inside.size == size)
         let leftEdge = SnipActionToolbar.frame(for: CGRect(x: 0, y: 400, width: 20, height: 20), in: bounds, topInset: 32)
         #expect(leftEdge.minX == 0)
+
+        let expanded = SnipActionToolbar.frame(for: CGRect(x: 400, y: 400, width: 300, height: 200), in: bounds, topInset: 32, showsStyleBar: true)
+        #expect(bounds.contains(expanded) && expanded.size == SnipActionToolbar.expandedSize)
+        #expect(expanded.maxY <= 400)
     }
 
     @Test @MainActor func magnifierStaysInsideAndAvoidsNotch() {

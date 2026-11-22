@@ -22,6 +22,8 @@ options:
 packages:
   CPXCore:
     path: Packages/CPXCore
+  CPXAnnotate:
+    path: Packages/CPXAnnotate
   CPXCapture:
     path: Packages/CPXCapture
   CPXPin:
@@ -44,6 +46,7 @@ targets:
       - path: App
     dependencies:
       - package: CPXCore
+      - package: CPXAnnotate
       - package: CPXCapture
       - package: CPXPin
     settings:
