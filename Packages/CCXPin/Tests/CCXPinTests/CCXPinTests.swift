@@ -251,7 +251,7 @@ final class PinPanelAndManagerTests: XCTestCase {
         let titles = menu.items.map(\.title)
         XCTAssertTrue(titles.contains("Copy"))
         XCTAssertTrue(titles.contains("Copy Text (OCR)"))
-        XCTAssertTrue(titles.contains("Save PNG…"))
+        XCTAssertTrue(titles.contains("Save PNG"))
         XCTAssertTrue(titles.contains("Reset Zoom (100%)"))
         XCTAssertTrue(titles.contains("Rotate 90°"))
         XCTAssertTrue(titles.contains("Flip Horizontal"))

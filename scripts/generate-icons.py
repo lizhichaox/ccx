@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Generate CCX's CHAOX-family app icons (SVG masters, macOS AppIcon set, and preview sheet).
+"""Generate CCX's CHAOX-family app icons (SVG masters, AppIcon set, MenuBarIcon, and preview sheet).
 
 Design rules aligned with `ipx/characters/chaox/marks.md`:
-  - Three colors max (ground included):
-      * Light: warm paper #F5F1E9, night ink #070809, REC crimson #D9383A
-      * Dark:  night ink  #070809, warm paper #F5F1E9, REC crimson #FF5A5F
-  - Accent color falls on "CC" (Control · Command), while "X" stays in ink.
+  - Four roles max (ground + ink brackets + dual wordmark accents):
+      * Light: warm paper #F5F1E9, night ink #070809, "CC" mint green #17A57A, "X" blood red #B0101A
+      * Dark:  night ink  #070809, warm paper #F5F1E9, "CC" mint green #4AE3B5, "X" blood red #D61A26
+  - "CC" (Control · Command) is mint green and "X" is blood red, framed by neutral ink brackets.
   - Heavy italic glyphs match `ipx/src/chaox/redraw/italic.ts` (`GLYPH_X`,
     cap height 76..124, STEM = 13.03, SLANT = 7.97) paired with two mathematically
     sheared parametric heavy-italic "C"s and subtle viewfinder corner brackets.
@@ -26,6 +26,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DESIGN_DIR = os.path.join(ROOT, "Design", "Icon")
 APPICON_DIR = os.path.join(ROOT, "App", "Assets.xcassets", "AppIcon.appiconset")
 BRANDICON_DIR = os.path.join(ROOT, "App", "Assets.xcassets", "BrandIcon.imageset")
+MENUBARICON_DIR = os.path.join(ROOT, "App", "Assets.xcassets", "MenuBarIcon.imageset")
 
 CHROME_CANDIDATES = [
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -44,25 +45,30 @@ STEM = 13.03
 SLANT = 7.97
 SHEAR = SLANT / 48.0
 
-# Canonical wordmark magnification from italic.ts (780 / 150.5) and slight boost for <=64px icons.
+# Canonical wordmark magnification from italic.ts (780 / 150.5) and boosts for <=64px / 18pt icons.
 CANONICAL_SCALE = 780.0 / 150.5
 SMALL_SCALE = CANONICAL_SCALE * 1.07
+MENUBAR_SCALE = CANONICAL_SCALE * 0.90
 SMALL_PIXELS = 64
 
 APPEARANCES = {
     "light": {
         "ground": "#F5F1E9",
         "ink": "#070809",
-        "accent": "#D9383A",
+        "cc": "#17A57A",
+        "x": "#B0101A",
         "frame_opacity_large": 0.22,
         "frame_opacity_small": 0.34,
+        "frame_opacity_menubar": 0.34,
     },
     "dark": {
         "ground": "#070809",
         "ink": "#F5F1E9",
-        "accent": "#FF5A5F",
+        "cc": "#4AE3B5",
+        "x": "#D61A26",
         "frame_opacity_large": 0.26,
         "frame_opacity_small": 0.38,
+        "frame_opacity_menubar": 0.36,
     },
 }
 
@@ -170,11 +176,18 @@ WORD_LEFT = 38.35
 WORD_RIGHT = 175.533 + X_DX
 
 
-def viewfinder_brackets(ink: str, opacity: float, small: bool) -> str:
+def viewfinder_brackets(
+    ink: str,
+    opacity: float,
+    small: bool,
+    inset_override: float | None = None,
+    arm_override: float | None = None,
+    stroke_override: float | None = None,
+) -> str:
     """Subtle architectural viewfinder L-brackets framing the mark."""
-    inset = 126.0 if not small else 118.0
-    arm = 112.0 if not small else 132.0
-    stroke_w = 24.0 if not small else 36.0
+    inset = inset_override if inset_override is not None else (126.0 if not small else 118.0)
+    arm = arm_override if arm_override is not None else (112.0 if not small else 132.0)
+    stroke_w = stroke_override if stroke_override is not None else (24.0 if not small else 36.0)
     far = 1024.0 - inset
     paths = [
         f"M{inset + arm:.0f} {inset:.0f}H{inset:.0f}V{inset + arm:.0f}",
@@ -190,15 +203,15 @@ def viewfinder_brackets(ink: str, opacity: float, small: bool) -> str:
     )
 
 
-def wordmark(ink: str, accent: str, small: bool) -> str:
-    scale = SMALL_SCALE if small else CANONICAL_SCALE
+def wordmark(cc_color: str, x_color: str, small: bool = False, scale_override: float | None = None) -> str:
+    scale = scale_override if scale_override is not None else (SMALL_SCALE if small else CANONICAL_SCALE)
     tx = 512.0 - ((WORD_LEFT + WORD_RIGHT) / 2.0) * scale
     ty = 512.0 - 100.0 * scale
     return (
         f'<g transform="translate({tx:.2f} {ty:.2f}) scale({scale:.4f})">'
-        f'<path d="{GLYPH_C1}" fill="{accent}"/>'
-        f'<path d="{GLYPH_C2}" fill="{accent}"/>'
-        f'<path transform="translate({X_DX} 0)" d="{GLYPH_X}" fill="{ink}"/>'
+        f'<path d="{GLYPH_C1}" fill="{cc_color}"/>'
+        f'<path d="{GLYPH_C2}" fill="{cc_color}"/>'
+        f'<path transform="translate({X_DX} 0)" d="{GLYPH_X}" fill="{x_color}"/>'
         "</g>"
     )
 
@@ -209,7 +222,7 @@ def body(appearance: str, small: bool = False) -> str:
     return (
         f'<rect width="1024" height="1024" fill="{cfg["ground"]}"/>'
         + viewfinder_brackets(cfg["ink"], opacity, small)
-        + wordmark(cfg["ink"], cfg["accent"], small)
+        + wordmark(cfg["cc"], cfg["x"], small=small)
     )
 
 
@@ -230,18 +243,49 @@ def mac_plate_svg(appearance: str, size: int) -> str:
     shadow_opacity = "0.28" if appearance == "light" else "0.45"
     rim_opacity = "0.18" if appearance == "dark" else "0.08"
     rim_width = "10" if small else "6"
+    clip_id = f"plate-{appearance}-{size}"
+    shadow_id = f"shadow-{appearance}-{size}"
     return (
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" viewBox="0 0 1024 1024">'
         "<defs>"
-        f'<clipPath id="plate"><rect {plate}/></clipPath>'
-        '<filter id="shadow" x="-12%" y="-12%" width="124%" height="132%">'
+        f'<clipPath id="{clip_id}"><rect {plate}/></clipPath>'
+        f'<filter id="{shadow_id}" x="-12%" y="-12%" width="124%" height="132%">'
         f'<feDropShadow dx="0" dy="10" stdDeviation="12" flood-color="#000" flood-opacity="{shadow_opacity}"/>'
         "</filter>"
         "</defs>"
-        f'<rect {plate} fill="{ground}" filter="url(#shadow)"/>'
-        '<g clip-path="url(#plate)"><g transform="translate(100 100) scale(0.8046875)">'
+        f'<rect {plate} fill="{ground}" filter="url(#{shadow_id})"/>'
+        f'<g clip-path="url(#{clip_id})"><g transform="translate(100 100) scale(0.8046875)">'
         + body(appearance, small=small)
         + f'</g><rect {plate} fill="none" stroke="{ink}" stroke-opacity="{rim_opacity}" stroke-width="{rim_width}"/></g></svg>'
+    )
+
+
+def menu_bar_icon_svg(appearance: str, size: int) -> str:
+    """Full-frame squircle badge matching CCX's brand icon for 18pt/36px menu bar rendering."""
+    plate = 'x="36" y="36" width="952" height="952" rx="220"'
+    cfg = APPEARANCES[appearance]
+    ground = cfg["ground"]
+    ink = cfg["ink"]
+    rim_opacity = "0.20" if appearance == "dark" else "0.16"
+    clip_id = f"menubar-plate-{appearance}-{size}"
+    return (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" viewBox="0 0 1024 1024">'
+        "<defs>"
+        f'<clipPath id="{clip_id}"><rect {plate}/></clipPath>'
+        "</defs>"
+        f'<rect {plate} fill="{ground}"/>'
+        f'<g clip-path="url(#{clip_id})">'
+        + viewfinder_brackets(
+            ink,
+            cfg["frame_opacity_menubar"],
+            small=True,
+            inset_override=132.0,
+            arm_override=132.0,
+            stroke_override=36.0,
+        )
+        + wordmark(cfg["cc"], cfg["x"], small=True, scale_override=MENUBAR_SCALE)
+        + f'<rect {plate} fill="none" stroke="{ink}" stroke-opacity="{rim_opacity}" stroke-width="24"/>'
+        "</g></svg>"
     )
 
 
@@ -370,6 +414,44 @@ def write_brand_icon_imageset() -> None:
         f.write("\n")
 
 
+def write_menubar_icon_imageset(chrome: str, work: str) -> None:
+    os.makedirs(MENUBARICON_DIR, exist_ok=True)
+    specs = [
+        ("light", 1, 18, "menubar_icon@1x.png"),
+        ("light", 2, 36, "menubar_icon@2x.png"),
+        ("dark", 1, 18, "menubar_icon-dark@1x.png"),
+        ("dark", 2, 36, "menubar_icon-dark@2x.png"),
+    ]
+    for appearance, _, px, filename in specs:
+        out_png = os.path.join(MENUBARICON_DIR, filename)
+        render_svg_to_png(chrome, work, menu_bar_icon_svg(appearance, px), out_png, px, px)
+
+    images = [
+        {"filename": "menubar_icon@1x.png", "idiom": "mac", "scale": "1x"},
+        {
+            "appearances": [{"appearance": "luminosity", "value": "dark"}],
+            "filename": "menubar_icon-dark@1x.png",
+            "idiom": "mac",
+            "scale": "1x",
+        },
+        {"filename": "menubar_icon@2x.png", "idiom": "mac", "scale": "2x"},
+        {
+            "appearances": [{"appearance": "luminosity", "value": "dark"}],
+            "filename": "menubar_icon-dark@2x.png",
+            "idiom": "mac",
+            "scale": "2x",
+        },
+    ]
+    payload = {
+        "images": images,
+        "info": {"author": "xcode", "version": 1},
+        "properties": {"template-rendering-intent": "original"},
+    }
+    with open(os.path.join(MENUBARICON_DIR, "Contents.json"), "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+        f.write("\n")
+
+
 def write_preview_sheet(chrome: str, work: str, out_png: str) -> None:
     html = f"""<!doctype html>
 <html>
@@ -394,10 +476,23 @@ def write_preview_sheet(chrome: str, work: str, out_png: str) -> None:
   .label {{ margin-top: 10px; font-size: 12px; color: #555; font-weight: 600; }}
   .plates {{ display: flex; gap: 16px; align-items: flex-end; margin-top: 24px; }}
   .plates figure {{ margin: 0; text-align: center; }}
+  .menubar-row {{ display: flex; gap: 24px; align-items: center; margin-top: 22px; }}
+  .bar {{
+    display: inline-flex;
+    align-items: center;
+    gap: 14px;
+    padding: 8px 16px;
+    border-radius: 10px;
+    font-size: 12px;
+    font-weight: 600;
+  }}
+  .bar-dark {{ background: #1C1C1E; color: #E5E5EA; }}
+  .bar-light {{ background: #EAEAEF; color: #1C1C1E; }}
+  .icon-box {{ display: inline-flex; align-items: center; gap: 8px; }}
 </style>
 </head>
 <body>
-  <h1>CCX — CHAOX App Icon Review</h1>
+  <h1>CCX — Mint Green CC + Blood Red X Review</h1>
   <div class="grid">
     <div class="card">
       <div style="border-radius:46px;overflow:hidden;width:240px;height:240px;box-shadow:0 8px 24px rgba(0,0,0,0.12)">
@@ -421,12 +516,24 @@ def write_preview_sheet(chrome: str, work: str, out_png: str) -> None:
     <figure>{mac_plate_svg("dark", 32)}<figcaption class="label">32 Dark</figcaption></figure>
     <figure>{mac_plate_svg("light", 16)}<figcaption class="label">16</figcaption></figure>
   </div>
+  <div class="menubar-row">
+    <div class="bar bar-dark">
+      <span>Menu Bar Dark</span>
+      <span class="icon-box">{menu_bar_icon_svg("dark", 18)}<span>18pt</span></span>
+      <span class="icon-box">{menu_bar_icon_svg("dark", 36)}<span>36px (2x)</span></span>
+    </div>
+    <div class="bar bar-light">
+      <span>Menu Bar Light</span>
+      <span class="icon-box">{menu_bar_icon_svg("light", 18)}<span>18pt</span></span>
+      <span class="icon-box">{menu_bar_icon_svg("light", 36)}<span>36px (2x)</span></span>
+    </div>
+  </div>
 </body>
 </html>"""
     html_path = os.path.join(work, "preview.html")
     with open(html_path, "w", encoding="utf-8") as f:
         f.write(html)
-    render_html_to_png(chrome, work, html_path, out_png, 920, 620)
+    render_html_to_png(chrome, work, html_path, out_png, 920, 720)
 
 
 def main() -> None:
@@ -459,12 +566,14 @@ def main() -> None:
                     render_svg_to_png(chrome, work, mac_plate_svg(appearance, px), out_png, px, px)
                     rendered[key] = out_png
 
+        write_menubar_icon_imageset(chrome, work)
+
         if args.preview:
             write_preview_sheet(chrome, work, args.preview)
 
     write_contents_json()
     write_brand_icon_imageset()
-    print(f"Generated Design/Icon SVG masters, 20 AppIcon PNGs, and BrandIcon imageset")
+    print("Generated Design/Icon SVG masters, 20 AppIcon PNGs, BrandIcon imageset, and MenuBarIcon imageset")
 
 
 if __name__ == "__main__":

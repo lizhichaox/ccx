@@ -211,7 +211,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Windows
 
-    private func showOnboarding(startingAt step: OnboardingStep = .welcome) {
+    private func showOnboarding(startingAt step: OnboardingStep = .welcome, anchoredTo anchorRect: NSRect? = nil) {
         if onboardingController == nil {
             onboardingController = OnboardingWindowController(
                 onComplete: {
@@ -226,14 +226,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             )
         }
-        onboardingController?.show(startingAt: step)
+        onboardingController?.show(startingAt: step, anchoredTo: anchorRect)
     }
 
     private func showSettings() {
         if settingsController == nil {
             settingsController = SettingsWindowController()
         }
-        settingsController?.show()
+        settingsController?.show(anchoredTo: menuBarController?.statusButtonScreenFrame)
     }
 }
 
@@ -270,7 +270,12 @@ extension AppDelegate: MenuBarControllerDelegate {
     }
 
     func menuBarRequestedPermissionsGuide() {
-        showOnboarding(startingAt: .permissions)
+        let status = PermissionManager.currentStatus()
+        let allGranted = status.screenRecording && status.accessibility
+        showOnboarding(
+            startingAt: allGranted ? .welcome : .permissions,
+            anchoredTo: menuBarController?.statusButtonScreenFrame
+        )
     }
 
     func menuBarRequestedSettings() {

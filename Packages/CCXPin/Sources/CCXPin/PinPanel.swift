@@ -250,7 +250,7 @@ public final class PinPanel: NSPanel {
         if case .image = content {
             menu.addItem(menuItem("Copy Text (OCR)", #selector(recognizeTextFromMenu(_:))))
         }
-        menu.addItem(menuItem("Save PNG…", #selector(savePin(_:)), key: "s"))
+        menu.addItem(menuItem("Save PNG", #selector(savePin(_:)), key: "s"))
         menu.addItem(.separator())
         menu.addItem(menuItem("Reset Zoom (100%)", #selector(resetZoom(_:))))
         menu.addItem(menuItem("Rotate 90°", #selector(rotate90(_:))))

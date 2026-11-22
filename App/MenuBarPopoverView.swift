@@ -53,10 +53,10 @@ struct MenuBarPopoverView: View {
     let actions: MenuBarPopoverActions
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 9) {
-            HeaderStrip(permissions: model.permissions, onOpenPermissions: actions.onOpenPermissions)
+        VStack(alignment: .center, spacing: 12) {
+            CCXBrandIcon(size: 38)
 
-            HStack(spacing: 7) {
+            HStack(spacing: 8) {
                 QuickActionTile(
                     title: "Snip",
                     badge: model.snipShortcut,
@@ -99,79 +99,12 @@ struct MenuBarPopoverView: View {
                 onQuit: actions.onQuit
             )
         }
-        .padding(11)
-        .frame(width: 272)
+        .padding(.top, 14)
+        .padding(.horizontal, 14)
+        .padding(.bottom, 10)
+        .frame(width: 276)
         .fixedSize(horizontal: false, vertical: true)
-        .ccxPopoverSurface(cornerRadius: 15)
-    }
-}
-
-// MARK: - Header
-
-private struct HeaderStrip: View {
-    let permissions: CCXPermissionStatus
-    let onOpenPermissions: () -> Void
-
-    var body: some View {
-        HStack(spacing: 8) {
-            HStack(spacing: 6) {
-                CCXBrandIcon(size: 22)
-
-                Text("CCX")
-                    .font(.system(size: 13.5, weight: .semibold))
-            }
-
-            Spacer()
-
-            StatusBadge(permissions: permissions, onTap: onOpenPermissions)
-        }
-        .padding(.horizontal, 2)
-    }
-}
-
-private struct StatusBadge: View {
-    let permissions: CCXPermissionStatus
-    let onTap: () -> Void
-
-    @State private var isHovering = false
-
-    var body: some View {
-        if permissions.screenRecording && permissions.accessibility {
-            HStack(spacing: 4) {
-                Circle()
-                    .fill(Color.green)
-                    .frame(width: 5.5, height: 5.5)
-                Text("Ready")
-                    .font(.system(size: 10.5, weight: .medium))
-                    .foregroundStyle(.secondary)
-            }
-            .padding(.horizontal, 7)
-            .padding(.vertical, 3)
-            .background(Color.primary.opacity(0.05), in: Capsule())
-        } else {
-            let needsScreen = !permissions.screenRecording
-            let pillTint: Color = needsScreen ? .orange : .yellow
-            let pillTitle = needsScreen ? "Setup Needed" : "Accessibility"
-
-            Button(action: onTap) {
-                HStack(spacing: 4) {
-                    Circle()
-                        .fill(pillTint)
-                        .frame(width: 5.5, height: 5.5)
-                    Text(pillTitle)
-                        .font(.system(size: 10.5, weight: .semibold))
-                        .foregroundStyle(needsScreen ? Color.orange : Color.primary)
-                }
-                .padding(.horizontal, 7)
-                .padding(.vertical, 3)
-                .background(
-                    pillTint.opacity(isHovering ? 0.22 : 0.14),
-                    in: Capsule()
-                )
-            }
-            .buttonStyle(.plain)
-            .onHover { isHovering = $0 }
-        }
+        .ccxPopoverSurface(cornerRadius: 16)
     }
 }
 
@@ -189,38 +122,37 @@ private struct QuickActionTile: View {
 
     var body: some View {
         Button(action: action) {
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(alignment: .top) {
-                    Image(systemName: symbol)
-                        .font(.system(size: 13.5, weight: .semibold))
-                        .foregroundStyle(tint)
-                        .frame(width: 24, height: 24)
-                        .background(
-                            tint.opacity(isHovering ? 0.22 : 0.14),
-                            in: RoundedRectangle(cornerRadius: 7, style: .continuous)
-                        )
+            VStack(spacing: 6) {
+                Image(systemName: symbol)
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(tint)
+                    .frame(width: 28, height: 28)
+                    .background(
+                        tint.opacity(isHovering ? 0.24 : 0.15),
+                        in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    )
 
-                    Spacer(minLength: 4)
+                VStack(spacing: 2) {
+                    Text(title)
+                        .font(.system(size: 12.5, weight: .semibold))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
 
                     Text(badge)
-                        .font(.system(size: 10.5, weight: .medium).monospacedDigit())
+                        .font(.system(size: 10, weight: .medium).monospacedDigit())
                         .foregroundStyle(isBadgeDimmed ? .tertiary : .secondary)
                         .lineLimit(1)
                 }
-
-                Text(title)
-                    .font(.system(size: 12.5, weight: .semibold))
-                    .foregroundStyle(.primary)
             }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 8)
-            .frame(maxWidth: .infinity, minHeight: 56, alignment: .leading)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 11)
+            .frame(maxWidth: .infinity, alignment: .center)
             .background(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
                     .fill(isHovering ? Color.primary.opacity(0.09) : Color.primary.opacity(0.05))
             )
             .overlay(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
                     .strokeBorder(
                         isHovering ? tint.opacity(0.35) : Color.primary.opacity(0.08),
                         lineWidth: 1
@@ -239,29 +171,22 @@ private struct RecentSnipsSection: View {
     let onPinHistory: (SnipHistoryEntry) -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            Divider().opacity(0.6)
+        VStack(alignment: .center, spacing: 6) {
+            Divider().opacity(0.45)
 
-            HStack {
-                Text("RECENT SNIPS")
-                    .font(.system(size: 9.5, weight: .semibold))
-                    .foregroundStyle(.secondary)
-                    .tracking(0.4)
-                Spacer()
-                Text("Click to pin")
-                    .font(.system(size: 9.5))
-                    .foregroundStyle(.tertiary)
-            }
-            .padding(.horizontal, 2)
+            Text("RECENT SNIPS")
+                .font(.system(size: 9.5, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .tracking(0.6)
 
-            HStack(spacing: 5) {
+            HStack(spacing: 6) {
                 ForEach(entries) { entry in
                     RecentSnipThumbnail(entry: entry) {
                         onPinHistory(entry)
                     }
                 }
-                Spacer(minLength: 0)
             }
+            .frame(maxWidth: .infinity, alignment: .center)
         }
     }
 }
@@ -277,7 +202,7 @@ private struct RecentSnipThumbnail: View {
             Image(nsImage: NSImage(cgImage: entry.image, size: .zero))
                 .resizable()
                 .aspectRatio(contentMode: .fill)
-                .frame(width: 58, height: 38)
+                .frame(width: 57.5, height: 38)
                 .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
                 .overlay(
                     RoundedRectangle(cornerRadius: 6, style: .continuous)
@@ -288,6 +213,7 @@ private struct RecentSnipThumbnail: View {
                 )
         }
         .buttonStyle(.plain)
+        .help("Click to pin")
         .onHover { isHovering = $0 }
     }
 }
@@ -303,16 +229,14 @@ private struct FloatingPinsSection: View {
     let onCloseAllPins: () -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            Divider().opacity(0.6)
+        VStack(alignment: .center, spacing: 6) {
+            Divider().opacity(0.45)
 
-            HStack {
+            HStack(spacing: 6) {
                 Text("FLOATING PINS")
                     .font(.system(size: 9.5, weight: .semibold))
                     .foregroundStyle(.secondary)
-                    .tracking(0.4)
-
-                Spacer()
+                    .tracking(0.6)
 
                 Text("\(pinCount) active")
                     .font(.system(size: 9.5, weight: .semibold).monospacedDigit())
@@ -321,10 +245,10 @@ private struct FloatingPinsSection: View {
                     .padding(.vertical, 2)
                     .background(Color.accentColor.opacity(0.14), in: Capsule())
             }
-            .padding(.horizontal, 2)
+            .frame(maxWidth: .infinity, alignment: .center)
 
-            VStack(spacing: 5) {
-                HStack(spacing: 5) {
+            VStack(spacing: 6) {
+                HStack(spacing: 8) {
                     PinControlPill(
                         title: arePinsHidden ? "Show All" : "Hide All",
                         symbol: arePinsHidden ? "eye" : "eye.slash",
@@ -377,13 +301,13 @@ private struct PinControlPill: View {
             }
             .foregroundStyle(foregroundColor)
             .frame(maxWidth: .infinity)
-            .frame(height: 28)
+            .frame(height: 30)
             .background(
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
                     .fill(backgroundColor)
             )
             .overlay(
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
                     .strokeBorder(borderColor, lineWidth: 1)
             )
         }
@@ -410,7 +334,7 @@ private struct PinControlPill: View {
     }
 }
 
-// MARK: - Utility Footer
+// MARK: - Utility Dock
 
 private struct UtilityFooterSection: View {
     let permissions: CCXPermissionStatus
@@ -419,100 +343,106 @@ private struct UtilityFooterSection: View {
     let onQuit: () -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Divider().opacity(0.6)
-                .padding(.bottom, 1)
+        VStack(spacing: 8) {
+            Divider().opacity(0.45)
 
             let allGranted = permissions.screenRecording && permissions.accessibility
-            MenuActionRow(
-                title: "Permissions & Guide…",
-                symbol: allGranted ? "checkmark.shield" : "exclamationmark.triangle.fill",
-                symbolTint: allGranted ? .green : .orange,
-                trailingDotColor: allGranted ? .green : .orange,
-                action: onOpenPermissions
-            )
+            HStack(spacing: 6) {
+                UtilityDockButton(
+                    title: allGranted ? "Ready" : "Guide",
+                    symbol: allGranted ? "checkmark.shield" : "exclamationmark.triangle.fill",
+                    symbolTint: allGranted ? .green : .orange,
+                    needsAttention: !allGranted,
+                    tooltip: allGranted
+                        ? "All permissions granted — click to open Guide"
+                        : "Setup needed — click to open Permissions & Guide",
+                    action: onOpenPermissions
+                )
 
-            MenuActionRow(
-                title: "Settings…",
-                symbol: "gearshape",
-                shortcut: "⌘,",
-                action: onOpenSettings
-            )
+                UtilityDockButton(
+                    title: "Settings",
+                    symbol: "gearshape",
+                    tooltip: "Settings (⌘,)",
+                    action: onOpenSettings
+                )
 
-            Divider().opacity(0.6)
-                .padding(.vertical, 1)
-
-            MenuActionRow(
-                title: "Quit CCX",
-                symbol: "power",
-                shortcut: "⌘Q",
-                isDestructive: true,
-                action: onQuit
-            )
+                UtilityDockButton(
+                    title: "Quit",
+                    symbol: "power",
+                    isDestructive: true,
+                    tooltip: "Quit CCX (⌘Q)",
+                    action: onQuit
+                )
+            }
         }
     }
 }
 
-// MARK: - Uniform Row & Surface
-
-private struct MenuActionRow: View {
+private struct UtilityDockButton: View {
     let title: String
     let symbol: String
     var symbolTint: Color? = nil
-    var shortcut: String? = nil
-    var trailingDotColor: Color? = nil
+    var needsAttention = false
     var isDestructive = false
+    let tooltip: String
     let action: () -> Void
 
     @State private var isHovering = false
 
     var body: some View {
         Button(action: action) {
-            HStack(spacing: 7) {
+            VStack(spacing: 4) {
                 Image(systemName: symbol)
-                    .font(.system(size: 12.5, weight: .medium))
+                    .font(.system(size: 13.5, weight: .medium))
                     .foregroundStyle(resolvedSymbolColor)
-                    .frame(width: 16, alignment: .center)
 
                 Text(title)
-                    .font(.system(size: 12.5))
-                    .foregroundStyle(isHovering && isDestructive ? Color.red : Color.primary)
+                    .font(.system(size: 10.5, weight: .medium))
+                    .foregroundStyle(resolvedLabelColor)
                     .lineLimit(1)
-
-                Spacer(minLength: 10)
-
-                if let trailingDotColor {
-                    Circle()
-                        .fill(trailingDotColor)
-                        .frame(width: 6.5, height: 6.5)
-                } else if let shortcut {
-                    Text(shortcut)
-                        .font(.system(size: 11.5, weight: .medium).monospacedDigit())
-                        .foregroundStyle(.secondary)
-                }
             }
-            .padding(.horizontal, 8)
-            .frame(height: 27)
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(maxWidth: .infinity)
+            .frame(height: 44)
             .background(
-                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
                     .fill(hoverBackground)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .strokeBorder(hoverBorder, lineWidth: 1)
             )
         }
         .buttonStyle(.plain)
+        .help(tooltip)
         .onHover { isHovering = $0 }
     }
 
     private var resolvedSymbolColor: Color {
-        if isHovering && isDestructive { return .red }
-        return symbolTint ?? .secondary
+        if isDestructive && isHovering { return .red }
+        if let symbolTint { return symbolTint }
+        return isHovering ? .primary : .secondary
+    }
+
+    private var resolvedLabelColor: Color {
+        if isDestructive && isHovering { return .red }
+        if needsAttention { return .orange }
+        return isHovering ? .primary : .secondary
     }
 
     private var hoverBackground: Color {
-        guard isHovering else { return .clear }
-        return isDestructive ? Color.red.opacity(0.11) : Color.primary.opacity(0.08)
+        if isDestructive && isHovering { return Color.red.opacity(0.11) }
+        if needsAttention { return Color.orange.opacity(isHovering ? 0.18 : 0.10) }
+        return isHovering ? Color.primary.opacity(0.08) : .clear
+    }
+
+    private var hoverBorder: Color {
+        if isDestructive && isHovering { return Color.red.opacity(0.28) }
+        if needsAttention { return Color.orange.opacity(isHovering ? 0.36 : 0.22) }
+        return isHovering ? Color.primary.opacity(0.10) : .clear
     }
 }
+
+// MARK: - Surface
 
 private extension View {
     @ViewBuilder

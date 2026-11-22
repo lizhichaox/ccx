@@ -1,6 +1,5 @@
 import AppKit
 import CCXCore
-import ServiceManagement
 import SwiftUI
 
 enum OnboardingStep: Int, CaseIterable {
@@ -11,18 +10,45 @@ enum OnboardingStep: Int, CaseIterable {
 
 @MainActor
 final class OnboardingFlowState: ObservableObject {
+    static let springAnimation = Animation.spring(response: 0.30, dampingFraction: 0.86)
+
     @Published var step: OnboardingStep = .welcome
     @Published var requestedScreenRecording = false
+    @Published var swipeOffset: CGFloat = 0
+
+    func goNext() {
+        guard let next = OnboardingStep(rawValue: step.rawValue + 1) else { return }
+        step = next
+    }
+
+    func goPrevious() {
+        guard let previous = OnboardingStep(rawValue: step.rawValue - 1) else { return }
+        step = previous
+    }
 }
 
-/// Hosts the 3-step first-run guide: Welcome, Permissions, and Ready.
+/// Hosts the compact 3-page Guide & Permissions flow with native horizontal swipe paging.
 @MainActor
 final class OnboardingWindowController: NSObject, NSWindowDelegate {
+    private static let windowSize = NSSize(width: 440, height: 300)
+
+    private enum GestureAxis {
+        case horizontal
+        case vertical
+    }
+
     private let model = PermissionStatusModel()
     private let flow = OnboardingFlowState()
     private let onComplete: () -> Void
     private let onTrySnip: () -> Void
     private var window: NSWindow?
+
+    nonisolated(unsafe) private var eventMonitor: Any?
+    private var accumulatedScrollX: CGFloat = 0
+    private var accumulatedScrollY: CGFloat = 0
+    private var lastHorizontalDelta: CGFloat = 0
+    private var activeAxis: GestureAxis?
+    private var lastDiscreteSwipeTime: TimeInterval = 0
 
     init(
         onComplete: @escaping () -> Void,
@@ -33,14 +59,26 @@ final class OnboardingWindowController: NSObject, NSWindowDelegate {
         super.init()
     }
 
-    func show(startingAt step: OnboardingStep = .welcome) {
+    deinit {
+        if let eventMonitor {
+            NSEvent.removeMonitor(eventMonitor)
+        }
+    }
+
+    func show(startingAt step: OnboardingStep = .welcome, anchoredTo anchorRect: NSRect? = nil) {
+        flow.swipeOffset = 0
         flow.step = step
+
         let window = self.window ?? makeWindow()
         self.window = window
         model.refresh()
         model.startPolling()
+
+        if !window.isVisible {
+            position(window: window, anchoredTo: anchorRect)
+        }
+        installEventMonitor()
         NSApp.activate()
-        window.center()
         window.makeKeyAndOrderFront(nil)
     }
 
@@ -56,6 +94,7 @@ final class OnboardingWindowController: NSObject, NSWindowDelegate {
                 self?.onComplete()
                 self?.window?.orderOut(nil)
                 self?.model.stopPolling()
+                self?.removeEventMonitor()
                 self?.onTrySnip()
             }
         )
@@ -67,13 +106,220 @@ final class OnboardingWindowController: NSObject, NSWindowDelegate {
         window.styleMask = [.titled, .closable, .fullSizeContentView]
         window.isReleasedWhenClosed = false
         window.delegate = self
-        window.setContentSize(NSSize(width: 580, height: 420))
-        window.center()
+        window.setContentSize(Self.windowSize)
         return window
+    }
+
+    private func position(window: NSWindow, anchoredTo anchorRect: NSRect?) {
+        let size = window.frame.size
+        guard let anchorRect else {
+            window.center()
+            return
+        }
+
+        let screen = NSScreen.screens.first { $0.frame.intersects(anchorRect) } ?? NSScreen.main
+        var originX = anchorRect.midX - size.width / 2
+        var originY = anchorRect.minY - 6 - size.height
+
+        if let visibleFrame = screen?.visibleFrame {
+            let minX = visibleFrame.minX + 8
+            let maxX = max(minX, visibleFrame.maxX - size.width - 8)
+            let minY = visibleFrame.minY + 8
+            let maxY = max(minY, visibleFrame.maxY - size.height - 6)
+            originX = min(max(originX, minX), maxX)
+            originY = min(max(originY, minY), maxY)
+        }
+
+        window.setFrameOrigin(NSPoint(x: originX, y: originY))
     }
 
     func windowWillClose(_ notification: Notification) {
         model.stopPolling()
+        removeEventMonitor()
+    }
+
+    // MARK: - Swipe & Keyboard Navigation
+
+    private func matchesWindow(windowNumber: Int, mouseLocation: NSPoint) -> Bool {
+        guard let window, window.isVisible else { return false }
+        return windowNumber == window.windowNumber || (windowNumber == 0 && window.frame.contains(mouseLocation))
+    }
+
+    private func installEventMonitor() {
+        removeEventMonitor()
+        eventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.scrollWheel, .swipe, .keyDown]) { [weak self] event in
+            let windowNumber = event.windowNumber
+            let mouseLocation = NSEvent.mouseLocation
+
+            switch event.type {
+            case .scrollWheel:
+                let phase = event.phase
+                let momentumPhase = event.momentumPhase
+                let precise = event.hasPreciseScrollingDeltas
+                let scrollDeltaX = event.scrollingDeltaX
+                let scrollDeltaY = event.scrollingDeltaY
+                let timestamp = event.timestamp
+                let consumed = MainActor.assumeIsolated {
+                    guard let self, self.matchesWindow(windowNumber: windowNumber, mouseLocation: mouseLocation) else {
+                        return false
+                    }
+                    return self.handleScrollWheel(
+                        phase: phase,
+                        momentumPhase: momentumPhase,
+                        hasPreciseDeltas: precise,
+                        deltaX: scrollDeltaX,
+                        deltaY: scrollDeltaY,
+                        timestamp: timestamp
+                    )
+                }
+                return consumed ? nil : event
+
+            case .swipe:
+                let swipeDeltaX = event.deltaX
+                let consumed = MainActor.assumeIsolated {
+                    guard let self, self.matchesWindow(windowNumber: windowNumber, mouseLocation: mouseLocation) else {
+                        return false
+                    }
+                    return self.handleSwipeGesture(deltaX: swipeDeltaX)
+                }
+                return consumed ? nil : event
+
+            case .keyDown:
+                let keyCode = event.keyCode
+                let modifiers = event.modifierFlags
+                    .intersection(.deviceIndependentFlagsMask)
+                    .subtracting([.capsLock, .numericPad, .function])
+                let consumed = MainActor.assumeIsolated {
+                    guard let self, self.matchesWindow(windowNumber: windowNumber, mouseLocation: mouseLocation) else {
+                        return false
+                    }
+                    guard modifiers.intersection([.command, .option, .control]).isEmpty else { return false }
+                    if keyCode == 123 {
+                        withAnimation(OnboardingFlowState.springAnimation) { self.flow.goPrevious() }
+                        return true
+                    }
+                    if keyCode == 124 {
+                        withAnimation(OnboardingFlowState.springAnimation) { self.flow.goNext() }
+                        return true
+                    }
+                    return false
+                }
+                return consumed ? nil : event
+
+            default:
+                return event
+            }
+        }
+    }
+
+    private func removeEventMonitor() {
+        if let eventMonitor {
+            NSEvent.removeMonitor(eventMonitor)
+            self.eventMonitor = nil
+        }
+        resetSwipeTracking()
+    }
+
+    private func resetSwipeTracking() {
+        accumulatedScrollX = 0
+        accumulatedScrollY = 0
+        lastHorizontalDelta = 0
+        activeAxis = nil
+        if flow.swipeOffset != 0 { flow.swipeOffset = 0 }
+    }
+
+    private func handleSwipeGesture(deltaX: CGFloat) -> Bool {
+        if deltaX < 0 {
+            withAnimation(OnboardingFlowState.springAnimation) { flow.goNext() }
+            return true
+        }
+        if deltaX > 0 {
+            withAnimation(OnboardingFlowState.springAnimation) { flow.goPrevious() }
+            return true
+        }
+        return false
+    }
+
+    private func handleScrollWheel(
+        phase: NSEvent.Phase,
+        momentumPhase: NSEvent.Phase,
+        hasPreciseDeltas: Bool,
+        deltaX: CGFloat,
+        deltaY: CGFloat,
+        timestamp: TimeInterval
+    ) -> Bool {
+        guard momentumPhase.isEmpty else { return false }
+
+        if hasPreciseDeltas && !phase.isEmpty {
+            if phase.contains(.mayBegin) || phase.contains(.began) {
+                accumulatedScrollX = 0
+                accumulatedScrollY = 0
+                lastHorizontalDelta = 0
+                activeAxis = nil
+            }
+
+            if phase.contains(.began) || phase.contains(.changed) {
+                accumulatedScrollX += deltaX
+                accumulatedScrollY += deltaY
+                if deltaX != 0 {
+                    lastHorizontalDelta = deltaX
+                }
+
+                if activeAxis == nil, abs(accumulatedScrollX) + abs(accumulatedScrollY) >= 2.5 {
+                    activeAxis = abs(accumulatedScrollX) >= abs(accumulatedScrollY) ? .horizontal : .vertical
+                }
+
+                if activeAxis == .horizontal {
+                    let atStartBoundary = flow.step == .welcome && accumulatedScrollX > 0
+                    let atEndBoundary = flow.step == .ready && accumulatedScrollX < 0
+                    if atStartBoundary || atEndBoundary {
+                        flow.swipeOffset = min(max(accumulatedScrollX * 0.25, -48), 48)
+                    } else {
+                        let limit = Self.windowSize.width * 0.85
+                        flow.swipeOffset = min(max(accumulatedScrollX, -limit), limit)
+                    }
+                    return true
+                }
+                return false
+            }
+
+            if phase.contains(.ended) || phase.contains(.cancelled) {
+                let wasHorizontal = activeAxis == .horizontal
+                let totalX = accumulatedScrollX + deltaX
+                let velocityX = deltaX != 0 ? deltaX : lastHorizontalDelta
+                accumulatedScrollX = 0
+                accumulatedScrollY = 0
+                lastHorizontalDelta = 0
+                activeAxis = nil
+
+                guard wasHorizontal else { return false }
+                withAnimation(OnboardingFlowState.springAnimation) {
+                    if phase.contains(.ended) {
+                        if totalX <= -28 || (totalX <= -12 && velocityX <= -4) {
+                            flow.goNext()
+                        } else if totalX >= 28 || (totalX >= 12 && velocityX >= 4) {
+                            flow.goPrevious()
+                        }
+                    }
+                    flow.swipeOffset = 0
+                }
+                return true
+            }
+            return false
+        }
+
+        // Discrete horizontal mouse wheel / Magic Mouse flick without gesture phases.
+        guard abs(deltaX) > abs(deltaY), abs(deltaX) >= 2 else { return false }
+        guard timestamp - lastDiscreteSwipeTime >= 0.28 else { return true }
+        lastDiscreteSwipeTime = timestamp
+        withAnimation(OnboardingFlowState.springAnimation) {
+            if deltaX < 0 {
+                flow.goNext()
+            } else {
+                flow.goPrevious()
+            }
+        }
+        return true
     }
 }
 
@@ -95,7 +341,7 @@ enum AppRelauncher {
     }
 }
 
-// MARK: - Root Onboarding View
+// MARK: - Root Guide Pager
 
 private struct OnboardingView: View {
     @ObservedObject var model: PermissionStatusModel
@@ -107,8 +353,8 @@ private struct OnboardingView: View {
         ZStack(alignment: .top) {
             LinearGradient(
                 colors: [
-                    Color.accentColor.opacity(0.14),
-                    Color.indigo.opacity(0.05),
+                    Color.accentColor.opacity(0.12),
+                    Color.indigo.opacity(0.04),
                     Color.clear,
                 ],
                 startPoint: .top,
@@ -117,25 +363,32 @@ private struct OnboardingView: View {
             .ignoresSafeArea()
 
             VStack(spacing: 0) {
-                Group {
-                    switch flow.step {
-                    case .welcome:
+                GeometryReader { proxy in
+                    let pageWidth = max(proxy.size.width, 1)
+                    HStack(spacing: 0) {
                         WelcomeStepView()
-                            .transition(.opacity.combined(with: .move(edge: .leading)))
-                    case .permissions:
-                        PermissionsStepView(model: model, flow: flow)
-                            .transition(.opacity)
-                    case .ready:
-                        ReadyStepView()
-                            .transition(.opacity.combined(with: .move(edge: .trailing)))
-                    }
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .padding(.horizontal, 28)
-                .padding(.top, 20)
-                .padding(.bottom, 14)
+                            .padding(.horizontal, 20)
+                            .padding(.top, 16)
+                            .padding(.bottom, 10)
+                            .frame(width: pageWidth, height: proxy.size.height)
 
-                Divider()
+                        PermissionsStepView(model: model, flow: flow)
+                            .padding(.horizontal, 20)
+                            .padding(.top, 16)
+                            .padding(.bottom, 10)
+                            .frame(width: pageWidth, height: proxy.size.height)
+
+                        ReadyStepView()
+                            .padding(.horizontal, 20)
+                            .padding(.top, 16)
+                            .padding(.bottom, 10)
+                            .frame(width: pageWidth, height: proxy.size.height)
+                    }
+                    .offset(x: -CGFloat(flow.step.rawValue) * pageWidth + flow.swipeOffset)
+                }
+                .clipped()
+
+                Divider().opacity(0.6)
 
                 OnboardingFooterBar(
                     model: model,
@@ -143,56 +396,46 @@ private struct OnboardingView: View {
                     onDone: onDone,
                     onTrySnip: onTrySnip
                 )
-                .padding(.horizontal, 24)
-                .frame(height: 54)
+                .padding(.horizontal, 18)
+                .frame(height: 48)
             }
         }
-        .frame(width: 580, height: 420)
-        .animation(.spring(duration: 0.25), value: flow.step)
+        .frame(width: 440, height: 300)
     }
 }
 
-// MARK: - Step 1: Welcome
+// MARK: - Step 1: Overview
 
 private struct WelcomeStepView: View {
     var body: some View {
-        VStack(spacing: 18) {
+        VStack(spacing: 16) {
             Spacer(minLength: 0)
 
             VStack(spacing: 8) {
-                CCXBrandIcon(size: 78)
+                CCXBrandIcon(size: 50)
 
-                VStack(spacing: 4) {
-                    Text("Welcome to CCX")
-                        .font(.system(size: 24, weight: .bold))
-                        .fixedSize(horizontal: false, vertical: true)
-
-                    Text("Capture, pin, and record your screen at native macOS speed.")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
+                Text("Control · Command · X")
+                    .font(.system(size: 16, weight: .bold))
             }
 
-            HStack(alignment: .top, spacing: 10) {
+            HStack(alignment: .center, spacing: 8) {
                 FeatureBentoCard(
                     symbol: "viewfinder",
                     tint: .blue,
                     title: "Smart Snip",
-                    detail: "Auto-detect windows and UI elements with a pixel-accurate loupe."
+                    detail: "Detect, draw & OCR"
                 )
                 FeatureBentoCard(
                     symbol: "pin.fill",
                     tint: .indigo,
                     title: "Floating Pins",
-                    detail: "Keep snips, colors, and clipboard notes floating across Spaces."
+                    detail: "Always on top"
                 )
                 FeatureBentoCard(
                     symbol: "bolt.fill",
                     tint: .teal,
-                    title: "Built for macOS",
-                    detail: "ScreenCaptureKit + Retina native speed, zero telemetry."
+                    title: "Native Speed",
+                    detail: "Local & private"
                 )
             }
             .fixedSize(horizontal: false, vertical: true)
@@ -209,29 +452,28 @@ private struct FeatureBentoCard: View {
     let detail: String
 
     var body: some View {
-        VStack(alignment: .center, spacing: 6) {
+        VStack(alignment: .center, spacing: 5) {
             Image(systemName: symbol)
-                .font(.system(size: 16, weight: .semibold))
+                .font(.system(size: 14, weight: .semibold))
                 .foregroundStyle(tint)
-                .frame(width: 30, height: 30)
-                .background(tint.opacity(0.14), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .frame(width: 28, height: 28)
+                .background(tint.opacity(0.14), in: RoundedRectangle(cornerRadius: 7.5, style: .continuous))
 
             Text(title)
-                .font(.system(size: 13.5, weight: .semibold))
+                .font(.system(size: 12.5, weight: .semibold))
                 .multilineTextAlignment(.center)
-                .fixedSize(horizontal: false, vertical: true)
+                .lineLimit(1)
 
             Text(detail)
-                .font(.caption)
+                .font(.system(size: 10.5))
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
-                .lineSpacing(1.5)
-                .fixedSize(horizontal: false, vertical: true)
+                .lineLimit(1)
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 14)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
-        .ccxCardSurface(cornerRadius: 14)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 12)
+        .frame(maxWidth: .infinity, alignment: .center)
+        .ccxCardSurface(cornerRadius: 12)
     }
 }
 
@@ -242,61 +484,44 @@ private struct PermissionsStepView: View {
     @ObservedObject var flow: OnboardingFlowState
 
     var body: some View {
-        VStack(spacing: 14) {
+        VStack(spacing: 12) {
             Spacer(minLength: 0)
 
-            VStack(alignment: .center, spacing: 4) {
-                Text("Grant macOS Permissions")
-                    .font(.system(size: 20, weight: .bold))
-                    .multilineTextAlignment(.center)
-                    .fixedSize(horizontal: false, vertical: true)
+            Text("Permissions")
+                .font(.system(size: 16, weight: .bold))
 
-                Text("Everything runs locally on your Mac. Nothing leaves your device.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-
-            VStack(spacing: 10) {
-                PermissionSetupCard(
+            VStack(spacing: 0) {
+                PermissionRow(
                     symbol: "rectangle.dashed.badge.record",
                     tint: .blue,
-                    title: "Screen & System Audio Recording",
-                    badgeText: "Required",
-                    badgeTint: .blue,
-                    detail: "Needed to capture displays, windows, and color pixels cleanly.",
+                    title: "Screen Recording",
+                    detail: "Capture displays & pixels",
                     granted: model.status.screenRecording,
-                    prominentAction: true,
-                    onAllow: {
-                        flow.requestedScreenRecording = true
-                        model.allowScreenRecording()
-                    },
-                    extraFooter: {
-                        if !model.status.screenRecording {
-                            ScreenRecordingHintStrip(
-                                showRelaunch: flow.requestedScreenRecording,
-                                onVerify: {
-                                    model.verifyScreenRecordingLive()
-                                }
-                            )
-                        }
-                    }
-                )
+                    prominentAction: true
+                ) {
+                    flow.requestedScreenRecording = true
+                    model.allowScreenRecording()
+                }
 
-                PermissionSetupCard(
+                Divider().padding(.leading, 46)
+
+                PermissionRow(
                     symbol: "accessibility",
                     tint: .indigo,
                     title: "Accessibility",
-                    badgeText: "Recommended",
-                    badgeTint: .secondary,
-                    detail: "Enables automatic detection of UI buttons, toolbars, and controls under your cursor.",
+                    detail: "Detect UI elements",
                     granted: model.status.accessibility,
-                    prominentAction: false,
-                    onAllow: {
-                        model.allowAccessibility()
-                    },
-                    extraFooter: { EmptyView() }
+                    prominentAction: false
+                ) {
+                    model.allowAccessibility()
+                }
+            }
+            .ccxCardSurface(cornerRadius: 12)
+
+            if !model.status.screenRecording {
+                ScreenRecordingHintStrip(
+                    showRelaunch: flow.requestedScreenRecording,
+                    onVerify: { model.verifyScreenRecordingLive() }
                 )
             }
 
@@ -306,87 +531,66 @@ private struct PermissionsStepView: View {
     }
 }
 
-private struct PermissionSetupCard<Footer: View>: View {
+private struct PermissionRow: View {
     let symbol: String
     let tint: Color
     let title: String
-    let badgeText: String
-    let badgeTint: Color
     let detail: String
     let granted: Bool
     let prominentAction: Bool
     let onAllow: () -> Void
-    @ViewBuilder let extraFooter: () -> Footer
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(alignment: .center, spacing: 12) {
-                Image(systemName: symbol)
-                    .font(.system(size: 18, weight: .semibold))
-                    .foregroundStyle(granted ? .green : tint)
-                    .frame(width: 36, height: 36)
-                    .background(
-                        (granted ? Color.green : tint).opacity(0.14),
-                        in: RoundedRectangle(cornerRadius: 9, style: .continuous)
-                    )
+        HStack(spacing: 10) {
+            Image(systemName: symbol)
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(granted ? .green : tint)
+                .frame(width: 28, height: 28)
+                .background(
+                    (granted ? Color.green : tint).opacity(0.14),
+                    in: RoundedRectangle(cornerRadius: 7.5, style: .continuous)
+                )
 
-                VStack(alignment: .leading, spacing: 3) {
-                    HStack(spacing: 8) {
-                        Text(title)
-                            .font(.headline)
-                            .fixedSize(horizontal: false, vertical: true)
-
-                        if !granted {
-                            Text(badgeText)
-                                .font(.caption2.weight(.semibold))
-                                .foregroundStyle(badgeTint)
-                                .padding(.horizontal, 7)
-                                .padding(.vertical, 2)
-                                .background(badgeTint.opacity(0.12), in: Capsule())
-                                .fixedSize()
-                        }
-                    }
-
-                    Text(detail)
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-
-                Spacer(minLength: 12)
-
-                if granted {
-                    PermissionGrantedPill()
-                        .fixedSize()
-                } else if prominentAction {
-                    Button("Allow Access", action: onAllow)
-                        .buttonStyle(.borderedProminent)
-                        .controlSize(.regular)
-                        .fixedSize()
-                } else {
-                    Button("Allow Access", action: onAllow)
-                        .buttonStyle(.bordered)
-                        .controlSize(.regular)
-                        .fixedSize()
-                }
+            VStack(alignment: .leading, spacing: 1.5) {
+                Text(title)
+                    .font(.system(size: 13, weight: .semibold))
+                    .lineLimit(1)
+                Text(detail)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
             }
 
-            extraFooter()
+            Spacer(minLength: 8)
+
+            if granted {
+                PermissionGrantedPill()
+            } else if prominentAction {
+                Button("Allow", action: onAllow)
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .fixedSize()
+            } else {
+                Button("Allow", action: onAllow)
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .fixedSize()
+            }
         }
-        .padding(14)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .ccxCardSurface(cornerRadius: 14)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
     }
 }
 
 private struct PermissionGrantedPill: View {
     var body: some View {
         Label("Granted", systemImage: "checkmark.circle.fill")
-            .font(.callout.weight(.semibold))
+            .font(.system(size: 11, weight: .semibold))
             .foregroundStyle(.green)
-            .padding(.horizontal, 10)
-            .padding(.vertical, 5)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3.5)
             .background(Color.green.opacity(0.14), in: Capsule())
+            .fixedSize()
     }
 }
 
@@ -395,31 +599,13 @@ private struct ScreenRecordingHintStrip: View {
     let onVerify: () -> Void
 
     var body: some View {
-        HStack(spacing: 10) {
-            HStack(spacing: 6) {
-                Text("CCX")
-                    .font(.caption2.weight(.semibold))
-                ZStack(alignment: .trailing) {
-                    Capsule()
-                        .fill(Color.accentColor)
-                        .frame(width: 24, height: 14)
-                    Circle()
-                        .fill(.white)
-                        .frame(width: 10, height: 10)
-                        .padding(.trailing, 2)
-                }
-            }
-            .padding(.horizontal, 7)
-            .padding(.vertical, 4)
-            .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
-            .fixedSize()
-
-            Text("Enable CCX under Screen & System Audio Recording (top list, not System Audio Only), then relaunch CCX.")
-                .font(.caption)
+        HStack(spacing: 8) {
+            Text("Enable CCX in Screen Recording, then relaunch.")
+                .font(.system(size: 11))
                 .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
+                .lineLimit(1)
 
-            Spacer(minLength: 8)
+            Spacer(minLength: 6)
 
             Button("Verify", action: onVerify)
                 .buttonStyle(.bordered)
@@ -427,147 +613,91 @@ private struct ScreenRecordingHintStrip: View {
                 .fixedSize()
 
             if showRelaunch {
-                Button("Relaunch Now") {
+                Button("Relaunch") {
                     AppRelauncher.relaunch()
                 }
-                .buttonStyle(.bordered)
+                .buttonStyle(.borderedProminent)
                 .controlSize(.small)
                 .fixedSize()
             }
         }
-        .padding(9)
-        .background(Color.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(Color.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
     }
 }
 
-// MARK: - Step 3: Ready
+// MARK: - Step 3: Shortcuts & Gestures
 
 private struct ReadyStepView: View {
-    @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
-
     var body: some View {
-        VStack(spacing: 14) {
+        VStack(spacing: 12) {
             Spacer(minLength: 0)
 
-            VStack(alignment: .center, spacing: 4) {
-                HStack(spacing: 7) {
-                    Image(systemName: "checkmark.seal.fill")
-                        .font(.system(size: 22, weight: .semibold))
-                        .foregroundStyle(.green)
+            HStack(spacing: 6) {
+                Image(systemName: "checkmark.seal.fill")
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(.green)
 
-                    Text("You're All Set")
-                        .font(.system(size: 20, weight: .bold))
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-
-                Text("CCX stays quietly in your menu bar. Here's how to use it:")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-                    .fixedSize(horizontal: false, vertical: true)
+                Text("All Set")
+                    .font(.system(size: 16, weight: .bold))
             }
 
             VStack(spacing: 0) {
                 GuideActionRow(
                     symbol: "viewfinder",
+                    tint: .blue,
                     title: "Smart Snip",
-                    subtitle: "Capture windows, regions, or sample screen pixels",
                     trailing: { KeycapComboView(combo: .defaultSnip) }
                 )
                 Divider().padding(.leading, 40)
                 GuideActionRow(
                     symbol: "pin.fill",
+                    tint: .indigo,
                     title: "Paste as Pin",
-                    subtitle: "Float your clipboard image, text, or HEX color on top",
                     trailing: { InteractionPillView(text: "Right-Click Icon") }
                 )
                 Divider().padding(.leading, 40)
                 GuideActionRow(
-                    symbol: "macwindow.on.rectangle",
-                    title: "Manage Floating Pins",
-                    subtitle: "Hide, close, or unlock click-through pins anytime",
-                    trailing: { InteractionPillView(text: "Menu Bar") }
+                    symbol: "text.viewfinder",
+                    tint: .cyan,
+                    title: "Annotate & OCR",
+                    trailing: { InteractionPillView(text: "1–8 · T") }
                 )
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 4)
-            .ccxCardSurface(cornerRadius: 14)
-
-            HStack(spacing: 12) {
-                Image(systemName: "power")
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundStyle(.teal)
-                    .frame(width: 28, height: 28)
-                    .background(Color.teal.opacity(0.14), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
-
-                Text("Launch CCX at login")
-                    .font(.system(size: 13, weight: .medium))
-
-                Spacer()
-
-                Toggle("", isOn: $launchAtLogin)
-                    .labelsHidden()
-                    .toggleStyle(.switch)
-                    .controlSize(.small)
-                    .onChange(of: launchAtLogin) { _, enabled in
-                        applyLaunchAtLogin(enabled)
-                    }
-            }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 10)
             .ccxCardSurface(cornerRadius: 12)
 
             Spacer(minLength: 0)
         }
         .frame(maxWidth: .infinity)
-        .onAppear {
-            launchAtLogin = SMAppService.mainApp.status == .enabled
-        }
-    }
-
-    private func applyLaunchAtLogin(_ enabled: Bool) {
-        do {
-            if enabled {
-                try SMAppService.mainApp.register()
-            } else {
-                try SMAppService.mainApp.unregister()
-            }
-        } catch {
-            launchAtLogin = SMAppService.mainApp.status == .enabled
-        }
     }
 }
 
 private struct GuideActionRow<Trailing: View>: View {
     let symbol: String
+    let tint: Color
     let title: String
-    let subtitle: String
     @ViewBuilder let trailing: () -> Trailing
 
     var body: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: 10) {
             Image(systemName: symbol)
-                .font(.system(size: 15, weight: .semibold))
-                .foregroundStyle(Color.accentColor)
-                .frame(width: 28, height: 28)
-                .background(Color.accentColor.opacity(0.12), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+                .font(.system(size: 12.5, weight: .semibold))
+                .foregroundStyle(tint)
+                .frame(width: 24, height: 24)
+                .background(tint.opacity(0.14), in: RoundedRectangle(cornerRadius: 6.5, style: .continuous))
 
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(.headline)
-                    .fixedSize(horizontal: false, vertical: true)
-                Text(subtitle)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
+            Text(title)
+                .font(.system(size: 12.5, weight: .medium))
+                .lineLimit(1)
 
-            Spacer(minLength: 12)
+            Spacer(minLength: 10)
 
             trailing()
                 .fixedSize()
         }
-        .padding(.vertical, 8)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8.5)
     }
 }
 
@@ -576,10 +706,10 @@ private struct InteractionPillView: View {
 
     var body: some View {
         Text(text)
-            .font(.system(size: 11.5, weight: .medium))
+            .font(.system(size: 11, weight: .medium))
             .foregroundStyle(.secondary)
-            .padding(.horizontal, 10)
-            .frame(minHeight: 24)
+            .padding(.horizontal, 9)
+            .frame(minHeight: 22)
             .background(
                 Capsule()
                     .fill(Color.primary.opacity(0.06))
@@ -640,60 +770,56 @@ private struct OnboardingFooterBar: View {
 
     var body: some View {
         ZStack {
-            HStack(spacing: 12) {
-                // Left: Back button
+            HStack(spacing: 10) {
                 if flow.step != .welcome {
                     Button("Back") {
-                        if let previous = OnboardingStep(rawValue: flow.step.rawValue - 1) {
-                            flow.step = previous
+                        withAnimation(OnboardingFlowState.springAnimation) {
+                            flow.goPrevious()
                         }
                     }
                     .buttonStyle(.bordered)
+                    .controlSize(.regular)
                     .fixedSize()
                 }
 
                 Spacer()
 
-                // Right: Primary & secondary navigation CTAs
-                HStack(spacing: 10) {
+                HStack(spacing: 8) {
                     switch flow.step {
                     case .welcome:
                         Button("Get Started") {
-                            flow.step = .permissions
+                            withAnimation(OnboardingFlowState.springAnimation) {
+                                flow.step = .permissions
+                            }
                         }
                         .buttonStyle(.borderedProminent)
                         .keyboardShortcut(.defaultAction)
                         .fixedSize()
 
                     case .permissions:
-                        if model.status.screenRecording {
+                        if !model.status.screenRecording && flow.requestedScreenRecording {
+                            Button("Relaunch") {
+                                AppRelauncher.relaunch()
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .fixedSize()
+                        } else if model.status.screenRecording {
                             Button("Continue") {
-                                flow.step = .ready
+                                withAnimation(OnboardingFlowState.springAnimation) {
+                                    flow.step = .ready
+                                }
                             }
                             .buttonStyle(.borderedProminent)
                             .keyboardShortcut(.defaultAction)
                             .fixedSize()
                         } else {
-                            Button("Skip for now") {
-                                flow.step = .ready
-                            }
-                            .buttonStyle(.plain)
-                            .foregroundStyle(.secondary)
-                            .fixedSize()
-
-                            if flow.requestedScreenRecording {
-                                Button("Relaunch CCX") {
-                                    AppRelauncher.relaunch()
-                                }
-                                .buttonStyle(.borderedProminent)
-                                .fixedSize()
-                            } else {
-                                Button("Continue") {
+                            Button("Continue") {
+                                withAnimation(OnboardingFlowState.springAnimation) {
                                     flow.step = .ready
                                 }
-                                .buttonStyle(.bordered)
-                                .fixedSize()
                             }
+                            .buttonStyle(.bordered)
+                            .fixedSize()
                         }
 
                     case .ready:
@@ -701,7 +827,7 @@ private struct OnboardingFooterBar: View {
                             .buttonStyle(.bordered)
                             .fixedSize()
 
-                        Button("Try Snip Now", action: onTrySnip)
+                        Button("Try Snip", action: onTrySnip)
                             .buttonStyle(.borderedProminent)
                             .keyboardShortcut(.defaultAction)
                             .fixedSize()
@@ -709,11 +835,12 @@ private struct OnboardingFooterBar: View {
                 }
             }
 
-            // Center: Mathematically centered step indicator pills
             HStack(spacing: 7) {
                 ForEach(OnboardingStep.allCases, id: \.self) { step in
                     Button {
-                        flow.step = step
+                        withAnimation(OnboardingFlowState.springAnimation) {
+                            flow.step = step
+                        }
                     } label: {
                         Capsule()
                             .fill(flow.step == step ? Color.accentColor : Color.primary.opacity(0.2))

@@ -23,7 +23,7 @@ private final class MenuBarPanel: NSPanel {
 
     init() {
         super.init(
-            contentRect: NSRect(x: 0, y: 0, width: 272, height: 220),
+            contentRect: NSRect(x: 0, y: 0, width: 276, height: 220),
             styleMask: [.borderless, .nonactivatingPanel, .fullSizeContentView],
             backing: .buffered,
             defer: false
@@ -66,10 +66,17 @@ final class MenuBarController: NSObject, NSWindowDelegate {
         super.init()
 
         if let button = statusItem.button {
-            let image = NSImage(systemSymbolName: "camera.viewfinder", accessibilityDescription: "CCX")
-                ?? NSImage(systemSymbolName: "viewfinder", accessibilityDescription: "CCX")
-            image?.isTemplate = true
-            button.image = image
+            if let brandImage = NSImage(named: "MenuBarIcon") ?? NSImage(named: "BrandIcon") {
+                brandImage.size = NSSize(width: 18, height: 18)
+                brandImage.isTemplate = false
+                brandImage.accessibilityDescription = "CCX"
+                button.image = brandImage
+            } else {
+                let fallback = NSImage(systemSymbolName: "camera.viewfinder", accessibilityDescription: "CCX")
+                    ?? NSImage(systemSymbolName: "viewfinder", accessibilityDescription: "CCX")
+                fallback?.isTemplate = true
+                button.image = fallback
+            }
             button.target = self
             button.action = #selector(handleStatusItemClick)
             button.sendAction(on: [.leftMouseDown, .rightMouseDown])
@@ -82,6 +89,12 @@ final class MenuBarController: NSObject, NSWindowDelegate {
         if let globalMouseMonitor { NSEvent.removeMonitor(globalMouseMonitor) }
         if let localMouseMonitor { NSEvent.removeMonitor(localMouseMonitor) }
         if let localKeyMonitor { NSEvent.removeMonitor(localKeyMonitor) }
+    }
+
+    /// Screen-coordinate frame of the menu bar status item button, used to anchor
+    /// auxiliary windows (such as Settings) right beneath the menu bar icon.
+    var statusButtonScreenFrame: NSRect? {
+        statusItem.button?.window?.frame
     }
 
     /// Refreshes popover data and updates the panel geometry if visible.
