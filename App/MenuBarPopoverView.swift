@@ -120,18 +120,11 @@ private struct HeaderStrip: View {
     var body: some View {
         HStack(spacing: 8) {
             HStack(spacing: 7) {
-                Image(systemName: "camera.viewfinder")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(.white)
-                    .frame(width: 22, height: 22)
-                    .background(
-                        LinearGradient(
-                            colors: [Color.blue, Color.indigo],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
-                        ),
-                        in: RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    )
+                Image(nsImage: NSApp.applicationIconImage)
+                    .resizable()
+                    .interpolation(.high)
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 26, height: 26)
 
                 Text("CPX")
                     .font(.system(size: 14, weight: .semibold))

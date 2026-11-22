@@ -175,22 +175,11 @@ private struct WelcomeStepView: View {
             Spacer(minLength: 4)
 
             VStack(spacing: 14) {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 18, style: .continuous)
-                        .fill(
-                            LinearGradient(
-                                colors: [Color.blue, Color.indigo],
-                                startPoint: .topLeading,
-                                endPoint: .bottomTrailing
-                            )
-                        )
-                        .frame(width: 72, height: 72)
-                        .shadow(color: Color.indigo.opacity(0.28), radius: 14, y: 6)
-
-                    Image(systemName: "camera.viewfinder")
-                        .font(.system(size: 34, weight: .semibold))
-                        .foregroundStyle(.white)
-                }
+                Image(nsImage: NSApp.applicationIconImage)
+                    .resizable()
+                    .interpolation(.high)
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 88, height: 88)
 
                 VStack(spacing: 6) {
                     Text("Welcome to CPX")

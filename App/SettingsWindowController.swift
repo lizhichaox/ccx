@@ -154,9 +154,11 @@ private struct HotKeyRow: View {
 private struct SettingsHeader: View {
     var body: some View {
         let content = HStack(spacing: 12) {
-            Image(systemName: "camera.viewfinder")
-                .font(.system(size: 26, weight: .medium))
-                .foregroundStyle(.tint)
+            Image(nsImage: NSApp.applicationIconImage)
+                .resizable()
+                .interpolation(.high)
+                .aspectRatio(contentMode: .fit)
+                .frame(width: 44, height: 44)
             VStack(alignment: .leading, spacing: 2) {
                 Text("CPX").font(.title3.weight(.semibold))
                 Text("Capture · Paste · X — \(AppVersion.display)")
