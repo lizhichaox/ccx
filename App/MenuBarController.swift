@@ -113,11 +113,6 @@ final class MenuBarController: NSObject, NSWindowDelegate {
     // MARK: - Panel lifecycle
 
     @objc private func handleStatusItemClick() {
-        if let type = NSApp.currentEvent?.type, type == .rightMouseDown || type == .rightMouseUp {
-            hidePanel()
-            delegate?.menuBarRequestedPinFromClipboard()
-            return
-        }
         togglePanel()
     }
 
@@ -138,7 +133,11 @@ final class MenuBarController: NSObject, NSWindowDelegate {
         panel.invalidateShadow()
 
         Task { @MainActor [weak self] in
-            self?.statusItem.button?.highlight(true)
+            guard let self else { return }
+            self.statusItem.button?.highlight(true)
+            if let panel = self.panel, panel.isVisible {
+                self.layoutAndPosition(panel: panel)
+            }
         }
     }
 
@@ -243,7 +242,7 @@ final class MenuBarController: NSObject, NSWindowDelegate {
         } else if pinManager.arePinsHidden {
             statusItem.button?.toolTip = "CCX — \(pinManager.pinCount) pin(s) hidden (click to show)"
         } else {
-            statusItem.button?.toolTip = "CCX — Click to open, right-click to pin clipboard"
+            statusItem.button?.toolTip = "CCX — Control · Command · X"
         }
     }
 
@@ -327,6 +326,11 @@ final class MenuBarController: NSObject, NSWindowDelegate {
     }
 
     func windowDidResignKey(_ notification: Notification) {
+        if let type = NSApp.currentEvent?.type,
+           type == .leftMouseDown || type == .rightMouseDown,
+           statusButtonScreenFrame?.contains(NSEvent.mouseLocation) == true {
+            return
+        }
         hidePanel()
     }
 }
