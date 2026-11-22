@@ -13,14 +13,24 @@ final class SnipOverlayPanel: NSPanel {
 final class SnipOverlayController {
     private let snapshots: [DisplaySnapshot]
     private let detector: SmartElementDetector
+    private let initialStyle: AnnotationStyle
+    private let onStyleUpdated: ((AnnotationStyle) -> Void)?
     private let onFinish: (SnipOutcome) -> Void
     private var panels: [SnipOverlayPanel] = []
     private var views: [SnipOverlayView] = []
     private var isFinished = false
 
-    init(snapshots: [DisplaySnapshot], detector: SmartElementDetector, onFinish: @escaping (SnipOutcome) -> Void) {
+    init(
+        snapshots: [DisplaySnapshot],
+        detector: SmartElementDetector,
+        initialStyle: AnnotationStyle = AnnotationStyle(),
+        onStyleUpdated: ((AnnotationStyle) -> Void)? = nil,
+        onFinish: @escaping (SnipOutcome) -> Void
+    ) {
         self.snapshots = snapshots
         self.detector = detector
+        self.initialStyle = initialStyle
+        self.onStyleUpdated = onStyleUpdated
         self.onFinish = onFinish
     }
 
@@ -58,12 +68,15 @@ final class SnipOverlayController {
             panel.animationBehavior = .none
             panel.setFrame(snapshot.screenFrame, display: false)
 
-            let view = SnipOverlayView(snapshot: snapshot, topInset: topInset)
+            let view = SnipOverlayView(snapshot: snapshot, topInset: topInset, initialStyle: initialStyle)
             view.hoverRectProvider = { [weak self] global in self?.detector.windowRect(at: global) }
             view.elementRectRequester = { [weak self, weak view] global in
                 self?.detector.requestElementRect(at: global) { rect, point in
                     view?.applyRefinedElementRect(rect, forGlobalPoint: point)
                 }
+            }
+            view.onStyleUpdated = { [weak self] style in
+                self?.onStyleUpdated?(style)
             }
             view.onBeginInteraction = { [weak self, weak view] in
                 guard let self, let view else { return }
@@ -133,6 +146,13 @@ final class SnipOverlayController {
                 document: view.annotations,
                 mosaicCache: view.mosaicCache
             ).map(SnipOutcome.save) ?? .cancelled
+        case let .ocr(rect):
+            outcome = Self.makeResult(
+                localRect: rect,
+                snapshot: view.snapshot,
+                document: view.annotations,
+                mosaicCache: view.mosaicCache
+            ).map(SnipOutcome.ocr) ?? .cancelled
         case let .copyColor(sample, format):
             outcome = .copiedColor(sample, format)
         case .cancel:

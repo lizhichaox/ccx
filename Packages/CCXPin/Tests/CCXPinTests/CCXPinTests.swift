@@ -80,6 +80,13 @@ final class PinStateTests: XCTestCase {
         XCTAssertTrue(state.isClickThrough)
         state.toggleThumbnail()
         XCTAssertTrue(state.isThumbnail)
+
+        state.rotateCounterClockwise()
+        XCTAssertEqual(state.rotationDegrees, 270)
+        state.toggleFlipHorizontal()
+        XCTAssertTrue(state.isFlippedHorizontally)
+        state.toggleFlipVertical()
+        XCTAssertTrue(state.isFlippedVertically)
     }
 }
 
@@ -159,6 +166,15 @@ final class PinLayoutTests: XCTestCase {
         XCTAssertEqual(rot180.width, 4)
         XCTAssertEqual(rot180.height, 2)
         XCTAssertEqual(CCXColorSample.samplePixel(from: rot180, pixelX: 3, pixelY: 1)?.red, 255)
+
+        let flipH = PinLayout.transformedImage(img, clockwiseDegrees: 0, flipHorizontal: true, flipVertical: false)!
+        XCTAssertEqual(CCXColorSample.samplePixel(from: flipH, pixelX: 3, pixelY: 0)?.red, 255)
+
+        let flipV = PinLayout.transformedImage(img, clockwiseDegrees: 0, flipHorizontal: false, flipVertical: true)!
+        XCTAssertEqual(CCXColorSample.samplePixel(from: flipV, pixelX: 0, pixelY: 1)?.red, 255)
+
+        let rot90FlipH = PinLayout.transformedImage(img, clockwiseDegrees: 90, flipHorizontal: true, flipVertical: false)!
+        XCTAssertEqual(CCXColorSample.samplePixel(from: rot90FlipH, pixelX: 0, pixelY: 0)?.red, 255)
     }
 
     @MainActor
@@ -234,15 +250,43 @@ final class PinPanelAndManagerTests: XCTestCase {
         let menu = panel.makeContextMenu()
         let titles = menu.items.map(\.title)
         XCTAssertTrue(titles.contains("Copy"))
+        XCTAssertTrue(titles.contains("Copy Text (OCR)"))
         XCTAssertTrue(titles.contains("Save PNG…"))
         XCTAssertTrue(titles.contains("Reset Zoom (100%)"))
         XCTAssertTrue(titles.contains("Rotate 90°"))
+        XCTAssertTrue(titles.contains("Flip Horizontal"))
+        XCTAssertTrue(titles.contains("Flip Vertical"))
         XCTAssertTrue(titles.contains("Opacity"))
         XCTAssertTrue(titles.contains("Toggle Click-Through"))
         XCTAssertTrue(titles.contains("Toggle Thumbnail"))
+        XCTAssertTrue(titles.contains("Show Border"))
+        XCTAssertTrue(titles.contains("Show Shadow"))
         XCTAssertTrue(titles.contains("Close Pin"))
         XCTAssertTrue(titles.contains("Hide All Pins"))
         XCTAssertTrue(titles.contains("Close All Pins"))
+
+        // Keyboard shortcuts on focused panel: R, H, V, 0.
+        if let rKey = NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: 0,
+            context: nil, characters: "r", charactersIgnoringModifiers: "r", isARepeat: false, keyCode: 15
+        ) {
+            panel.keyDown(with: rKey)
+            XCTAssertEqual(panel.state.rotationDegrees, 180)
+        }
+        if let hKey = NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: 0,
+            context: nil, characters: "h", charactersIgnoringModifiers: "h", isARepeat: false, keyCode: 4
+        ) {
+            panel.keyDown(with: hKey)
+            XCTAssertTrue(panel.state.isFlippedHorizontally)
+        }
+        if let zeroKey = NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: 0,
+            context: nil, characters: "0", charactersIgnoringModifiers: "0", isARepeat: false, keyCode: 29
+        ) {
+            panel.keyDown(with: zeroKey)
+            XCTAssertEqual(panel.state.zoom, 1.0)
+        }
 
         let opacitySubmenu = menu.items.first(where: { $0.title == "Opacity" })?.submenu
         XCTAssertEqual(opacitySubmenu?.items.map(\.title), ["100%", "80%", "60%", "40%", "20%"])
@@ -255,6 +299,10 @@ final class PinPanelAndManagerTests: XCTestCase {
         manager.onPinsChanged = { changeCount += 1 }
         var savedImages: [CGImage] = []
         manager.onRequestSavePNG = { savedImages.append($0) }
+        var copiedMessages: [String] = []
+        manager.onCopied = { copiedMessages.append($0) }
+        var ocrImages: [CGImage] = []
+        manager.onRequestRecognizeText = { ocrImages.append($0) }
 
         // Empty clipboard -> returns false.
         pb.clearContents()
@@ -307,6 +355,10 @@ final class PinPanelAndManagerTests: XCTestCase {
 
         manager.panels[2].copyPin(nil)
         XCTAssertNotNil(pb.data(forType: .png))
+        XCTAssertEqual(copiedMessages.count, 3)
+
+        manager.panels[2].recognizeTextFromMenu(nil)
+        XCTAssertEqual(ocrImages.count, 1)
 
         // Closing one panel via Esc (`cancelOperation`) updates pinCount.
         manager.panels[0].cancelOperation(nil)

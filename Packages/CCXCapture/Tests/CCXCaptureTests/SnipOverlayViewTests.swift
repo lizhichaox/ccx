@@ -271,4 +271,56 @@ struct SnipOverlayViewTests {
         view.keyDown(with: try makeKeyEvent(characters: "\u{7F}", modifiers: [], keyCode: 51))
         #expect(view.annotations.items.isEmpty)
     }
+
+    @Test func snipErgonomicsOCRCmdACmdDArrowNudgeRightClickAndStylePersistence() throws {
+        var persistedStyle: AnnotationStyle?
+        let view = SnipOverlayView(
+            snapshot: try makeSnapshot(),
+            topInset: 0,
+            initialStyle: AnnotationStyle(color: .blue, size: .large)
+        )
+        #expect(view.currentStyle.color == .blue)
+        view.onStyleUpdated = { persistedStyle = $0 }
+        view.applyStyle(AnnotationStyle(color: .green, size: .small))
+        #expect(persistedStyle == AnnotationStyle(color: .green, size: .small))
+
+        var actions: [OverlayAction] = []
+        view.onFinish = { actions.append($0) }
+
+        // Cmd+A while hovering selects the full display bounds.
+        #expect(view.performKeyEquivalent(with: try makeKeyEvent(characters: "a", modifiers: [.command], keyCode: 0)))
+        #expect(view.machine.selectionRect == CGRect(x: 0, y: 0, width: 200, height: 100))
+
+        // Activate Rectangle, draw, duplicate with Cmd+D, and nudge with Shift+Right arrow.
+        view.keyDown(with: try makeKeyEvent(characters: "1", modifiers: [], keyCode: 18))
+        view.mouseDown(with: try makeMouseEvent(type: .leftMouseDown, at: CGPoint(x: 20, y: 20)))
+        view.mouseDragged(with: try makeMouseEvent(type: .leftMouseDragged, at: CGPoint(x: 60, y: 60)))
+        view.mouseUp(with: try makeMouseEvent(type: .leftMouseUp, at: CGPoint(x: 60, y: 60)))
+        #expect(view.annotations.items.count == 1)
+
+        #expect(view.performKeyEquivalent(with: try makeKeyEvent(characters: "d", modifiers: [.command], keyCode: 2)))
+        #expect(view.annotations.items.count == 2)
+        #expect(view.annotations.items[0].id != view.annotations.items[1].id)
+
+        let beforeNudge = try #require(view.annotations.selectedItem?.boundingBox)
+        view.keyDown(with: try makeKeyEvent(characters: "", modifiers: [.shift], keyCode: 124))
+        let afterNudge = try #require(view.annotations.selectedItem?.boundingBox)
+        #expect(abs(afterNudge.minX - (beforeNudge.minX + 10)) < 0.01)
+
+        // Pressing T triggers OCR for the active selection.
+        view.keyDown(with: try makeKeyEvent(characters: "t", modifiers: [], keyCode: 17))
+        #expect(actions == [.ocr(CGRect(x: 0, y: 0, width: 200, height: 100))])
+
+        // Right-click exits active drawing tool -> resets to hovering -> cancels on next right-click.
+        let rightClick = try makeMouseEvent(type: .rightMouseDown, at: CGPoint(x: 50, y: 50))
+        view.rightMouseDown(with: rightClick)
+        #expect(view.activeTool == .select)
+        #expect(view.machine.selectionRect != nil)
+
+        view.rightMouseDown(with: rightClick)
+        #expect(view.machine.isHovering)
+
+        view.rightMouseDown(with: rightClick)
+        #expect(actions == [.ocr(CGRect(x: 0, y: 0, width: 200, height: 100)), .cancel])
+    }
 }

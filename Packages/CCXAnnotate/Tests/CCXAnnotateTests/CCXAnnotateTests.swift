@@ -137,4 +137,21 @@ struct CCXAnnotateTests {
         let untouched = try samplePixel(in: baked, x: 190, y: 10)
         #expect(abs(Int(untouched.r) - 26) <= 2 && abs(Int(untouched.b) - 77) <= 2)
     }
+
+    @Test func aabbEarlyRejectsFarPointsOnPolylinesAndArrows() {
+        let pen = AnnotationItem(
+            kind: .pen([CGPoint(x: 10, y: 10), CGPoint(x: 90, y: 10)]),
+            style: AnnotationStyle()
+        )
+        #expect(pen.hitTest(point: CGPoint(x: 50, y: 10)))
+        #expect(!pen.hitTest(point: CGPoint(x: 200, y: 10)))
+        #expect(!pen.hitTest(point: CGPoint(x: 50, y: 50)))
+
+        let arrow = AnnotationItem(
+            kind: .arrow(start: CGPoint(x: 20, y: 20), end: CGPoint(x: 120, y: 20)),
+            style: AnnotationStyle()
+        )
+        #expect(arrow.hitTest(point: CGPoint(x: 120, y: 20)))
+        #expect(!arrow.hitTest(point: CGPoint(x: 250, y: 20)))
+    }
 }

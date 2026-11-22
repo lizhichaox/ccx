@@ -15,6 +15,7 @@ public final class PinPanel: NSPanel {
     var onClose: ((PinPanel) -> Void)?
     var onCopy: ((PinPanel) -> Void)?
     var onSave: ((PinPanel) -> Void)?
+    var onRecognizeText: ((PinPanel) -> Void)?
     var onHideAll: (() -> Void)?
     var onCloseAll: (() -> Void)?
     var onStateChanged: ((PinPanel) -> Void)?
@@ -91,6 +92,8 @@ public final class PinPanel: NSPanel {
             || previous?.showsBorder != state.showsBorder
             || previous?.isClickThrough != state.isClickThrough
             || previous?.rotationDegrees != state.rotationDegrees
+            || previous?.isFlippedHorizontally != state.isFlippedHorizontally
+            || previous?.isFlippedVertically != state.isFlippedVertically
             || previous?.zoom != state.zoom
         if needsContentRedraw {
             pinView.needsDisplay = true
@@ -102,6 +105,16 @@ public final class PinPanel: NSPanel {
             || previous?.isQuarterTurned != state.isQuarterTurned
         if needsShadowInvalidation {
             invalidateShadow()
+        }
+
+        if let previous {
+            if state.isThumbnail {
+                pinView.hideHUD()
+            } else if abs(previous.zoom - state.zoom) > 0.0001 {
+                pinView.showHUD("\(Int((state.zoom * 100).rounded()))%")
+            } else if abs(previous.opacity - state.opacity) > 0.0001 {
+                pinView.showHUD("Opacity \(Int((state.opacity * 100).rounded()))%")
+            }
         }
 
         if previous?.isClickThrough != state.isClickThrough {
@@ -122,6 +135,26 @@ public final class PinPanel: NSPanel {
 
     public func rotateClockwise() {
         mutateState(anchor: frameCenter) { $0.rotateClockwise() }
+    }
+
+    public func rotateCounterClockwise() {
+        mutateState(anchor: frameCenter) { $0.rotateCounterClockwise() }
+    }
+
+    public func toggleFlipHorizontal() {
+        mutateState(anchor: frameCenter) { $0.toggleFlipHorizontal() }
+    }
+
+    public func toggleFlipVertical() {
+        mutateState(anchor: frameCenter) { $0.toggleFlipVertical() }
+    }
+
+    public func setShowsBorder(_ shows: Bool) {
+        mutateState { $0.showsBorder = shows }
+    }
+
+    public func setShowsShadow(_ shows: Bool) {
+        mutateState { $0.showsShadow = shows }
     }
 
     public func setClickThrough(_ enabled: Bool) {
@@ -151,6 +184,34 @@ public final class PinPanel: NSPanel {
         if event.keyCode == 53 { // Escape
             close()
             return
+        }
+        let flags = event.modifierFlags
+            .intersection(.deviceIndependentFlagsMask)
+            .subtracting([.capsLock, .numericPad, .function])
+        let char = event.charactersIgnoringModifiers?.lowercased() ?? ""
+        if !flags.contains(.command) && !flags.contains(.control) && !flags.contains(.option) {
+            switch char {
+            case "r":
+                if flags.contains(.shift) { rotateCounterClockwise() } else { rotateClockwise() }
+                return
+            case "h":
+                toggleFlipHorizontal()
+                return
+            case "v":
+                toggleFlipVertical()
+                return
+            case "0":
+                setZoom(1)
+                return
+            case "=", "+":
+                if !state.isThumbnail { mutateState(anchor: frameCenter) { $0.multiplyZoom(by: 1.1) } }
+                return
+            case "-":
+                if !state.isThumbnail { mutateState(anchor: frameCenter) { $0.multiplyZoom(by: 1 / 1.1) } }
+                return
+            default:
+                break
+            }
         }
         super.keyDown(with: event)
     }
@@ -186,10 +247,19 @@ public final class PinPanel: NSPanel {
         let menu = NSMenu(title: "Pin")
         menu.autoenablesItems = false
         menu.addItem(menuItem("Copy", #selector(copyPin(_:)), key: "c"))
+        if case .image = content {
+            menu.addItem(menuItem("Copy Text (OCR)", #selector(recognizeTextFromMenu(_:))))
+        }
         menu.addItem(menuItem("Save PNG…", #selector(savePin(_:)), key: "s"))
         menu.addItem(.separator())
         menu.addItem(menuItem("Reset Zoom (100%)", #selector(resetZoom(_:))))
         menu.addItem(menuItem("Rotate 90°", #selector(rotate90(_:))))
+        let flipH = menuItem("Flip Horizontal", #selector(flipHorizontalFromMenu(_:)))
+        flipH.state = state.isFlippedHorizontally ? .on : .off
+        menu.addItem(flipH)
+        let flipV = menuItem("Flip Vertical", #selector(flipVerticalFromMenu(_:)))
+        flipV.state = state.isFlippedVertically ? .on : .off
+        menu.addItem(flipV)
 
         let opacityItem = NSMenuItem(title: "Opacity", action: nil, keyEquivalent: "")
         let opacityMenu = NSMenu(title: "Opacity")
@@ -208,6 +278,12 @@ public final class PinPanel: NSPanel {
         let thumbnail = menuItem("Toggle Thumbnail", #selector(toggleThumbnailFromMenu(_:)))
         thumbnail.state = state.isThumbnail ? .on : .off
         menu.addItem(thumbnail)
+        let showBorder = menuItem("Show Border", #selector(toggleBorderFromMenu(_:)))
+        showBorder.state = state.showsBorder ? .on : .off
+        menu.addItem(showBorder)
+        let showShadow = menuItem("Show Shadow", #selector(toggleShadowFromMenu(_:)))
+        showShadow.state = state.showsShadow ? .on : .off
+        menu.addItem(showShadow)
         menu.addItem(.separator())
         menu.addItem(menuItem("Close Pin", #selector(closePin(_:)), key: "w"))
         menu.addItem(menuItem("Hide All Pins", #selector(hideAllPins(_:))))
@@ -223,19 +299,29 @@ public final class PinPanel: NSPanel {
     }
 
     @objc func copyPin(_ sender: Any?) { onCopy?(self) }
+    @objc func recognizeTextFromMenu(_ sender: Any?) { onRecognizeText?(self) }
     @objc func savePin(_ sender: Any?) { onSave?(self) }
     @objc func resetZoom(_ sender: Any?) { setZoom(1) }
     @objc func rotate90(_ sender: Any?) { rotateClockwise() }
+    @objc func flipHorizontalFromMenu(_ sender: Any?) { toggleFlipHorizontal() }
+    @objc func flipVerticalFromMenu(_ sender: Any?) { toggleFlipVertical() }
     @objc func setOpacityFromMenu(_ sender: NSMenuItem) { setOpacity(CGFloat(sender.tag) / 100) }
     @objc func toggleClickThroughFromMenu(_ sender: Any?) { setClickThrough(!state.isClickThrough) }
     @objc func toggleThumbnailFromMenu(_ sender: Any?) { toggleThumbnail() }
+    @objc func toggleBorderFromMenu(_ sender: Any?) { setShowsBorder(!state.showsBorder) }
+    @objc func toggleShadowFromMenu(_ sender: Any?) { setShowsShadow(!state.showsShadow) }
     @objc func closePin(_ sender: Any?) { close() }
     @objc func hideAllPins(_ sender: Any?) { onHideAll?() }
     @objc func closeAllPins(_ sender: Any?) { onCloseAll?() }
 
-    /// Image used for copy/save: the original pixels (rotated) or a rendered card.
+    /// Image used for copy/save/OCR: the original pixels (transformed) or a rendered card.
     public func exportImage() -> CGImage? {
-        PinRenderer.exportImage(for: content, rotationDegrees: state.rotationDegrees)
+        PinRenderer.exportImage(
+            for: content,
+            rotationDegrees: state.rotationDegrees,
+            flipHorizontal: state.isFlippedHorizontally,
+            flipVertical: state.isFlippedVertically
+        )
     }
 
     /// Pixels per point of `exportImage()`.
@@ -245,14 +331,74 @@ public final class PinPanel: NSPanel {
     }
 }
 
-/// Content view that draws the pin and routes mouse interactions.
+/// Content view that draws the pin, transient zoom/opacity HUD, and routes mouse interactions.
 final class PinContentView: NSView {
     weak var panel: PinPanel?
+
+    private let hudView = PinHUDView()
+    private var hudHideTask: Task<Void, Never>?
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        hudView.isHidden = true
+        addSubview(hudView)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
     override var isFlipped: Bool { false }
     override var acceptsFirstResponder: Bool { true }
     override var mouseDownCanMoveWindow: Bool { false }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func layout() {
+        super.layout()
+        if !hudView.isHidden {
+            positionHUD()
+        }
+    }
+
+    func showHUD(_ text: String) {
+        hudHideTask?.cancel()
+        hudView.setText(text)
+        guard bounds.width >= 56 && bounds.height >= 28 else {
+            hudView.isHidden = true
+            return
+        }
+        positionHUD()
+        hudView.alphaValue = 1
+        hudView.isHidden = false
+        hudHideTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(750))
+            guard !Task.isCancelled, let self else { return }
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.2
+                self.hudView.animator().alphaValue = 0
+            } completionHandler: { [weak self] in
+                Task { @MainActor [weak self] in
+                    guard let self, self.hudView.alphaValue <= 0.01 else { return }
+                    self.hudView.isHidden = true
+                }
+            }
+        }
+    }
+
+    func hideHUD() {
+        hudHideTask?.cancel()
+        hudHideTask = nil
+        hudView.isHidden = true
+    }
+
+    private func positionHUD() {
+        let size = hudView.intrinsicContentSize
+        hudView.frame = CGRect(
+            x: (bounds.midX - size.width / 2).rounded(),
+            y: (bounds.midY - size.height / 2).rounded(),
+            width: size.width,
+            height: size.height
+        )
+    }
 
     override func mouseDown(with event: NSEvent) {
         panel?.makeKey()
@@ -321,6 +467,12 @@ final class PinContentView: NSView {
         let base = panel.baseSize
         context.saveGState()
         context.translateBy(x: bounds.midX, y: bounds.midY)
+        if state.isFlippedHorizontally || state.isFlippedVertically {
+            context.scaleBy(
+                x: state.isFlippedHorizontally ? -1 : 1,
+                y: state.isFlippedVertically ? -1 : 1
+            )
+        }
         context.rotate(by: -CGFloat(state.rotationDegrees) * .pi / 180)
         let unrotated = state.isQuarterTurned
             ? CGSize(width: bounds.height, height: bounds.width)
@@ -341,6 +493,12 @@ final class PinContentView: NSView {
         // Aspect-fill the thumbnail square.
         let fill = max(bounds.width / base.width, bounds.height / base.height)
         context.translateBy(x: bounds.midX, y: bounds.midY)
+        if state.isFlippedHorizontally || state.isFlippedVertically {
+            context.scaleBy(
+                x: state.isFlippedHorizontally ? -1 : 1,
+                y: state.isFlippedVertically ? -1 : 1
+            )
+        }
         context.rotate(by: -CGFloat(state.rotationDegrees) * .pi / 180)
         context.scaleBy(x: fill, y: fill)
         let rect = CGRect(
@@ -357,5 +515,47 @@ final class PinContentView: NSView {
             PinRenderer.draw(panel.content, in: rect, zoom: fill, context: context)
         }
         context.restoreGState()
+    }
+}
+
+private final class PinHUDView: NSView {
+    private let label = NSTextField(labelWithString: "")
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.black.withAlphaComponent(0.74).cgColor
+        layer?.cornerRadius = 11
+        layer?.masksToBounds = true
+
+        label.font = .monospacedDigitSystemFont(ofSize: 11.5, weight: .semibold)
+        label.textColor = .white
+        addSubview(label)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    func setText(_ text: String) {
+        label.stringValue = text
+        label.sizeToFit()
+    }
+
+    override var intrinsicContentSize: NSSize {
+        let labelSize = label.intrinsicContentSize
+        return NSSize(width: ceil(labelSize.width) + 18, height: 22)
+    }
+
+    override func layout() {
+        super.layout()
+        label.sizeToFit()
+        label.frame = CGRect(
+            x: ((bounds.width - label.frame.width) / 2).rounded(),
+            y: ((bounds.height - label.frame.height) / 2).rounded(),
+            width: label.frame.width,
+            height: label.frame.height
+        )
     }
 }

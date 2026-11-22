@@ -15,6 +15,10 @@ public final class PinManager {
     /// Called when the user asks to save a pin (Cmd+S or "Save PNG…"); the host shows the
     /// save panel and typically calls `ClipboardStore.savePNG(_:to:)`.
     public var onRequestSavePNG: ((CGImage) -> Void)?
+    /// Called after copying pin content to the clipboard with a short confirmation label.
+    public var onCopied: ((String) -> Void)?
+    /// Called when the user triggers OCR ("Copy Text (OCR)") on an image pin.
+    public var onRequestRecognizeText: ((CGImage) -> Void)?
 
     private let clipboardStore: ClipboardStore
 
@@ -36,6 +40,7 @@ public final class PinManager {
         panel.onClose = { [weak self] panel in self?.panelDidClose(panel) }
         panel.onCopy = { [weak self] panel in self?.copy(panel) }
         panel.onSave = { [weak self] panel in self?.save(panel) }
+        panel.onRecognizeText = { [weak self] panel in self?.recognizeText(panel) }
         panel.onHideAll = { [weak self] in self?.toggleVisibilityOfAllPins() }
         panel.onCloseAll = { [weak self] in self?.closeAllPins() }
         panel.onStateChanged = { [weak self] _ in self?.onPinsChanged?() }
@@ -107,11 +112,14 @@ public final class PinManager {
         switch panel.content {
         case let .text(text):
             clipboardStore.copyText(text)
+            onCopied?("Copied to Clipboard")
         case let .color(color):
             clipboardStore.copyText(color.hexString)
+            onCopied?("Copied \(color.hexString)")
         case .image:
             if let image = panel.exportImage() {
                 clipboardStore.copyImage(image, scale: panel.exportScale)
+                onCopied?("Copied to Clipboard")
             }
         }
     }
@@ -119,6 +127,11 @@ public final class PinManager {
     private func save(_ panel: PinPanel) {
         guard let image = panel.exportImage() else { return }
         onRequestSavePNG?(image)
+    }
+
+    private func recognizeText(_ panel: PinPanel) {
+        guard case .image = panel.content, let image = panel.exportImage() else { return }
+        onRequestRecognizeText?(image)
     }
 
     private static func visibleFrameUnderMouse() -> CGRect {

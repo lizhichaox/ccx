@@ -3,7 +3,7 @@ import CCXAnnotate
 
 /// Action commands triggered from the floating snip toolbar.
 enum SnipToolbarAction: Sendable {
-    case undo, redo, pin, copy, save, cancel
+    case undo, redo, ocr, pin, copy, save, cancel
 }
 
 /// Two-tier Liquid Glass floating toolbar for selecting annotation tools, styles,
@@ -13,8 +13,8 @@ final class SnipActionToolbar: NSView {
     static let primaryHeight: CGFloat = 40
     static let styleBarHeight: CGFloat = 34
     static let barGap: CGFloat = 6
-    static let preferredSize = CGSize(width: 488, height: primaryHeight)
-    static let expandedSize = CGSize(width: 488, height: primaryHeight + barGap + styleBarHeight)
+    static let preferredSize = CGSize(width: 520, height: primaryHeight)
+    static let expandedSize = CGSize(width: 520, height: primaryHeight + barGap + styleBarHeight)
 
     var onAction: ((SnipToolbarAction) -> Void)?
     var onToolSelected: ((AnnotationTool) -> Void)?
@@ -186,6 +186,9 @@ final class SnipActionToolbar: NSView {
 
         views.append(Self.makeDivider())
 
+        views.append(ToolbarIconButton(symbol: "text.viewfinder", tooltip: "Copy Text (OCR) (T)", tint: .systemCyan, width: 30) { [weak self] in
+            self?.onAction?(.ocr)
+        })
         views.append(ToolbarIconButton(symbol: "pin", tooltip: "Pin (Return)", tint: .systemGreen, width: 32) { [weak self] in
             self?.onAction?(.pin)
         })

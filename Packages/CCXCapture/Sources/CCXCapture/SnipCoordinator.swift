@@ -1,4 +1,5 @@
 import AppKit
+import CCXAnnotate
 import CCXCore
 import OSLog
 
@@ -10,6 +11,7 @@ public final class SnipCoordinator {
     private var overlay: SnipOverlayController?
     private var captureTask: Task<Void, Never>?
     private var completion: (@MainActor (SnipOutcome) -> Void)?
+    private var lastAnnotationStyle = AnnotationStyle()
 
     /// Whether a snip session is currently capturing or showing its overlay.
     public private(set) var isSessionActive = false
@@ -58,9 +60,17 @@ public final class SnipCoordinator {
 
     private func presentOverlay(snapshots: [DisplaySnapshot], detector: SmartElementDetector) {
         captureTask = nil
-        let controller = SnipOverlayController(snapshots: snapshots, detector: detector) { [weak self] outcome in
-            self?.finish(outcome)
-        }
+        let controller = SnipOverlayController(
+            snapshots: snapshots,
+            detector: detector,
+            initialStyle: lastAnnotationStyle,
+            onStyleUpdated: { [weak self] style in
+                self?.lastAnnotationStyle = style
+            },
+            onFinish: { [weak self] outcome in
+                self?.finish(outcome)
+            }
+        )
         overlay = controller
         controller.show()
     }

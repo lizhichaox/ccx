@@ -8,6 +8,7 @@ enum OverlayAction: Equatable {
     case pin(CGRect)
     case copy(CGRect)
     case save(CGRect)
+    case ocr(CGRect)
     case copyColor(CCXColorSample, ColorFormat)
     case cancel
 }
@@ -33,6 +34,8 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
     var shouldBecomeKeyOnHover: (() -> Bool)?
     /// Called once when the user finishes the session from this view.
     var onFinish: ((OverlayAction) -> Void)?
+    /// Called whenever the active annotation style changes so the next session restores it.
+    var onStyleUpdated: ((AnnotationStyle) -> Void)?
 
     private static let axGapBridgeMargin: CGFloat = 24
     private static let axRequeryDistance: CGFloat = 2
@@ -83,9 +86,10 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
     private let toolbar = SnipActionToolbar(frame: CGRect(origin: .zero, size: SnipActionToolbar.preferredSize))
     private var trackingArea: NSTrackingArea?
 
-    init(snapshot: DisplaySnapshot, topInset: CGFloat) {
+    init(snapshot: DisplaySnapshot, topInset: CGFloat, initialStyle: AnnotationStyle = AnnotationStyle()) {
         self.snapshot = snapshot
         self.topInset = topInset
+        self.currentStyle = initialStyle
         let localBounds = CGRect(origin: .zero, size: snapshot.screenFrame.size)
         self.machine = SelectionStateMachine(bounds: localBounds)
         let cache = MosaicImageCache(baseImage: snapshot.image)
@@ -278,6 +282,7 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
 
     func applyStyle(_ style: AnnotationStyle) {
         currentStyle = style
+        onStyleUpdated?(style)
         if let editor = inlineEditor {
             editor.textColor = style.color.nsColor
             editor.font = NSFont.systemFont(ofSize: style.size.fontSize, weight: .bold)
@@ -509,7 +514,21 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
     }
 
     override func rightMouseDown(with event: NSEvent) {
-        cancelInlineTextEditor()
+        if isEditingText {
+            cancelInlineTextEditor()
+            refresh()
+            return
+        }
+        if !machine.isHovering {
+            if activeTool.isDrawingTool {
+                setActiveTool(.select)
+                return
+            }
+            let local = convert(event.locationInWindow, from: nil)
+            resetSelection()
+            primeWithMouseLocation(toGlobal(local))
+            return
+        }
         onFinish?(.cancel)
     }
 
@@ -783,12 +802,31 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
         guard flags == .command else { return false }
 
         switch char {
+        case "a":
+            if machine.isHovering {
+                machine.select(bounds)
+                lastRefinedLocalRect = nil
+                lastAXQueryPoint = nil
+                annotationView.invalidateActiveRegion()
+                refresh()
+                return true
+            }
+            return false
         case "c":
             if let rect = selectedRect {
                 finish(.copy(rect))
                 return true
             } else if let sample = currentSample {
                 onFinish?(.copyColor(sample, colorFormat))
+                return true
+            }
+            return false
+        case "d":
+            if let rect = selectedRect, let item = annotations.selectedItem {
+                let copy = duplicateAnnotation(item, within: rect)
+                annotations.commit(copy)
+                annotationView.invalidate(rect: copy.boundingBox)
+                refresh()
                 return true
             }
             return false
@@ -831,6 +869,7 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
             return
         }
 
+        let step: CGFloat = flags.contains(.shift) ? 10 : 1
         switch event.keyCode {
         case 53: // Escape
             onFinish?(.cancel)
@@ -844,10 +883,10 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
                 refresh()
                 return
             }
-        case 123: nudge(dx: -1, dy: 0); return
-        case 124: nudge(dx: 1, dy: 0); return
-        case 125: nudge(dx: 0, dy: -1); return
-        case 126: nudge(dx: 0, dy: 1); return
+        case 123: nudgeSelectionOrAnnotation(dx: -step, dy: 0); return
+        case 124: nudgeSelectionOrAnnotation(dx: step, dy: 0); return
+        case 125: nudgeSelectionOrAnnotation(dx: 0, dy: -step); return
+        case 126: nudgeSelectionOrAnnotation(dx: 0, dy: step); return
         default: break
         }
 
@@ -855,7 +894,11 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
             return
         }
 
-        if flags.isEmpty, selectedRect != nil {
+        if flags.isEmpty, let rect = selectedRect {
+            if characters == "t" {
+                finish(.ocr(rect))
+                return
+            }
             if characters == "v" {
                 setActiveTool(.select)
                 return
@@ -893,6 +936,46 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
         if machine.nudge(dx: dx, dy: dy) { refresh() }
     }
 
+    private func nudgeSelectionOrAnnotation(dx: CGFloat, dy: CGFloat) {
+        if let selection = selectedRect, let selected = annotations.selectedItem {
+            let oldBox = selected.boundingBox
+            let clamped = Self.clampedTranslation(for: oldBox, desired: CGSize(width: dx, height: dy), within: selection)
+            guard clamped.width != 0 || clamped.height != 0 else { return }
+            let moved = selected.translated(by: clamped)
+            annotations.replaceItem(moved, recordUndo: true)
+            annotationView.invalidate(rect: oldBox.union(moved.boundingBox))
+            refresh()
+        } else {
+            nudge(dx: dx, dy: dy)
+        }
+    }
+
+    private func duplicateAnnotation(_ item: AnnotationItem, within selection: CGRect) -> AnnotationItem {
+        let primary = Self.clampedTranslation(for: item.boundingBox, desired: CGSize(width: 14, height: -14), within: selection)
+        let delta: CGSize
+        if abs(primary.width) >= 1 || abs(primary.height) >= 1 {
+            delta = primary
+        } else {
+            delta = Self.clampedTranslation(for: item.boundingBox, desired: CGSize(width: -14, height: 14), within: selection)
+        }
+        let shifted = item.translated(by: delta)
+        return AnnotationItem(kind: shifted.kind, style: shifted.style)
+    }
+
+    private static func clampedTranslation(for box: CGRect, desired: CGSize, within boundsRect: CGRect) -> CGSize {
+        let dx: CGFloat = if box.width <= boundsRect.width {
+            min(max(box.minX + desired.width, boundsRect.minX), boundsRect.maxX - box.width) - box.minX
+        } else {
+            desired.width
+        }
+        let dy: CGFloat = if box.height <= boundsRect.height {
+            min(max(box.minY + desired.height, boundsRect.minY), boundsRect.maxY - box.height) - box.minY
+        } else {
+            desired.height
+        }
+        return CGSize(width: dx, height: dy)
+    }
+
     private func handleToolbar(_ action: SnipToolbarAction) {
         switch action {
         case .undo:
@@ -907,6 +990,8 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
                 annotationView.invalidateActiveRegion()
                 refresh()
             }
+        case .ocr:
+            if let rect = selectedRect { finish(.ocr(rect)) }
         case .pin:
             if let rect = selectedRect { finish(.pin(rect)) }
         case .copy:

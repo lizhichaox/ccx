@@ -106,8 +106,20 @@ enum PinLayout {
     /// Returns `image` rotated clockwise by a multiple of 90 degrees (other angles return
     /// the original image).
     static func rotatedImage(_ image: CGImage, clockwiseDegrees degrees: Int) -> CGImage? {
+        transformedImage(image, clockwiseDegrees: degrees, flipHorizontal: false, flipVertical: false)
+    }
+
+    /// Returns `image` rotated clockwise by a multiple of 90 degrees and mirrored in screen space.
+    static func transformedImage(
+        _ image: CGImage,
+        clockwiseDegrees degrees: Int,
+        flipHorizontal: Bool,
+        flipVertical: Bool
+    ) -> CGImage? {
         let degrees = ((degrees % 360) + 360) % 360
-        guard degrees != 0 else { return image }
+        if degrees == 0, !flipHorizontal, !flipVertical {
+            return image
+        }
         guard degrees % 90 == 0 else { return image }
         let quarter = degrees % 180 == 90
         let width = quarter ? image.height : image.width
@@ -120,6 +132,9 @@ enum PinLayout {
         ) else { return nil }
         context.interpolationQuality = .none
         context.translateBy(x: CGFloat(width) / 2, y: CGFloat(height) / 2)
+        if flipHorizontal || flipVertical {
+            context.scaleBy(x: flipHorizontal ? -1 : 1, y: flipVertical ? -1 : 1)
+        }
         context.rotate(by: -CGFloat(degrees) * .pi / 180)
         context.draw(
             image,
@@ -180,11 +195,22 @@ enum PinRenderer {
             .draw(at: CGPoint(x: textX, y: rect.minY + 12))
     }
 
-    /// Renders `content` at its base size into a bitmap (used for copy/save of
-    /// non-image pins and rotated images).
-    static func exportImage(for content: PinContent, rotationDegrees: Int, scale: CGFloat = 2) -> CGImage? {
+    /// Renders `content` at its base size into a bitmap (used for copy/save/OCR of
+    /// non-image pins and transformed images).
+    static func exportImage(
+        for content: PinContent,
+        rotationDegrees: Int,
+        flipHorizontal: Bool = false,
+        flipVertical: Bool = false,
+        scale: CGFloat = 2
+    ) -> CGImage? {
         if case let .image(image, _) = content {
-            return PinLayout.rotatedImage(image, clockwiseDegrees: rotationDegrees)
+            return PinLayout.transformedImage(
+                image,
+                clockwiseDegrees: rotationDegrees,
+                flipHorizontal: flipHorizontal,
+                flipVertical: flipVertical
+            )
         }
         let size = PinLayout.baseSize(for: content)
         let width = Int((size.width * scale).rounded())
@@ -202,6 +228,11 @@ enum PinRenderer {
         draw(content, in: CGRect(origin: .zero, size: size), zoom: 1, context: context)
         NSGraphicsContext.restoreGraphicsState()
         guard let rendered = context.makeImage() else { return nil }
-        return PinLayout.rotatedImage(rendered, clockwiseDegrees: rotationDegrees)
+        return PinLayout.transformedImage(
+            rendered,
+            clockwiseDegrees: rotationDegrees,
+            flipHorizontal: flipHorizontal,
+            flipVertical: flipVertical
+        )
     }
 }

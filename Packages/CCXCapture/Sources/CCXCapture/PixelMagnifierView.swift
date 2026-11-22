@@ -7,7 +7,7 @@ final class PixelMagnifierView: NSView {
     /// Number of image pixels shown per side (odd so there is a center pixel).
     static let gridPixels = 11
     static let cellSize: CGFloat = 14
-    static let infoHeight: CGFloat = 58
+    static let infoHeight: CGFloat = 70
     static var gridSide: CGFloat { CGFloat(gridPixels) * cellSize }
     static var preferredSize: CGSize { CGSize(width: gridSide, height: gridSide + infoHeight) }
 
@@ -145,6 +145,14 @@ final class PixelMagnifierView: NSView {
             let text = sample.formatted(as: format)
             (text as NSString).draw(at: CGPoint(x: swatch.maxX + 5, y: swatch.minY - 1), withAttributes: attributes)
         }
+        let hintAttributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedSystemFont(ofSize: 8.5, weight: .regular),
+            .foregroundColor: NSColor.white.withAlphaComponent(0.55),
+        ]
+        ("C copy · ⇧ format" as NSString).draw(
+            at: CGPoint(x: 6, y: max(3, infoTop - 4 * lineHeight + 3)),
+            withAttributes: hintAttributes
+        )
     }
 
     /// Chooses a frame near `cursor` that stays inside `bounds` and below the top safe-area inset (Notch).

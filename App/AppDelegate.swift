@@ -48,6 +48,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         pinManager.onRequestSavePNG = { [weak self] image in
             self?.presentSavePanel(for: image)
         }
+        pinManager.onCopied = { [weak self] message in
+            self?.toast.show(message)
+        }
+        pinManager.onRequestRecognizeText = { [weak self] image in
+            self?.recognizeAndCopyText(from: image)
+        }
 
         hotKeyManager.onAction = { [weak self] action in
             self?.perform(action)
@@ -129,6 +135,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .save(let result):
             record(result)
             presentSavePanel(for: result.image)
+        case .ocr(let result):
+            record(result)
+            recognizeAndCopyText(from: result.image)
         case .copiedColor(let sample, let format):
             let text = sample.formatted(as: format)
             clipboardStore.copyText(text)
@@ -147,6 +156,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func record(_ result: SnipResult) {
         clipboardStore.recordSnip(image: result.image, scale: result.scale, screenRect: result.screenRect)
+    }
+
+    private func recognizeAndCopyText(from image: CGImage) {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let text = try await TextRecognizer.recognizeText(in: image)
+                if text.isEmpty {
+                    self.toast.show("No Text Found", symbolName: "exclamationmark.circle")
+                } else {
+                    self.clipboardStore.copyText(text)
+                    self.toast.show("Copied Text (OCR)", symbolName: "text.viewfinder")
+                }
+            } catch {
+                self.toast.show("OCR Failed", symbolName: "exclamationmark.triangle")
+            }
+        }
     }
 
     // MARK: - Saving

@@ -389,4 +389,57 @@ final class ClipboardStoreTests: XCTestCase {
         let badURL = URL(fileURLWithPath: "/nonexistent-dir-\(UUID().uuidString)/x.png")
         XCTAssertThrowsError(try store.savePNG(image, to: badURL))
     }
+
+    func testTIFFCompressionAndDecodeRoundTrip() {
+        let img = makeTestImage(width: 24, height: 12) { _, _ in (12, 34, 56, 255) }
+        let tiffData = ClipboardStore.encode(img, type: .tiff, scale: 2)
+        XCTAssertNotNil(tiffData)
+        if let tiffData {
+            let decoded = ClipboardStore.decode(tiffData)
+            XCTAssertEqual(decoded?.0.width, 24)
+            XCTAssertEqual(decoded?.0.height, 12)
+            XCTAssertEqual(decoded?.1, 2)
+            XCTAssertEqual(CCXColorSample.samplePixel(from: decoded!.0, pixelX: 4, pixelY: 4)?.red, 12)
+        }
+    }
+}
+
+final class TextRecognizerTests: XCTestCase {
+    @MainActor
+    func testRecognizeHighContrastBannerText() async throws {
+        let width = 360
+        let height = 100
+        let ctx = CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        )!
+        ctx.setFillColor(red: 1, green: 1, blue: 1, alpha: 1)
+        ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
+
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: ctx, flipped: false)
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 44, weight: .bold),
+            .foregroundColor: NSColor.black,
+        ]
+        ("CCX 2026" as NSString).draw(at: CGPoint(x: 32, y: 26), withAttributes: attrs)
+        NSGraphicsContext.restoreGraphicsState()
+
+        let image = ctx.makeImage()!
+        let text: String
+        do {
+            text = try await TextRecognizer.recognizeText(in: image)
+        } catch {
+            if error.localizedDescription.contains("CVPixelBuffer") {
+                throw XCTSkip("Vision CVPixelBuffer allocation is unavailable in sandboxed test shells")
+            }
+            throw error
+        }
+        XCTAssertTrue(text.contains("CCX"), "Expected OCR text containing CCX, got: \(text)")
+    }
 }

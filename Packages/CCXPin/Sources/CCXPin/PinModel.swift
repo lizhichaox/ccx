@@ -32,6 +32,8 @@ public struct PinState: Equatable, Sendable {
     public var isThumbnail: Bool = false
     public var showsBorder: Bool = true
     public var showsShadow: Bool = true
+    public var isFlippedHorizontally: Bool = false
+    public var isFlippedVertically: Bool = false
 
     public init(
         zoom: CGFloat = 1.0,
@@ -40,7 +42,9 @@ public struct PinState: Equatable, Sendable {
         isClickThrough: Bool = false,
         isThumbnail: Bool = false,
         showsBorder: Bool = true,
-        showsShadow: Bool = true
+        showsShadow: Bool = true,
+        isFlippedHorizontally: Bool = false,
+        isFlippedVertically: Bool = false
     ) {
         self.zoom = Self.clamp(zoom, to: Self.zoomRange, fallback: 1.0)
         self.opacity = Self.clamp(opacity, to: Self.opacityRange, fallback: 1.0)
@@ -49,6 +53,8 @@ public struct PinState: Equatable, Sendable {
         self.isThumbnail = isThumbnail
         self.showsBorder = showsBorder
         self.showsShadow = showsShadow
+        self.isFlippedHorizontally = isFlippedHorizontally
+        self.isFlippedVertically = isFlippedVertically
     }
 
     public mutating func setZoom(_ value: CGFloat) { zoom = value }
@@ -65,6 +71,12 @@ public struct PinState: Equatable, Sendable {
     public mutating func rotate(byDegrees degrees: Int) { rotationDegrees += degrees }
 
     public mutating func rotateClockwise() { rotate(byDegrees: 90) }
+
+    public mutating func rotateCounterClockwise() { rotate(byDegrees: -90) }
+
+    public mutating func toggleFlipHorizontal() { isFlippedHorizontally.toggle() }
+
+    public mutating func toggleFlipVertical() { isFlippedVertically.toggle() }
 
     public mutating func toggleClickThrough() { isClickThrough.toggle() }
 
