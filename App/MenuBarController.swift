@@ -128,7 +128,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
             action: #selector(openAccessibilitySettings)
         ))
         submenu.addItem(.separator())
-        submenu.addItem(item("Open Permissions Guide…", symbol: "questionmark.circle", action: #selector(openPermissionsGuide)))
+        submenu.addItem(item("Welcome & Permissions Guide…", symbol: "questionmark.circle", action: #selector(openPermissionsGuide)))
         parent.submenu = submenu
         return parent
     }

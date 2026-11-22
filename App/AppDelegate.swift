@@ -8,6 +8,8 @@ import UniformTypeIdentifiers
 /// outcomes between the capture, pin, and clipboard modules.
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    private static let hasCompletedOnboardingKey = "CPXHasCompletedOnboarding"
+
     private let clipboardStore: ClipboardStore
     private let pinManager: PinManager
     private let snipCoordinator: SnipCoordinator
@@ -50,7 +52,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.menuBarController = menuBarController
 
         if !PermissionManager.currentStatus().screenRecording {
-            showOnboarding()
+            showOnboarding(startingAt: .welcome)
+        } else if !UserDefaults.standard.bool(forKey: Self.hasCompletedOnboardingKey) {
+            showOnboarding(startingAt: .ready)
         }
     }
 
@@ -82,7 +86,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard !snipCoordinator.isSessionActive else { return }
         guard PermissionManager.currentStatus().screenRecording else {
             PermissionManager.requestScreenRecording()
-            showOnboarding()
+            showOnboarding(startingAt: .permissions)
             return
         }
         snipCoordinator.startSnip { [weak self] outcome in
@@ -176,11 +180,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Windows
 
-    private func showOnboarding() {
+    private func showOnboarding(startingAt step: OnboardingStep = .welcome) {
         if onboardingController == nil {
-            onboardingController = OnboardingWindowController()
+            onboardingController = OnboardingWindowController(
+                currentCombo: { [weak self] action in
+                    self?.hotKeyManager.currentCombo(for: action) ?? HotKeyPreferences.defaultCombo(for: action)
+                },
+                onComplete: {
+                    UserDefaults.standard.set(true, forKey: Self.hasCompletedOnboardingKey)
+                },
+                onTrySnip: { [weak self] in
+                    UserDefaults.standard.set(true, forKey: Self.hasCompletedOnboardingKey)
+                    Task { @MainActor [weak self] in
+                        try? await Task.sleep(for: .milliseconds(220))
+                        self?.startSnip()
+                    }
+                },
+                onOpenSettings: { [weak self] in
+                    self?.showSettings()
+                }
+            )
         }
-        onboardingController?.show()
+        onboardingController?.show(startingAt: step)
     }
 
     private func showSettings() {
@@ -246,7 +267,7 @@ extension AppDelegate: MenuBarControllerDelegate {
     }
 
     func menuBarRequestedPermissionsGuide() {
-        showOnboarding()
+        showOnboarding(startingAt: .permissions)
     }
 
     func menuBarRequestedSettings() {
