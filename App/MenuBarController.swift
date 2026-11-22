@@ -73,9 +73,8 @@ final class MenuBarController: NSObject, NSWindowDelegate {
                 ?? NSImage(systemSymbolName: "viewfinder", accessibilityDescription: "CPX")
             image?.isTemplate = true
             button.image = image
-            button.toolTip = "CPX"
             button.target = self
-            button.action = #selector(togglePanel)
+            button.action = #selector(handleStatusItemClick)
             button.sendAction(on: [.leftMouseDown, .rightMouseDown])
         }
 
@@ -97,6 +96,15 @@ final class MenuBarController: NSObject, NSWindowDelegate {
     }
 
     // MARK: - Panel lifecycle
+
+    @objc private func handleStatusItemClick() {
+        if let type = NSApp.currentEvent?.type, type == .rightMouseDown || type == .rightMouseUp {
+            hidePanel()
+            delegate?.menuBarRequestedPinFromClipboard()
+            return
+        }
+        togglePanel()
+    }
 
     @objc private func togglePanel() {
         if let panel, panel.isVisible {
@@ -211,6 +219,13 @@ final class MenuBarController: NSObject, NSWindowDelegate {
             hotKeyManager: hotKeyManager,
             clipboardStore: clipboardStore
         )
+        if pinManager.hasClickThroughPins {
+            statusItem.button?.toolTip = "CPX — Click-through pin active (click to unlock)"
+        } else if pinManager.arePinsHidden {
+            statusItem.button?.toolTip = "CPX — \(pinManager.pinCount) pin(s) hidden (click to show)"
+        } else {
+            statusItem.button?.toolTip = "CPX — Click to open, right-click to pin clipboard"
+        }
     }
 
     // MARK: - Event monitors & NSWindowDelegate

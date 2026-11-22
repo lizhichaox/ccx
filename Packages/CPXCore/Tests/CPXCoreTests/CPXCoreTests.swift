@@ -212,19 +212,11 @@ final class HotKeyComboTests: XCTestCase {
     func testDefaults() {
         XCTAssertEqual(HotKeyCombo.defaultSnip,
                        HotKeyCombo(keyCode: UInt32(kVK_ANSI_X), carbonModifiers: UInt32(controlKey | cmdKey)))
-        XCTAssertEqual(HotKeyCombo.defaultPastePin, HotKeyCombo(keyCode: 99, carbonModifiers: 0))
-        XCTAssertEqual(HotKeyCombo.defaultToggleAllPins, HotKeyCombo(keyCode: 99, carbonModifiers: UInt32(shiftKey)))
-        XCTAssertEqual(HotKeyCombo.defaultUnlockClickThrough,
-                       HotKeyCombo(keyCode: 99, carbonModifiers: UInt32(optionKey | shiftKey)))
-        XCTAssertEqual(CPXHotKeyAction.allCases.map(\.defaultCombo),
-                       [.defaultSnip, .defaultPastePin, .defaultToggleAllPins, .defaultUnlockClickThrough])
+        XCTAssertEqual(CPXHotKeyAction.allCases.map(\.defaultCombo), [.defaultSnip])
     }
 
     func testDisplayString() {
         XCTAssertEqual(HotKeyCombo.defaultSnip.displayString, "⌃⌘X")
-        XCTAssertEqual(HotKeyCombo.defaultPastePin.displayString, "F3")
-        XCTAssertEqual(HotKeyCombo.defaultToggleAllPins.displayString, "⇧F3")
-        XCTAssertEqual(HotKeyCombo.defaultUnlockClickThrough.displayString, "⌥⇧F3")
         let all = HotKeyCombo(keyCode: UInt32(kVK_ANSI_A),
                               carbonModifiers: UInt32(cmdKey | shiftKey | optionKey | controlKey))
         XCTAssertEqual(all.displayString, "⌃⌥⇧⌘A")
@@ -239,11 +231,11 @@ final class HotKeyComboTests: XCTestCase {
     }
 
     func testCodableRoundTrip() throws {
-        let combo = HotKeyCombo.defaultUnlockClickThrough
+        let combo = HotKeyCombo.defaultSnip
         let decoded = try JSONDecoder().decode(HotKeyCombo.self, from: JSONEncoder().encode(combo))
         XCTAssertEqual(decoded, combo)
-        let action = try JSONDecoder().decode(CPXHotKeyAction.self, from: JSONEncoder().encode(CPXHotKeyAction.pastePin))
-        XCTAssertEqual(action, .pastePin)
+        let action = try JSONDecoder().decode(CPXHotKeyAction.self, from: JSONEncoder().encode(CPXHotKeyAction.snip))
+        XCTAssertEqual(action, .snip)
     }
 
     func testCarbonIDRoundTrip() {
@@ -262,6 +254,7 @@ final class GlobalHotKeyManagerTests: XCTestCase {
         let manager = GlobalHotKeyManager()
         // Use an unusual combo so it never collides with real shortcuts on the host.
         let combo = HotKeyCombo(keyCode: UInt32(kVK_F19), carbonModifiers: UInt32(controlKey | optionKey | shiftKey))
+        let alternate = HotKeyCombo(keyCode: UInt32(kVK_F18), carbonModifiers: UInt32(controlKey | optionKey | shiftKey))
         XCTAssertNil(manager.currentCombo(for: .snip))
         guard manager.register(.snip, combo: combo) else {
             // Carbon registration can be unavailable in headless/sandboxed sessions.
@@ -270,8 +263,8 @@ final class GlobalHotKeyManagerTests: XCTestCase {
         }
         XCTAssertEqual(manager.currentCombo(for: .snip), combo)
         XCTAssertTrue(manager.register(.snip, combo: combo), "Re-registering the same combo is a no-op")
-        XCTAssertFalse(manager.register(.pastePin, combo: combo), "Duplicate combo across actions is rejected")
-        XCTAssertNil(manager.currentCombo(for: .pastePin))
+        XCTAssertTrue(manager.register(.snip, combo: alternate), "Re-binding action updates its combo")
+        XCTAssertEqual(manager.currentCombo(for: .snip), alternate)
 
         manager.unregister(.snip)
         XCTAssertNil(manager.currentCombo(for: .snip))
@@ -288,14 +281,14 @@ final class GlobalHotKeyManagerTests: XCTestCase {
         var received: [CPXHotKeyAction] = []
         manager.onAction = { received.append($0) }
         let combo = HotKeyCombo(keyCode: UInt32(kVK_F18), carbonModifiers: UInt32(controlKey | optionKey | shiftKey))
-        let registered = manager.register(.toggleAllPins, combo: combo)
+        let registered = manager.register(.snip, combo: combo)
 
         // Find this manager's token by probing dispatch with every plausible token.
         for token in 1...UInt(64) {
-            GlobalHotKeyManager.dispatch(token: token, carbonID: CPXHotKeyAction.toggleAllPins.carbonID)
             GlobalHotKeyManager.dispatch(token: token, carbonID: CPXHotKeyAction.snip.carbonID)
+            GlobalHotKeyManager.dispatch(token: token, carbonID: 99)
         }
-        XCTAssertEqual(received, registered ? [.toggleAllPins] : [])
+        XCTAssertEqual(received, registered ? [.snip] : [])
         manager.unregisterAll()
     }
 }

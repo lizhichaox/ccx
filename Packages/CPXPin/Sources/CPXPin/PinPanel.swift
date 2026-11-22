@@ -15,6 +15,7 @@ public final class PinPanel: NSPanel {
     var onClose: ((PinPanel) -> Void)?
     var onCopy: ((PinPanel) -> Void)?
     var onSave: ((PinPanel) -> Void)?
+    var onHideAll: (() -> Void)?
     var onCloseAll: (() -> Void)?
     var onStateChanged: ((PinPanel) -> Void)?
 
@@ -188,6 +189,7 @@ public final class PinPanel: NSPanel {
         menu.addItem(thumbnail)
         menu.addItem(.separator())
         menu.addItem(menuItem("Close Pin", #selector(closePin(_:)), key: "w"))
+        menu.addItem(menuItem("Hide All Pins", #selector(hideAllPins(_:))))
         menu.addItem(menuItem("Close All Pins", #selector(closeAllPins(_:))))
         return menu
     }
@@ -207,6 +209,7 @@ public final class PinPanel: NSPanel {
     @objc func toggleClickThroughFromMenu(_ sender: Any?) { setClickThrough(!state.isClickThrough) }
     @objc func toggleThumbnailFromMenu(_ sender: Any?) { toggleThumbnail() }
     @objc func closePin(_ sender: Any?) { close() }
+    @objc func hideAllPins(_ sender: Any?) { onHideAll?() }
     @objc func closeAllPins(_ sender: Any?) { onCloseAll?() }
 
     /// Image used for copy/save: the original pixels (rotated) or a rendered card.

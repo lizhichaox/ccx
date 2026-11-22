@@ -5,17 +5,11 @@ import Foundation
 /// Global actions that can be bound to a system-wide hotkey.
 public enum CPXHotKeyAction: String, CaseIterable, Sendable, Codable {
     case snip
-    case pastePin
-    case toggleAllPins
-    case unlockClickThrough
 
     /// Human-readable title for settings and menus.
     public var displayName: String {
         switch self {
         case .snip: "Snip"
-        case .pastePin: "Paste as Pin"
-        case .toggleAllPins: "Hide/Show All Pins"
-        case .unlockClickThrough: "Unlock Click-Through Pins"
         }
     }
 
@@ -23,9 +17,6 @@ public enum CPXHotKeyAction: String, CaseIterable, Sendable, Codable {
     public var defaultCombo: HotKeyCombo {
         switch self {
         case .snip: .defaultSnip
-        case .pastePin: .defaultPastePin
-        case .toggleAllPins: .defaultToggleAllPins
-        case .unlockClickThrough: .defaultUnlockClickThrough
         }
     }
 
@@ -61,15 +52,6 @@ public struct HotKeyCombo: Equatable, Hashable, Sendable, Codable {
         keyCode: UInt32(kVK_ANSI_X),
         carbonModifiers: UInt32(controlKey | cmdKey)
     )
-    /// `F3`
-    public static let defaultPastePin = HotKeyCombo(keyCode: UInt32(kVK_F3), carbonModifiers: 0)
-    /// `Shift+F3`
-    public static let defaultToggleAllPins = HotKeyCombo(keyCode: UInt32(kVK_F3), carbonModifiers: UInt32(shiftKey))
-    /// `Option+Shift+F3`
-    public static let defaultUnlockClickThrough = HotKeyCombo(
-        keyCode: UInt32(kVK_F3),
-        carbonModifiers: UInt32(optionKey | shiftKey)
-    )
 
     /// Converts AppKit modifier flags into a Carbon modifier mask.
     public static func carbonModifiers(from flags: NSEvent.ModifierFlags) -> UInt32 {
@@ -91,7 +73,7 @@ public struct HotKeyCombo: Equatable, Hashable, Sendable, Codable {
         return flags
     }
 
-    /// Mac-style shortcut string, modifiers in canonical `⌃⌥⇧⌘` order, e.g. `⌥⇧F3`.
+    /// Mac-style shortcut string, modifiers in canonical `⌃⌥⇧⌘` order, e.g. `⌃⌘X`.
     public var displayString: String {
         var result = ""
         if carbonModifiers & UInt32(controlKey) != 0 { result += "⌃" }

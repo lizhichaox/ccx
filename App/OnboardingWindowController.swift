@@ -482,7 +482,7 @@ private struct ReadyStepView: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
 
-                Text("CPX stays quietly in your menu bar. Here are your core shortcuts:")
+                Text("CPX stays quietly in your menu bar. Here's how to use it:")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
@@ -490,25 +490,25 @@ private struct ReadyStepView: View {
             }
 
             VStack(spacing: 0) {
-                ShortcutCheatRow(
+                GuideActionRow(
                     symbol: "viewfinder",
                     title: "Smart Snip",
                     subtitle: "Capture windows, regions, or sample screen pixels",
-                    combo: currentCombo(.snip)
+                    trailing: { KeycapComboView(combo: currentCombo(.snip)) }
                 )
                 Divider().padding(.leading, 40)
-                ShortcutCheatRow(
+                GuideActionRow(
                     symbol: "pin.fill",
                     title: "Paste as Pin",
                     subtitle: "Float your clipboard image, text, or HEX color on top",
-                    combo: currentCombo(.pastePin)
+                    trailing: { InteractionPillView(text: "Right-Click Icon") }
                 )
                 Divider().padding(.leading, 40)
-                ShortcutCheatRow(
-                    symbol: "eye.slash",
-                    title: "Hide / Show Pins",
-                    subtitle: "Temporarily tuck all floating pins out of the way",
-                    combo: currentCombo(.toggleAllPins)
+                GuideActionRow(
+                    symbol: "macwindow.on.rectangle",
+                    title: "Manage Floating Pins",
+                    subtitle: "Hide, close, or unlock click-through pins anytime",
+                    trailing: { InteractionPillView(text: "Menu Bar") }
                 )
             }
             .padding(.horizontal, 14)
@@ -524,7 +524,7 @@ private struct ReadyStepView: View {
 
                 Spacer()
 
-                Button("Customize Shortcuts…", action: onOpenSettings)
+                Button("Change Shortcut…", action: onOpenSettings)
                     .buttonStyle(.bordered)
                     .controlSize(.regular)
                     .fixedSize()
@@ -554,11 +554,11 @@ private struct ReadyStepView: View {
     }
 }
 
-private struct ShortcutCheatRow: View {
+private struct GuideActionRow<Trailing: View>: View {
     let symbol: String
     let title: String
     let subtitle: String
-    let combo: HotKeyCombo
+    @ViewBuilder let trailing: () -> Trailing
 
     var body: some View {
         HStack(spacing: 12) {
@@ -580,10 +580,30 @@ private struct ShortcutCheatRow: View {
 
             Spacer(minLength: 12)
 
-            KeycapComboView(combo: combo)
+            trailing()
                 .fixedSize()
         }
         .padding(.vertical, 8)
+    }
+}
+
+private struct InteractionPillView: View {
+    let text: String
+
+    var body: some View {
+        Text(text)
+            .font(.system(size: 11.5, weight: .medium))
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 10)
+            .frame(minHeight: 24)
+            .background(
+                Capsule()
+                    .fill(Color.primary.opacity(0.06))
+            )
+            .overlay(
+                Capsule()
+                    .strokeBorder(Color.primary.opacity(0.12), lineWidth: 1)
+            )
     }
 }
 

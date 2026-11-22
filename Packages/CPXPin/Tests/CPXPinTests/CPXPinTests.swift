@@ -241,6 +241,7 @@ final class PinPanelAndManagerTests: XCTestCase {
         XCTAssertTrue(titles.contains("Toggle Click-Through"))
         XCTAssertTrue(titles.contains("Toggle Thumbnail"))
         XCTAssertTrue(titles.contains("Close Pin"))
+        XCTAssertTrue(titles.contains("Hide All Pins"))
         XCTAssertTrue(titles.contains("Close All Pins"))
 
         let opacitySubmenu = menu.items.first(where: { $0.title == "Opacity" })?.submenu

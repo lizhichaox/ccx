@@ -1,8 +1,7 @@
 import CPXCore
 import Foundation
 
-/// Persists user-selected global hotkeys and offers preset choices for the
-/// Settings window.
+/// Persists the global snip hotkey and offers preset choices for Settings.
 enum HotKeyPreferences {
     // Carbon modifier masks (mirrors `cmdKey`, `shiftKey`, `optionKey`,
     // `controlKey` from Carbon.HIToolbox without importing Carbon here).
@@ -14,22 +13,16 @@ enum HotKeyPreferences {
     // Carbon virtual key codes.
     private enum KeyCode {
         static let a: UInt32 = 0
-        static let h: UInt32 = 4
-        static let p: UInt32 = 35
-        static let u: UInt32 = 32
         static let f1: UInt32 = 122
         static let f2: UInt32 = 120
-        static let f4: UInt32 = 118
     }
 
     private static let defaultsKeyPrefix = "CPXHotKey."
+    private static let legacyKeys = ["pastePin", "toggleAllPins", "unlockClickThrough"]
 
     static func defaultCombo(for action: CPXHotKeyAction) -> HotKeyCombo {
         switch action {
         case .snip: .defaultSnip
-        case .pastePin: .defaultPastePin
-        case .toggleAllPins: .defaultToggleAllPins
-        case .unlockClickThrough: .defaultUnlockClickThrough
         }
     }
 
@@ -43,22 +36,6 @@ enum HotKeyPreferences {
                 HotKeyCombo(keyCode: KeyCode.f2, carbonModifiers: 0),
                 HotKeyCombo(keyCode: KeyCode.a, carbonModifiers: control | shift),
                 HotKeyCombo(keyCode: KeyCode.a, carbonModifiers: command | shift | option),
-            ]
-        case .pastePin:
-            alternatives = [
-                HotKeyCombo(keyCode: KeyCode.f4, carbonModifiers: 0),
-                HotKeyCombo(keyCode: KeyCode.p, carbonModifiers: control | shift),
-                HotKeyCombo(keyCode: KeyCode.p, carbonModifiers: command | shift | option),
-            ]
-        case .toggleAllPins:
-            alternatives = [
-                HotKeyCombo(keyCode: KeyCode.f4, carbonModifiers: shift),
-                HotKeyCombo(keyCode: KeyCode.h, carbonModifiers: control | shift),
-            ]
-        case .unlockClickThrough:
-            alternatives = [
-                HotKeyCombo(keyCode: KeyCode.f4, carbonModifiers: option | shift),
-                HotKeyCombo(keyCode: KeyCode.u, carbonModifiers: control | shift),
             ]
         }
         return [defaultCombo(for: action)] + alternatives
@@ -80,10 +57,12 @@ enum HotKeyPreferences {
         }
     }
 
-    /// Registers the defaults, then applies any saved overrides. A saved combo
-    /// that fails to register falls back to the default binding.
+    /// Removes retired hotkey prefs, registers defaults, and applies any saved overrides.
     @MainActor
     static func registerAll(on manager: GlobalHotKeyManager) {
+        for legacyKey in legacyKeys {
+            UserDefaults.standard.removeObject(forKey: defaultsKeyPrefix + legacyKey)
+        }
         manager.registerDefaults()
         for action in CPXHotKeyAction.allCases {
             guard let saved = savedCombo(for: action), saved != manager.currentCombo(for: action) else {
@@ -102,9 +81,6 @@ extension CPXHotKeyAction {
     var cpxMenuTitle: String {
         switch self {
         case .snip: "Snip"
-        case .pastePin: "Paste / Pin from Clipboard"
-        case .toggleAllPins: "Hide / Show All Pins"
-        case .unlockClickThrough: "Unlock Click-Through Pins"
         }
     }
 }

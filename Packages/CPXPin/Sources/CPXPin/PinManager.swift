@@ -36,6 +36,7 @@ public final class PinManager {
         panel.onClose = { [weak self] panel in self?.panelDidClose(panel) }
         panel.onCopy = { [weak self] panel in self?.copy(panel) }
         panel.onSave = { [weak self] panel in self?.save(panel) }
+        panel.onHideAll = { [weak self] in self?.toggleVisibilityOfAllPins() }
         panel.onCloseAll = { [weak self] in self?.closeAllPins() }
         panel.onStateChanged = { [weak self] _ in self?.onPinsChanged?() }
 

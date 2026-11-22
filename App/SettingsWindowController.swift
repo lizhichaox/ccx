@@ -68,9 +68,9 @@ private struct SettingsView: View {
                         )
                     }
                 } header: {
-                    Text("Global Hotkeys")
+                    Text("Global Shortcut")
                 } footer: {
-                    Text("Hotkeys work system-wide, even when CPX is in the background.")
+                    Text("Triggers interactive snip from anywhere. Pin actions live in the menu bar popover and pin right-click menus.")
                         .foregroundStyle(.secondary)
                 }
 
@@ -96,7 +96,7 @@ private struct SettingsView: View {
             }
             .formStyle(.grouped)
         }
-        .frame(width: 480, height: 560)
+        .frame(width: 480, height: 470)
     }
 }
 

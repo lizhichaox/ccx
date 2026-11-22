@@ -19,6 +19,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var menuBarController: MenuBarController?
     private var onboardingController: OnboardingWindowController?
     private var settingsController: SettingsWindowController?
+    private var hadClickThroughPins = false
 
     override init() {
         let clipboardStore = ClipboardStore()
@@ -36,7 +37,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.accessory)
 
         pinManager.onPinsChanged = { [weak self] in
-            self?.menuBarController?.refresh()
+            guard let self else { return }
+            let hasClickThrough = self.pinManager.hasClickThroughPins
+            if hasClickThrough && !self.hadClickThroughPins {
+                self.toast.show("Click-Through On — Unlock in Menu Bar", symbolName: "cursorarrow.click")
+            }
+            self.hadClickThroughPins = hasClickThrough
+            self.menuBarController?.refresh()
         }
         pinManager.onRequestSavePNG = { [weak self] image in
             self?.presentSavePanel(for: image)
@@ -77,12 +84,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         switch action {
         case .snip:
             startSnip()
-        case .pastePin:
-            pinFromClipboard()
-        case .toggleAllPins:
-            toggleAllPins()
-        case .unlockClickThrough:
-            unlockClickThroughPins()
         }
     }
 

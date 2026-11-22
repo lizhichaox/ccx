@@ -13,9 +13,7 @@ final class MenuBarPanelModel: ObservableObject {
     @Published private(set) var recentSnips: [SnipHistoryEntry] = []
 
     @Published private(set) var snipShortcut = HotKeyCombo.defaultSnip.displayString
-    @Published private(set) var pastePinShortcut = HotKeyCombo.defaultPastePin.displayString
-    @Published private(set) var togglePinsShortcut = HotKeyCombo.defaultToggleAllPins.displayString
-    @Published private(set) var unlockClickThroughShortcut = HotKeyCombo.defaultUnlockClickThrough.displayString
+    @Published private(set) var clipboardBadge = "Empty"
 
     func sync(
         pinManager: PinManager,
@@ -29,9 +27,12 @@ final class MenuBarPanelModel: ObservableObject {
         recentSnips = Array(clipboardStore.history.prefix(4))
 
         snipShortcut = comboString(.snip, on: hotKeyManager)
-        pastePinShortcut = comboString(.pastePin, on: hotKeyManager)
-        togglePinsShortcut = comboString(.toggleAllPins, on: hotKeyManager)
-        unlockClickThroughShortcut = comboString(.unlockClickThrough, on: hotKeyManager)
+        switch clipboardStore.readPinPayload() {
+        case .image: clipboardBadge = "Image"
+        case let .color(sample): clipboardBadge = sample.hexString
+        case .text: clipboardBadge = "Text"
+        case nil: clipboardBadge = "Empty"
+        }
     }
 
     private func comboString(_ action: CPXHotKeyAction, on manager: GlobalHotKeyManager) -> String {
@@ -64,14 +65,15 @@ struct MenuBarPopoverView: View {
             HStack(spacing: 8) {
                 QuickActionTile(
                     title: "Snip",
-                    shortcut: model.snipShortcut,
+                    badge: model.snipShortcut,
                     symbol: "viewfinder",
                     tint: .blue,
                     action: actions.onSnip
                 )
                 QuickActionTile(
                     title: "Paste Pin",
-                    shortcut: model.pastePinShortcut,
+                    badge: model.clipboardBadge,
+                    isBadgeDimmed: model.clipboardBadge == "Empty",
                     symbol: "pin.fill",
                     tint: .indigo,
                     action: actions.onPastePin
@@ -89,9 +91,6 @@ struct MenuBarPopoverView: View {
                 pinCount: model.pinCount,
                 arePinsHidden: model.arePinsHidden,
                 hasClickThroughPins: model.hasClickThroughPins,
-                pastePinShortcut: model.pastePinShortcut,
-                togglePinsShortcut: model.togglePinsShortcut,
-                unlockClickThroughShortcut: model.unlockClickThroughShortcut,
                 onToggleAllPins: actions.onToggleAllPins,
                 onUnlockClickThrough: actions.onUnlockClickThrough,
                 onCloseAllPins: actions.onCloseAllPins
@@ -188,7 +187,8 @@ private struct StatusBadge: View {
 
 private struct QuickActionTile: View {
     let title: String
-    let shortcut: String
+    let badge: String
+    var isBadgeDimmed = false
     let symbol: String
     let tint: Color
     let action: () -> Void
@@ -210,9 +210,10 @@ private struct QuickActionTile: View {
 
                     Spacer(minLength: 4)
 
-                    Text(shortcut)
+                    Text(badge)
                         .font(.system(size: 11, weight: .medium).monospacedDigit())
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(isBadgeDimmed ? .tertiary : .secondary)
+                        .lineLimit(1)
                 }
 
                 Text(title)
@@ -305,9 +306,6 @@ private struct FloatingPinsSection: View {
     let pinCount: Int
     let arePinsHidden: Bool
     let hasClickThroughPins: Bool
-    let pastePinShortcut: String
-    let togglePinsShortcut: String
-    let unlockClickThroughShortcut: String
     let onToggleAllPins: () -> Void
     let onUnlockClickThrough: () -> Void
     let onCloseAllPins: () -> Void
@@ -337,38 +335,97 @@ private struct FloatingPinsSection: View {
             .padding(.horizontal, 2)
 
             if pinCount == 0 {
-                Text("Press \(pastePinShortcut) to pin clipboard items")
-                    .font(.system(size: 12))
+                Text("Use Paste Pin above or right-click the menu bar icon.")
+                    .font(.system(size: 11.5))
                     .foregroundStyle(.secondary)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
+                    .padding(.horizontal, 4)
+                    .padding(.vertical, 3)
             } else {
-                VStack(spacing: 2) {
-                    MenuActionRow(
-                        title: arePinsHidden ? "Show All Pins" : "Hide All Pins",
-                        symbol: arePinsHidden ? "eye" : "eye.slash",
-                        shortcut: togglePinsShortcut,
-                        action: onToggleAllPins
-                    )
+                VStack(spacing: 6) {
+                    HStack(spacing: 6) {
+                        PinControlPill(
+                            title: arePinsHidden ? "Show All" : "Hide All",
+                            symbol: arePinsHidden ? "eye" : "eye.slash",
+                            tint: arePinsHidden ? .accentColor : .secondary,
+                            isActive: arePinsHidden,
+                            action: onToggleAllPins
+                        )
 
-                    if hasClickThroughPins {
-                        MenuActionRow(
-                            title: "Unlock Click-Through",
-                            symbol: "cursorarrow.click",
-                            shortcut: unlockClickThroughShortcut,
-                            action: onUnlockClickThrough
+                        PinControlPill(
+                            title: "Close All",
+                            symbol: "xmark.circle",
+                            tint: .secondary,
+                            isDestructive: true,
+                            action: onCloseAllPins
                         )
                     }
 
-                    MenuActionRow(
-                        title: "Close All Pins",
-                        symbol: "xmark.circle",
-                        isDestructive: true,
-                        action: onCloseAllPins
-                    )
+                    if hasClickThroughPins {
+                        PinControlPill(
+                            title: "Unlock Click-Through",
+                            symbol: "cursorarrow.click",
+                            tint: .cyan,
+                            isActive: true,
+                            action: onUnlockClickThrough
+                        )
+                    }
                 }
             }
         }
+    }
+}
+
+private struct PinControlPill: View {
+    let title: String
+    let symbol: String
+    let tint: Color
+    var isActive = false
+    var isDestructive = false
+    let action: () -> Void
+
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 6) {
+                Image(systemName: symbol)
+                    .font(.system(size: 12, weight: .semibold))
+                Text(title)
+                    .font(.system(size: 12, weight: .medium))
+                    .lineLimit(1)
+            }
+            .foregroundStyle(foregroundColor)
+            .frame(maxWidth: .infinity)
+            .frame(height: 32)
+            .background(
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .fill(backgroundColor)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .strokeBorder(borderColor, lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+        .onHover { isHovering = $0 }
+    }
+
+    private var foregroundColor: Color {
+        if isHovering && isDestructive { return .red }
+        if isActive { return tint }
+        return .primary
+    }
+
+    private var backgroundColor: Color {
+        if isHovering && isDestructive { return Color.red.opacity(0.11) }
+        if isActive { return tint.opacity(isHovering ? 0.22 : 0.14) }
+        return isHovering ? Color.primary.opacity(0.09) : Color.primary.opacity(0.05)
+    }
+
+    private var borderColor: Color {
+        if isHovering && isDestructive { return Color.red.opacity(0.32) }
+        if isActive { return tint.opacity(0.35) }
+        return Color.primary.opacity(0.08)
     }
 }
 
