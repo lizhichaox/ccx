@@ -12,6 +12,7 @@ public final class SnipCoordinator {
     private var captureTask: Task<Void, Never>?
     private var completion: (@MainActor (SnipOutcome) -> Void)?
     private var lastAnnotationStyle = AnnotationStyle()
+    private var lastSelectionByDisplay: [CGDirectDisplayID: CGRect] = [:]
 
     /// Whether a snip session is currently capturing or showing its overlay.
     public private(set) var isSessionActive = false
@@ -64,8 +65,12 @@ public final class SnipCoordinator {
             snapshots: snapshots,
             detector: detector,
             initialStyle: lastAnnotationStyle,
+            previousSelections: lastSelectionByDisplay,
             onStyleUpdated: { [weak self] style in
                 self?.lastAnnotationStyle = style
+            },
+            onSelectionCommitted: { [weak self] displayID, rect in
+                self?.lastSelectionByDisplay[displayID] = rect
             },
             onFinish: { [weak self] outcome in
                 self?.finish(outcome)

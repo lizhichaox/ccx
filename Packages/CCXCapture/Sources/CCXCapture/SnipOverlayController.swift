@@ -14,7 +14,9 @@ final class SnipOverlayController {
     private let snapshots: [DisplaySnapshot]
     private let detector: SmartElementDetector
     private let initialStyle: AnnotationStyle
+    private let previousSelections: [CGDirectDisplayID: CGRect]
     private let onStyleUpdated: ((AnnotationStyle) -> Void)?
+    private let onSelectionCommitted: ((CGDirectDisplayID, CGRect) -> Void)?
     private let onFinish: (SnipOutcome) -> Void
     private var panels: [SnipOverlayPanel] = []
     private var views: [SnipOverlayView] = []
@@ -24,13 +26,17 @@ final class SnipOverlayController {
         snapshots: [DisplaySnapshot],
         detector: SmartElementDetector,
         initialStyle: AnnotationStyle = AnnotationStyle(),
+        previousSelections: [CGDirectDisplayID: CGRect] = [:],
         onStyleUpdated: ((AnnotationStyle) -> Void)? = nil,
+        onSelectionCommitted: ((CGDirectDisplayID, CGRect) -> Void)? = nil,
         onFinish: @escaping (SnipOutcome) -> Void
     ) {
         self.snapshots = snapshots
         self.detector = detector
         self.initialStyle = initialStyle
+        self.previousSelections = previousSelections
         self.onStyleUpdated = onStyleUpdated
+        self.onSelectionCommitted = onSelectionCommitted
         self.onFinish = onFinish
     }
 
@@ -68,7 +74,12 @@ final class SnipOverlayController {
             panel.animationBehavior = .none
             panel.setFrame(snapshot.screenFrame, display: false)
 
-            let view = SnipOverlayView(snapshot: snapshot, topInset: topInset, initialStyle: initialStyle)
+            let view = SnipOverlayView(
+                snapshot: snapshot,
+                topInset: topInset,
+                initialStyle: initialStyle,
+                previousSelectionRect: previousSelections[snapshot.displayID]
+            )
             view.hoverRectProvider = { [weak self] global in self?.detector.windowRect(at: global) }
             view.elementRectRequester = { [weak self, weak view] global in
                 self?.detector.requestElementRect(at: global) { rect, point in
@@ -123,36 +134,30 @@ final class SnipOverlayController {
 
     private func finish(_ action: OverlayAction, from view: SnipOverlayView) {
         guard !isFinished else { return }
+        func renderResult(for rect: CGRect) -> SnipResult? {
+            let result = Self.makeResult(
+                localRect: rect,
+                snapshot: view.snapshot,
+                document: view.annotations,
+                mosaicCache: view.mosaicCache
+            )
+            if result != nil {
+                onSelectionCommitted?(view.snapshot.displayID, rect)
+            }
+            return result
+        }
         let outcome: SnipOutcome
         switch action {
         case let .pin(rect):
-            outcome = Self.makeResult(
-                localRect: rect,
-                snapshot: view.snapshot,
-                document: view.annotations,
-                mosaicCache: view.mosaicCache
-            ).map(SnipOutcome.pin) ?? .cancelled
+            outcome = renderResult(for: rect).map(SnipOutcome.pin) ?? .cancelled
         case let .copy(rect):
-            outcome = Self.makeResult(
-                localRect: rect,
-                snapshot: view.snapshot,
-                document: view.annotations,
-                mosaicCache: view.mosaicCache
-            ).map(SnipOutcome.copy) ?? .cancelled
+            outcome = renderResult(for: rect).map(SnipOutcome.copy) ?? .cancelled
         case let .save(rect):
-            outcome = Self.makeResult(
-                localRect: rect,
-                snapshot: view.snapshot,
-                document: view.annotations,
-                mosaicCache: view.mosaicCache
-            ).map(SnipOutcome.save) ?? .cancelled
+            outcome = renderResult(for: rect).map(SnipOutcome.save) ?? .cancelled
+        case let .quickSave(rect):
+            outcome = renderResult(for: rect).map(SnipOutcome.quickSave) ?? .cancelled
         case let .ocr(rect):
-            outcome = Self.makeResult(
-                localRect: rect,
-                snapshot: view.snapshot,
-                document: view.annotations,
-                mosaicCache: view.mosaicCache
-            ).map(SnipOutcome.ocr) ?? .cancelled
+            outcome = renderResult(for: rect).map(SnipOutcome.ocr) ?? .cancelled
         case let .copyColor(sample, format):
             outcome = .copiedColor(sample, format)
         case .cancel:

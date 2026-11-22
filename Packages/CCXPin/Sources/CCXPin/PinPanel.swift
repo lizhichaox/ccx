@@ -15,6 +15,9 @@ public final class PinPanel: NSPanel {
     var onClose: ((PinPanel) -> Void)?
     var onCopy: ((PinPanel) -> Void)?
     var onSave: ((PinPanel) -> Void)?
+    var onQuickSave: ((PinPanel) -> Void)?
+    var onDuplicate: ((PinPanel) -> Void)?
+    var onCopyFormattedColor: ((PinPanel, ColorFormat) -> Void)?
     var onRecognizeText: ((PinPanel) -> Void)?
     var onHideAll: (() -> Void)?
     var onCloseAll: (() -> Void)?
@@ -166,7 +169,19 @@ public final class PinPanel: NSPanel {
         mutateState(anchor: frameTopLeft) { $0.toggleThumbnail() }
     }
 
+    /// Resets zoom, opacity, rotation, flip, and thumbnail mode back to defaults.
+    public func resetAllTransforms() {
+        mutateState(anchor: frameCenter) { $0.resetAll() }
+        pinView.showHUD("Reset")
+    }
+
     // MARK: - Events
+
+    override public func magnify(with event: NSEvent) {
+        guard !state.isThumbnail, event.magnification != 0 else { return }
+        let factor = max(0.2, 1 + event.magnification)
+        mutateState(anchor: NSEvent.mouseLocation) { $0.multiplyZoom(by: factor) }
+    }
 
     override public func scrollWheel(with event: NSEvent) {
         let delta = event.scrollingDeltaY
@@ -188,6 +203,16 @@ public final class PinPanel: NSPanel {
         let flags = event.modifierFlags
             .intersection(.deviceIndependentFlagsMask)
             .subtracting([.capsLock, .numericPad, .function])
+
+        let nudgeStep: CGFloat = flags.contains(.shift) ? 10 : 1
+        switch event.keyCode {
+        case 123: nudgeFrame(dx: -nudgeStep, dy: 0); return
+        case 124: nudgeFrame(dx: nudgeStep, dy: 0); return
+        case 125: nudgeFrame(dx: 0, dy: -nudgeStep); return
+        case 126: nudgeFrame(dx: 0, dy: nudgeStep); return
+        default: break
+        }
+
         let char = event.charactersIgnoringModifiers?.lowercased() ?? ""
         if !flags.contains(.command) && !flags.contains(.control) && !flags.contains(.option) {
             switch char {
@@ -200,8 +225,12 @@ public final class PinPanel: NSPanel {
             case "v":
                 toggleFlipVertical()
                 return
-            case "0":
-                setZoom(1)
+            case "0", ")":
+                if flags.contains(.shift) {
+                    resetAllTransforms()
+                } else {
+                    setZoom(1)
+                }
                 return
             case "=", "+":
                 if !state.isThumbnail { mutateState(anchor: frameCenter) { $0.multiplyZoom(by: 1.1) } }
@@ -216,6 +245,13 @@ public final class PinPanel: NSPanel {
         super.keyDown(with: event)
     }
 
+    private func nudgeFrame(dx: CGFloat, dy: CGFloat) {
+        var origin = frame.origin
+        origin.x += dx
+        origin.y += dy
+        setFrameOrigin(origin)
+    }
+
     override public func cancelOperation(_ sender: Any?) {
         close()
     }
@@ -223,9 +259,15 @@ public final class PinPanel: NSPanel {
     override public func performKeyEquivalent(with event: NSEvent) -> Bool {
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
             .subtracting([.capsLock, .numericPad, .function])
-        if flags == .command, let key = event.charactersIgnoringModifiers?.lowercased() {
+        let key = event.charactersIgnoringModifiers?.lowercased()
+        if flags == [.command, .shift], key == "s" {
+            quickSavePin(nil)
+            return true
+        }
+        if flags == .command, let key {
             switch key {
             case "c": copyPin(nil); return true
+            case "d": duplicatePin(nil); return true
             case "s": savePin(nil); return true
             case "w": close(); return true
             default: break
@@ -247,10 +289,21 @@ public final class PinPanel: NSPanel {
         let menu = NSMenu(title: "Pin")
         menu.autoenablesItems = false
         menu.addItem(menuItem("Copy", #selector(copyPin(_:)), key: "c"))
-        if case .image = content {
+        switch content {
+        case .image:
             menu.addItem(menuItem("Copy Text (OCR)", #selector(recognizeTextFromMenu(_:))))
+        case .color:
+            menu.addItem(menuItem("Copy HEX", #selector(copyHexColor(_:))))
+            menu.addItem(menuItem("Copy RGB", #selector(copyRGBColor(_:))))
+            menu.addItem(menuItem("Copy HSL", #selector(copyHSLColor(_:))))
+        case .text:
+            break
         }
         menu.addItem(menuItem("Save PNG", #selector(savePin(_:)), key: "s"))
+        let quickSave = menuItem("Quick Save PNG", #selector(quickSavePin(_:)), key: "s")
+        quickSave.keyEquivalentModifierMask = [.command, .shift]
+        menu.addItem(quickSave)
+        menu.addItem(menuItem("Duplicate", #selector(duplicatePin(_:)), key: "d"))
         menu.addItem(.separator())
         menu.addItem(menuItem("Reset Zoom (100%)", #selector(resetZoom(_:))))
         menu.addItem(menuItem("Rotate 90°", #selector(rotate90(_:))))
@@ -299,8 +352,13 @@ public final class PinPanel: NSPanel {
     }
 
     @objc func copyPin(_ sender: Any?) { onCopy?(self) }
+    @objc func copyHexColor(_ sender: Any?) { onCopyFormattedColor?(self, .hex) }
+    @objc func copyRGBColor(_ sender: Any?) { onCopyFormattedColor?(self, .rgb) }
+    @objc func copyHSLColor(_ sender: Any?) { onCopyFormattedColor?(self, .hsl) }
     @objc func recognizeTextFromMenu(_ sender: Any?) { onRecognizeText?(self) }
     @objc func savePin(_ sender: Any?) { onSave?(self) }
+    @objc func quickSavePin(_ sender: Any?) { onQuickSave?(self) }
+    @objc func duplicatePin(_ sender: Any?) { onDuplicate?(self) }
     @objc func resetZoom(_ sender: Any?) { setZoom(1) }
     @objc func rotate90(_ sender: Any?) { rotateClockwise() }
     @objc func flipHorizontalFromMenu(_ sender: Any?) { toggleFlipHorizontal() }

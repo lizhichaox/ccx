@@ -9,6 +9,7 @@ protocol MenuBarControllerDelegate: AnyObject {
     func menuBarRequestedSnip()
     func menuBarRequestedPinFromClipboard()
     func menuBarRequestedPinHistoryEntry(_ entry: SnipHistoryEntry)
+    func menuBarRequestedClearHistory()
     func menuBarRequestedToggleAllPins()
     func menuBarRequestedUnlockClickThrough()
     func menuBarRequestedCloseAllPins()
@@ -102,6 +103,10 @@ final class MenuBarController: NSObject, NSWindowDelegate {
         syncModel()
         if let panel, panel.isVisible {
             layoutAndPosition(panel: panel)
+            Task { @MainActor [weak self] in
+                guard let self, let panel = self.panel, panel.isVisible else { return }
+                self.layoutAndPosition(panel: panel)
+            }
         }
     }
 
@@ -164,6 +169,10 @@ final class MenuBarController: NSObject, NSWindowDelegate {
                     self?.hidePanel()
                     self?.delegate?.menuBarRequestedPinHistoryEntry(entry)
                 },
+                onClearHistory: { [weak self] in
+                    self?.delegate?.menuBarRequestedClearHistory()
+                    self?.refresh()
+                },
                 onToggleAllPins: { [weak self] in
                     self?.hidePanel()
                     self?.delegate?.menuBarRequestedToggleAllPins()
@@ -221,6 +230,7 @@ final class MenuBarController: NSObject, NSWindowDelegate {
         }
 
         panel.setFrame(NSRect(x: originX, y: originY, width: size.width, height: size.height), display: true)
+        panel.invalidateShadow()
     }
 
     private func syncModel() {

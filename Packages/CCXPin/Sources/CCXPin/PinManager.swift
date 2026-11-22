@@ -12,9 +12,11 @@ public final class PinManager {
 
     /// Called whenever pins are added, removed, hidden/shown, or change state.
     public var onPinsChanged: (() -> Void)?
-    /// Called when the user asks to save a pin (Cmd+S or "Save PNG…"); the host shows the
+    /// Called when the user asks to save a pin (Cmd+S or "Save PNG"); the host shows the
     /// save panel and typically calls `ClipboardStore.savePNG(_:to:)`.
     public var onRequestSavePNG: ((CGImage) -> Void)?
+    /// Called when the user asks to instant-save a pin without a dialog (Shift+Cmd+S).
+    public var onRequestQuickSavePNG: ((CGImage) -> Void)?
     /// Called after copying pin content to the clipboard with a short confirmation label.
     public var onCopied: ((String) -> Void)?
     /// Called when the user triggers OCR ("Copy Text (OCR)") on an image pin.
@@ -37,14 +39,26 @@ public final class PinManager {
             visibleFrame: Self.visibleFrameUnderMouse()
         )
         let panel = PinPanel(content: content, frame: placement.frame, state: PinState(zoom: placement.zoom))
+        attachHandlers(to: panel)
+        presentNewPanel(panel)
+    }
+
+    private func attachHandlers(to panel: PinPanel) {
         panel.onClose = { [weak self] panel in self?.panelDidClose(panel) }
         panel.onCopy = { [weak self] panel in self?.copy(panel) }
         panel.onSave = { [weak self] panel in self?.save(panel) }
+        panel.onQuickSave = { [weak self] panel in self?.quickSave(panel) }
+        panel.onDuplicate = { [weak self] panel in self?.duplicate(panel) }
+        panel.onCopyFormattedColor = { [weak self] panel, format in
+            self?.copyFormattedColor(panel, format: format)
+        }
         panel.onRecognizeText = { [weak self] panel in self?.recognizeText(panel) }
         panel.onHideAll = { [weak self] in self?.toggleVisibilityOfAllPins() }
         panel.onCloseAll = { [weak self] in self?.closeAllPins() }
         panel.onStateChanged = { [weak self] _ in self?.onPinsChanged?() }
+    }
 
+    private func presentNewPanel(_ panel: PinPanel) {
         panels.append(panel)
         if arePinsHidden {
             // A new pin implies the user wants to see pins again.
@@ -129,9 +143,51 @@ public final class PinManager {
         onRequestSavePNG?(image)
     }
 
+    private func quickSave(_ panel: PinPanel) {
+        guard let image = panel.exportImage() else { return }
+        onRequestQuickSavePNG?(image)
+    }
+
+    private func duplicate(_ panel: PinPanel) {
+        var clonedState = panel.state
+        clonedState.isClickThrough = false
+
+        let visible = Self.visibleFrame(containing: panel.frame)
+        let origin = panel.frame
+        var candidate = origin.offsetBy(dx: 20, dy: -20)
+        if candidate.maxX > visible.maxX || candidate.minY < visible.minY {
+            let alt = origin.offsetBy(dx: -20, dy: 20)
+            if alt.minX >= visible.minX && alt.maxY <= visible.maxY {
+                candidate = alt
+            }
+        }
+        if visible.width > 0 && visible.height > 0 {
+            let maxX = max(visible.minX, visible.maxX - candidate.width)
+            let maxY = max(visible.minY, visible.maxY - candidate.height)
+            candidate.origin.x = min(max(candidate.minX, visible.minX), maxX)
+            candidate.origin.y = min(max(candidate.minY, visible.minY), maxY)
+        }
+
+        let copy = PinPanel(content: panel.content, frame: candidate, state: clonedState)
+        attachHandlers(to: copy)
+        presentNewPanel(copy)
+    }
+
+    private func copyFormattedColor(_ panel: PinPanel, format: ColorFormat) {
+        guard case let .color(sample) = panel.content else { return }
+        let formatted = sample.formatted(as: format)
+        clipboardStore.copyText(formatted)
+        onCopied?("Copied \(formatted)")
+    }
+
     private func recognizeText(_ panel: PinPanel) {
         guard case .image = panel.content, let image = panel.exportImage() else { return }
         onRequestRecognizeText?(image)
+    }
+
+    private static func visibleFrame(containing rect: CGRect) -> CGRect {
+        let screen = NSScreen.screens.first { $0.frame.intersects(rect) }
+        return screen?.visibleFrame ?? visibleFrameUnderMouse()
     }
 
     private static func visibleFrameUnderMouse() -> CGRect {

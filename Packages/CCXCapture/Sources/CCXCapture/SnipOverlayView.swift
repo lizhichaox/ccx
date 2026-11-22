@@ -8,6 +8,7 @@ enum OverlayAction: Equatable {
     case pin(CGRect)
     case copy(CGRect)
     case save(CGRect)
+    case quickSave(CGRect)
     case ocr(CGRect)
     case copyColor(CCXColorSample, ColorFormat)
     case cancel
@@ -23,6 +24,7 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
     let annotations = AnnotationDocument()
     let mosaicCache: MosaicImageCache
     private let topInset: CGFloat
+    private let previousSelectionRect: CGRect?
 
     /// Tier 1 hover lookup: global AppKit point -> global window rect.
     var hoverRectProvider: ((CGPoint) -> CGRect?)?
@@ -87,10 +89,16 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
     private(set) var customToolbarTopLeft: CGPoint?
     private var trackingArea: NSTrackingArea?
 
-    init(snapshot: DisplaySnapshot, topInset: CGFloat, initialStyle: AnnotationStyle = AnnotationStyle()) {
+    init(
+        snapshot: DisplaySnapshot,
+        topInset: CGFloat,
+        initialStyle: AnnotationStyle = AnnotationStyle(),
+        previousSelectionRect: CGRect? = nil
+    ) {
         self.snapshot = snapshot
         self.topInset = topInset
         self.currentStyle = initialStyle
+        self.previousSelectionRect = previousSelectionRect
         let localBounds = CGRect(origin: .zero, size: snapshot.screenFrame.size)
         self.machine = SelectionStateMachine(bounds: localBounds)
         let cache = MosaicImageCache(baseImage: snapshot.image)
@@ -806,6 +814,11 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
             return true
         }
 
+        if flags == [.command, .shift], char == "s", let rect = selectedRect {
+            finish(.quickSave(rect))
+            return true
+        }
+
         guard flags == .command else { return false }
 
         switch char {
@@ -901,6 +914,17 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
             return
         }
 
+        if flags.isEmpty, machine.isHovering, characters == "r",
+           let prev = previousSelectionRect?.intersection(bounds),
+           !prev.isNull, prev.width >= 2, prev.height >= 2 {
+            machine.select(prev)
+            lastRefinedLocalRect = nil
+            lastAXQueryPoint = nil
+            annotationView.invalidateActiveRegion()
+            refresh()
+            return
+        }
+
         if flags.isEmpty, let rect = selectedRect {
             if characters == "t" {
                 finish(.ocr(rect))
@@ -927,7 +951,7 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
 
     override func flagsChanged(with event: NSEvent) {
         let shift = event.modifierFlags.contains(.shift)
-        if shift && !isShiftDown {
+        if shift && !isShiftDown && machine.isHovering {
             colorFormat = colorFormat.next
             refresh()
         }

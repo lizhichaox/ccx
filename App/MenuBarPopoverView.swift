@@ -25,20 +25,17 @@ final class MenuBarPanelModel: ObservableObject {
         permissions = PermissionManager.currentStatus()
         recentSnips = Array(clipboardStore.history.prefix(4))
 
-        switch clipboardStore.readPinPayload() {
-        case .image: clipboardBadge = "Image"
-        case let .color(sample): clipboardBadge = sample.hexString
-        case .text: clipboardBadge = "Text"
-        case nil: clipboardBadge = "Empty"
-        }
+        clipboardBadge = clipboardStore.peekPinBadge().displayText
     }
 }
 
-/// Action callbacks invoked from the popover UI (panel closes before running).
+/// Action callbacks invoked from the popover UI (navigation/capture actions close
+/// the panel; in-place actions such as Clear keep it open).
 struct MenuBarPopoverActions {
     let onSnip: () -> Void
     let onPastePin: () -> Void
     let onPinHistory: (SnipHistoryEntry) -> Void
+    let onClearHistory: () -> Void
     let onToggleAllPins: () -> Void
     let onUnlockClickThrough: () -> Void
     let onCloseAllPins: () -> Void
@@ -77,7 +74,8 @@ struct MenuBarPopoverView: View {
             if !model.recentSnips.isEmpty {
                 RecentSnipsSection(
                     entries: model.recentSnips,
-                    onPinHistory: actions.onPinHistory
+                    onPinHistory: actions.onPinHistory,
+                    onClearHistory: actions.onClearHistory
                 )
             }
 
@@ -169,15 +167,24 @@ private struct QuickActionTile: View {
 private struct RecentSnipsSection: View {
     let entries: [SnipHistoryEntry]
     let onPinHistory: (SnipHistoryEntry) -> Void
+    let onClearHistory: () -> Void
 
     var body: some View {
         VStack(alignment: .center, spacing: 6) {
             Divider().opacity(0.45)
 
-            Text("RECENT SNIPS")
-                .font(.system(size: 9.5, weight: .semibold))
-                .foregroundStyle(.secondary)
-                .tracking(0.6)
+            ZStack {
+                Text("RECENT SNIPS")
+                    .font(.system(size: 9.5, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .tracking(0.6)
+
+                HStack {
+                    Spacer()
+                    RecentClearButton(action: onClearHistory)
+                }
+            }
+            .frame(maxWidth: .infinity)
 
             HStack(spacing: 6) {
                 ForEach(entries) { entry in
@@ -191,6 +198,29 @@ private struct RecentSnipsSection: View {
     }
 }
 
+private struct RecentClearButton: View {
+    let action: () -> Void
+
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: action) {
+            Text("Clear")
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(isHovering ? Color.red : Color.secondary)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 2)
+                .background(
+                    RoundedRectangle(cornerRadius: 5, style: .continuous)
+                        .fill(isHovering ? Color.red.opacity(0.11) : Color.clear)
+                )
+        }
+        .buttonStyle(.plain)
+        .help("Clear all recent snips")
+        .onHover { isHovering = $0 }
+    }
+}
+
 private struct RecentSnipThumbnail: View {
     let entry: SnipHistoryEntry
     let action: () -> Void
@@ -199,7 +229,7 @@ private struct RecentSnipThumbnail: View {
 
     var body: some View {
         Button(action: action) {
-            Image(nsImage: NSImage(cgImage: entry.image, size: .zero))
+            Image(nsImage: NSImage(cgImage: entry.thumbnail, size: .zero))
                 .resizable()
                 .aspectRatio(contentMode: .fill)
                 .frame(width: 57.5, height: 38)
@@ -213,7 +243,7 @@ private struct RecentSnipThumbnail: View {
                 )
         }
         .buttonStyle(.plain)
-        .help("Click to pin")
+        .help("\(entry.image.width) × \(entry.image.height) · Click to pin")
         .onHover { isHovering = $0 }
     }
 }

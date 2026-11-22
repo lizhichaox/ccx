@@ -82,6 +82,16 @@ public struct PinState: Equatable, Sendable {
 
     public mutating func toggleThumbnail() { isThumbnail.toggle() }
 
+    /// Restores all transform and presentation state (except border/shadow) back to defaults.
+    public mutating func resetAll() {
+        zoom = 1.0
+        opacity = 1.0
+        rotationDegrees = 0
+        isFlippedHorizontally = false
+        isFlippedVertically = false
+        isThumbnail = false
+    }
+
     /// `true` when the rotation swaps width and height (90 or 270 degrees).
     public var isQuarterTurned: Bool { rotationDegrees % 180 == 90 }
 

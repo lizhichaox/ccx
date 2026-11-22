@@ -9,6 +9,7 @@ import UniformTypeIdentifiers
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private static let hasCompletedOnboardingKey = "CCXHasCompletedOnboarding"
+    private static let lastSaveDirectoryKey = "CCXLastSaveDirectory"
 
     private let clipboardStore: ClipboardStore
     private let pinManager: PinManager
@@ -47,6 +48,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         pinManager.onRequestSavePNG = { [weak self] image in
             self?.presentSavePanel(for: image)
+        }
+        pinManager.onRequestQuickSavePNG = { [weak self] image in
+            self?.quickSavePNG(image)
         }
         pinManager.onCopied = { [weak self] message in
             self?.toast.show(message)
@@ -135,6 +139,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .save(let result):
             record(result)
             presentSavePanel(for: result.image)
+        case .quickSave(let result):
+            record(result)
+            quickSavePNG(result.image)
         case .ocr(let result):
             record(result)
             recognizeAndCopyText(from: result.image)
@@ -180,6 +187,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func presentSavePanel(for image: CGImage) {
         let panel = NSSavePanel()
         panel.title = "Save Snip"
+        panel.directoryURL = preferredSaveDirectoryURL()
         panel.allowedContentTypes = [.png]
         panel.canCreateDirectories = true
         panel.isExtensionHidden = false
@@ -188,6 +196,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         NSApp.activate()
         guard panel.runModal() == .OK, let url = panel.url else { return }
+        UserDefaults.standard.set(url.deletingLastPathComponent().path, forKey: Self.lastSaveDirectoryKey)
 
         do {
             try clipboardStore.savePNG(image, to: url)
@@ -198,6 +207,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             alert.messageText = "Could Not Save PNG"
             alert.informativeText = error.localizedDescription
             alert.runModal()
+        }
+    }
+
+    private func preferredSaveDirectoryURL() -> URL {
+        let fm = FileManager.default
+        if let savedPath = UserDefaults.standard.string(forKey: Self.lastSaveDirectoryKey) {
+            var isDir: ObjCBool = false
+            if fm.fileExists(atPath: savedPath, isDirectory: &isDir),
+               isDir.boolValue,
+               fm.isWritableFile(atPath: savedPath) {
+                return URL(fileURLWithPath: savedPath, isDirectory: true)
+            }
+        }
+        return fm.urls(for: .desktopDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Desktop", isDirectory: true)
+    }
+
+    private func quickSavePNG(_ image: CGImage) {
+        let directory = preferredSaveDirectoryURL()
+        let baseName = Self.defaultPNGFileName(for: Date()).replacingOccurrences(of: ".png", with: "")
+        let fm = FileManager.default
+        var targetURL = directory.appendingPathComponent("\(baseName).png")
+        var suffix = 2
+        while fm.fileExists(atPath: targetURL.path) {
+            targetURL = directory.appendingPathComponent("\(baseName)-\(suffix).png")
+            suffix += 1
+        }
+        do {
+            try clipboardStore.savePNG(image, to: targetURL)
+            toast.show("Saved to \(directory.lastPathComponent)", symbolName: "square.and.arrow.down")
+        } catch {
+            toast.show("Could Not Save PNG", symbolName: "exclamationmark.triangle")
         }
     }
 
@@ -253,6 +294,11 @@ extension AppDelegate: MenuBarControllerDelegate {
 
     func menuBarRequestedPinHistoryEntry(_ entry: SnipHistoryEntry) {
         pinManager.pin(content: .image(entry.image, scale: entry.scale), at: nil)
+        menuBarController?.refresh()
+    }
+
+    func menuBarRequestedClearHistory() {
+        clipboardStore.clearHistory()
         menuBarController?.refresh()
     }
 

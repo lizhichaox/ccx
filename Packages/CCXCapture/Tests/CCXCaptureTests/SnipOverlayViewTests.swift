@@ -407,4 +407,67 @@ struct SnipOverlayViewTests {
         try selectRect(CGRect(x: 40, y: 520, width: 220, height: 120), on: view)
         #expect(view.customToolbarTopLeft == nil)
     }
+
+    @Test func repeatLastSelectionQuickSaveAndShiftGuard() throws {
+        let prevRect = CGRect(x: 20, y: 15, width: 90, height: 45)
+        let view = SnipOverlayView(
+            snapshot: try makeSnapshot(),
+            topInset: 0,
+            previousSelectionRect: prevRect
+        )
+        view.primeWithMouseLocation(CGPoint(x: 50, y: 50))
+
+        var actions: [OverlayAction] = []
+        view.onFinish = { actions.append($0) }
+
+        // Shift while hovering cycles format from .hex -> .rgb.
+        let shiftDown = try #require(NSEvent.keyEvent(
+            with: .flagsChanged,
+            location: .zero,
+            modifierFlags: [.shift],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            characters: "",
+            charactersIgnoringModifiers: "",
+            isARepeat: false,
+            keyCode: 56
+        ))
+        let shiftUp = try #require(NSEvent.keyEvent(
+            with: .flagsChanged,
+            location: .zero,
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            characters: "",
+            charactersIgnoringModifiers: "",
+            isARepeat: false,
+            keyCode: 56
+        ))
+        view.flagsChanged(with: shiftDown)
+        view.flagsChanged(with: shiftUp)
+
+        // Pressing "R" while hovering restores the previous selection rect.
+        view.keyDown(with: try makeKeyEvent(characters: "r", modifiers: [], keyCode: 15))
+        #expect(view.machine.selectionRect == prevRect)
+
+        // Pressing Shift while selected must not advance colorFormat to .hsl.
+        view.flagsChanged(with: shiftDown)
+        view.flagsChanged(with: shiftUp)
+
+        // Shift+Cmd+S emits .quickSave for the active selection.
+        #expect(view.performKeyEquivalent(with: try makeKeyEvent(characters: "s", modifiers: [.command, .shift], keyCode: 1)))
+        #expect(actions == [.quickSave(prevRect)])
+
+        // Return to hovering via right-click and copy hovered color -> remains .rgb.
+        view.rightMouseDown(with: try makeMouseEvent(type: .rightMouseDown, at: CGPoint(x: 50, y: 50)))
+        #expect(view.machine.isHovering)
+        #expect(view.performKeyEquivalent(with: try makeKeyEvent(characters: "c", modifiers: [.command], keyCode: 8)))
+        guard case let .copyColor(_, format) = actions.last else {
+            Issue.record("Expected .copyColor action, got \(actions)")
+            return
+        }
+        #expect(format == .rgb)
+    }
 }

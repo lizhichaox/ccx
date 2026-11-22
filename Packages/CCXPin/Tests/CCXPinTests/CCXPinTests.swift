@@ -252,6 +252,8 @@ final class PinPanelAndManagerTests: XCTestCase {
         XCTAssertTrue(titles.contains("Copy"))
         XCTAssertTrue(titles.contains("Copy Text (OCR)"))
         XCTAssertTrue(titles.contains("Save PNG"))
+        XCTAssertTrue(titles.contains("Quick Save PNG"))
+        XCTAssertTrue(titles.contains("Duplicate"))
         XCTAssertTrue(titles.contains("Reset Zoom (100%)"))
         XCTAssertTrue(titles.contains("Rotate 90°"))
         XCTAssertTrue(titles.contains("Flip Horizontal"))
@@ -265,7 +267,22 @@ final class PinPanelAndManagerTests: XCTestCase {
         XCTAssertTrue(titles.contains("Hide All Pins"))
         XCTAssertTrue(titles.contains("Close All Pins"))
 
-        // Keyboard shortcuts on focused panel: R, H, V, 0.
+        // Keyboard shortcuts on focused panel: arrows nudge 1pt / Shift+Arrow 10pt, R, H, V, 0, Shift+0 reset.
+        let originBeforeNudge = panel.frame.origin
+        if let rightArrow = NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: 0,
+            context: nil, characters: "", charactersIgnoringModifiers: "", isARepeat: false, keyCode: 124
+        ) {
+            panel.keyDown(with: rightArrow)
+            XCTAssertEqual(panel.frame.origin.x, originBeforeNudge.x + 1, accuracy: 0.01)
+        }
+        if let shiftUp = NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: [.shift], timestamp: 0, windowNumber: 0,
+            context: nil, characters: "", charactersIgnoringModifiers: "", isARepeat: false, keyCode: 126
+        ) {
+            panel.keyDown(with: shiftUp)
+            XCTAssertEqual(panel.frame.origin.y, originBeforeNudge.y + 10, accuracy: 0.01)
+        }
         if let rKey = NSEvent.keyEvent(
             with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: 0,
             context: nil, characters: "r", charactersIgnoringModifiers: "r", isARepeat: false, keyCode: 15
@@ -287,9 +304,70 @@ final class PinPanelAndManagerTests: XCTestCase {
             panel.keyDown(with: zeroKey)
             XCTAssertEqual(panel.state.zoom, 1.0)
         }
+        if let shiftZero = NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: [.shift], timestamp: 0, windowNumber: 0,
+            context: nil, characters: ")", charactersIgnoringModifiers: ")", isARepeat: false, keyCode: 29
+        ) {
+            panel.setOpacity(0.5)
+            panel.keyDown(with: shiftZero)
+            XCTAssertEqual(panel.state.rotationDegrees, 0)
+            XCTAssertEqual(panel.state.opacity, 1.0)
+            XCTAssertFalse(panel.state.isFlippedHorizontally)
+        }
 
         let opacitySubmenu = menu.items.first(where: { $0.title == "Opacity" })?.submenu
         XCTAssertEqual(opacitySubmenu?.items.map(\.title), ["100%", "80%", "60%", "40%", "20%"])
+    }
+
+    func testPinDuplicateQuickSaveAndColorFormatMenu() {
+        let (store, pb) = makeStore()
+        let manager = PinManager(clipboardStore: store)
+        defer { manager.closeAllPins() }
+
+        var quickSavedImages: [CGImage] = []
+        manager.onRequestQuickSavePNG = { quickSavedImages.append($0) }
+        var copiedMessages: [String] = []
+        manager.onCopied = { copiedMessages.append($0) }
+
+        let img = makePinTestImage(width: 80, height: 40) { _, _ in (10, 20, 30, 255) }
+        manager.pin(content: .image(img, scale: 2), at: CGRect(x: 150, y: 150, width: 40, height: 20))
+        let original = try! XCTUnwrap(manager.panels.first)
+        original.setClickThrough(true)
+        original.rotateClockwise()
+
+        if let cmdD = NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: [.command], timestamp: 0, windowNumber: 0,
+            context: nil, characters: "d", charactersIgnoringModifiers: "d", isARepeat: false, keyCode: 2
+        ) {
+            XCTAssertTrue(original.performKeyEquivalent(with: cmdD))
+        }
+        XCTAssertEqual(manager.pinCount, 2)
+        let cloned = try! XCTUnwrap(manager.panels.last)
+        XCTAssertFalse(cloned.state.isClickThrough)
+        XCTAssertEqual(cloned.state.rotationDegrees, 90)
+
+        if let shiftCmdS = NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: [.command, .shift], timestamp: 0, windowNumber: 0,
+            context: nil, characters: "s", charactersIgnoringModifiers: "s", isARepeat: false, keyCode: 1
+        ) {
+            XCTAssertTrue(cloned.performKeyEquivalent(with: shiftCmdS))
+        }
+        XCTAssertEqual(quickSavedImages.count, 1)
+        XCTAssertEqual(quickSavedImages.first?.width, 40)
+
+        store.copyText("#FF8000")
+        XCTAssertTrue(manager.pinFromClipboard())
+        let colorPanel = try! XCTUnwrap(manager.panels.last)
+        let colorTitles = colorPanel.makeContextMenu().items.map(\.title)
+        XCTAssertTrue(colorTitles.contains("Copy HEX"))
+        XCTAssertTrue(colorTitles.contains("Copy RGB"))
+        XCTAssertTrue(colorTitles.contains("Copy HSL"))
+
+        colorPanel.copyRGBColor(nil)
+        XCTAssertEqual(pb.string(), "rgb(255, 128, 0)")
+        colorPanel.copyHSLColor(nil)
+        XCTAssertEqual(pb.string(), "hsl(30, 100%, 50%)")
+        XCTAssertEqual(copiedMessages.suffix(2), ["Copied rgb(255, 128, 0)", "Copied hsl(30, 100%, 50%)"])
     }
 
     func testPinManagerLifecycleClipboardAndCallbacks() {
