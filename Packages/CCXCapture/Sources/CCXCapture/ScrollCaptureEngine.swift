@@ -57,22 +57,39 @@ public final class ScrollCaptureEngine {
             : content.windows.filter { excludingWindowIDs.contains($0.windowID) }
         let filter = SCContentFilter(display: display, excludingWindows: excludedWindows)
 
+        let rawLocal = request.localRect.standardized
+        let displayBounds = CGRect(origin: .zero, size: request.displayFrame.size)
+        let intersected = rawLocal.intersection(displayBounds)
+        let effectiveLocal = (!intersected.isNull && intersected.width >= 1 && intersected.height >= 1)
+            ? intersected
+            : rawLocal
+
         let config = SCStreamConfiguration()
         // SCStreamConfiguration.sourceRect uses top-left origin in display points.
         config.sourceRect = CGRect(
-            x: request.localRect.minX,
-            y: max(0, request.displayFrame.height - request.localRect.maxY),
-            width: request.localRect.width,
-            height: request.localRect.height
+            x: effectiveLocal.minX,
+            y: max(0, request.displayFrame.height - effectiveLocal.maxY),
+            width: effectiveLocal.width,
+            height: effectiveLocal.height
         )
-        config.width = max(2, Int((request.localRect.width * request.scale).rounded()))
-        config.height = max(2, Int((request.localRect.height * request.scale).rounded()))
+        config.width = max(2, fallbackInitialImage.width)
+        config.height = max(2, fallbackInitialImage.height)
+        config.captureResolution = .best
         config.scalesToFit = false
         config.showsCursor = false
         config.capturesAudio = false
         config.pixelFormat = kCVPixelFormatType_32BGRA
         config.minimumFrameInterval = CMTime(value: 1, timescale: 20)
         config.queueDepth = 3
+
+        let sourceRectDescription = NSStringFromRect(config.sourceRect)
+        let streamWidth = config.width
+        let streamHeight = config.height
+        let fallbackWidth = fallbackInitialImage.width
+        let fallbackHeight = fallbackInitialImage.height
+        Self.logger.info(
+            "Starting scroll stream sourceRect=\(sourceRectDescription, privacy: .public) config=\(streamWidth)x\(streamHeight) fallback=\(fallbackWidth)x\(fallbackHeight)"
+        )
 
         let handler = StreamOutputHandler(
             onFrame: { [weak self] frame in
@@ -143,11 +160,15 @@ public final class ScrollCaptureEngine {
 // MARK: - Serial Stitch Worker
 
 private final class ScrollStitchWorker: @unchecked Sendable {
+    private static let logger = Logger(subsystem: "com.lizhichaox.ccx", category: "ScrollStitchWorker")
+
     private let queue = DispatchQueue(label: "com.lizhichaox.ccx.scroll-stitch", qos: .userInitiated)
     private let stateLock = NSLock()
     private let stitcher: ScrollImageStitcher
     private var inFlightCount = 0
     private var isCancelled = false
+    private var hasReceivedStreamFrame = false
+    private var rejectedFrameCount = 0
 
     init(scale: CGFloat) {
         self.stitcher = ScrollImageStitcher(scale: scale)
@@ -155,6 +176,8 @@ private final class ScrollStitchWorker: @unchecked Sendable {
 
     func seedInitial(_ frame: ScrollFrameBuffer) {
         queue.sync {
+            hasReceivedStreamFrame = false
+            rejectedFrameCount = 0
             stitcher.seed(frame)
         }
     }
@@ -183,9 +206,34 @@ private final class ScrollStitchWorker: @unchecked Sendable {
                 self.stateLock.unlock()
             }
             guard !self.cancelled() else { return }
+
+            if !self.hasReceivedStreamFrame {
+                self.hasReceivedStreamFrame = true
+                if self.stitcher.stitchedFrameCount <= 1 {
+                    let previousSize = (self.stitcher.width, self.stitcher.totalStitchedHeight)
+                    self.stitcher.seed(frame)
+                    Self.logger.info(
+                        "Seeded first stream frame \(frame.width)x\(frame.height) (fallback was \(previousSize.0)x\(previousSize.1))"
+                    )
+                    if (self.stitcher.width, self.stitcher.totalStitchedHeight) != previousSize {
+                        let progress = self.makeProgress(includePreview: true)
+                        onUpdate(progress)
+                    }
+                    return
+                }
+            }
+
             if self.stitcher.append(frame) {
+                self.rejectedFrameCount = 0
                 let progress = self.makeProgress(includePreview: true)
                 onUpdate(progress)
+            } else {
+                self.rejectedFrameCount += 1
+                if self.rejectedFrameCount == 1 || self.rejectedFrameCount % 20 == 0 {
+                    Self.logger.debug(
+                        "Rejected scroll frame #\(self.rejectedFrameCount) size=\(frame.width)x\(frame.height) stitcher=\(self.stitcher.width)x\(self.stitcher.totalStitchedHeight)"
+                    )
+                }
             }
         }
     }
@@ -303,7 +351,7 @@ public final class AutoScrollDriver {
         isRunning = true
         onStateChanged?(true)
 
-        let stepPixels = Int32(min(max(captureScreenRect.height * 0.30, 120), 280))
+        let stepPixels = Int32(min(max(captureScreenRect.height * 0.18, 70), 180))
         timer = Timer.scheduledTimer(withTimeInterval: 0.15, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
                 self?.tick(stepPixels: stepPixels)

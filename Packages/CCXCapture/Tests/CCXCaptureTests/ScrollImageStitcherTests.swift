@@ -544,4 +544,228 @@ struct ScrollImageStitcherTests {
             }
         }
     }
+
+    @Test func handlesGradualMicroScrollWithSparseCardsAndFixedSidebars() throws {
+        let width = 700
+        let viewportH = 400
+        let leftWidth = 120
+        let rightWidth = 110
+        let topBarH = 40
+        let shifts = [0, 4, 10, 18, 30, 48, 72, 105, 150, 210, 280]
+        let docHeight = shifts.last! + viewportH
+
+        // Sparse white-background card webpage (similar to modern SaaS dashboards).
+        var centerDoc = [UInt8](repeating: 255, count: width * docHeight * 4)
+        for y in 0..<docHeight {
+            let row = y * width * 4
+            let cardIdx = y / 120
+            let yInCard = y % 120
+            if yInCard >= 10 && yInCard < 20 {
+                let titleEnd = min(420, 220 + (cardIdx * 37) % 160)
+                for x in 155..<titleEnd where (x / 5 + y / 2 + cardIdx) % 3 == 0 {
+                    let px = row + x * 4
+                    centerDoc[px] = 45; centerDoc[px + 1] = 45; centerDoc[px + 2] = 45; centerDoc[px + 3] = 255
+                }
+            } else if yInCard == 28 || yInCard == 96 {
+                for x in 150..<550 {
+                    let px = row + x * 4
+                    centerDoc[px] = 220; centerDoc[px + 1] = 220; centerDoc[px + 2] = 220; centerDoc[px + 3] = 255
+                }
+            } else if yInCard > 28 && yInCard < 96 {
+                let leftBorder = row + 150 * 4
+                let rightBorder = row + 549 * 4
+                centerDoc[leftBorder] = 220; centerDoc[leftBorder + 1] = 220; centerDoc[leftBorder + 2] = 220; centerDoc[leftBorder + 3] = 255
+                centerDoc[rightBorder] = 220; centerDoc[rightBorder + 1] = 220; centerDoc[rightBorder + 2] = 220; centerDoc[rightBorder + 3] = 255
+                if yInCard >= 44 && yInCard < 80 {
+                    for x in 170..<530 {
+                        let px = row + x * 4
+                        centerDoc[px] = 246; centerDoc[px + 1] = 245; centerDoc[px + 2] = 244; centerDoc[px + 3] = 255
+                    }
+                    if yInCard >= 56 && yInCard < 66 {
+                        for x in 240..<460 where (x / 4 + y / 2 + cardIdx) % 3 == 0 {
+                            let px = row + x * 4
+                            centerDoc[px] = 105; centerDoc[px + 1] = 105; centerDoc[px + 2] = 105; centerDoc[px + 3] = 255
+                        }
+                    }
+                }
+            }
+        }
+
+        let topBytes = makeTexturedBarBytes(width: width, height: topBarH, seed: 7)
+        let rowBytes = width * 4
+
+        func makeFrame(offset: Int) throws -> CGImage {
+            var bytes = Array(centerDoc[(offset * rowBytes)..<((offset + viewportH) * rowBytes)])
+            bytes.replaceSubrange(0..<(topBarH * rowBytes), with: topBytes)
+
+            for y in topBarH..<viewportH {
+                let row = y * rowBytes
+                let inNav = (y % 26 >= 7 && y % 26 < 17)
+                for x in 0..<leftWidth {
+                    let px = row + x * 4
+                    if x == leftWidth - 1 {
+                        bytes[px] = 216; bytes[px + 1] = 212; bytes[px + 2] = 208; bytes[px + 3] = 255
+                    } else if inNav && x >= 18 && x < 92 && (x / 5 + y / 3) % 2 == 0 {
+                        bytes[px] = 85; bytes[px + 1] = 85; bytes[px + 2] = 85; bytes[px + 3] = 255
+                    } else {
+                        bytes[px] = 248; bytes[px + 1] = 246; bytes[px + 2] = 245; bytes[px + 3] = 255
+                    }
+                }
+                let tocStart = width - rightWidth
+                let inToc = (y >= topBarH + 14 && y <= 240) && (y % 22 >= 6 && y % 22 < 14)
+                for x in tocStart..<width {
+                    let px = row + x * 4
+                    if x == tocStart {
+                        bytes[px] = 224; bytes[px + 1] = 220; bytes[px + 2] = 216; bytes[px + 3] = 255
+                    } else if inToc && x >= tocStart + 14 && x < width - 20 && (x / 4 + y / 2) % 2 == 0 {
+                        bytes[px] = 95; bytes[px + 1] = 95; bytes[px + 2] = 95; bytes[px + 3] = 255
+                    } else {
+                        bytes[px] = 255; bytes[px + 1] = 255; bytes[px + 2] = 255; bytes[px + 3] = 255
+                    }
+                }
+            }
+
+            let provider = try #require(CGDataProvider(data: Data(bytes) as CFData))
+            return try #require(CGImage(
+                width: width,
+                height: viewportH,
+                bitsPerComponent: 8,
+                bitsPerPixel: 32,
+                bytesPerRow: rowBytes,
+                space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                bitmapInfo: CGBitmapInfo(rawValue: CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.noneSkipFirst.rawValue),
+                provider: provider,
+                decode: nil,
+                shouldInterpolate: false,
+                intent: .defaultIntent
+            ))
+        }
+
+        let stitcher = ScrollImageStitcher(scale: 2)
+        for offset in shifts {
+            let img = try makeFrame(offset: offset)
+            #expect(stitcher.append(try #require(ScrollFrameBuffer(cgImage: img))))
+        }
+
+        #expect(stitcher.totalStitchedHeight == docHeight)
+        #expect((112...132).contains(stitcher.detectedStickyLeft))
+        #expect((100...124).contains(stitcher.detectedStickyRight))
+
+        let final = try #require(stitcher.buildFinalImage())
+        let finalBuf = try #require(ScrollFrameBuffer(cgImage: final))
+        finalBuf.bgraData.withUnsafeBytes { fRaw in
+            centerDoc.withUnsafeBytes { cRaw in
+                let fPtr = fRaw.baseAddress!.assumingMemoryBound(to: UInt8.self)
+                let cPtr = cRaw.baseAddress!.assumingMemoryBound(to: UInt8.self)
+                for y in topBarH..<(docHeight - 48) {
+                    let row = y * finalBuf.bytesPerRow
+                    for x in 150..<550 {
+                        let fp = row + x * 4
+                        #expect(fPtr[fp] == cPtr[fp])
+                        #expect(fPtr[fp + 1] == cPtr[fp + 1])
+                        #expect(fPtr[fp + 2] == cPtr[fp + 2])
+                    }
+                }
+                for y in viewportH..<(docHeight - 48) {
+                    let row = y * finalBuf.bytesPerRow
+                    for x in 12..<108 {
+                        let px = row + x * 4
+                        #expect(fPtr[px] == 248 && fPtr[px + 1] == 246 && fPtr[px + 2] == 245)
+                    }
+                }
+            }
+        }
+    }
+
+    @Test func handlesSparseDarkModePageWithSmallScrollsWithoutPeriodicJump() throws {
+        let width = 640
+        let viewportH = 400
+        let leftWidth = 120
+        let shifts = [0, 4, 10, 18, 30, 50, 80, 120, 180, 260]
+        let docHeight = shifts.last! + viewportH
+
+        var doc = [UInt8](repeating: 30, count: width * docHeight * 4)
+        for i in stride(from: 3, to: doc.count, by: 4) { doc[i] = 255 }
+        for y in 0..<docHeight {
+            let row = y * width * 4
+            let lineIdx = y / 44
+            let inCodeLine = (y % 44) >= 14 && (y % 44) < 24
+            if inCodeLine {
+                let lineEnd = min(width - 40, 220 + (lineIdx * 67) % 320)
+                for x in 150..<lineEnd where (x / 5 + y / 2 + lineIdx) % 2 == 0 {
+                    let px = row + x * 4
+                    doc[px] = 220; doc[px + 1] = 210; doc[px + 2] = 190
+                }
+            }
+        }
+
+        let rowBytes = width * 4
+        func makeFrame(offset: Int) throws -> CGImage {
+            var bytes = Array(doc[(offset * rowBytes)..<((offset + viewportH) * rowBytes)])
+            for y in 0..<viewportH {
+                let row = y * rowBytes
+                let inItem = (y % 32 >= 9 && y % 32 < 20)
+                for x in 0..<leftWidth {
+                    let px = row + x * 4
+                    if x == leftWidth - 1 {
+                        bytes[px] = 64; bytes[px + 1] = 64; bytes[px + 2] = 64
+                    } else if inItem && x >= 16 && x < 98 && (x / 5 + y / 3) % 2 == 0 {
+                        bytes[px] = 175; bytes[px + 1] = 175; bytes[px + 2] = 175
+                    } else {
+                        bytes[px] = 22; bytes[px + 1] = 22; bytes[px + 2] = 22
+                    }
+                }
+            }
+            let provider = try #require(CGDataProvider(data: Data(bytes) as CFData))
+            return try #require(CGImage(
+                width: width,
+                height: viewportH,
+                bitsPerComponent: 8,
+                bitsPerPixel: 32,
+                bytesPerRow: rowBytes,
+                space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                bitmapInfo: CGBitmapInfo(rawValue: CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.noneSkipFirst.rawValue),
+                provider: provider,
+                decode: nil,
+                shouldInterpolate: false,
+                intent: .defaultIntent
+            ))
+        }
+
+        let stitcher = ScrollImageStitcher(scale: 2)
+        for offset in shifts {
+            let img = try makeFrame(offset: offset)
+            #expect(stitcher.append(try #require(ScrollFrameBuffer(cgImage: img))))
+        }
+
+        #expect(stitcher.totalStitchedHeight == docHeight)
+        #expect((112...130).contains(stitcher.detectedStickyLeft))
+    }
+
+    @Test func reSeedOnDifferentDimensionFirstStreamFrameAllowsStitching() throws {
+        let fallbackDoc = try renderSyntheticDocument(width: 320, height: 300)
+        let fallbackBuf = try #require(ScrollFrameBuffer(cgImage: fallbackDoc))
+
+        let streamDoc = try renderSyntheticDocument(width: 321, height: 600)
+        let stitcher = ScrollImageStitcher(scale: 2)
+        stitcher.seed(fallbackBuf)
+        #expect(stitcher.width == 320)
+
+        // First SCStream frame arrives with 321x300 (1px different from fallback crop):
+        // re-seeding allows subsequent stream frames to stitch cleanly.
+        let s0 = try #require(ScrollFrameBuffer(cgImage: try renderViewport(from: streamDoc, scrollY: 0, viewportHeight: 300)))
+        stitcher.seed(s0)
+        #expect(stitcher.width == 321)
+
+        for offset in [70, 155, 240] {
+            let sNext = try #require(ScrollFrameBuffer(cgImage: try renderViewport(from: streamDoc, scrollY: offset, viewportHeight: 300)))
+            #expect(stitcher.append(sNext))
+        }
+
+        let expectedHeight = 300 + 240
+        #expect(stitcher.totalStitchedHeight == expectedHeight)
+        let final = try #require(stitcher.buildFinalImage())
+        let expectedDoc = try #require(streamDoc.cropping(to: CGRect(x: 0, y: 0, width: 321, height: expectedHeight)))
+        #expect(try maxPixelChannelDiff(final, expectedDoc) == 0)
+    }
 }

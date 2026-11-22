@@ -1,5 +1,6 @@
 import AppKit
 import CCXCore
+import OSLog
 import QuartzCore
 
 /// Region and initial snapshot handed from `SnipOverlayController` to begin a scroll capture.
@@ -32,6 +33,8 @@ public struct ScrollCaptureRequest: Sendable {
 /// optional side preview strip, `SCStream` stitching engine, and optional Auto-Scroll.
 @MainActor
 final class ScrollCaptureController {
+    private static let logger = Logger(subsystem: "com.lizhichaox.ccx", category: "ScrollCaptureController")
+
     private enum FinishKind {
         case pin, copy, save, quickSave, ocr
     }
@@ -50,7 +53,7 @@ final class ScrollCaptureController {
 
     private var isFinishing = false
     private var isClosed = false
-    private let initialPixelHeight: Int
+    private var initialPixelHeight: Int
     private var statusText = "Scroll down"
 
     init(request: ScrollCaptureRequest, onFinish: @escaping (SnipOutcome) -> Void) {
@@ -108,6 +111,7 @@ final class ScrollCaptureController {
                 try await self.engine.start(excludingWindowIDs: excludedWindowIDs)
             } catch {
                 guard !self.isClosed else { return }
+                Self.logger.error("Failed to start scroll capture: \(error.localizedDescription)")
                 self.cancelWithError(error)
             }
         }
@@ -131,6 +135,9 @@ final class ScrollCaptureController {
     private func wireCallbacks() {
         engine.onProgress = { [weak self] progress in
             guard let self, !self.isClosed, !self.isFinishing else { return }
+            if progress.frameCount == 1, progress.pixelHeight > 0 {
+                self.initialPixelHeight = progress.pixelHeight
+            }
             self.autoScroll.notifyHeightAdvanced(progress.pixelHeight)
 
             let accent: ScrollCaptureVisualAccent
@@ -358,6 +365,7 @@ private final class ScrollCaptureFramePanel: NSPanel {
         backgroundColor = .clear
         isOpaque = false
         hasShadow = false
+        sharingType = .none
         hidesOnDeactivate = false
         isReleasedWhenClosed = false
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient, .ignoresCycle]
@@ -435,6 +443,7 @@ private final class ScrollCaptureHUDPanel: NSPanel {
         isOpaque = false
         backgroundColor = .clear
         hasShadow = true
+        sharingType = .none
         hidesOnDeactivate = false
         isReleasedWhenClosed = false
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient, .ignoresCycle]
@@ -673,6 +682,7 @@ private final class ScrollCapturePreviewPanel: NSPanel {
         isOpaque = false
         backgroundColor = .clear
         hasShadow = true
+        sharingType = .none
         hidesOnDeactivate = false
         isReleasedWhenClosed = false
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient, .ignoresCycle]

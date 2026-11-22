@@ -277,6 +277,8 @@ public final class ScrollImageStitcher {
     private var lockedBottomCapHeight: Int = 0
     private var leftSidebarFillStrip: CGImage?
     private var rightSidebarFillStrip: CGImage?
+    private var hasLockedSidebars: Bool = false
+    private var cumulativeScrolledHeight: Int = 0
 
     public var totalStitchedHeight: Int {
         if committedSlices.isEmpty {
@@ -309,8 +311,175 @@ public final class ScrollImageStitcher {
         lockedBottomCapHeight = 0
         leftSidebarFillStrip = nil
         rightSidebarFillStrip = nil
+        hasLockedSidebars = false
+        cumulativeScrolledHeight = 0
         stitchedFrameCount = 1
         isAtHeightLimit = frame.height >= maxTotalHeight
+    }
+
+    /// Minimum accumulated downward scroll (in pixels) required before locking static sidebars.
+    private static func sidebarLockMinScroll(for frameHeight: Int) -> Int {
+        max(48, min(140, frameHeight / 8))
+    }
+
+    private static func dynamicMatchingColumnRange(
+        previous: ScrollFrameBuffer,
+        current: ScrollFrameBuffer,
+        minX: Int,
+        maxX: Int
+    ) -> (minX: Int, maxX: Int) {
+        let width = previous.width
+        let height = previous.height
+        guard width == current.width,
+              height == current.height,
+              width >= 160,
+              height >= 120
+        else { return (minX, maxX) }
+
+        let vTop = min(height / 8, 80)
+        let vBottom = max(vTop + 24, height - min(height / 8, 64))
+        let rowSpan = vBottom - vTop
+        guard rowSpan >= 24 else { return (minX, maxX) }
+
+        let rowSampleCount = min(96, rowSpan)
+        var sampleRows = [Int](repeating: 0, count: rowSampleCount)
+        for i in 0..<rowSampleCount {
+            sampleRows[i] = vTop + (i * rowSpan) / rowSampleCount
+        }
+
+        let binW = width >= 400 ? 4 : 2
+        let totalBins = width / binW
+        let startBin = max(0, minX / binW)
+        let endBin = min(totalBins, (maxX + binW - 1) / binW)
+        let binSpan = endBin - startBin
+        guard binSpan >= 8 else { return (minX, maxX) }
+
+        var changedRows = [Int](repeating: 0, count: binSpan)
+        previous.bgraData.withUnsafeBytes { prevRaw in
+            current.bgraData.withUnsafeBytes { currRaw in
+                guard let prevPtr = prevRaw.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                      let currPtr = currRaw.baseAddress?.assumingMemoryBound(to: UInt8.self)
+                else { return }
+                let prevBytes = previous.bytesPerRow
+                let currBytes = current.bytesPerRow
+
+                for offset in 0..<binSpan {
+                    let b = startBin + offset
+                    let x = min(b * binW + binW / 2, width - 1)
+                    let xOff = x * 4
+                    var changes = 0
+                    for r in 0..<rowSampleCount {
+                        let y = sampleRows[r]
+                        let pPx = y * prevBytes + xOff
+                        let cPx = y * currBytes + xOff
+                        let diff = max(
+                            abs(Int(prevPtr[pPx]) - Int(currPtr[cPx])),
+                            max(
+                                abs(Int(prevPtr[pPx + 1]) - Int(currPtr[cPx + 1])),
+                                abs(Int(prevPtr[pPx + 2]) - Int(currPtr[cPx + 2]))
+                            )
+                        )
+                        if diff > 5 { changes += 1 }
+                    }
+                    changedRows[offset] = changes
+                }
+            }
+        }
+
+        var l = 0
+        while l < binSpan {
+            if changedRows[l] == 0 {
+                l += 1
+            } else if changedRows[l] <= 2,
+                      l + 3 < binSpan,
+                      changedRows[l + 1] == 0,
+                      changedRows[l + 2] == 0,
+                      changedRows[l + 3] == 0 {
+                l += 1
+            } else {
+                break
+            }
+        }
+
+        var r = binSpan
+        while r > l {
+            if changedRows[r - 1] == 0 {
+                r -= 1
+            } else if changedRows[r - 1] <= 2,
+                      r - 4 >= l,
+                      changedRows[r - 2] == 0,
+                      changedRows[r - 3] == 0,
+                      changedRows[r - 4] == 0 {
+                r -= 1
+            } else {
+                break
+            }
+        }
+
+        let movMinX = max(minX, (startBin + l) * binW)
+        let movMaxX = min(maxX, (startBin + r) * binW)
+        guard movMaxX - movMinX >= max(64, width / 6) else {
+            return (minX, maxX)
+        }
+        return (movMinX, movMaxX)
+    }
+
+    private static func evaluateFramePair(
+        previous: ScrollFrameBuffer,
+        current: ScrollFrameBuffer,
+        stickyLeft: Int,
+        stickyRight: Int,
+        lockedTop: Int,
+        lockedBottom: Int,
+        fallbackBottomCap: Int,
+        maxAllowedMAD: Double
+    ) -> (sticky: ScrollStickyBounds, match: ScrollMatchResult)? {
+        func runMatch(in range: (minX: Int, maxX: Int)) -> (sticky: ScrollStickyBounds, match: ScrollMatchResult)? {
+            let sticky = detectStickyBounds(
+                previous: previous,
+                current: current,
+                activeMinX: range.minX,
+                activeMaxX: range.maxX
+            )
+            guard !sticky.isIdenticalFrame else { return nil }
+
+            let matchTop = max(lockedTop, sticky.stickyTop)
+            let effectiveBottomCap = lockedBottom > 0
+                ? max(lockedBottom, sticky.stickyBottom)
+                : max(sticky.stickyBottom, fallbackBottomCap)
+            let matchBottom = current.height - effectiveBottomCap
+            guard let match = estimateVerticalShift(
+                previous: previous,
+                current: current,
+                dynamicTop: matchTop,
+                dynamicBottom: matchBottom,
+                activeMinX: range.minX,
+                activeMaxX: range.maxX,
+                maxAllowedMAD: maxAllowedMAD
+            ) else {
+                return nil
+            }
+            return (sticky, match)
+        }
+
+        let baseRange = activeColumnRange(
+            width: current.width,
+            stickyLeft: stickyLeft,
+            stickyRight: stickyRight
+        )
+        if stickyLeft == 0 && stickyRight == 0 {
+            let dynamicRange = dynamicMatchingColumnRange(
+                previous: previous,
+                current: current,
+                minX: baseRange.minX,
+                maxX: baseRange.maxX
+            )
+            if dynamicRange.minX != baseRange.minX || dynamicRange.maxX != baseRange.maxX,
+               let dynamicResult = runMatch(in: dynamicRange) {
+                return dynamicResult
+            }
+        }
+        return runMatch(in: baseRange)
     }
 
     /// Processes the next frame in sequence. Returns `true` when new content was appended.
@@ -329,59 +498,67 @@ public final class ScrollImageStitcher {
         }
 
         if committedSlices.isEmpty {
-            let sidebars = Self.detectStaticSidebars(previous: frontier, current: frame)
-            let activeRange = Self.activeColumnRange(
-                width: frame.width,
-                stickyLeft: sidebars.stickyLeft,
-                stickyRight: sidebars.stickyRight
-            )
-            let sticky = Self.detectStickyBounds(
-                previous: frontier,
-                current: frame,
-                activeMinX: activeRange.minX,
-                activeMaxX: activeRange.maxX
-            )
-            if sticky.isIdenticalFrame {
-                return false
-            }
+            let cornerCap = Self.cornerSafeCap(width: frame.width, height: frameHeight)
+            let tentativeSidebars = Self.detectStaticSidebars(previous: frontier, current: frame)
+            var effectiveSidebars = tentativeSidebars
 
-            let bottomCap = max(sticky.stickyBottom, Self.cornerSafeCap(width: frame.width, height: frameHeight))
-            guard let match = Self.estimateVerticalShift(
+            var evaluated = Self.evaluateFramePair(
                 previous: frontier,
                 current: frame,
-                dynamicTop: sticky.stickyTop,
-                dynamicBottom: frameHeight - bottomCap,
-                activeMinX: activeRange.minX,
-                activeMaxX: activeRange.maxX,
+                stickyLeft: tentativeSidebars.stickyLeft,
+                stickyRight: tentativeSidebars.stickyRight,
+                lockedTop: 0,
+                lockedBottom: 0,
+                fallbackBottomCap: cornerCap,
                 maxAllowedMAD: maxAllowedMAD
-            ) else {
-                return false
+            )
+            if evaluated == nil && (tentativeSidebars.stickyLeft > 0 || tentativeSidebars.stickyRight > 0) {
+                effectiveSidebars = ScrollSidebarBounds(stickyLeft: 0, stickyRight: 0)
+                evaluated = Self.evaluateFramePair(
+                    previous: frontier,
+                    current: frame,
+                    stickyLeft: 0,
+                    stickyRight: 0,
+                    lockedTop: 0,
+                    lockedBottom: 0,
+                    fallbackBottomCap: cornerCap,
+                    maxAllowedMAD: maxAllowedMAD
+                )
             }
+            guard let (sticky, match) = evaluated else { return false }
 
-            detectedStickyLeft = sidebars.stickyLeft
-            detectedStickyRight = sidebars.stickyRight
             detectedStickyTop = sticky.stickyTop
             detectedStickyBottom = sticky.stickyBottom
-            lockedBottomCapHeight = bottomCap
+            lockedBottomCapHeight = max(sticky.stickyBottom, cornerCap)
+            cumulativeScrolledHeight = match.dy
 
             let commitBottom = frameHeight - lockedBottomCapHeight
-            if detectedStickyLeft > 0 {
-                leftSidebarFillStrip = Self.makeSidebarFillStrip(
-                    from: frontier,
-                    xStart: 0,
-                    stripWidth: detectedStickyLeft,
-                    yStart: detectedStickyTop,
-                    yEnd: commitBottom
-                )
-            }
-            if detectedStickyRight > 0 {
-                rightSidebarFillStrip = Self.makeSidebarFillStrip(
-                    from: frontier,
-                    xStart: frame.width - detectedStickyRight,
-                    stripWidth: detectedStickyRight,
-                    yStart: detectedStickyTop,
-                    yEnd: commitBottom
-                )
+            if cumulativeScrolledHeight >= Self.sidebarLockMinScroll(for: frameHeight) {
+                detectedStickyLeft = effectiveSidebars.stickyLeft
+                detectedStickyRight = effectiveSidebars.stickyRight
+                hasLockedSidebars = true
+                if detectedStickyLeft > 0 {
+                    leftSidebarFillStrip = Self.makeSidebarFillStrip(
+                        from: frontier,
+                        xStart: 0,
+                        stripWidth: detectedStickyLeft,
+                        yStart: detectedStickyTop,
+                        yEnd: commitBottom
+                    )
+                }
+                if detectedStickyRight > 0 {
+                    rightSidebarFillStrip = Self.makeSidebarFillStrip(
+                        from: frontier,
+                        xStart: frame.width - detectedStickyRight,
+                        stripWidth: detectedStickyRight,
+                        yStart: detectedStickyTop,
+                        yEnd: commitBottom
+                    )
+                }
+            } else {
+                detectedStickyLeft = 0
+                detectedStickyRight = 0
+                hasLockedSidebars = false
             }
 
             let baseHeight = min(commitBottom, maxTotalHeight - lockedBottomCapHeight)
@@ -413,34 +590,29 @@ public final class ScrollImageStitcher {
 
         // Keep sidebars anchored at the locked column range and handle any sticky top/bottom
         // chrome during matching while anchoring slice joins at `lockedBottomCapHeight`.
-        let activeRange = Self.activeColumnRange(
-            width: frame.width,
+        var evaluated = Self.evaluateFramePair(
+            previous: frontier,
+            current: frame,
             stickyLeft: detectedStickyLeft,
-            stickyRight: detectedStickyRight
-        )
-        let sticky = Self.detectStickyBounds(
-            previous: frontier,
-            current: frame,
-            activeMinX: activeRange.minX,
-            activeMaxX: activeRange.maxX
-        )
-        if sticky.isIdenticalFrame {
-            return false
-        }
-
-        let matchTop = max(detectedStickyTop, sticky.stickyTop)
-        let matchBottom = frameHeight - max(lockedBottomCapHeight, sticky.stickyBottom)
-        guard let match = Self.estimateVerticalShift(
-            previous: frontier,
-            current: frame,
-            dynamicTop: matchTop,
-            dynamicBottom: matchBottom,
-            activeMinX: activeRange.minX,
-            activeMaxX: activeRange.maxX,
+            stickyRight: detectedStickyRight,
+            lockedTop: detectedStickyTop,
+            lockedBottom: lockedBottomCapHeight,
+            fallbackBottomCap: lockedBottomCapHeight,
             maxAllowedMAD: maxAllowedMAD
-        ) else {
-            return false
+        )
+        if evaluated == nil && (detectedStickyLeft > 0 || detectedStickyRight > 0) {
+            evaluated = Self.evaluateFramePair(
+                previous: frontier,
+                current: frame,
+                stickyLeft: 0,
+                stickyRight: 0,
+                lockedTop: detectedStickyTop,
+                lockedBottom: lockedBottomCapHeight,
+                fallbackBottomCap: lockedBottomCapHeight,
+                maxAllowedMAD: maxAllowedMAD
+            )
         }
+        guard let (_, match) = evaluated else { return false }
 
         let commitBottom = frameHeight - lockedBottomCapHeight
         let remaining = maxTotalHeight - currentSlicesHeight - lockedBottomCapHeight
@@ -457,6 +629,34 @@ public final class ScrollImageStitcher {
         }
         committedSlices.append(slice)
         currentSlicesHeight += slice.height
+        cumulativeScrolledHeight += allowedDy
+
+        if !hasLockedSidebars,
+           cumulativeScrolledHeight >= Self.sidebarLockMinScroll(for: frameHeight),
+           let initial = initialFrame {
+            let sidebars = Self.detectStaticSidebars(previous: initial, current: frame)
+            detectedStickyLeft = sidebars.stickyLeft
+            detectedStickyRight = sidebars.stickyRight
+            hasLockedSidebars = true
+            if detectedStickyLeft > 0 {
+                leftSidebarFillStrip = Self.makeSidebarFillStrip(
+                    from: initial,
+                    xStart: 0,
+                    stripWidth: detectedStickyLeft,
+                    yStart: detectedStickyTop,
+                    yEnd: commitBottom
+                )
+            }
+            if detectedStickyRight > 0 {
+                rightSidebarFillStrip = Self.makeSidebarFillStrip(
+                    from: initial,
+                    xStart: frame.width - detectedStickyRight,
+                    stripWidth: detectedStickyRight,
+                    yStart: detectedStickyTop,
+                    yEnd: commitBottom
+                )
+            }
+        }
 
         if lockedBottomCapHeight > 0,
            let cap = frame.cropCGImage(yStart: commitBottom, height: lockedBottomCapHeight) {
@@ -668,7 +868,15 @@ public final class ScrollImageStitcher {
 
         var staticRatio = [Double](repeating: 0, count: binCount)
         var meanVertGrad = [Double](repeating: 0, count: binCount)
-        var meanHorizEdge = [Double](repeating: 0, count: binCount)
+        var isStaticBin = [Bool](repeating: false, count: binCount)
+        var isStrongStaticBin = [Bool](repeating: false, count: binCount)
+        var hasMovingTexture = [Bool](repeating: false, count: binCount)
+
+        var prevLumas = [Int](repeating: 0, count: rowSampleCount)
+        var currLumas = [Int](repeating: 0, count: rowSampleCount)
+        var rgbDiffs = [Int](repeating: 0, count: rowSampleCount)
+        var sortedPrev = [Int](repeating: 0, count: rowSampleCount)
+        var sortedCurr = [Int](repeating: 0, count: rowSampleCount)
 
         previous.bgraData.withUnsafeBytes { prevRaw in
             current.bgraData.withUnsafeBytes { currRaw in
@@ -680,14 +888,10 @@ public final class ScrollImageStitcher {
 
                 for b in 0..<binCount {
                     let x = min(b * binW + binW / 2, width - 1)
-                    let prevX = max(0, x - binW)
                     let xOff = x * 4
-                    let prevXOff = prevX * 4
 
                     var staticHits = 0
                     var vertSum = 0
-                    var horizSum = 0
-                    var prevSampleLuma = 0
 
                     for r in 0..<rowSampleCount {
                         let y = sampleRows[r]
@@ -701,85 +905,130 @@ public final class ScrollImageStitcher {
                                 abs(Int(prevPtr[pPx + 2]) - Int(currPtr[cPx + 2]))
                             )
                         )
-                        if diff <= 5 { staticHits += 1 }
+                        rgbDiffs[r] = diff
+                        if diff <= 4 { staticHits += 1 }
 
-                        let luma = (77 * Int(prevPtr[pPx + 2]) + 150 * Int(prevPtr[pPx + 1]) + 29 * Int(prevPtr[pPx])) >> 8
+                        let pLuma = (77 * Int(prevPtr[pPx + 2]) + 150 * Int(prevPtr[pPx + 1]) + 29 * Int(prevPtr[pPx])) >> 8
+                        let cLuma = (77 * Int(currPtr[cPx + 2]) + 150 * Int(currPtr[cPx + 1]) + 29 * Int(currPtr[cPx])) >> 8
+                        prevLumas[r] = pLuma
+                        currLumas[r] = cLuma
+                        sortedPrev[r] = pLuma
+                        sortedCurr[r] = cLuma
                         if r > 0 {
-                            vertSum += abs(luma - prevSampleLuma)
+                            vertSum += abs(pLuma - prevLumas[r - 1])
                         }
-                        prevSampleLuma = luma
-
-                        let leftPx = y * prevBytes + prevXOff
-                        let leftLuma = (77 * Int(prevPtr[leftPx + 2]) + 150 * Int(prevPtr[leftPx + 1]) + 29 * Int(prevPtr[leftPx])) >> 8
-                        horizSum += abs(luma - leftLuma)
                     }
 
-                    staticRatio[b] = Double(staticHits) / Double(rowSampleCount)
+                    sortedPrev.sort()
+                    sortedCurr.sort()
+                    let medianPrev = sortedPrev[rowSampleCount / 2]
+                    let medianCurr = sortedCurr[rowSampleCount / 2]
+
+                    var nonBgCount = 0
+                    var nonBgStaticCount = 0
+                    for r in 0..<rowSampleCount {
+                        if abs(prevLumas[r] - medianPrev) >= 8 || abs(currLumas[r] - medianCurr) >= 8 {
+                            nonBgCount += 1
+                            if rgbDiffs[r] <= 4 {
+                                nonBgStaticCount += 1
+                            }
+                        }
+                    }
+
+                    let sr = Double(staticHits) / Double(rowSampleCount)
+                    let nonBgStaticRatio = nonBgCount > 0 ? Double(nonBgStaticCount) / Double(nonBgCount) : 1.0
+                    let statBin = sr >= 0.94 && (nonBgCount < 2 || nonBgStaticRatio >= 0.85)
+                    let strongBin = statBin && sr >= 0.96
+                    let movingTex = nonBgCount >= 2 && nonBgStaticRatio < 0.70
+
+                    staticRatio[b] = sr
                     meanVertGrad[b] = rowSampleCount > 1 ? Double(vertSum) / Double(rowSampleCount - 1) : 0
-                    meanHorizEdge[b] = Double(horizSum) / Double(rowSampleCount)
+                    isStaticBin[b] = statBin
+                    isStrongStaticBin[b] = strongBin
+                    hasMovingTexture[b] = movingTex
                 }
             }
         }
 
-        // Scan leftward region from left edge to find stationary textured chrome.
-        // Allow bridging a narrow <= 2-bin highlight/indicator if >= 2 adjacent bins past it are static.
+        // Refuse to infer sidebars when the active area hasn't scrolled meaningfully yet.
+        var clearlyMovingBins = 0
+        for b in 0..<binCount where staticRatio[b] < 0.88 || hasMovingTexture[b] {
+            clearlyMovingBins += 1
+        }
+        guard clearlyMovingBins >= max(4, binCount * 8 / 100) else {
+            return ScrollSidebarBounds(stickyLeft: 0, stickyRight: 0)
+        }
+
+        // Scan leftward region from left edge to find stationary textured chrome (hard-capped at 32%).
         var stickyLeft = 0
+        let maxLeftWidth = width * 32 / 100
+        let maxLeftScanBin = min(binCount, (width * 36 / 100) / binW)
         var firstMovingBin = 0
-        while firstMovingBin < binCount {
-            if staticRatio[firstMovingBin] >= 0.92 {
+        while firstMovingBin < maxLeftScanBin {
+            if isStaticBin[firstMovingBin] {
                 firstMovingBin += 1
-            } else if firstMovingBin == 0 && binCount > 2 && staticRatio[1] >= 0.92 {
+            } else if firstMovingBin == 0 && binCount > 2 && isStaticBin[1] {
                 firstMovingBin += 1
-            } else if firstMovingBin + 2 < binCount,
-                      staticRatio[firstMovingBin + 1] >= 0.92,
-                      staticRatio[firstMovingBin + 2] >= 0.92 {
+            } else if firstMovingBin + 2 < maxLeftScanBin,
+                      staticRatio[firstMovingBin] >= 0.72,
+                      isStrongStaticBin[firstMovingBin + 1],
+                      isStrongStaticBin[firstMovingBin + 2] {
                 firstMovingBin += 1
-            } else if firstMovingBin + 3 < binCount,
-                      staticRatio[firstMovingBin + 2] >= 0.92,
-                      staticRatio[firstMovingBin + 3] >= 0.92 {
+            } else if firstMovingBin + 3 < maxLeftScanBin,
+                      staticRatio[firstMovingBin] >= 0.72,
+                      staticRatio[firstMovingBin + 1] >= 0.72,
+                      isStrongStaticBin[firstMovingBin + 2],
+                      isStrongStaticBin[firstMovingBin + 3] {
                 firstMovingBin += 2
             } else {
                 break
             }
         }
-        let firstMovingX = firstMovingBin * binW
+        let firstMovingX = min(firstMovingBin * binW, maxLeftWidth)
         if firstMovingBin > 0 {
             var texturedBins = 0
             var lastTexturedBin: Int?
-            for b in 0..<firstMovingBin where meanVertGrad[b] >= 4.0 {
+            for b in 0..<firstMovingBin where meanVertGrad[b] >= 4.0 && isStaticBin[b] {
                 texturedBins += 1
                 lastTexturedBin = b
             }
             if let lastTex = lastTexturedBin,
                texturedBins * binW >= 16,
-               (lastTex + 1) * binW >= 32 {
+               (lastTex + 1) * binW >= 32,
+               (lastTex + 1) * binW <= maxLeftWidth {
                 let gapStartX = (lastTex + 1) * binW
+                let searchEndX = min(firstMovingBin * binW, maxLeftWidth + 16)
                 let dividerX = Self.findVerticalDividerX(
                     previous: previous,
                     current: current,
                     sampleRows: sampleRows,
-                    xRange: max(1, gapStartX)..<max(1, firstMovingX),
-                    searchFromRight: true
+                    xRange: max(1, gapStartX)..<max(1, searchEndX),
+                    searchFromRight: false
                 )
                 stickyLeft = min(dividerX.map { $0 + 1 } ?? (gapStartX + 12), firstMovingX)
             }
         }
 
-        // Scan rightward region inward, skipping extreme-right overlay scrollbar margin.
+        // Scan rightward region inward, skipping extreme-right overlay scrollbar margin (hard-capped at 32%).
         var stickyRight = 0
+        let maxRightWidth = width * 32 / 100
         let scrollbarExcl = width >= 240 ? min(28, width / 20) : 0
         let rightEndBin = max(0, (width - scrollbarExcl) / binW)
+        let minRightScanBin = max(0, (width - width * 36 / 100) / binW)
         var lastMovingBin = rightEndBin
-        while lastMovingBin > 0 {
-            if staticRatio[lastMovingBin - 1] >= 0.92 {
+        while lastMovingBin > minRightScanBin {
+            if isStaticBin[lastMovingBin - 1] {
                 lastMovingBin -= 1
-            } else if lastMovingBin - 3 >= 0,
-                      staticRatio[lastMovingBin - 2] >= 0.92,
-                      staticRatio[lastMovingBin - 3] >= 0.92 {
+            } else if lastMovingBin - 3 >= minRightScanBin,
+                      staticRatio[lastMovingBin - 1] >= 0.72,
+                      isStrongStaticBin[lastMovingBin - 2],
+                      isStrongStaticBin[lastMovingBin - 3] {
                 lastMovingBin -= 1
-            } else if lastMovingBin - 4 >= 0,
-                      staticRatio[lastMovingBin - 3] >= 0.92,
-                      staticRatio[lastMovingBin - 4] >= 0.92 {
+            } else if lastMovingBin - 4 >= minRightScanBin,
+                      staticRatio[lastMovingBin - 1] >= 0.72,
+                      staticRatio[lastMovingBin - 2] >= 0.72,
+                      isStrongStaticBin[lastMovingBin - 3],
+                      isStrongStaticBin[lastMovingBin - 4] {
                 lastMovingBin -= 2
             } else {
                 break
@@ -788,30 +1037,32 @@ public final class ScrollImageStitcher {
         if lastMovingBin < rightEndBin {
             var texturedBins = 0
             var firstTexturedBin: Int?
-            for b in lastMovingBin..<rightEndBin where meanVertGrad[b] >= 4.0 {
+            for b in lastMovingBin..<rightEndBin where meanVertGrad[b] >= 4.0 && isStaticBin[b] {
                 texturedBins += 1
                 if firstTexturedBin == nil { firstTexturedBin = b }
             }
             if let firstTex = firstTexturedBin,
                texturedBins * binW >= 16,
-               (rightEndBin - firstTex) * binW >= 32 {
+               (rightEndBin - firstTex) * binW >= 32,
+               width - firstTex * binW <= maxRightWidth {
                 let gapEndX = firstTex * binW
-                let movingEndX = lastMovingBin * binW
+                let minAllowedRightX = width - maxRightWidth
+                let movingEndX = max(lastMovingBin * binW, minAllowedRightX - 16)
                 let dividerX = Self.findVerticalDividerX(
                     previous: previous,
                     current: current,
                     sampleRows: sampleRows,
                     xRange: max(1, movingEndX)..<max(1, gapEndX),
-                    searchFromRight: false
+                    searchFromRight: true
                 )
                 let rawStart = dividerX ?? (gapEndX - 12)
-                let rightStartX = max(rawStart, movingEndX)
+                let rightStartX = max(rawStart, max(lastMovingBin * binW, minAllowedRightX))
                 stickyRight = width - rightStartX
             }
         }
 
         // Ensure a generous dynamic scrolling center remains.
-        let minActiveCenter = max(120, width / 3)
+        let minActiveCenter = max(120, width * 40 / 100)
         if width - stickyLeft - stickyRight < minActiveCenter {
             if stickyLeft > stickyRight {
                 stickyRight = 0
@@ -861,6 +1112,7 @@ public final class ScrollImageStitcher {
                     let rightOff = min(x + 1, previous.width - 1) * 4
                     var staticHits = 0
                     var edgeSum = 0
+                    var edgeRows = 0
 
                     for y in sampleRows {
                         let pPx = y * prevBytes + xOff
@@ -872,21 +1124,26 @@ public final class ScrollImageStitcher {
                                 abs(Int(prevPtr[pPx + 2]) - Int(currPtr[cPx + 2]))
                             )
                         )
-                        if diff <= 5 { staticHits += 1 }
+                        if diff <= 4 { staticHits += 1 }
 
                         let lPx = y * prevBytes + leftOff
                         let luma = (77 * Int(prevPtr[pPx + 2]) + 150 * Int(prevPtr[pPx + 1]) + 29 * Int(prevPtr[pPx])) >> 8
                         let leftLuma = (77 * Int(prevPtr[lPx + 2]) + 150 * Int(prevPtr[lPx + 1]) + 29 * Int(prevPtr[lPx])) >> 8
+                        let edge: Int
                         if searchFromRight {
-                            edgeSum += abs(luma - leftLuma)
-                        } else {
                             let rPx = y * prevBytes + rightOff
                             let rightLuma = (77 * Int(prevPtr[rPx + 2]) + 150 * Int(prevPtr[rPx + 1]) + 29 * Int(prevPtr[rPx])) >> 8
-                            edgeSum += max(abs(luma - leftLuma), abs(luma - rightLuma))
+                            edge = abs(luma - rightLuma)
+                        } else {
+                            edge = abs(luma - leftLuma)
                         }
+                        edgeSum += edge
+                        if edge >= 4 { edgeRows += 1 }
                     }
 
-                    if staticHits * 100 >= rowCount * 94 && Double(edgeSum) / Double(rowCount) >= 3.5 {
+                    if staticHits * 100 >= rowCount * 94,
+                       edgeRows * 100 >= rowCount * 75,
+                       Double(edgeSum) / Double(rowCount) >= 3.5 {
                         foundX = x
                         return
                     }
@@ -982,10 +1239,13 @@ public final class ScrollImageStitcher {
                 for y in 0..<height {
                     let base = y * sigW
                     var diffSum = 0
+                    var changedSamples = 0
                     for i in 0..<sigW {
-                        diffSum += abs(Int(prevSig[base + i]) - Int(currSig[base + i]))
+                        let d = abs(Int(prevSig[base + i]) - Int(currSig[base + i]))
+                        diffSum += d
+                        if d >= 14 { changedSamples += 1 }
                     }
-                    if diffSum / sigW <= 1 {
+                    if diffSum <= sigW && changedSamples <= 1 {
                         identicalRows += 1
                     }
                 }
@@ -1085,33 +1345,38 @@ public final class ScrollImageStitcher {
         }
 
         var rowDiffs = [Int](repeating: 0, count: height)
+        var rowChanged = [Int](repeating: 0, count: height)
         var staticRows = 0
         prevProf.rowSignatures.withUnsafeBufferPointer { prevSig in
             currProf.rowSignatures.withUnsafeBufferPointer { currSig in
                 for y in 0..<height {
                     let base = y * sigW
                     var diffSum = 0
+                    var changedSamples = 0
                     for i in 0..<sigW {
-                        diffSum += abs(Int(prevSig[base + i]) - Int(currSig[base + i]))
+                        let d = abs(Int(prevSig[base + i]) - Int(currSig[base + i]))
+                        diffSum += d
+                        if d >= 12 { changedSamples += 1 }
                     }
                     let meanDiff = diffSum / sigW
                     rowDiffs[y] = meanDiff
-                    if meanDiff <= 2 {
+                    rowChanged[y] = changedSamples
+                    if meanDiff <= 2 && changedSamples <= 1 {
                         staticRows += 1
                     }
                 }
             }
         }
 
-        if staticRows * 100 >= height * 98 {
+        if staticRows * 100 >= height * 99 {
             return ScrollStickyBounds(stickyTop: 0, stickyBottom: 0, isIdenticalFrame: true)
         }
 
-        let maxStickyTop = min(height * 45 / 100, 520)
+        let maxStickyTop = min(height * 35 / 100, 400)
         var lastTexturedTop = 0
         if maxStickyTop > 0 {
             for y in 0..<maxStickyTop {
-                guard rowDiffs[y] <= 3 else { break }
+                guard rowDiffs[y] <= 3 && rowChanged[y] <= 1 else { break }
                 if prevProf.rowEnergy[y] >= 120 {
                     lastTexturedTop = y + 1
                 }
@@ -1124,7 +1389,7 @@ public final class ScrollImageStitcher {
         if maxStickyBottom > 0 {
             for offset in 0..<maxStickyBottom {
                 let y = height - 1 - offset
-                guard rowDiffs[y] <= 3 else { break }
+                guard rowDiffs[y] <= 3 && rowChanged[y] <= 1 else { break }
                 if prevProf.rowEnergy[y] >= 120 {
                     firstTexturedBottom = y
                 }
@@ -1175,37 +1440,42 @@ public final class ScrollImageStitcher {
         let searchMaxStart = bottomBound - bandHeight
         guard searchMaxStart >= searchMinY else { return nil }
 
-        // Select the lowest textured anchor band in the dynamic viewport so large downward
-        // jumps remain visible higher up in `current`. Fall back to highest contrast band.
-        var anchorY: Int?
-        var bestContrastY: Int?
-        var bestContrastScore: Int64 = 0
+        // Select the lowest richly textured anchor band in the dynamic viewport so large downward
+        // jumps remain visible higher up in `current`. Require meaningful texture relative to the
+        // best band contrast so sparse 1px card borders do not shadow rich text right above them.
         let requiredTexture = Int64(bandHeight) * 80
         let fallbackFloorY = topBound + dynamicHeight / 4
-
+        var bandContrasts = [Int64](repeating: 0, count: searchMaxStart - searchMinY + 1)
         var runningContrast: Int64 = 0
         for y in searchMinY..<(searchMinY + bandHeight) {
             runningContrast += Int64(prevProf.rowContrast[y])
         }
-        if runningContrast >= requiredTexture {
-            anchorY = searchMinY
-        }
-        if runningContrast > bestContrastScore, searchMinY >= fallbackFloorY {
-            bestContrastScore = runningContrast
-            bestContrastY = searchMinY
-        }
+        bandContrasts[0] = runningContrast
+        var maxRangeContrast = runningContrast
+        var bestContrastY = (searchMinY >= fallbackFloorY && runningContrast > 0) ? searchMinY : nil
+        var bestContrastScore = (bestContrastY != nil) ? runningContrast : 0
 
         if searchMaxStart > searchMinY {
             for y in (searchMinY + 1)...searchMaxStart {
                 runningContrast += Int64(prevProf.rowContrast[y + bandHeight - 1])
                 runningContrast -= Int64(prevProf.rowContrast[y - 1])
-                if runningContrast >= requiredTexture {
-                    anchorY = y
+                bandContrasts[y - searchMinY] = runningContrast
+                if runningContrast > maxRangeContrast {
+                    maxRangeContrast = runningContrast
                 }
                 if y >= fallbackFloorY && runningContrast > bestContrastScore {
                     bestContrastScore = runningContrast
                     bestContrastY = y
                 }
+            }
+        }
+
+        let effectiveTextureThreshold = max(requiredTexture, maxRangeContrast / 3)
+        var anchorY: Int?
+        for idx in bandContrasts.indices.reversed() {
+            if bandContrasts[idx] >= effectiveTextureThreshold {
+                anchorY = searchMinY + idx
+                break
             }
         }
         if anchorY == nil && bestContrastY == nil {
@@ -1248,7 +1518,7 @@ public final class ScrollImageStitcher {
             let score: Int
         }
         var coarseScores: [Candidate] = []
-        coarseScores.reserveCapacity(maxShift / coarseStep + 2)
+        coarseScores.reserveCapacity(maxShift / coarseStep + 36)
 
         prevProf.rowSignatures.withUnsafeBufferPointer { prevSig in
             currProf.rowSignatures.withUnsafeBufferPointer { currSig in
@@ -1268,19 +1538,27 @@ public final class ScrollImageStitcher {
                         row += rowStep
                     }
                     coarseScores.append(Candidate(dy: dy, score: diffSum))
-                    dy += coarseStep
+                    dy += (dy < 32 ? 1 : coarseStep)
                 }
             }
         }
 
-        coarseScores.sort { $0.score < $1.score }
+        let sortedCoarse = coarseScores.sorted {
+            if $0.score != $1.score { return $0.score < $1.score }
+            return $0.dy < $1.dy
+        }
         var topCandidates: [Int] = []
-        let minPeakSeparation = max(8, coarseStep * 2)
-        for cand in coarseScores {
+        let minPeakSeparation = max(6, coarseStep * 2)
+        for cand in sortedCoarse {
             if topCandidates.allSatisfy({ abs($0 - cand.dy) >= minPeakSeparation }) {
                 topCandidates.append(cand.dy)
-                if topCandidates.count >= 4 { break }
+                if topCandidates.count >= 8 { break }
             }
+        }
+        let smallLimit = min(48, maxShift)
+        if let bestSmall = coarseScores.filter({ $0.dy <= smallLimit }).min(by: { $0.score < $1.score }),
+           topCandidates.allSatisfy({ abs($0 - bestSmall.dy) >= 4 }) {
+            topCandidates.append(bestSmall.dy)
         }
         if topCandidates.isEmpty {
             topCandidates.append(1)
@@ -1297,7 +1575,17 @@ public final class ScrollImageStitcher {
             colOffsets[i] = c * 4
         }
 
-        var testedDy = Set<Int>()
+        var candidateDys = Set<Int>()
+        for centerDy in topCandidates {
+            let radius = centerDy <= 32 ? 2 : coarseStep
+            let lower = max(1, centerDy - radius)
+            let upper = min(maxShift, centerDy + radius)
+            for dy in lower...upper {
+                candidateDys.insert(dy)
+            }
+        }
+        let orderedDys = candidateDys.sorted()
+
         var bestDy: Int?
         var bestMAD = Double.greatestFiniteMagnitude
         let prevRowBytes = previous.bytesPerRow
@@ -1309,35 +1597,31 @@ public final class ScrollImageStitcher {
                       let currPtr = currRaw.baseAddress?.assumingMemoryBound(to: UInt8.self)
                 else { return }
 
-                for centerDy in topCandidates {
-                    let lower = max(1, centerDy - coarseStep)
-                    let upper = min(maxShift, centerDy + coarseStep)
-                    for dy in lower...upper where testedDy.insert(dy).inserted {
-                        let overlapRows = dynamicHeight - dy
-                        guard overlapRows >= minOverlap else { continue }
-                        let rowStride = max(1, overlapRows / 120)
-                        var totalAbsDiff = 0
-                        var sampleChannels = 0
-                        var yOffset = 0
-                        while yOffset < overlapRows {
-                            let pRow = (topBound + dy + yOffset) * prevRowBytes
-                            let cRow = (topBound + yOffset) * currRowBytes
-                            for colByteOffset in colOffsets {
-                                let pPx = pRow + colByteOffset
-                                let cPx = cRow + colByteOffset
-                                totalAbsDiff += abs(Int(prevPtr[pPx]) - Int(currPtr[cPx]))
-                                totalAbsDiff += abs(Int(prevPtr[pPx + 1]) - Int(currPtr[cPx + 1]))
-                                totalAbsDiff += abs(Int(prevPtr[pPx + 2]) - Int(currPtr[cPx + 2]))
-                            }
-                            sampleChannels += fineCols * 3
-                            yOffset += rowStride
+                for dy in orderedDys {
+                    let overlapRows = dynamicHeight - dy
+                    guard overlapRows >= minOverlap else { continue }
+                    let rowStride = max(1, overlapRows / 200)
+                    var totalAbsDiff = 0
+                    var sampleChannels = 0
+                    var yOffset = 0
+                    while yOffset < overlapRows {
+                        let pRow = (topBound + dy + yOffset) * prevRowBytes
+                        let cRow = (topBound + yOffset) * currRowBytes
+                        for colByteOffset in colOffsets {
+                            let pPx = pRow + colByteOffset
+                            let cPx = cRow + colByteOffset
+                            totalAbsDiff += abs(Int(prevPtr[pPx]) - Int(currPtr[cPx]))
+                            totalAbsDiff += abs(Int(prevPtr[pPx + 1]) - Int(currPtr[cPx + 1]))
+                            totalAbsDiff += abs(Int(prevPtr[pPx + 2]) - Int(currPtr[cPx + 2]))
                         }
-                        guard sampleChannels > 0 else { continue }
-                        let mad = Double(totalAbsDiff) / Double(sampleChannels)
-                        if mad < bestMAD {
-                            bestMAD = mad
-                            bestDy = dy
-                        }
+                        sampleChannels += fineCols * 3
+                        yOffset += rowStride
+                    }
+                    guard sampleChannels > 0 else { continue }
+                    let mad = Double(totalAbsDiff) / Double(sampleChannels)
+                    if bestDy == nil || mad < bestMAD - 0.35 || (mad < bestMAD && bestMAD > 2.0) {
+                        bestMAD = mad
+                        bestDy = dy
                     }
                 }
             }
