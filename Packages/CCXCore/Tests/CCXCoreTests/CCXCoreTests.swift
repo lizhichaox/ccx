@@ -449,6 +449,14 @@ final class ClipboardStoreTests: XCTestCase {
         let largeEntry = SnipHistoryEntry(image: large, scale: 2, screenRect: .zero)
         XCTAssertEqual(largeEntry.thumbnail.width, 160)
         XCTAssertEqual(largeEntry.thumbnail.height, 80)
+
+        let tall = makeTestImage(width: 800, height: 8000) { _, y in
+            y < 1000 ? (255, 0, 0, 255) : (0, 0, 255, 255)
+        }
+        let tallEntry = SnipHistoryEntry(image: tall, scale: 2, screenRect: .zero)
+        XCTAssertEqual(tallEntry.thumbnail.width, 80)
+        XCTAssertEqual(tallEntry.thumbnail.height, 160)
+        XCTAssertGreaterThan(CCXColorSample.samplePixel(from: tallEntry.thumbnail, pixelX: 10, pixelY: 10)?.red ?? 0, 200)
     }
 }
 

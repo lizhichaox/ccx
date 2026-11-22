@@ -11,6 +11,33 @@ final class PixelMagnifierView: NSView {
     static var gridSide: CGFloat { CGFloat(gridPixels) * cellSize }
     static var preferredSize: CGSize { CGSize(width: gridSide, height: gridSide + infoHeight) }
 
+    private static let backgroundCGColor = NSColor(white: 0.08, alpha: 0.92).cgColor
+    private static let gridLineCGColor = NSColor.black.withAlphaComponent(0.18).cgColor
+    private static let crosshairTintCGColor = NSColor.systemCyan.withAlphaComponent(0.22).cgColor
+    private static let swatchBorderCGColor = NSColor.white.withAlphaComponent(0.6).cgColor
+    private static let infoAttributes: [NSAttributedString.Key: Any] = [
+        .font: NSFont.monospacedSystemFont(ofSize: 9.5, weight: .medium),
+        .foregroundColor: NSColor.white,
+    ]
+    private static let hintAttributes: [NSAttributedString.Key: Any] = [
+        .font: NSFont.monospacedSystemFont(ofSize: 8.5, weight: .regular),
+        .foregroundColor: NSColor.white.withAlphaComponent(0.55),
+    ]
+    private static let gridLinesPath: CGPath = {
+        let side = gridSide
+        let cell = cellSize
+        let gridY = preferredSize.height - side
+        let path = CGMutablePath()
+        for index in 1..<gridPixels {
+            let offset = CGFloat(index) * cell
+            path.move(to: CGPoint(x: offset, y: gridY))
+            path.addLine(to: CGPoint(x: offset, y: gridY + side))
+            path.move(to: CGPoint(x: 0, y: gridY + offset))
+            path.addLine(to: CGPoint(x: side, y: gridY + offset))
+        }
+        return path
+    }()
+
     private var gridImage: CGImage?
     /// Offset (in cells) of `gridImage` inside the grid when cropped at image edges.
     private var gridOffset = CGPoint.zero
@@ -82,8 +109,8 @@ final class PixelMagnifierView: NSView {
         let cell = Self.cellSize
         let gridOrigin = CGPoint(x: 0, y: bounds.height - side)
 
-        NSColor(white: 0.08, alpha: 0.92).setFill()
-        bounds.fill()
+        context.setFillColor(Self.backgroundCGColor)
+        context.fill(bounds)
 
         // Pixel grid (nearest-neighbor). Image rows run top-down; AppKit y runs bottom-up.
         if let gridImage {
@@ -99,22 +126,16 @@ final class PixelMagnifierView: NSView {
             context.restoreGState()
         }
 
-        // Faint grid lines.
+        // Faint grid lines (pre-built CGPath).
         context.saveGState()
-        context.setStrokeColor(NSColor.black.withAlphaComponent(0.18).cgColor)
+        context.setStrokeColor(Self.gridLineCGColor)
         context.setLineWidth(0.5)
-        for index in 1..<Self.gridPixels {
-            let offset = CGFloat(index) * cell
-            context.move(to: CGPoint(x: gridOrigin.x + offset, y: gridOrigin.y))
-            context.addLine(to: CGPoint(x: gridOrigin.x + offset, y: gridOrigin.y + side))
-            context.move(to: CGPoint(x: gridOrigin.x, y: gridOrigin.y + offset))
-            context.addLine(to: CGPoint(x: gridOrigin.x + side, y: gridOrigin.y + offset))
-        }
+        context.addPath(Self.gridLinesPath)
         context.strokePath()
 
         // Center crosshair band + center pixel outline.
         let center = CGFloat(Self.gridPixels / 2) * cell
-        context.setFillColor(NSColor.systemCyan.withAlphaComponent(0.22).cgColor)
+        context.setFillColor(Self.crosshairTintCGColor)
         context.fill(CGRect(x: gridOrigin.x + center, y: gridOrigin.y, width: cell, height: side))
         context.fill(CGRect(x: gridOrigin.x, y: gridOrigin.y + center, width: side, height: cell))
         let centerRect = CGRect(x: gridOrigin.x + center, y: gridOrigin.y + center, width: cell, height: cell)
@@ -127,31 +148,24 @@ final class PixelMagnifierView: NSView {
         context.restoreGState()
 
         // Info area.
-        let attributes: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedSystemFont(ofSize: 9.5, weight: .medium),
-            .foregroundColor: NSColor.white,
-        ]
         let lineHeight: CGFloat = 16
         let infoTop = gridOrigin.y - 4
-        (positionText as NSString).draw(at: CGPoint(x: 6, y: infoTop - lineHeight), withAttributes: attributes)
-        (sizeText as NSString).draw(at: CGPoint(x: 6, y: infoTop - 2 * lineHeight), withAttributes: attributes)
+        (positionText as NSString).draw(at: CGPoint(x: 6, y: infoTop - lineHeight), withAttributes: Self.infoAttributes)
+        (sizeText as NSString).draw(at: CGPoint(x: 6, y: infoTop - 2 * lineHeight), withAttributes: Self.infoAttributes)
 
         let swatch = CGRect(x: 6, y: infoTop - 3 * lineHeight + 2, width: 12, height: 12)
         if let sample {
-            sample.nsColor.setFill()
-            NSBezierPath(rect: swatch).fill()
-            NSColor.white.withAlphaComponent(0.6).setStroke()
-            NSBezierPath(rect: swatch).stroke()
+            context.setFillColor(sample.nsColor.cgColor)
+            context.fill(swatch)
+            context.setStrokeColor(Self.swatchBorderCGColor)
+            context.setLineWidth(1)
+            context.stroke(swatch)
             let text = sample.formatted(as: format)
-            (text as NSString).draw(at: CGPoint(x: swatch.maxX + 5, y: swatch.minY - 1), withAttributes: attributes)
+            (text as NSString).draw(at: CGPoint(x: swatch.maxX + 5, y: swatch.minY - 1), withAttributes: Self.infoAttributes)
         }
-        let hintAttributes: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedSystemFont(ofSize: 8.5, weight: .regular),
-            .foregroundColor: NSColor.white.withAlphaComponent(0.55),
-        ]
         ("C copy · ⇧ format" as NSString).draw(
             at: CGPoint(x: 6, y: max(3, infoTop - 4 * lineHeight + 3)),
-            withAttributes: hintAttributes
+            withAttributes: Self.hintAttributes
         )
     }
 

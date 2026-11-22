@@ -80,13 +80,17 @@ enum PinLayout {
     ) -> (frame: CGRect, zoom: CGFloat) {
         if let screenRect {
             let rect = screenRect.standardized
-            let frame = CGRect(
-                x: rect.minX,
-                y: rect.maxY - baseSize.height,
-                width: baseSize.width,
-                height: baseSize.height
-            )
-            return (frame, 1)
+            let fitsScreen = visibleFrame.width <= 0 || visibleFrame.height <= 0 ||
+                (baseSize.width <= visibleFrame.width * 1.05 && baseSize.height <= visibleFrame.height * 1.05)
+            if fitsScreen {
+                let frame = CGRect(
+                    x: rect.minX,
+                    y: rect.maxY - baseSize.height,
+                    width: baseSize.width,
+                    height: baseSize.height
+                )
+                return (frame, 1)
+            }
         }
         var zoom: CGFloat = 1
         if visibleFrame.width > 0, visibleFrame.height > 0, baseSize.width > 0, baseSize.height > 0 {

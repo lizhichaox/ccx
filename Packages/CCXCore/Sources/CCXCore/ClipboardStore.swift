@@ -50,11 +50,19 @@ public struct SnipHistoryEntry: Identifiable, Sendable {
     }
 
     private static func makeThumbnail(from image: CGImage, maxPixelDimension: CGFloat) -> CGImage {
-        let width = CGFloat(image.width)
-        let height = CGFloat(image.height)
+        // For ultra-tall scrolling captures, crop the top portion so thumbnails show crisp header content.
+        let sourceImage: CGImage
+        if CGFloat(image.height) > CGFloat(image.width) * 2.5, image.width > 0 {
+            let cropHeight = min(image.height, image.width * 2)
+            sourceImage = image.cropping(to: CGRect(x: 0, y: 0, width: image.width, height: cropHeight)) ?? image
+        } else {
+            sourceImage = image
+        }
+        let width = CGFloat(sourceImage.width)
+        let height = CGFloat(sourceImage.height)
         let longest = max(width, height)
         guard longest > maxPixelDimension, width > 0, height > 0 else {
-            return image
+            return sourceImage
         }
         let scale = maxPixelDimension / longest
         let targetWidth = max(1, Int((width * scale).rounded()))
@@ -70,11 +78,11 @@ public struct SnipHistoryEntry: Identifiable, Sendable {
                   bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
               )
         else {
-            return image
+            return sourceImage
         }
         context.interpolationQuality = .medium
-        context.draw(image, in: CGRect(x: 0, y: 0, width: targetWidth, height: targetHeight))
-        return context.makeImage() ?? image
+        context.draw(sourceImage, in: CGRect(x: 0, y: 0, width: targetWidth, height: targetHeight))
+        return context.makeImage() ?? sourceImage
     }
 }
 

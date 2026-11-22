@@ -149,6 +149,14 @@ final class PinLayoutTests: XCTestCase {
         XCTAssertLessThan(huge.zoom, 1.0)
         XCTAssertLessThanOrEqual(huge.frame.width, visible.width * 0.9 + 1)
         XCTAssertLessThanOrEqual(huge.frame.height, visible.height * 0.9 + 1)
+
+        // Tall scrolling snip shrinks to fit within 90% of visibleFrame even with screenRect supplied.
+        let tallRect = CGRect(x: 400, y: 200, width: 400, height: 500)
+        let tallPlaced = PinLayout.initialPlacement(baseSize: CGSize(width: 400, height: 3000),
+                                                    screenRect: tallRect,
+                                                    visibleFrame: visible)
+        XCTAssertLessThan(tallPlaced.zoom, 1.0)
+        XCTAssertLessThanOrEqual(tallPlaced.frame.height, visible.height * 0.9 + 1)
     }
 
     func testRotatedImageDimensionsAndPixelMapping() {

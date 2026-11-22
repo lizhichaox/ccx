@@ -257,10 +257,34 @@ final class AXQueryWorker: @unchecked Sendable {
         guard status == .success, let element else { return nil }
         AXUIElementSetMessagingTimeout(element, Self.messagingTimeout)
 
-        guard
-            let position = Self.copyPoint(element, attribute: kAXPositionAttribute),
-            let size = Self.copySize(element, attribute: kAXSizeAttribute)
-        else { return nil }
+        let attributes = [kAXPositionAttribute as CFString, kAXSizeAttribute as CFString] as CFArray
+        var values: CFArray?
+        let position: CGPoint
+        let size: CGSize
+        if AXUIElementCopyMultipleAttributeValues(element, attributes, [], &values) == .success,
+           let array = values as? [AnyObject],
+           array.count == 2,
+           CFGetTypeID(array[0]) == AXValueGetTypeID(),
+           CFGetTypeID(array[1]) == AXValueGetTypeID() {
+            var pt = CGPoint.zero
+            var sz = CGSize.zero
+            // swiftlint:disable:next force_cast
+            let posAX = array[0] as! AXValue
+            // swiftlint:disable:next force_cast
+            let sizeAX = array[1] as! AXValue
+            guard AXValueGetValue(posAX, .cgPoint, &pt),
+                  AXValueGetValue(sizeAX, .cgSize, &sz)
+            else { return nil }
+            position = pt
+            size = sz
+        } else {
+            guard
+                let fallbackPos = Self.copyPoint(element, attribute: kAXPositionAttribute),
+                let fallbackSize = Self.copySize(element, attribute: kAXSizeAttribute)
+            else { return nil }
+            position = fallbackPos
+            size = fallbackSize
+        }
         let quartzRect = CGRect(origin: position, size: size)
         return CoordinateConverter.quartzToAppKit(quartzRect, primaryScreenHeight: request.primaryScreenHeight)
     }

@@ -195,4 +195,54 @@ struct SelectionStateMachineTests {
         #expect(ResizeHandle.left.flipped(horizontally: true, vertically: false) == .right)
         #expect(ResizeHandle.bottom.flipped(horizontally: false, vertically: false) == .bottom)
     }
+
+    @Test func squareDragAndCornerResizeConstrainAspectRatio() {
+        var machine = SelectionStateMachine(bounds: bounds)
+        machine.mouseDown(at: CGPoint(x: 100, y: 100))
+        machine.mouseDragged(to: CGPoint(x: 320, y: 180), constrainSquare: true)
+        #expect(machine.selectionRect == CGRect(x: 100, y: 100, width: 220, height: 220))
+        machine.mouseUp(at: CGPoint(x: 320, y: 180))
+        #expect(machine.state == .selected(rect: CGRect(x: 100, y: 100, width: 220, height: 220)))
+
+        // Corner resize with constrainSquare keeps 1:1 anchored at opposite corner.
+        machine.mouseDown(at: CGPoint(x: 320, y: 320))
+        machine.mouseDragged(to: CGPoint(x: 420, y: 200), constrainSquare: true)
+        #expect(machine.selectionRect == CGRect(x: 100, y: 100, width: 320, height: 320))
+        machine.mouseUp(at: CGPoint(x: 420, y: 200))
+        #expect(machine.state == .selected(rect: CGRect(x: 100, y: 100, width: 320, height: 320)))
+    }
+
+    @Test func spacebarMoveOriginTranslatesInFlightDragAndClamps() {
+        var machine = SelectionStateMachine(bounds: bounds)
+        machine.mouseDown(at: CGPoint(x: 100, y: 100))
+        machine.mouseDragged(to: CGPoint(x: 300, y: 250))
+        #expect(machine.selectionRect == CGRect(x: 100, y: 100, width: 200, height: 150))
+
+        // Holding space shifts the whole in-flight selection cleanly without changing size.
+        machine.mouseDragged(to: CGPoint(x: 350, y: 290), moveOrigin: true)
+        #expect(machine.selectionRect == CGRect(x: 150, y: 140, width: 200, height: 150))
+
+        // Pushing past screen bounds clamps size-preservingly.
+        machine.mouseDragged(to: CGPoint(x: 1200, y: 1000), moveOrigin: true)
+        #expect(machine.selectionRect == CGRect(x: 800, y: 650, width: 200, height: 150))
+    }
+
+    @Test func resizeByExpandsShrinksAndClampsToBounds() {
+        var hovering = SelectionStateMachine(bounds: bounds)
+        let hoverResized = hovering.resizeBy(dw: 10, dh: 10)
+        #expect(hoverResized == false)
+
+        var machine = selected(CGRect(x: 100, y: 200, width: 200, height: 100))
+        let grown = machine.resizeBy(dw: 25, dh: 20)
+        #expect(grown)
+        #expect(machine.selectionRect == CGRect(x: 100, y: 180, width: 225, height: 120))
+
+        let shrunk = machine.resizeBy(dw: -50, dh: -40)
+        #expect(shrunk)
+        #expect(machine.selectionRect == CGRect(x: 100, y: 220, width: 175, height: 80))
+
+        let clamped = machine.resizeBy(dw: -1000, dh: -1000)
+        #expect(clamped)
+        #expect(machine.selectionRect?.size == CGSize(width: 1, height: 1))
+    }
 }

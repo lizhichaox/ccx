@@ -8,6 +8,12 @@ public enum ResizeHandle: CaseIterable, Sendable, Hashable {
     var movesMaxX: Bool { self == .topRight || self == .right || self == .bottomRight }
     var movesMinY: Bool { self == .bottomLeft || self == .bottom || self == .bottomRight }
     var movesMaxY: Bool { self == .topLeft || self == .top || self == .topRight }
+    var isCorner: Bool {
+        switch self {
+        case .topLeft, .topRight, .bottomRight, .bottomLeft: true
+        case .top, .right, .bottom, .left: false
+        }
+    }
 
     /// Returns the handle that results from flipping across the horizontal and/or vertical axis.
     func flipped(horizontally: Bool, vertically: Bool) -> ResizeHandle {
@@ -115,19 +121,52 @@ public struct SelectionStateMachine: Sendable {
         }
     }
 
-    public mutating func mouseDragged(to rawPoint: CGPoint) {
+    public mutating func mouseDragged(
+        to rawPoint: CGPoint,
+        constrainSquare: Bool = false,
+        moveOrigin: Bool = false
+    ) {
         let point = Self.clampedPoint(rawPoint, in: bounds)
         switch state {
-        case let .dragging(origin, _):
-            state = .dragging(origin: origin, current: point)
+        case let .dragging(origin, current):
+            if moveOrigin {
+                let activeRect = Self.rect(from: origin, to: current)
+                let moved = Self.clampedOffset(
+                    activeRect,
+                    dx: point.x - current.x,
+                    dy: point.y - current.y,
+                    in: bounds
+                )
+                let appliedDx = moved.minX - activeRect.minX
+                let appliedDy = moved.minY - activeRect.minY
+                state = .dragging(
+                    origin: CGPoint(x: origin.x + appliedDx, y: origin.y + appliedDy),
+                    current: CGPoint(x: current.x + appliedDx, y: current.y + appliedDy)
+                )
+            } else if constrainSquare {
+                let constrained = Self.squareConstrainedPoint(from: origin, to: point, in: bounds)
+                state = .dragging(origin: origin, current: constrained)
+            } else {
+                state = .dragging(origin: origin, current: point)
+            }
         case let .moving(rect, startPoint):
             let moved = Self.clampedOffset(rect, dx: point.x - startPoint.x, dy: point.y - startPoint.y, in: bounds)
             // Advance the anchor only by the applied delta so the grab offset stays stable at edges.
             let applied = CGPoint(x: startPoint.x + (moved.minX - rect.minX), y: startPoint.y + (moved.minY - rect.minY))
             state = .moving(rect: moved, startPoint: applied)
         case let .resizing(rect, handle, _):
-            let (newRect, newHandle) = Self.resize(rect, handle: handle, to: point)
-            state = .resizing(rect: newRect, handle: newHandle, startPoint: point)
+            let target: CGPoint
+            if constrainSquare && handle.isCorner {
+                let anchor = CGPoint(
+                    x: handle.movesMinX ? rect.maxX : rect.minX,
+                    y: handle.movesMinY ? rect.maxY : rect.minY
+                )
+                target = Self.squareConstrainedPoint(from: anchor, to: point, in: bounds)
+            } else {
+                target = point
+            }
+            let (newRect, newHandle) = Self.resize(rect, handle: handle, to: target)
+            state = .resizing(rect: newRect, handle: newHandle, startPoint: target)
         case .hovering, .selected:
             break
         }
@@ -136,8 +175,11 @@ public struct SelectionStateMachine: Sendable {
     public mutating func mouseUp(at rawPoint: CGPoint) {
         let point = Self.clampedPoint(rawPoint, in: bounds)
         switch state {
-        case let .dragging(origin, _):
-            let isClick = abs(point.x - origin.x) < clickThreshold && abs(point.y - origin.y) < clickThreshold
+        case let .dragging(origin, current):
+            let dragMoved = current != origin
+            let isClick = !dragMoved &&
+                abs(point.x - origin.x) < clickThreshold &&
+                abs(point.y - origin.y) < clickThreshold
             if isClick {
                 if let previous = previousSelection {
                     state = .selected(rect: previous)
@@ -145,7 +187,8 @@ public struct SelectionStateMachine: Sendable {
                     state = .selected(rect: pendingDetectedRect ?? bounds)
                 }
             } else {
-                let rect = Self.rect(from: origin, to: point)
+                let finalPoint = dragMoved ? current : point
+                let rect = Self.rect(from: origin, to: finalPoint)
                 state = .selected(rect: Self.enforceMinimumSize(rect, in: bounds))
             }
             pendingDetectedRect = nil
@@ -162,6 +205,24 @@ public struct SelectionStateMachine: Sendable {
     public mutating func nudge(dx: CGFloat, dy: CGFloat) -> Bool {
         guard case let .selected(rect) = state else { return false }
         state = .selected(rect: Self.clampedOffset(rect, dx: dx, dy: dy, in: bounds))
+        return true
+    }
+
+    /// Expands or shrinks the selected rectangle by `dw`/`dh` points (anchored at top-left),
+    /// clamped to `bounds` and minimum `1 × 1`. Returns `true` if handled.
+    @discardableResult
+    public mutating func resizeBy(dw: CGFloat, dh: CGFloat) -> Bool {
+        guard case let .selected(rect) = state else { return false }
+        let newWidth = min(max(rect.width + dw, 1), bounds.maxX - rect.minX)
+        let newHeight = min(max(rect.height + dh, 1), bounds.height)
+        let newY = max(bounds.minY, rect.maxY - newHeight)
+        let resized = CGRect(
+            x: rect.minX,
+            y: min(newY, bounds.maxY - newHeight),
+            width: newWidth,
+            height: newHeight
+        )
+        state = .selected(rect: Self.clampedOffset(resized, dx: 0, dy: 0, in: bounds))
         return true
     }
 
@@ -237,6 +298,19 @@ public struct SelectionStateMachine: Sendable {
         result.size.width = max(result.width, 1)
         result.size.height = max(result.height, 1)
         return clampedOffset(result, dx: 0, dy: 0, in: bounds)
+    }
+
+    /// Returns a 1:1 square-constrained target endpoint from `origin` toward `point`, clamped within `bounds`.
+    static func squareConstrainedPoint(from origin: CGPoint, to point: CGPoint, in bounds: CGRect) -> CGPoint {
+        let dx = point.x - origin.x
+        let dy = point.y - origin.y
+        let signX: CGFloat = dx >= 0 ? 1 : -1
+        let signY: CGFloat = dy >= 0 ? 1 : -1
+        let maxAvailX = dx >= 0 ? (bounds.maxX - origin.x) : (origin.x - bounds.minX)
+        let maxAvailY = dy >= 0 ? (bounds.maxY - origin.y) : (origin.y - bounds.minY)
+        let maxSide = max(0, min(maxAvailX, maxAvailY))
+        let side = min(max(abs(dx), abs(dy)), maxSide)
+        return CGPoint(x: origin.x + signX * side, y: origin.y + signY * side)
     }
 
     /// Moves the edges controlled by `handle` to `point`, flipping the handle when an edge crosses its anchor.
