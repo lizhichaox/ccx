@@ -3,7 +3,7 @@ import CCXAnnotate
 
 /// Action commands triggered from the floating snip toolbar.
 enum SnipToolbarAction: Sendable {
-    case undo, redo, ocr, pin, copy, save, cancel
+    case undo, redo, scroll, ocr, pin, copy, save, cancel
 }
 
 /// Two-tier Liquid Glass floating toolbar for selecting annotation tools, styles,
@@ -13,8 +13,9 @@ final class SnipActionToolbar: NSView {
     static let primaryHeight: CGFloat = 40
     static let styleBarHeight: CGFloat = 34
     static let barGap: CGFloat = 6
-    static let preferredSize = CGSize(width: 536, height: primaryHeight)
-    static let expandedSize = CGSize(width: 536, height: primaryHeight + barGap + styleBarHeight)
+    static let toolbarWidth: CGFloat = 568
+    static let preferredSize = CGSize(width: toolbarWidth, height: primaryHeight)
+    static let expandedSize = CGSize(width: toolbarWidth, height: primaryHeight + barGap + styleBarHeight)
 
     var onAction: ((SnipToolbarAction) -> Void)?
     var onToolSelected: ((AnnotationTool) -> Void)?
@@ -272,6 +273,15 @@ final class SnipActionToolbar: NSView {
 
         views.append(Self.makeDivider())
 
+        views.append(ToolbarIconButton(
+            symbol: "rectangle.expand.vertical",
+            fallbackSymbol: "arrow.up.arrow.down",
+            tooltip: "Scroll Capture (L)",
+            tint: .systemMint,
+            width: 30
+        ) { [weak self] in
+            self?.onAction?(.scroll)
+        })
         views.append(ToolbarIconButton(symbol: "text.viewfinder", tooltip: "Copy Text (OCR) (T)", tint: .systemCyan, width: 30) { [weak self] in
             self?.onAction?(.ocr)
         })
@@ -569,11 +579,20 @@ private final class ToolbarIconButton: HoverButton {
         }
     }
 
-    init(symbol: String, tooltip: String, tint: NSColor, width: CGFloat, action: @escaping () -> Void) {
+    init(
+        symbol: String,
+        fallbackSymbol: String? = nil,
+        tooltip: String,
+        tint: NSColor,
+        width: CGFloat,
+        action: @escaping () -> Void
+    ) {
         self.baseTint = tint
         self.handler = action
         super.init(frame: .zero)
-        let image = NSImage(systemSymbolName: symbol, accessibilityDescription: tooltip) ?? NSImage()
+        let image = NSImage(systemSymbolName: symbol, accessibilityDescription: tooltip)
+            ?? fallbackSymbol.flatMap { NSImage(systemSymbolName: $0, accessibilityDescription: tooltip) }
+            ?? NSImage()
         self.image = image
         self.target = self
         self.action = #selector(tapped)

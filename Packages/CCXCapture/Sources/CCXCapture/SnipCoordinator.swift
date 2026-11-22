@@ -9,6 +9,7 @@ public final class SnipCoordinator {
     private static let logger = Logger(subsystem: "com.lizhichaox.ccx", category: "SnipCoordinator")
 
     private var overlay: SnipOverlayController?
+    private var scrollController: ScrollCaptureController?
     private var captureTask: Task<Void, Never>?
     private var completion: (@MainActor (SnipOutcome) -> Void)?
     private var lastAnnotationStyle = AnnotationStyle()
@@ -72,12 +73,25 @@ public final class SnipCoordinator {
             onSelectionCommitted: { [weak self] displayID, rect in
                 self?.lastSelectionByDisplay[displayID] = rect
             },
+            onRequestScrollCapture: { [weak self] request in
+                self?.beginScrollCapture(request)
+            },
             onFinish: { [weak self] outcome in
                 self?.finish(outcome)
             }
         )
         overlay = controller
         controller.show()
+    }
+
+    private func beginScrollCapture(_ request: ScrollCaptureRequest) {
+        guard isSessionActive else { return }
+        overlay = nil
+        let controller = ScrollCaptureController(request: request) { [weak self] outcome in
+            self?.finish(outcome)
+        }
+        scrollController = controller
+        controller.start()
     }
 
     private func finish(_ outcome: SnipOutcome) {
@@ -87,6 +101,8 @@ public final class SnipCoordinator {
         captureTask = nil
         overlay?.close()
         overlay = nil
+        scrollController?.cancel()
+        scrollController = nil
         let completion = self.completion
         self.completion = nil
         completion?(outcome)

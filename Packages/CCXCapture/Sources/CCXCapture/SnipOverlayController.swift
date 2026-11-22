@@ -17,6 +17,7 @@ final class SnipOverlayController {
     private let previousSelections: [CGDirectDisplayID: CGRect]
     private let onStyleUpdated: ((AnnotationStyle) -> Void)?
     private let onSelectionCommitted: ((CGDirectDisplayID, CGRect) -> Void)?
+    private let onRequestScrollCapture: ((ScrollCaptureRequest) -> Void)?
     private let onFinish: (SnipOutcome) -> Void
     private var panels: [SnipOverlayPanel] = []
     private var views: [SnipOverlayView] = []
@@ -29,6 +30,7 @@ final class SnipOverlayController {
         previousSelections: [CGDirectDisplayID: CGRect] = [:],
         onStyleUpdated: ((AnnotationStyle) -> Void)? = nil,
         onSelectionCommitted: ((CGDirectDisplayID, CGRect) -> Void)? = nil,
+        onRequestScrollCapture: ((ScrollCaptureRequest) -> Void)? = nil,
         onFinish: @escaping (SnipOutcome) -> Void
     ) {
         self.snapshots = snapshots
@@ -37,6 +39,7 @@ final class SnipOverlayController {
         self.previousSelections = previousSelections
         self.onStyleUpdated = onStyleUpdated
         self.onSelectionCommitted = onSelectionCommitted
+        self.onRequestScrollCapture = onRequestScrollCapture
         self.onFinish = onFinish
     }
 
@@ -156,6 +159,26 @@ final class SnipOverlayController {
             outcome = renderResult(for: rect).map(SnipOutcome.save) ?? .cancelled
         case let .quickSave(rect):
             outcome = renderResult(for: rect).map(SnipOutcome.quickSave) ?? .cancelled
+        case let .scroll(rect):
+            let initialResult = Self.makeResult(localRect: rect, snapshot: view.snapshot)
+            if initialResult != nil {
+                onSelectionCommitted?(view.snapshot.displayID, rect)
+            }
+            close()
+            if let initialResult, let onRequestScrollCapture {
+                let request = ScrollCaptureRequest(
+                    displayID: view.snapshot.displayID,
+                    displayFrame: view.snapshot.screenFrame,
+                    localRect: rect,
+                    screenRect: initialResult.screenRect,
+                    scale: initialResult.scale,
+                    initialImage: initialResult.image
+                )
+                onRequestScrollCapture(request)
+            } else {
+                onFinish(.cancelled)
+            }
+            return
         case let .ocr(rect):
             outcome = renderResult(for: rect).map(SnipOutcome.ocr) ?? .cancelled
         case let .copyColor(sample, format):

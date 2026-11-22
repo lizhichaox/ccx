@@ -470,4 +470,58 @@ struct SnipOverlayViewTests {
         }
         #expect(format == .rgb)
     }
+
+    @Test func scrollShortcutToolbarOptionResizeSquareAndSpaceMove() throws {
+        let view = SnipOverlayView(snapshot: try makeSnapshot(size: CGSize(width: 600, height: 400)), topInset: 0)
+        var actions: [OverlayAction] = []
+        view.onFinish = { actions.append($0) }
+
+        // Shift+Drag draws a square, and holding Space mid-drag translates its origin without resizing.
+        view.mouseDown(with: try makeMouseEvent(type: .leftMouseDown, at: CGPoint(x: 40, y: 40)))
+        let shiftDrag = try #require(NSEvent.mouseEvent(
+            with: .leftMouseDragged,
+            location: CGPoint(x: 160, y: 90),
+            modifierFlags: [.shift],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            eventNumber: 0,
+            clickCount: 0,
+            pressure: 1
+        ))
+        view.mouseDragged(with: shiftDrag)
+        #expect(view.machine.selectionRect == CGRect(x: 40, y: 40, width: 120, height: 120))
+
+        // Press Spacebar (keyCode 49), drag +20pt, then release Spacebar.
+        view.keyDown(with: try makeKeyEvent(characters: " ", modifiers: [], keyCode: 49))
+        view.mouseDragged(with: try makeMouseEvent(type: .leftMouseDragged, at: CGPoint(x: 180, y: 180)))
+        #expect(view.machine.selectionRect == CGRect(x: 60, y: 60, width: 120, height: 120))
+        let spaceUp = try #require(NSEvent.keyEvent(
+            with: .keyUp,
+            location: .zero,
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            characters: " ",
+            charactersIgnoringModifiers: " ",
+            isARepeat: false,
+            keyCode: 49
+        ))
+        view.keyUp(with: spaceUp)
+        view.mouseUp(with: try makeMouseEvent(type: .leftMouseUp, at: CGPoint(x: 180, y: 180)))
+        let settled = try #require(view.machine.selectionRect)
+        #expect(settled == CGRect(x: 60, y: 60, width: 120, height: 120))
+
+        // Option+Right expands width by 1pt; Shift+Option+Up expands height by 10pt.
+        view.keyDown(with: try makeKeyEvent(characters: "", modifiers: [.option], keyCode: 124))
+        view.keyDown(with: try makeKeyEvent(characters: "", modifiers: [.option, .shift], keyCode: 126))
+        let resized = try #require(view.machine.selectionRect)
+        #expect(resized == CGRect(x: 60, y: 50, width: 121, height: 130))
+
+        // "L" triggers .scroll, and toolbar .scroll button triggers .scroll.
+        view.keyDown(with: try makeKeyEvent(characters: "l", modifiers: [], keyCode: 37))
+        view.toolbar.onAction?(.scroll)
+        #expect(actions == [.scroll(resized), .scroll(resized)])
+    }
 }

@@ -9,6 +9,7 @@ enum OverlayAction: Equatable {
     case copy(CGRect)
     case save(CGRect)
     case quickSave(CGRect)
+    case scroll(CGRect)
     case ocr(CGRect)
     case copyColor(CCXColorSample, ColorFormat)
     case cancel
@@ -59,6 +60,8 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
     private var lastSampledPixel: (x: Int, y: Int)?
     private var currentSample: CCXColorSample?
     private var isShiftDown = false
+    private var isSpaceDown = false
+    private var lastSizeLabelText: String?
 
     private(set) var activeTool: AnnotationTool = .select
     private(set) var currentStyle = AnnotationStyle()
@@ -233,6 +236,8 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
         lastRefinedLocalRect = nil
         lastAXQueryPoint = nil
         lastSampledPixel = nil
+        isSpaceDown = false
+        lastSizeLabelText = nil
         machine.reset()
         refresh()
     }
@@ -474,7 +479,7 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
         case .none:
             break
         case .selectionMachine:
-            machine.mouseDragged(to: point)
+            machine.mouseDragged(to: point, constrainSquare: constrain, moveOrigin: isSpaceDown)
         case let .drawing(tool, origin):
             let clamped = clampToSelection(point)
             updateDraft(tool: tool, origin: origin, current: clamped, constrain: constrain)
@@ -525,6 +530,7 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
         }
 
         activeDrag = .none
+        isSpaceDown = false
         refresh()
     }
 
@@ -549,36 +555,38 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
 
     private func handleHover(at point: CGPoint) {
         lastMousePoint = point
-        if machine.isHovering {
-            let global = toGlobal(point)
-            let tier1Local = hoverRectProvider?(global).map {
-                $0.offsetBy(dx: -snapshot.screenFrame.minX, dy: -snapshot.screenFrame.minY)
-            }
-            let sameWindow = rectsNearlyEqual(tier1Local, lastTier1LocalRect)
-            lastTier1LocalRect = tier1Local
+        guard machine.isHovering else {
+            updateCursor()
+            return
+        }
+        let global = toGlobal(point)
+        let tier1Local = hoverRectProvider?(global).map {
+            $0.offsetBy(dx: -snapshot.screenFrame.minX, dy: -snapshot.screenFrame.minY)
+        }
+        let sameWindow = rectsNearlyEqual(tier1Local, lastTier1LocalRect)
+        lastTier1LocalRect = tier1Local
 
-            if !sameWindow {
-                lastRefinedLocalRect = nil
-                lastAXQueryPoint = nil
-                machine.updateHover(detectedRect: tier1Local ?? bounds)
-            } else if let refined = lastRefinedLocalRect {
-                if refined.contains(point) {
-                    machine.updateHover(detectedRect: refined)
-                } else if tier1Local != nil,
-                          refined.insetBy(dx: -Self.axGapBridgeMargin, dy: -Self.axGapBridgeMargin).contains(point) {
-                    machine.updateHover(detectedRect: refined)
-                } else {
-                    lastRefinedLocalRect = nil
-                    machine.updateHover(detectedRect: tier1Local ?? bounds)
-                }
+        if !sameWindow {
+            lastRefinedLocalRect = nil
+            lastAXQueryPoint = nil
+            machine.updateHover(detectedRect: tier1Local ?? bounds)
+        } else if let refined = lastRefinedLocalRect {
+            if refined.contains(point) {
+                machine.updateHover(detectedRect: refined)
+            } else if tier1Local != nil,
+                      refined.insetBy(dx: -Self.axGapBridgeMargin, dy: -Self.axGapBridgeMargin).contains(point) {
+                machine.updateHover(detectedRect: refined)
             } else {
+                lastRefinedLocalRect = nil
                 machine.updateHover(detectedRect: tier1Local ?? bounds)
             }
+        } else {
+            machine.updateHover(detectedRect: tier1Local ?? bounds)
+        }
 
-            if tier1Local != nil && shouldRequestAX(at: point) {
-                lastAXQueryPoint = point
-                elementRectRequester?(global)
-            }
+        if tier1Local != nil && shouldRequestAX(at: point) {
+            lastAXQueryPoint = point
+            elementRectRequester?(global)
         }
         refresh()
     }
@@ -890,9 +898,15 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
         }
 
         let step: CGFloat = flags.contains(.shift) ? 10 : 1
+        let resizeEdges = flags.contains(.option) && selectedRect != nil && annotations.selectedItem == nil
         switch event.keyCode {
         case 53: // Escape
             onFinish?(.cancel)
+            return
+        case 49: // Space (moves in-flight selection origin while dragging)
+            if case .dragging = machine.state {
+                isSpaceDown = true
+            }
             return
         case 36, 76: // Return, keypad Enter
             if let rect = selectedRect { finish(.pin(rect)) }
@@ -903,10 +917,18 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
                 refresh()
                 return
             }
-        case 123: nudgeSelectionOrAnnotation(dx: -step, dy: 0); return
-        case 124: nudgeSelectionOrAnnotation(dx: step, dy: 0); return
-        case 125: nudgeSelectionOrAnnotation(dx: 0, dy: -step); return
-        case 126: nudgeSelectionOrAnnotation(dx: 0, dy: step); return
+        case 123:
+            if resizeEdges { resizeSelection(dw: -step, dh: 0) } else { nudgeSelectionOrAnnotation(dx: -step, dy: 0) }
+            return
+        case 124:
+            if resizeEdges { resizeSelection(dw: step, dh: 0) } else { nudgeSelectionOrAnnotation(dx: step, dy: 0) }
+            return
+        case 125:
+            if resizeEdges { resizeSelection(dw: 0, dh: -step) } else { nudgeSelectionOrAnnotation(dx: 0, dy: -step) }
+            return
+        case 126:
+            if resizeEdges { resizeSelection(dw: 0, dh: step) } else { nudgeSelectionOrAnnotation(dx: 0, dy: step) }
+            return
         default: break
         }
 
@@ -926,6 +948,10 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
         }
 
         if flags.isEmpty, let rect = selectedRect {
+            if characters == "l" {
+                finish(.scroll(rect))
+                return
+            }
             if characters == "t" {
                 finish(.ocr(rect))
                 return
@@ -949,6 +975,14 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
         }
     }
 
+    override func keyUp(with event: NSEvent) {
+        if event.keyCode == 49 {
+            isSpaceDown = false
+            return
+        }
+        super.keyUp(with: event)
+    }
+
     override func flagsChanged(with event: NSEvent) {
         let shift = event.modifierFlags.contains(.shift)
         if shift && !isShiftDown && machine.isHovering {
@@ -965,6 +999,10 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
 
     private func nudge(dx: CGFloat, dy: CGFloat) {
         if machine.nudge(dx: dx, dy: dy) { refresh() }
+    }
+
+    private func resizeSelection(dw: CGFloat, dh: CGFloat) {
+        if machine.resizeBy(dw: dw, dh: dh) { refresh() }
     }
 
     private func nudgeSelectionOrAnnotation(dx: CGFloat, dy: CGFloat) {
@@ -1021,6 +1059,8 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
                 annotationView.invalidateActiveRegion()
                 refresh()
             }
+        case .scroll:
+            if let rect = selectedRect { finish(.scroll(rect)) }
         case .ocr:
             if let rect = selectedRect { finish(.ocr(rect)) }
         case .pin:
@@ -1114,18 +1154,22 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
 
     private func updateSizeLabel(for rect: CGRect?) {
         guard let rect, !machine.isHovering || rect != bounds else {
-            sizeLabel.isHidden = true
+            if !sizeLabel.isHidden { sizeLabel.isHidden = true }
             return
         }
-        sizeLabel.stringValue = " \(sizeText(for: rect)) "
-        sizeLabel.sizeToFit()
+        let formatted = " \(sizeText(for: rect)) "
+        if formatted != lastSizeLabelText {
+            lastSizeLabelText = formatted
+            sizeLabel.stringValue = formatted
+            sizeLabel.sizeToFit()
+        }
         var origin = CGPoint(x: rect.minX, y: rect.maxY + 4)
         if origin.y + sizeLabel.frame.height > bounds.maxY - topInset {
             origin.y = rect.maxY - sizeLabel.frame.height - 4
         }
         origin.x = min(max(origin.x, 0), bounds.maxX - sizeLabel.frame.width)
         sizeLabel.setFrameOrigin(origin)
-        sizeLabel.isHidden = false
+        if sizeLabel.isHidden { sizeLabel.isHidden = false }
     }
 
     private func updateMagnifier(highlight: CGRect?) {
@@ -1135,7 +1179,7 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
         case .selected, .moving: visibleState = false
         }
         guard visibleState, let point = lastMousePoint, bounds.contains(point) else {
-            magnifier.isHidden = true
+            if !magnifier.isHidden { magnifier.isHidden = true }
             currentSample = nil
             lastSampledPixel = nil
             return
@@ -1156,8 +1200,13 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
             format: colorFormat,
             sizeText: sizeText(for: highlight)
         )
-        magnifier.frame = PixelMagnifierView.frame(near: point, in: bounds, topInset: topInset)
-        magnifier.isHidden = false
+        let nextFrame = PixelMagnifierView.frame(near: point, in: bounds, topInset: topInset)
+        if magnifier.frame != nextFrame {
+            magnifier.frame = nextFrame
+        }
+        if magnifier.isHidden {
+            magnifier.isHidden = false
+        }
     }
 
     private func moveToolbar(toProposedTopLeft topLeft: CGPoint) {
