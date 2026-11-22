@@ -25,7 +25,8 @@ public final class SnipCoordinator {
         isSessionActive = true
         self.completion = completion
 
-        // Tier 1 window metadata is read before overlays appear so CPX's own panels never show up.
+        // Tier 1 window metadata and snapshots are read before overlays appear so all visible
+        // windows (including CPX's own guide, settings, and pins) are captured while overlays never show up.
         let detector = SmartElementDetector()
         detector.refreshWindowList()
 

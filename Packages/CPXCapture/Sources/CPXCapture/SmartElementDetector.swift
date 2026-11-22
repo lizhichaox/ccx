@@ -30,22 +30,35 @@ public struct DetectedWindow: Sendable, Equatable {
 ///   delivered back to the main actor; the caller keeps showing the Tier 1 rect until then.
 @MainActor
 public final class SmartElementDetector {
-    /// Window layers treated as user content (normal, floating, modal panel).
+    /// Window layers treated as user content (normal, floating, modal panel, utility, popup menu).
     public nonisolated static let allowedLayers: Set<Int> = [
         Int(CGWindowLevelForKey(.normalWindow)),
         Int(CGWindowLevelForKey(.floatingWindow)),
         Int(CGWindowLevelForKey(.modalPanelWindow)),
+        Int(CGWindowLevelForKey(.utilityWindow)),
+        Int(CGWindowLevelForKey(.popUpMenuWindow)),
     ]
 
     /// Front-to-back visible windows for the current session.
     public private(set) var windows: [DetectedWindow] = []
-    private let excludedPID: pid_t
+    private let excludedPID: pid_t?
+    private let excludedWindowIDs: Set<CGWindowID>
+    private let ownPID: pid_t = ProcessInfo.processInfo.processIdentifier
     private let axWorker: AXQueryWorker?
 
-    /// - Parameter enableAccessibility: when `true` and the process is AX-trusted, Tier 2 detection is enabled.
-    public init(excludingPID: pid_t = ProcessInfo.processInfo.processIdentifier, enableAccessibility: Bool = true) {
+    /// - Parameters:
+    ///   - excludingPID: optional process ID to exclude from Tier 1 detection (`nil` includes all visible windows, including CPX's).
+    ///   - excludingWindowIDs: specific window IDs to exclude from Tier 1 detection.
+    ///   - enableAccessibility: when `true` and the process is AX-trusted, Tier 2 detection is enabled.
+    public init(
+        excludingPID: pid_t? = nil,
+        excludingWindowIDs: Set<CGWindowID> = [],
+        enableAccessibility: Bool = true
+    ) {
         self.excludedPID = excludingPID
-        self.axWorker = enableAccessibility && AXIsProcessTrusted() ? AXQueryWorker(excludedPID: excludingPID) : nil
+        self.excludedWindowIDs = excludingWindowIDs
+        // Tier 2 AX always skips querying CPX's own PID because SnipOverlayPanel covers the screen while hovering.
+        self.axWorker = enableAccessibility && AXIsProcessTrusted() ? AXQueryWorker(excludedPID: ownPID) : nil
     }
 
     public var isAccessibilityEnabled: Bool { axWorker != nil }
@@ -57,7 +70,12 @@ public final class SmartElementDetector {
         let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
         let raw = (CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]]) ?? []
         let primaryHeight = CoordinateConverter.primaryScreenHeight(screens: NSScreen.screens.map(\.frame))
-        windows = Self.parseWindowList(raw, excludingPID: excludedPID, primaryScreenHeight: primaryHeight)
+        windows = Self.parseWindowList(
+            raw,
+            excludingPID: excludedPID,
+            excludingWindowIDs: excludedWindowIDs,
+            primaryScreenHeight: primaryHeight
+        )
     }
 
     /// The front-most window containing `globalPoint` (AppKit global coordinates).
@@ -68,7 +86,8 @@ public final class SmartElementDetector {
     /// Converts raw `CGWindowListCopyWindowInfo` dictionaries into filtered, Z-ordered windows.
     public nonisolated static func parseWindowList(
         _ list: [[String: Any]],
-        excludingPID: pid_t,
+        excludingPID: pid_t? = nil,
+        excludingWindowIDs: Set<CGWindowID> = [],
         primaryScreenHeight: CGFloat,
         minimumSize: CGFloat = 8
     ) -> [DetectedWindow] {
@@ -80,7 +99,9 @@ public final class SmartElementDetector {
                 let boundsDict = info[kCGWindowBounds as String] as? NSDictionary,
                 let quartzBounds = CGRect(dictionaryRepresentation: boundsDict as CFDictionary)
             else { return nil }
-            guard pid != excludingPID, allowedLayers.contains(layer) else { return nil }
+            let windowID = CGWindowID(number)
+            if let excludingPID, pid == excludingPID { return nil }
+            guard !excludingWindowIDs.contains(windowID), allowedLayers.contains(layer) else { return nil }
             if let alpha = (info[kCGWindowAlpha as String] as? NSNumber)?.doubleValue, alpha <= 0.01 { return nil }
             guard quartzBounds.width >= minimumSize, quartzBounds.height >= minimumSize else { return nil }
             let frame = CoordinateConverter.quartzToAppKit(quartzBounds, primaryScreenHeight: primaryScreenHeight)
@@ -111,7 +132,8 @@ public final class SmartElementDetector {
         completion: @escaping @MainActor @Sendable (CGRect?, CGPoint) -> Void
     ) {
         guard let axWorker else { return }
-        guard let targetWindow = Self.hitTest(windows, at: globalPoint) else {
+        guard let targetWindow = Self.hitTest(windows, at: globalPoint),
+              targetWindow.ownerPID != ownPID else {
             axWorker.cancelPending()
             return
         }

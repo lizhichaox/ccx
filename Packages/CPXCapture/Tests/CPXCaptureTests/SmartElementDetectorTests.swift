@@ -40,6 +40,31 @@ struct SmartElementDetectorTests {
         #expect(windows.last?.ownerPID == 12)
     }
 
+    @Test func includesOwnProcessVisibleWindowsAndSupportsWindowIDExclusion() {
+        let ownPID: Int32 = 42
+        let utilityLayer = Int(CGWindowLevelForKey(.utilityWindow))
+        let popupLayer = Int(CGWindowLevelForKey(.popUpMenuWindow))
+        let list: [[String: Any]] = [
+            entry(id: 10, pid: ownPID, layer: 0, x: 20, y: 20, width: 620, height: 490),           // Guide window
+            entry(id: 11, pid: ownPID, layer: 3, x: 40, y: 40, width: 200, height: 150),           // Pin panel
+            entry(id: 12, pid: ownPID, layer: utilityLayer, x: 60, y: 60, width: 300, height: 200),
+            entry(id: 13, pid: ownPID, layer: popupLayer, x: 80, y: 80, width: 304, height: 320),  // MenuBar popover
+            entry(id: 14, pid: ownPID, layer: 20, x: 0, y: 900, width: 1512, height: 80),          // Dock
+            entry(id: 15, pid: ownPID, layer: 25, x: 0, y: 0, width: 1512, height: 37),            // Menubar
+        ]
+
+        let allVisible = SmartElementDetector.parseWindowList(list, excludingPID: nil, primaryScreenHeight: 982)
+        #expect(allVisible.map(\.windowID) == [10, 11, 12, 13])
+
+        let withoutExcluded = SmartElementDetector.parseWindowList(
+            list,
+            excludingPID: nil,
+            excludingWindowIDs: [13],
+            primaryScreenHeight: 982
+        )
+        #expect(withoutExcluded.map(\.windowID) == [10, 11, 12])
+    }
+
     @Test func convertsQuartzBoundsToAppKitGlobal() {
         let list = [entry(id: 1, pid: 5, layer: 0, x: 100, y: 50, width: 400, height: 300)]
         let windows = SmartElementDetector.parseWindowList(list, excludingPID: 1, primaryScreenHeight: 1000)

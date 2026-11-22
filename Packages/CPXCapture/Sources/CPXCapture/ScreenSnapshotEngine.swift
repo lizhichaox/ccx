@@ -34,11 +34,11 @@ public enum ScreenSnapshotEngine {
         return nsError.domain == SCStreamErrorDomain && nsError.code == SCStreamError.userDeclined.rawValue
     }
 
-    /// Captures every active display concurrently, excluding CPX's own windows.
+    /// Captures every active display concurrently, including all visible windows except `excludingWindowIDs`.
     @MainActor
-    public static func captureAllDisplays() async throws -> [DisplaySnapshot] {
+    public static func captureAllDisplays(excludingWindowIDs: Set<CGWindowID> = []) async throws -> [DisplaySnapshot] {
         let geometries = currentScreenGeometries()
-        return try await capture(geometries: geometries)
+        return try await capture(geometries: geometries, excludingWindowIDs: excludingWindowIDs)
     }
 
     /// Reads `NSScreen` geometry keyed by `CGDirectDisplayID`.
@@ -59,15 +59,19 @@ public enum ScreenSnapshotEngine {
         return result
     }
 
-    nonisolated static func capture(geometries: [CGDirectDisplayID: ScreenGeometry]) async throws -> [DisplaySnapshot] {
+    nonisolated static func capture(
+        geometries: [CGDirectDisplayID: ScreenGeometry],
+        excludingWindowIDs: Set<CGWindowID> = []
+    ) async throws -> [DisplaySnapshot] {
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-        let ownPID = ProcessInfo.processInfo.processIdentifier
-        let ownApps = content.applications.filter { $0.processID == ownPID }
+        let excludedWindows = excludingWindowIDs.isEmpty
+            ? []
+            : content.windows.filter { excludingWindowIDs.contains($0.windowID) }
 
         var jobs: [(UncheckedSendableBox<SCContentFilter>, ScreenGeometry)] = []
         for display in content.displays {
             guard let geometry = geometries[display.displayID] else { continue }
-            let filter = SCContentFilter(display: display, excludingApplications: ownApps, exceptingWindows: [])
+            let filter = SCContentFilter(display: display, excludingWindows: excludedWindows)
             jobs.append((UncheckedSendableBox(filter), geometry))
         }
         guard !jobs.isEmpty else { throw ScreenSnapshotError.noDisplays }
