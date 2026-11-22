@@ -1,12 +1,14 @@
 import AppKit
 import CPXCore
 import CPXPin
+import SwiftUI
 
-/// Commands issued from the status bar menu.
+/// Commands issued from the status bar popover.
 @MainActor
 protocol MenuBarControllerDelegate: AnyObject {
     func menuBarRequestedSnip()
     func menuBarRequestedPinFromClipboard()
+    func menuBarRequestedPinHistoryEntry(_ entry: SnipHistoryEntry)
     func menuBarRequestedToggleAllPins()
     func menuBarRequestedUnlockClickThrough()
     func menuBarRequestedCloseAllPins()
@@ -14,20 +16,55 @@ protocol MenuBarControllerDelegate: AnyObject {
     func menuBarRequestedSettings()
 }
 
-/// Owns the `NSStatusItem` and rebuilds its menu from live pin, hotkey, and
-/// permission state every time it opens.
+/// Non-activating borderless floating panel hosting the menu bar popover.
+private final class MenuBarPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { false }
+
+    init() {
+        super.init(
+            contentRect: NSRect(x: 0, y: 0, width: 304, height: 320),
+            styleMask: [.borderless, .nonactivatingPanel, .fullSizeContentView],
+            backing: .buffered,
+            defer: false
+        )
+        isFloatingPanel = true
+        hidesOnDeactivate = false
+        level = .popUpMenu
+        backgroundColor = .clear
+        isOpaque = false
+        hasShadow = true
+        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient, .ignoresCycle]
+    }
+}
+
+/// Owns the `NSStatusItem` and presents a Liquid Glass popover panel anchored
+/// directly beneath the menu bar icon.
 @MainActor
-final class MenuBarController: NSObject, NSMenuDelegate {
+final class MenuBarController: NSObject, NSWindowDelegate {
     weak var delegate: MenuBarControllerDelegate?
 
     private let statusItem: NSStatusItem
-    private let menu = NSMenu()
     private let pinManager: PinManager
     private let hotKeyManager: GlobalHotKeyManager
+    private let clipboardStore: ClipboardStore
+    private let model = MenuBarPanelModel()
 
-    init(pinManager: PinManager, hotKeyManager: GlobalHotKeyManager) {
+    private var panel: MenuBarPanel?
+    private var hostingView: NSHostingView<MenuBarPopoverView>?
+
+    nonisolated(unsafe) private var globalMouseMonitor: Any?
+    nonisolated(unsafe) private var localMouseMonitor: Any?
+    nonisolated(unsafe) private var localKeyMonitor: Any?
+
+    init(
+        pinManager: PinManager,
+        hotKeyManager: GlobalHotKeyManager,
+        clipboardStore: ClipboardStore
+    ) {
         self.pinManager = pinManager
         self.hotKeyManager = hotKeyManager
+        self.clipboardStore = clipboardStore
         self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         super.init()
 
@@ -37,207 +74,219 @@ final class MenuBarController: NSObject, NSMenuDelegate {
             image?.isTemplate = true
             button.image = image
             button.toolTip = "CPX"
+            button.target = self
+            button.action = #selector(togglePanel)
+            button.sendAction(on: [.leftMouseDown, .rightMouseDown])
         }
 
-        menu.autoenablesItems = false
-        menu.delegate = self
-        statusItem.menu = menu
-        rebuildMenu()
+        syncModel()
     }
 
-    /// Rebuilds the menu so state changes are reflected immediately.
+    deinit {
+        if let globalMouseMonitor { NSEvent.removeMonitor(globalMouseMonitor) }
+        if let localMouseMonitor { NSEvent.removeMonitor(localMouseMonitor) }
+        if let localKeyMonitor { NSEvent.removeMonitor(localKeyMonitor) }
+    }
+
+    /// Refreshes popover data and updates the panel geometry if visible.
     func refresh() {
-        rebuildMenu()
-    }
-
-    // MARK: - NSMenuDelegate
-
-    func menuNeedsUpdate(_ menu: NSMenu) {
-        rebuildMenu()
-    }
-
-    // MARK: - Menu construction
-
-    private func rebuildMenu() {
-        menu.removeAllItems()
-
-        menu.addItem(commandItem(.snip, symbol: "viewfinder", action: #selector(snip)))
-        menu.addItem(commandItem(.pastePin, symbol: "pin", action: #selector(pinFromClipboard)))
-
-        menu.addItem(.separator())
-
-        let pinCount = pinManager.pinCount
-        let countItem = NSMenuItem(
-            title: pinCount == 1 ? "1 Active Pin" : "\(pinCount) Active Pins",
-            action: nil,
-            keyEquivalent: ""
-        )
-        countItem.isEnabled = false
-        menu.addItem(countItem)
-
-        let toggleItem = commandItem(
-            .toggleAllPins,
-            title: pinManager.arePinsHidden ? "Show All Pins" : "Hide All Pins",
-            symbol: pinManager.arePinsHidden ? "eye" : "eye.slash",
-            action: #selector(toggleAllPins)
-        )
-        toggleItem.isEnabled = pinCount > 0
-        menu.addItem(toggleItem)
-
-        let unlockItem = commandItem(
-            .unlockClickThrough,
-            symbol: "cursorarrow.click",
-            action: #selector(unlockClickThrough)
-        )
-        unlockItem.isEnabled = pinManager.hasClickThroughPins
-        menu.addItem(unlockItem)
-
-        let closeAllItem = item("Close All Pins", symbol: "xmark.circle", action: #selector(closeAllPins))
-        closeAllItem.isEnabled = pinCount > 0
-        menu.addItem(closeAllItem)
-
-        menu.addItem(.separator())
-
-        menu.addItem(permissionsItem())
-        menu.addItem(item("Settings…", symbol: "gearshape", action: #selector(openSettings), keyEquivalent: ","))
-
-        menu.addItem(.separator())
-
-        let quitItem = NSMenuItem(title: "Quit CPX", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
-        quitItem.target = NSApp
-        menu.addItem(quitItem)
-    }
-
-    private func permissionsItem() -> NSMenuItem {
-        let status = PermissionManager.currentStatus()
-        let allGranted = status.screenRecording && status.accessibility
-
-        let parent = NSMenuItem(title: "Permissions…", action: nil, keyEquivalent: "")
-        parent.image = symbolImage(allGranted ? "checkmark.shield" : "exclamationmark.triangle.fill")
-
-        let submenu = NSMenu()
-        submenu.autoenablesItems = false
-        submenu.addItem(permissionRow(
-            "Screen Recording",
-            granted: status.screenRecording,
-            action: #selector(openScreenRecordingSettings)
-        ))
-        submenu.addItem(permissionRow(
-            "Accessibility",
-            granted: status.accessibility,
-            action: #selector(openAccessibilitySettings)
-        ))
-        submenu.addItem(.separator())
-        submenu.addItem(item("Welcome & Permissions Guide…", symbol: "questionmark.circle", action: #selector(openPermissionsGuide)))
-        parent.submenu = submenu
-        return parent
-    }
-
-    private func permissionRow(_ title: String, granted: Bool, action: Selector) -> NSMenuItem {
-        let row = NSMenuItem(
-            title: granted ? title : "\(title) — Not Granted",
-            action: action,
-            keyEquivalent: ""
-        )
-        row.target = self
-        row.state = granted ? .on : .off
-        if !granted {
-            row.image = symbolImage("exclamationmark.triangle.fill")
+        syncModel()
+        if let panel, panel.isVisible {
+            layoutAndPosition(panel: panel)
         }
-        row.toolTip = granted ? "Granted" : "Click to open System Settings"
-        return row
     }
 
-    private func commandItem(
-        _ action: CPXHotKeyAction,
-        title: String? = nil,
-        symbol: String,
-        action selector: Selector
-    ) -> NSMenuItem {
-        let title = title ?? action.cpxMenuTitle
-        let menuItem = item(title, symbol: symbol, action: selector)
-        if let combo = hotKeyManager.currentCombo(for: action) {
-            menuItem.attributedTitle = Self.titleWithShortcut(title, shortcut: combo.displayString)
-            menuItem.toolTip = "\(title) (\(combo.displayString))"
+    // MARK: - Panel lifecycle
+
+    @objc private func togglePanel() {
+        if let panel, panel.isVisible {
+            hidePanel()
+        } else {
+            showPanel()
         }
-        return menuItem
     }
 
-    private func item(
-        _ title: String,
-        symbol: String,
-        action: Selector,
-        keyEquivalent: String = ""
-    ) -> NSMenuItem {
-        let menuItem = NSMenuItem(title: title, action: action, keyEquivalent: keyEquivalent)
-        menuItem.target = self
-        menuItem.image = symbolImage(symbol)
-        return menuItem
+    private func showPanel() {
+        syncModel()
+        let panel = ensurePanel()
+        layoutAndPosition(panel: panel)
+        installEventMonitors()
+        panel.makeKeyAndOrderFront(nil)
+        panel.invalidateShadow()
+
+        Task { @MainActor [weak self] in
+            self?.statusItem.button?.highlight(true)
+        }
     }
 
-    private func symbolImage(_ name: String) -> NSImage? {
-        let image = NSImage(systemSymbolName: name, accessibilityDescription: nil)
-        image?.isTemplate = true
-        return image
+    func hidePanel() {
+        removeEventMonitors()
+        statusItem.button?.highlight(false)
+        panel?.orderOut(nil)
     }
 
-    /// Renders "Title<tab>Shortcut" with a right-aligned, secondary-colored
-    /// global hotkey label (these are Carbon hotkeys, not menu key equivalents).
-    private static func titleWithShortcut(_ title: String, shortcut: String) -> NSAttributedString {
-        let paragraph = NSMutableParagraphStyle()
-        paragraph.tabStops = [NSTextTab(textAlignment: .right, location: 260)]
+    private func ensurePanel() -> MenuBarPanel {
+        if let panel { return panel }
 
-        let font = NSFont.menuFont(ofSize: 0)
-        let result = NSMutableAttributedString(
-            string: title,
-            attributes: [.font: font, .paragraphStyle: paragraph]
+        let panel = MenuBarPanel()
+        panel.delegate = self
+
+        let rootView = MenuBarPopoverView(
+            model: model,
+            actions: MenuBarPopoverActions(
+                onSnip: { [weak self] in
+                    self?.hidePanel()
+                    self?.delegate?.menuBarRequestedSnip()
+                },
+                onPastePin: { [weak self] in
+                    self?.hidePanel()
+                    self?.delegate?.menuBarRequestedPinFromClipboard()
+                },
+                onPinHistory: { [weak self] entry in
+                    self?.hidePanel()
+                    self?.delegate?.menuBarRequestedPinHistoryEntry(entry)
+                },
+                onToggleAllPins: { [weak self] in
+                    self?.hidePanel()
+                    self?.delegate?.menuBarRequestedToggleAllPins()
+                },
+                onUnlockClickThrough: { [weak self] in
+                    self?.hidePanel()
+                    self?.delegate?.menuBarRequestedUnlockClickThrough()
+                },
+                onCloseAllPins: { [weak self] in
+                    self?.hidePanel()
+                    self?.delegate?.menuBarRequestedCloseAllPins()
+                },
+                onOpenPermissions: { [weak self] in
+                    self?.hidePanel()
+                    self?.delegate?.menuBarRequestedPermissionsGuide()
+                },
+                onOpenSettings: { [weak self] in
+                    self?.hidePanel()
+                    self?.delegate?.menuBarRequestedSettings()
+                },
+                onQuit: { [weak self] in
+                    self?.hidePanel()
+                    NSApp.terminate(nil)
+                }
+            )
         )
-        result.append(NSAttributedString(
-            string: "\t\(shortcut)",
-            attributes: [
-                .font: font,
-                .foregroundColor: NSColor.secondaryLabelColor,
-                .paragraphStyle: paragraph,
-            ]
-        ))
-        return result
+
+        let hostingView = NSHostingView(rootView: rootView)
+        hostingView.wantsLayer = true
+        hostingView.layer?.backgroundColor = NSColor.clear.cgColor
+
+        panel.contentView = hostingView
+        self.panel = panel
+        self.hostingView = hostingView
+        return panel
     }
 
-    // MARK: - Actions
+    private func layoutAndPosition(panel: MenuBarPanel) {
+        guard let hostingView,
+              let button = statusItem.button,
+              let buttonWindow = button.window
+        else { return }
 
-    @objc private func snip() {
-        delegate?.menuBarRequestedSnip()
+        hostingView.layoutSubtreeIfNeeded()
+        let size = hostingView.fittingSize
+        let buttonFrame = buttonWindow.frame
+
+        var originX = buttonFrame.midX - size.width / 2
+        let originY = buttonFrame.minY - 6 - size.height
+
+        if let visibleFrame = (buttonWindow.screen ?? NSScreen.main)?.visibleFrame {
+            let minX = visibleFrame.minX + 8
+            let maxX = visibleFrame.maxX - size.width - 8
+            originX = min(max(originX, minX), maxX)
+        }
+
+        panel.setFrame(NSRect(x: originX, y: originY, width: size.width, height: size.height), display: true)
     }
 
-    @objc private func pinFromClipboard() {
-        delegate?.menuBarRequestedPinFromClipboard()
+    private func syncModel() {
+        model.sync(
+            pinManager: pinManager,
+            hotKeyManager: hotKeyManager,
+            clipboardStore: clipboardStore
+        )
     }
 
-    @objc private func toggleAllPins() {
-        delegate?.menuBarRequestedToggleAllPins()
+    // MARK: - Event monitors & NSWindowDelegate
+
+    private func installEventMonitors() {
+        removeEventMonitors()
+
+        globalMouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self, let panel = self.panel, panel.isVisible else { return }
+                let mouse = NSEvent.mouseLocation
+                if let buttonFrame = self.statusItem.button?.window?.frame, buttonFrame.contains(mouse) {
+                    return
+                }
+                self.hidePanel()
+            }
+        }
+
+        localMouseMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] event in
+            let eventWindowNumber = event.windowNumber
+            MainActor.assumeIsolated {
+                guard let self, let panel = self.panel, panel.isVisible else { return }
+                if eventWindowNumber != panel.windowNumber,
+                   eventWindowNumber != self.statusItem.button?.window?.windowNumber {
+                    self.hidePanel()
+                }
+            }
+            return event
+        }
+
+        localKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            let keyCode = event.keyCode
+            let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            let chars = event.charactersIgnoringModifiers?.lowercased()
+            let consumed = MainActor.assumeIsolated {
+                guard let self, let panel = self.panel, panel.isVisible else { return false }
+
+                if keyCode == 53 {
+                    self.hidePanel()
+                    return true
+                }
+
+                if modifiers == .command, let chars {
+                    if chars == "," {
+                        self.hidePanel()
+                        self.delegate?.menuBarRequestedSettings()
+                        return true
+                    }
+                    if chars == "q" {
+                        self.hidePanel()
+                        NSApp.terminate(nil)
+                        return true
+                    }
+                }
+                return false
+            }
+            return consumed ? nil : event
+        }
     }
 
-    @objc private func unlockClickThrough() {
-        delegate?.menuBarRequestedUnlockClickThrough()
+    private func removeEventMonitors() {
+        if let globalMouseMonitor {
+            NSEvent.removeMonitor(globalMouseMonitor)
+            self.globalMouseMonitor = nil
+        }
+        if let localMouseMonitor {
+            NSEvent.removeMonitor(localMouseMonitor)
+            self.localMouseMonitor = nil
+        }
+        if let localKeyMonitor {
+            NSEvent.removeMonitor(localKeyMonitor)
+            self.localKeyMonitor = nil
+        }
     }
 
-    @objc private func closeAllPins() {
-        delegate?.menuBarRequestedCloseAllPins()
-    }
-
-    @objc private func openScreenRecordingSettings() {
-        PermissionManager.openScreenRecordingSettings()
-    }
-
-    @objc private func openAccessibilitySettings() {
-        PermissionManager.openAccessibilitySettings()
-    }
-
-    @objc private func openPermissionsGuide() {
-        delegate?.menuBarRequestedPermissionsGuide()
-    }
-
-    @objc private func openSettings() {
-        delegate?.menuBarRequestedSettings()
+    func windowDidResignKey(_ notification: Notification) {
+        hidePanel()
     }
 }

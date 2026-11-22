@@ -47,7 +47,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         HotKeyPreferences.registerAll(on: hotKeyManager)
 
-        let menuBarController = MenuBarController(pinManager: pinManager, hotKeyManager: hotKeyManager)
+        let menuBarController = MenuBarController(
+            pinManager: pinManager,
+            hotKeyManager: hotKeyManager,
+            clipboardStore: clipboardStore
+        )
         menuBarController.delegate = self
         self.menuBarController = menuBarController
 
@@ -246,11 +250,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 extension AppDelegate: MenuBarControllerDelegate {
     func menuBarRequestedSnip() {
-        startSnip()
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(120))
+            self?.startSnip()
+        }
     }
 
     func menuBarRequestedPinFromClipboard() {
         pinFromClipboard()
+    }
+
+    func menuBarRequestedPinHistoryEntry(_ entry: SnipHistoryEntry) {
+        pinManager.pin(content: .image(entry.image, scale: entry.scale), at: nil)
+        menuBarController?.refresh()
     }
 
     func menuBarRequestedToggleAllPins() {
