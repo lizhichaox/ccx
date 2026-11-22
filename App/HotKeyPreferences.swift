@@ -17,6 +17,7 @@ enum HotKeyPreferences {
         static let h: UInt32 = 4
         static let p: UInt32 = 35
         static let u: UInt32 = 32
+        static let f1: UInt32 = 122
         static let f2: UInt32 = 120
         static let f4: UInt32 = 118
     }
@@ -38,6 +39,7 @@ enum HotKeyPreferences {
         switch action {
         case .snip:
             alternatives = [
+                HotKeyCombo(keyCode: KeyCode.f1, carbonModifiers: 0),
                 HotKeyCombo(keyCode: KeyCode.f2, carbonModifiers: 0),
                 HotKeyCombo(keyCode: KeyCode.a, carbonModifiers: control | shift),
                 HotKeyCombo(keyCode: KeyCode.a, carbonModifiers: command | shift | option),

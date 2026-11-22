@@ -56,8 +56,11 @@ public struct HotKeyCombo: Equatable, Hashable, Sendable, Codable {
         self.init(keyCode: keyCode, carbonModifiers: Self.carbonModifiers(from: modifierFlags))
     }
 
-    /// `F1`
-    public static let defaultSnip = HotKeyCombo(keyCode: UInt32(kVK_F1), carbonModifiers: 0)
+    /// `Control+Command+X` (`⌃⌘X`)
+    public static let defaultSnip = HotKeyCombo(
+        keyCode: UInt32(kVK_ANSI_X),
+        carbonModifiers: UInt32(controlKey | cmdKey)
+    )
     /// `F3`
     public static let defaultPastePin = HotKeyCombo(keyCode: UInt32(kVK_F3), carbonModifiers: 0)
     /// `Shift+F3`

@@ -210,7 +210,8 @@ final class ColorSampleTests: XCTestCase {
 
 final class HotKeyComboTests: XCTestCase {
     func testDefaults() {
-        XCTAssertEqual(HotKeyCombo.defaultSnip, HotKeyCombo(keyCode: 122, carbonModifiers: 0))
+        XCTAssertEqual(HotKeyCombo.defaultSnip,
+                       HotKeyCombo(keyCode: UInt32(kVK_ANSI_X), carbonModifiers: UInt32(controlKey | cmdKey)))
         XCTAssertEqual(HotKeyCombo.defaultPastePin, HotKeyCombo(keyCode: 99, carbonModifiers: 0))
         XCTAssertEqual(HotKeyCombo.defaultToggleAllPins, HotKeyCombo(keyCode: 99, carbonModifiers: UInt32(shiftKey)))
         XCTAssertEqual(HotKeyCombo.defaultUnlockClickThrough,
@@ -220,7 +221,7 @@ final class HotKeyComboTests: XCTestCase {
     }
 
     func testDisplayString() {
-        XCTAssertEqual(HotKeyCombo.defaultSnip.displayString, "F1")
+        XCTAssertEqual(HotKeyCombo.defaultSnip.displayString, "⌃⌘X")
         XCTAssertEqual(HotKeyCombo.defaultPastePin.displayString, "F3")
         XCTAssertEqual(HotKeyCombo.defaultToggleAllPins.displayString, "⇧F3")
         XCTAssertEqual(HotKeyCombo.defaultUnlockClickThrough.displayString, "⌥⇧F3")
