@@ -77,7 +77,7 @@ final class OnboardingWindowController: NSObject, NSWindowDelegate {
         window.styleMask = [.titled, .closable, .fullSizeContentView]
         window.isReleasedWhenClosed = false
         window.delegate = self
-        window.setContentSize(NSSize(width: 620, height: 490))
+        window.setContentSize(NSSize(width: 580, height: 420))
         window.center()
         return window
     }
@@ -146,9 +146,9 @@ private struct OnboardingView: View {
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .padding(.horizontal, 32)
-                .padding(.top, 26)
-                .padding(.bottom, 18)
+                .padding(.horizontal, 28)
+                .padding(.top, 20)
+                .padding(.bottom, 14)
 
                 Divider()
 
@@ -158,11 +158,11 @@ private struct OnboardingView: View {
                     onDone: onDone,
                     onTrySnip: onTrySnip
                 )
-                .padding(.horizontal, 28)
-                .frame(height: 60)
+                .padding(.horizontal, 24)
+                .frame(height: 54)
             }
         }
-        .frame(width: 620, height: 490)
+        .frame(width: 580, height: 420)
         .animation(.spring(duration: 0.25), value: flow.step)
     }
 }
@@ -171,30 +171,30 @@ private struct OnboardingView: View {
 
 private struct WelcomeStepView: View {
     var body: some View {
-        VStack(spacing: 20) {
-            Spacer(minLength: 4)
+        VStack(spacing: 18) {
+            Spacer(minLength: 0)
 
-            VStack(spacing: 14) {
+            VStack(spacing: 8) {
                 Image(nsImage: NSApp.applicationIconImage)
                     .resizable()
                     .interpolation(.high)
                     .aspectRatio(contentMode: .fit)
-                    .frame(width: 88, height: 88)
+                    .frame(width: 78, height: 78)
 
-                VStack(spacing: 6) {
+                VStack(spacing: 4) {
                     Text("Welcome to CPX")
-                        .font(.system(size: 26, weight: .bold))
+                        .font(.system(size: 24, weight: .bold))
                         .fixedSize(horizontal: false, vertical: true)
 
                     Text("Capture, pin, and record your screen at native macOS speed.")
-                        .font(.body)
+                        .font(.callout)
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
 
-            HStack(alignment: .top, spacing: 12) {
+            HStack(alignment: .top, spacing: 10) {
                 FeatureBentoCard(
                     symbol: "viewfinder",
                     tint: .blue,
@@ -214,8 +214,9 @@ private struct WelcomeStepView: View {
                     detail: "ScreenCaptureKit + Retina native speed, zero telemetry."
                 )
             }
+            .fixedSize(horizontal: false, vertical: true)
 
-            Spacer(minLength: 4)
+            Spacer(minLength: 0)
         }
     }
 }
@@ -227,26 +228,28 @@ private struct FeatureBentoCard: View {
     let detail: String
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .center, spacing: 6) {
             Image(systemName: symbol)
-                .font(.system(size: 18, weight: .semibold))
+                .font(.system(size: 16, weight: .semibold))
                 .foregroundStyle(tint)
-                .frame(width: 32, height: 32)
+                .frame(width: 30, height: 30)
                 .background(tint.opacity(0.14), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
 
             Text(title)
-                .font(.headline)
+                .font(.system(size: 13.5, weight: .semibold))
+                .multilineTextAlignment(.center)
                 .fixedSize(horizontal: false, vertical: true)
 
             Text(detail)
                 .font(.caption)
                 .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .lineSpacing(1.5)
                 .fixedSize(horizontal: false, vertical: true)
-
-            Spacer(minLength: 0)
         }
-        .padding(14)
-        .frame(maxWidth: .infinity, minHeight: 132, alignment: .topLeading)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 14)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
         .cpxCardSurface(cornerRadius: 14)
     }
 }
@@ -258,19 +261,23 @@ private struct PermissionsStepView: View {
     @ObservedObject var flow: OnboardingFlowState
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            VStack(alignment: .leading, spacing: 4) {
+        VStack(spacing: 14) {
+            Spacer(minLength: 0)
+
+            VStack(alignment: .center, spacing: 4) {
                 Text("Grant macOS Permissions")
-                    .font(.system(size: 22, weight: .bold))
+                    .font(.system(size: 20, weight: .bold))
+                    .multilineTextAlignment(.center)
                     .fixedSize(horizontal: false, vertical: true)
 
                 Text("Everything runs locally on your Mac. Nothing leaves your device.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
                     .fixedSize(horizontal: false, vertical: true)
             }
 
-            VStack(spacing: 12) {
+            VStack(spacing: 10) {
                 PermissionSetupCard(
                     symbol: "rectangle.dashed.badge.record",
                     tint: .blue,
@@ -314,7 +321,7 @@ private struct PermissionsStepView: View {
 
             Spacer(minLength: 0)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(maxWidth: .infinity)
     }
 }
 
@@ -331,18 +338,18 @@ private struct PermissionSetupCard<Footer: View>: View {
     @ViewBuilder let extraFooter: () -> Footer
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(alignment: .center, spacing: 14) {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .center, spacing: 12) {
                 Image(systemName: symbol)
-                    .font(.system(size: 20, weight: .semibold))
+                    .font(.system(size: 18, weight: .semibold))
                     .foregroundStyle(granted ? .green : tint)
-                    .frame(width: 40, height: 40)
+                    .frame(width: 36, height: 36)
                     .background(
                         (granted ? Color.green : tint).opacity(0.14),
-                        in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        in: RoundedRectangle(cornerRadius: 9, style: .continuous)
                     )
 
-                VStack(alignment: .leading, spacing: 4) {
+                VStack(alignment: .leading, spacing: 3) {
                     HStack(spacing: 8) {
                         Text(title)
                             .font(.headline)
@@ -385,7 +392,7 @@ private struct PermissionSetupCard<Footer: View>: View {
 
             extraFooter()
         }
-        .padding(16)
+        .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
         .cpxCardSurface(cornerRadius: 14)
     }
@@ -447,7 +454,7 @@ private struct ScreenRecordingHintStrip: View {
                 .fixedSize()
             }
         }
-        .padding(10)
+        .padding(9)
         .background(Color.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
 }
@@ -461,22 +468,25 @@ private struct ReadyStepView: View {
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            HStack(spacing: 12) {
-                Image(systemName: "checkmark.seal.fill")
-                    .font(.system(size: 32, weight: .semibold))
-                    .foregroundStyle(.green)
+        VStack(spacing: 14) {
+            Spacer(minLength: 0)
 
-                VStack(alignment: .leading, spacing: 3) {
+            VStack(alignment: .center, spacing: 4) {
+                HStack(spacing: 7) {
+                    Image(systemName: "checkmark.seal.fill")
+                        .font(.system(size: 22, weight: .semibold))
+                        .foregroundStyle(.green)
+
                     Text("You're All Set")
-                        .font(.system(size: 22, weight: .bold))
-                        .fixedSize(horizontal: false, vertical: true)
-
-                    Text("CPX stays quietly in your menu bar. Here are your core shortcuts:")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
+                        .font(.system(size: 20, weight: .bold))
                         .fixedSize(horizontal: false, vertical: true)
                 }
+
+                Text("CPX stays quietly in your menu bar. Here are your core shortcuts:")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
             VStack(spacing: 0) {
@@ -486,14 +496,14 @@ private struct ReadyStepView: View {
                     subtitle: "Capture windows, regions, or sample screen pixels",
                     combo: currentCombo(.snip)
                 )
-                Divider().padding(.leading, 44)
+                Divider().padding(.leading, 40)
                 ShortcutCheatRow(
                     symbol: "pin.fill",
                     title: "Paste as Pin",
                     subtitle: "Float your clipboard image, text, or HEX color on top",
                     combo: currentCombo(.pastePin)
                 )
-                Divider().padding(.leading, 44)
+                Divider().padding(.leading, 40)
                 ShortcutCheatRow(
                     symbol: "eye.slash",
                     title: "Hide / Show Pins",
@@ -501,8 +511,8 @@ private struct ReadyStepView: View {
                     combo: currentCombo(.toggleAllPins)
                 )
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 6)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 4)
             .cpxCardSurface(cornerRadius: 14)
 
             HStack {
@@ -519,13 +529,13 @@ private struct ReadyStepView: View {
                     .controlSize(.regular)
                     .fixedSize()
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 12)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
             .cpxCardSurface(cornerRadius: 12)
 
             Spacer(minLength: 0)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(maxWidth: .infinity)
         .onAppear {
             launchAtLogin = SMAppService.mainApp.status == .enabled
         }
@@ -573,7 +583,7 @@ private struct ShortcutCheatRow: View {
             KeycapComboView(combo: combo)
                 .fixedSize()
         }
-        .padding(.vertical, 10)
+        .padding(.vertical, 8)
     }
 }
 
@@ -625,24 +635,77 @@ private struct OnboardingFooterBar: View {
     let onTrySnip: () -> Void
 
     var body: some View {
-        HStack(spacing: 12) {
-            // Left: Back button
-            if flow.step != .welcome {
-                Button("Back") {
-                    if let previous = OnboardingStep(rawValue: flow.step.rawValue - 1) {
-                        flow.step = previous
+        ZStack {
+            HStack(spacing: 12) {
+                // Left: Back button
+                if flow.step != .welcome {
+                    Button("Back") {
+                        if let previous = OnboardingStep(rawValue: flow.step.rawValue - 1) {
+                            flow.step = previous
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .fixedSize()
+                }
+
+                Spacer()
+
+                // Right: Primary & secondary navigation CTAs
+                HStack(spacing: 10) {
+                    switch flow.step {
+                    case .welcome:
+                        Button("Get Started") {
+                            flow.step = .permissions
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .keyboardShortcut(.defaultAction)
+                        .fixedSize()
+
+                    case .permissions:
+                        if model.status.screenRecording {
+                            Button("Continue") {
+                                flow.step = .ready
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .keyboardShortcut(.defaultAction)
+                            .fixedSize()
+                        } else {
+                            Button("Skip for now") {
+                                flow.step = .ready
+                            }
+                            .buttonStyle(.plain)
+                            .foregroundStyle(.secondary)
+                            .fixedSize()
+
+                            if flow.requestedScreenRecording {
+                                Button("Relaunch CPX") {
+                                    AppRelauncher.relaunch()
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .fixedSize()
+                            } else {
+                                Button("Continue") {
+                                    flow.step = .ready
+                                }
+                                .buttonStyle(.bordered)
+                                .fixedSize()
+                            }
+                        }
+
+                    case .ready:
+                        Button("Done", action: onDone)
+                            .buttonStyle(.bordered)
+                            .fixedSize()
+
+                        Button("Try Snip Now", action: onTrySnip)
+                            .buttonStyle(.borderedProminent)
+                            .keyboardShortcut(.defaultAction)
+                            .fixedSize()
                     }
                 }
-                .buttonStyle(.bordered)
-                .fixedSize()
-            } else {
-                Spacer()
-                    .frame(width: 60)
             }
 
-            Spacer()
-
-            // Center: Step indicator pills
+            // Center: Mathematically centered step indicator pills
             HStack(spacing: 7) {
                 ForEach(OnboardingStep.allCases, id: \.self) { step in
                     Button {
@@ -654,62 +717,6 @@ private struct OnboardingFooterBar: View {
                     }
                     .buttonStyle(.plain)
                     .accessibilityLabel("Step \(step.rawValue + 1)")
-                }
-            }
-
-            Spacer()
-
-            // Right: Primary & secondary navigation CTAs
-            HStack(spacing: 10) {
-                switch flow.step {
-                case .welcome:
-                    Button("Get Started") {
-                        flow.step = .permissions
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .keyboardShortcut(.defaultAction)
-                    .fixedSize()
-
-                case .permissions:
-                    if model.status.screenRecording {
-                        Button("Continue") {
-                            flow.step = .ready
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .keyboardShortcut(.defaultAction)
-                        .fixedSize()
-                    } else {
-                        Button("Skip for now") {
-                            flow.step = .ready
-                        }
-                        .buttonStyle(.plain)
-                        .foregroundStyle(.secondary)
-                        .fixedSize()
-
-                        if flow.requestedScreenRecording {
-                            Button("Relaunch CPX") {
-                                AppRelauncher.relaunch()
-                            }
-                            .buttonStyle(.borderedProminent)
-                            .fixedSize()
-                        } else {
-                            Button("Continue") {
-                                flow.step = .ready
-                            }
-                            .buttonStyle(.bordered)
-                            .fixedSize()
-                        }
-                    }
-
-                case .ready:
-                    Button("Done", action: onDone)
-                        .buttonStyle(.bordered)
-                        .fixedSize()
-
-                    Button("Try Snip Now", action: onTrySnip)
-                        .buttonStyle(.borderedProminent)
-                        .keyboardShortcut(.defaultAction)
-                        .fixedSize()
                 }
             }
         }
