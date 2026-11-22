@@ -258,7 +258,9 @@ final class MenuBarController: NSObject, NSWindowDelegate {
 
         localKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             let keyCode = event.keyCode
-            let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            let modifiers = event.modifierFlags
+                .intersection(.deviceIndependentFlagsMask)
+                .subtracting([.capsLock, .numericPad, .function])
             let chars = event.charactersIgnoringModifiers?.lowercased()
             let consumed = MainActor.assumeIsolated {
                 guard let self, let panel = self.panel, panel.isVisible else { return false }
@@ -269,6 +271,10 @@ final class MenuBarController: NSObject, NSWindowDelegate {
                 }
 
                 if modifiers == .command, let chars {
+                    if chars == "w" {
+                        self.hidePanel()
+                        return true
+                    }
                     if chars == "," {
                         self.hidePanel()
                         self.delegate?.menuBarRequestedSettings()

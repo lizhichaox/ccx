@@ -367,6 +367,9 @@ final class SnipOverlayView: NSView {
                 return true
             }
             return false
+        case "w":
+            onFinish?(.cancel)
+            return true
         default:
             return false
         }

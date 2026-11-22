@@ -228,4 +228,18 @@ struct SnipOverlayViewTests {
         view.mouseUp(with: try makeMouseEvent(type: .leftMouseUp, at: gapPoint))
         #expect(view.machine.selectionRect == windowRect)
     }
+
+    @Test func performKeyEquivalentHandlesCmdWCancelInHoverAndSelectedStates() throws {
+        let view = SnipOverlayView(snapshot: try makeSnapshot(), topInset: 0)
+        var actions: [OverlayAction] = []
+        view.onFinish = { actions.append($0) }
+
+        let cmdW = try makeKeyEvent(characters: "w", modifiers: [.command], keyCode: 13)
+        #expect(view.performKeyEquivalent(with: cmdW) == true)
+        #expect(actions == [.cancel])
+
+        try selectRect(CGRect(x: 20, y: 10, width: 80, height: 40), on: view)
+        #expect(view.performKeyEquivalent(with: cmdW) == true)
+        #expect(actions == [.cancel, .cancel])
+    }
 }

@@ -69,7 +69,7 @@ final class OnboardingWindowController: NSObject, NSWindowDelegate {
                 self?.onOpenSettings()
             }
         )
-        let window = NSWindow(contentViewController: NSHostingController(rootView: view))
+        let window = DismissibleWindow(contentViewController: NSHostingController(rootView: view))
         window.title = "CPX"
         window.titleVisibility = .hidden
         window.titlebarAppearsTransparent = true

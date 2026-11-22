@@ -34,7 +34,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             currentCombo: currentCombo,
             updateCombo: updateCombo
         )
-        let window = NSWindow(contentViewController: NSHostingController(rootView: view))
+        let window = DismissibleWindow(contentViewController: NSHostingController(rootView: view))
         window.title = "CPX Settings"
         window.styleMask = [.titled, .closable, .miniaturizable]
         window.isReleasedWhenClosed = false
