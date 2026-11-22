@@ -1,0 +1,8 @@
+// Shared build settings for the CCX app target.
+//
+// Personal signing values (for example DEVELOPMENT_TEAM) belong in the
+// untracked Config/LocalSigning.xcconfig. Copy
+// Config/LocalSigning.xcconfig.example to get started. The include below is
+// optional, so builds work without the local file.
+
+#include? "LocalSigning.xcconfig"

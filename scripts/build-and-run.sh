@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Generates CPX.xcodeproj, builds CPX.app with a stable signing identity,
-# replaces /Applications/CPX.app, and launches it through LaunchServices so
+# Generates CCX.xcodeproj, builds CCX.app with a stable signing identity,
+# replaces /Applications/CCX.app, and launches it through LaunchServices so
 # TCC grants are tracked cleanly by bundle ID.
 #
 # Usage: scripts/build-and-run.sh [--build-only] [--no-install] [--release]
@@ -44,9 +44,9 @@ cd "$ROOT_DIR"
 
 export DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"
 DERIVED_DATA_PATH=".build/xcode"
-APP_PATH="$DERIVED_DATA_PATH/Build/Products/$CONFIGURATION/CPX.app"
-INSTALL_DIR="${CPX_INSTALL_DIR:-/Applications}"
-INSTALLED_APP="$INSTALL_DIR/CPX.app"
+APP_PATH="$DERIVED_DATA_PATH/Build/Products/$CONFIGURATION/CCX.app"
+INSTALL_DIR="${CCX_INSTALL_DIR:-/Applications}"
+INSTALLED_APP="$INSTALL_DIR/CCX.app"
 LOCAL_SIGNING_XCCONFIG="Config/LocalSigning.xcconfig"
 LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Versions/Current/Frameworks/LaunchServices.framework/Versions/Current/Support/lsregister"
 ARCH="$(uname -m)"
@@ -56,7 +56,7 @@ if ! command -v xcodegen >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "==> Generating CPX.xcodeproj"
+echo "==> Generating CCX.xcodeproj"
 xcodegen generate --spec project.yml --quiet
 
 # Resolve signing settings.
@@ -82,10 +82,10 @@ else
   fi
 fi
 
-echo "==> Building CPX ($CONFIGURATION, $ARCH)"
+echo "==> Building CCX ($CONFIGURATION, $ARCH)"
 xcodebuild \
-  -project CPX.xcodeproj \
-  -scheme CPX \
+  -project CCX.xcodeproj \
+  -scheme CCX \
   -configuration "$CONFIGURATION" \
   -destination "platform=macOS,arch=$ARCH" \
   -derivedDataPath "$DERIVED_DATA_PATH" \
@@ -103,11 +103,11 @@ if [[ "$BUILD_ONLY" -eq 1 ]]; then
 fi
 
 # Quit any running instance before replacing or launching the app bundle.
-if pgrep -x CPX >/dev/null 2>&1; then
-  echo "==> Quitting running CPX"
-  osascript -e 'tell application id "com.lizhichaox.cpx" to quit' >/dev/null 2>&1 || pkill -x CPX || true
+if pgrep -x CCX >/dev/null 2>&1; then
+  echo "==> Quitting running CCX"
+  osascript -e 'tell application id "com.lizhichaox.ccx" to quit' >/dev/null 2>&1 || pkill -x CCX || true
   for _ in 1 2 3 4 5 6 7 8 9 10; do
-    pgrep -x CPX >/dev/null 2>&1 || break
+    pgrep -x CCX >/dev/null 2>&1 || break
     sleep 0.3
   done
 fi
@@ -115,7 +115,7 @@ fi
 LAUNCH_APP="$APP_PATH"
 if [[ "$INSTALL_APP" -eq 1 ]]; then
   mkdir -p "$INSTALL_DIR"
-  STAGING_APP="$INSTALL_DIR/.CPX.app.staging.$$"
+  STAGING_APP="$INSTALL_DIR/.CCX.app.staging.$$"
   trap 'rm -rf "$STAGING_APP"' EXIT
   rm -rf "$STAGING_APP"
   echo "==> Installing to $INSTALLED_APP"

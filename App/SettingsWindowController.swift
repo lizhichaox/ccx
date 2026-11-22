@@ -1,22 +1,15 @@
 import AppKit
-import CPXCore
+import CCXCore
 import ServiceManagement
 import SwiftUI
 
 /// Hosts the compact, single-screen Settings window: shortcut, launch at login, and permissions.
 @MainActor
 final class SettingsWindowController: NSObject, NSWindowDelegate {
-    typealias ComboProvider = (CPXHotKeyAction) -> HotKeyCombo
-    typealias ComboUpdater = (CPXHotKeyAction, HotKeyCombo) -> Bool
-
     private let permissions = PermissionStatusModel()
-    private let currentCombo: ComboProvider
-    private let updateCombo: ComboUpdater
     private var window: NSWindow?
 
-    init(currentCombo: @escaping ComboProvider, updateCombo: @escaping ComboUpdater) {
-        self.currentCombo = currentCombo
-        self.updateCombo = updateCombo
+    override init() {
         super.init()
     }
 
@@ -30,14 +23,10 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     }
 
     private func makeWindow() -> NSWindow {
-        let view = SettingsView(
-            permissions: permissions,
-            currentCombo: currentCombo,
-            updateCombo: updateCombo
-        )
+        let view = SettingsView(permissions: permissions)
         let hosting = NSHostingController(rootView: view)
         let window = DismissibleWindow(contentViewController: hosting)
-        window.title = "CPX Settings"
+        window.title = "CCX Settings"
         window.titleVisibility = .hidden
         window.titlebarAppearsTransparent = true
         window.isMovableByWindowBackground = true
@@ -57,8 +46,6 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
 
 private struct SettingsView: View {
     @ObservedObject var permissions: PermissionStatusModel
-    let currentCombo: SettingsWindowController.ComboProvider
-    let updateCombo: SettingsWindowController.ComboUpdater
 
     var body: some View {
         ZStack(alignment: .top) {
@@ -76,10 +63,7 @@ private struct SettingsView: View {
                 SettingsIdentityHeader()
 
                 SettingsSection("GENERAL") {
-                    SnipShortcutRow(
-                        initialCombo: currentCombo(.snip),
-                        updateCombo: updateCombo
-                    )
+                    SnipShortcutRow()
                     Divider().padding(.leading, 48)
                     LaunchAtLoginRow()
                 }
@@ -169,13 +153,13 @@ private struct SettingsIdentityHeader: View {
 
             VStack(alignment: .leading, spacing: 2) {
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
-                    Text("CPX")
+                    Text("CCX")
                         .font(.system(size: 17, weight: .bold))
                     Text("v\(AppVersion.shortDisplay)")
                         .font(.caption.weight(.medium))
                         .foregroundStyle(.secondary)
                 }
-                Text("Capture · Paste · X")
+                Text("Control · Command · X")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -206,7 +190,7 @@ private struct SettingsSection<Content: View>: View {
             VStack(spacing: 0) {
                 content()
             }
-            .cpxSettingsCard(cornerRadius: 12)
+            .ccxSettingsCard(cornerRadius: 12)
         }
     }
 }
@@ -215,7 +199,6 @@ private struct SettingsRow<Trailing: View>: View {
     let symbol: String
     let tint: Color
     let title: String
-    var errorMessage: String? = nil
     @ViewBuilder let trailing: () -> Trailing
 
     var body: some View {
@@ -226,15 +209,8 @@ private struct SettingsRow<Trailing: View>: View {
                 .frame(width: 26, height: 26)
                 .background(tint.opacity(0.14), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
 
-            VStack(alignment: .leading, spacing: 1) {
-                Text(title)
-                    .font(.system(size: 13, weight: .medium))
-                if let errorMessage {
-                    Text(errorMessage)
-                        .font(.caption2)
-                        .foregroundStyle(.red)
-                }
-            }
+            Text(title)
+                .font(.system(size: 13, weight: .medium))
 
             Spacer(minLength: 10)
 
@@ -248,49 +224,9 @@ private struct SettingsRow<Trailing: View>: View {
 // MARK: - Rows
 
 private struct SnipShortcutRow: View {
-    let updateCombo: SettingsWindowController.ComboUpdater
-    private let options: [HotKeyCombo]
-
-    @State private var selection: HotKeyCombo
-    @State private var committed: HotKeyCombo
-    @State private var failed = false
-
-    init(initialCombo: HotKeyCombo, updateCombo: @escaping SettingsWindowController.ComboUpdater) {
-        self.updateCombo = updateCombo
-        var options = HotKeyPreferences.presets(for: .snip)
-        if !options.contains(initialCombo) {
-            options.append(initialCombo)
-        }
-        self.options = options
-        _selection = State(initialValue: initialCombo)
-        _committed = State(initialValue: initialCombo)
-    }
-
     var body: some View {
-        SettingsRow(
-            symbol: "viewfinder",
-            tint: .blue,
-            title: "Snip Shortcut",
-            errorMessage: failed ? "That shortcut is unavailable." : nil
-        ) {
-            Picker("", selection: $selection) {
-                ForEach(options, id: \.self) { combo in
-                    Text(combo.displayString).tag(combo)
-                }
-            }
-            .labelsHidden()
-            .pickerStyle(.menu)
-            .fixedSize()
-            .onChange(of: selection) { _, newValue in
-                guard newValue != committed else { return }
-                if updateCombo(.snip, newValue) {
-                    committed = newValue
-                    failed = false
-                } else {
-                    failed = true
-                    selection = committed
-                }
-            }
+        SettingsRow(symbol: "viewfinder", tint: .blue, title: "Snip Shortcut") {
+            KeycapComboView(combo: .defaultSnip)
         }
     }
 }
@@ -353,7 +289,7 @@ private struct PermissionSettingRow: View {
 
 private extension View {
     @ViewBuilder
-    func cpxSettingsCard(cornerRadius: CGFloat = 12) -> some View {
+    func ccxSettingsCard(cornerRadius: CGFloat = 12) -> some View {
         if #available(macOS 26.0, *) {
             self
                 .glassEffect(.regular, in: .rect(cornerRadius: cornerRadius))

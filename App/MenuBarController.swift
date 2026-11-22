@@ -1,6 +1,6 @@
 import AppKit
-import CPXCore
-import CPXPin
+import CCXCore
+import CCXPin
 import SwiftUI
 
 /// Commands issued from the status bar popover.
@@ -46,7 +46,6 @@ final class MenuBarController: NSObject, NSWindowDelegate {
 
     private let statusItem: NSStatusItem
     private let pinManager: PinManager
-    private let hotKeyManager: GlobalHotKeyManager
     private let clipboardStore: ClipboardStore
     private let model = MenuBarPanelModel()
 
@@ -59,18 +58,16 @@ final class MenuBarController: NSObject, NSWindowDelegate {
 
     init(
         pinManager: PinManager,
-        hotKeyManager: GlobalHotKeyManager,
         clipboardStore: ClipboardStore
     ) {
         self.pinManager = pinManager
-        self.hotKeyManager = hotKeyManager
         self.clipboardStore = clipboardStore
         self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         super.init()
 
         if let button = statusItem.button {
-            let image = NSImage(systemSymbolName: "camera.viewfinder", accessibilityDescription: "CPX")
-                ?? NSImage(systemSymbolName: "viewfinder", accessibilityDescription: "CPX")
+            let image = NSImage(systemSymbolName: "camera.viewfinder", accessibilityDescription: "CCX")
+                ?? NSImage(systemSymbolName: "viewfinder", accessibilityDescription: "CCX")
             image?.isTemplate = true
             button.image = image
             button.target = self
@@ -216,15 +213,14 @@ final class MenuBarController: NSObject, NSWindowDelegate {
     private func syncModel() {
         model.sync(
             pinManager: pinManager,
-            hotKeyManager: hotKeyManager,
             clipboardStore: clipboardStore
         )
         if pinManager.hasClickThroughPins {
-            statusItem.button?.toolTip = "CPX — Click-through pin active (click to unlock)"
+            statusItem.button?.toolTip = "CCX — Click-through pin active (click to unlock)"
         } else if pinManager.arePinsHidden {
-            statusItem.button?.toolTip = "CPX — \(pinManager.pinCount) pin(s) hidden (click to show)"
+            statusItem.button?.toolTip = "CCX — \(pinManager.pinCount) pin(s) hidden (click to show)"
         } else {
-            statusItem.button?.toolTip = "CPX — Click to open, right-click to pin clipboard"
+            statusItem.button?.toolTip = "CCX — Click to open, right-click to pin clipboard"
         }
     }
 

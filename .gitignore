@@ -32,7 +32,7 @@ xcuserdata/
 *.pkg
 
 # XcodeGen output (regenerate with `xcodegen generate`)
-CPX.xcodeproj/
+CCX.xcodeproj/
 
 # Personal signing settings (public repository)
 Config/LocalSigning.xcconfig

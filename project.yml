@@ -1,7 +1,7 @@
-# XcodeGen manifest for the CPX macOS app (XcodeGen 2.48.0).
+# XcodeGen manifest for the CCX macOS app (XcodeGen 2.48.0).
 #
 # Generate the project with `xcodegen generate` (or `scripts/build-and-run.sh`).
-# The generated CPX.xcodeproj is not tracked.
+# The generated CCX.xcodeproj is not tracked.
 #
 # Signing: this is a public repository, so no personal Team ID lives here.
 # Provide DEVELOPMENT_TEAM either on the xcodebuild command line
@@ -10,7 +10,7 @@
 # (copy Config/LocalSigning.xcconfig.example). DEVELOPMENT_TEAM must NOT be set
 # in the target settings below, because target settings override xcconfig values.
 
-name: CPX
+name: CCX
 
 options:
   bundleIdPrefix: com.lizhichaox
@@ -20,14 +20,14 @@ options:
   developmentLanguage: en
 
 packages:
-  CPXCore:
-    path: Packages/CPXCore
-  CPXAnnotate:
-    path: Packages/CPXAnnotate
-  CPXCapture:
-    path: Packages/CPXCapture
-  CPXPin:
-    path: Packages/CPXPin
+  CCXCore:
+    path: Packages/CCXCore
+  CCXAnnotate:
+    path: Packages/CCXAnnotate
+  CCXCapture:
+    path: Packages/CCXCapture
+  CCXPin:
+    path: Packages/CCXPin
 
 settings:
   base:
@@ -35,24 +35,24 @@ settings:
     SWIFT_VERSION: "6.0"
 
 targets:
-  CPX:
+  CCX:
     type: application
     platform: macOS
     deploymentTarget: "15.0"
     configFiles:
-      Debug: Config/CPX.xcconfig
-      Release: Config/CPX.xcconfig
+      Debug: Config/CCX.xcconfig
+      Release: Config/CCX.xcconfig
     sources:
       - path: App
     dependencies:
-      - package: CPXCore
-      - package: CPXAnnotate
-      - package: CPXCapture
-      - package: CPXPin
+      - package: CCXCore
+      - package: CCXAnnotate
+      - package: CCXCapture
+      - package: CCXPin
     settings:
       base:
-        PRODUCT_NAME: CPX
-        PRODUCT_BUNDLE_IDENTIFIER: com.lizhichaox.cpx
+        PRODUCT_NAME: CCX
+        PRODUCT_BUNDLE_IDENTIFIER: com.lizhichaox.ccx
         MACOSX_DEPLOYMENT_TARGET: "15.0"
         SWIFT_VERSION: "6.0"
         SWIFT_STRICT_CONCURRENCY: complete
@@ -60,7 +60,7 @@ targets:
         CURRENT_PROJECT_VERSION: 1
         INFOPLIST_FILE: App/Info.plist
         GENERATE_INFOPLIST_FILE: NO
-        CODE_SIGN_ENTITLEMENTS: App/CPX.entitlements
+        CODE_SIGN_ENTITLEMENTS: App/CCX.entitlements
         CODE_SIGN_STYLE: Manual
         CODE_SIGN_IDENTITY: "Apple Development"
         PROVISIONING_PROFILE_SPECIFIER: ""

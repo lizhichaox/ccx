@@ -1,5 +1,5 @@
 import AppKit
-import CPXCore
+import CCXCore
 import ServiceManagement
 import SwiftUI
 
@@ -20,22 +20,16 @@ final class OnboardingFlowState: ObservableObject {
 final class OnboardingWindowController: NSObject, NSWindowDelegate {
     private let model = PermissionStatusModel()
     private let flow = OnboardingFlowState()
-    private let currentCombo: (CPXHotKeyAction) -> HotKeyCombo
     private let onComplete: () -> Void
     private let onTrySnip: () -> Void
-    private let onOpenSettings: () -> Void
     private var window: NSWindow?
 
     init(
-        currentCombo: @escaping (CPXHotKeyAction) -> HotKeyCombo,
         onComplete: @escaping () -> Void,
-        onTrySnip: @escaping () -> Void,
-        onOpenSettings: @escaping () -> Void
+        onTrySnip: @escaping () -> Void
     ) {
-        self.currentCombo = currentCombo
         self.onComplete = onComplete
         self.onTrySnip = onTrySnip
-        self.onOpenSettings = onOpenSettings
         super.init()
     }
 
@@ -54,7 +48,6 @@ final class OnboardingWindowController: NSObject, NSWindowDelegate {
         let view = OnboardingView(
             model: model,
             flow: flow,
-            currentCombo: currentCombo,
             onDone: { [weak self] in
                 self?.onComplete()
                 self?.window?.close()
@@ -64,13 +57,10 @@ final class OnboardingWindowController: NSObject, NSWindowDelegate {
                 self?.window?.orderOut(nil)
                 self?.model.stopPolling()
                 self?.onTrySnip()
-            },
-            onOpenSettings: { [weak self] in
-                self?.onOpenSettings()
             }
         )
         let window = DismissibleWindow(contentViewController: NSHostingController(rootView: view))
-        window.title = "CPX"
+        window.title = "CCX"
         window.titleVisibility = .hidden
         window.titlebarAppearsTransparent = true
         window.isMovableByWindowBackground = true
@@ -87,7 +77,7 @@ final class OnboardingWindowController: NSObject, NSWindowDelegate {
     }
 }
 
-/// Relaunches CPX so macOS applies a freshly granted Screen Recording permission.
+/// Relaunches CCX so macOS applies a freshly granted Screen Recording permission.
 @MainActor
 enum AppRelauncher {
     static func relaunch() {
@@ -110,10 +100,8 @@ enum AppRelauncher {
 private struct OnboardingView: View {
     @ObservedObject var model: PermissionStatusModel
     @ObservedObject var flow: OnboardingFlowState
-    let currentCombo: (CPXHotKeyAction) -> HotKeyCombo
     let onDone: () -> Void
     let onTrySnip: () -> Void
-    let onOpenSettings: () -> Void
 
     var body: some View {
         ZStack(alignment: .top) {
@@ -138,11 +126,8 @@ private struct OnboardingView: View {
                         PermissionsStepView(model: model, flow: flow)
                             .transition(.opacity)
                     case .ready:
-                        ReadyStepView(
-                            currentCombo: currentCombo,
-                            onOpenSettings: onOpenSettings
-                        )
-                        .transition(.opacity.combined(with: .move(edge: .trailing)))
+                        ReadyStepView()
+                            .transition(.opacity.combined(with: .move(edge: .trailing)))
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -182,7 +167,7 @@ private struct WelcomeStepView: View {
                     .frame(width: 78, height: 78)
 
                 VStack(spacing: 4) {
-                    Text("Welcome to CPX")
+                    Text("Welcome to CCX")
                         .font(.system(size: 24, weight: .bold))
                         .fixedSize(horizontal: false, vertical: true)
 
@@ -250,7 +235,7 @@ private struct FeatureBentoCard: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 14)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
-        .cpxCardSurface(cornerRadius: 14)
+        .ccxCardSurface(cornerRadius: 14)
     }
 }
 
@@ -394,7 +379,7 @@ private struct PermissionSetupCard<Footer: View>: View {
         }
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .cpxCardSurface(cornerRadius: 14)
+        .ccxCardSurface(cornerRadius: 14)
     }
 }
 
@@ -416,7 +401,7 @@ private struct ScreenRecordingHintStrip: View {
     var body: some View {
         HStack(spacing: 10) {
             HStack(spacing: 6) {
-                Text("CPX")
+                Text("CCX")
                     .font(.caption2.weight(.semibold))
                 ZStack(alignment: .trailing) {
                     Capsule()
@@ -433,7 +418,7 @@ private struct ScreenRecordingHintStrip: View {
             .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
             .fixedSize()
 
-            Text("Enable CPX under Screen & System Audio Recording (top list, not System Audio Only), then relaunch CPX.")
+            Text("Enable CCX under Screen & System Audio Recording (top list, not System Audio Only), then relaunch CCX.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -462,9 +447,6 @@ private struct ScreenRecordingHintStrip: View {
 // MARK: - Step 3: Ready
 
 private struct ReadyStepView: View {
-    let currentCombo: (CPXHotKeyAction) -> HotKeyCombo
-    let onOpenSettings: () -> Void
-
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
 
     var body: some View {
@@ -482,7 +464,7 @@ private struct ReadyStepView: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
 
-                Text("CPX stays quietly in your menu bar. Here's how to use it:")
+                Text("CCX stays quietly in your menu bar. Here's how to use it:")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
@@ -494,7 +476,7 @@ private struct ReadyStepView: View {
                     symbol: "viewfinder",
                     title: "Smart Snip",
                     subtitle: "Capture windows, regions, or sample screen pixels",
-                    trailing: { KeycapComboView(combo: currentCombo(.snip)) }
+                    trailing: { KeycapComboView(combo: .defaultSnip) }
                 )
                 Divider().padding(.leading, 40)
                 GuideActionRow(
@@ -513,25 +495,25 @@ private struct ReadyStepView: View {
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 4)
-            .cpxCardSurface(cornerRadius: 14)
+            .ccxCardSurface(cornerRadius: 14)
 
             HStack {
-                Toggle("Launch CPX at login", isOn: $launchAtLogin)
-                    .toggleStyle(.switch)
-                    .onChange(of: launchAtLogin) { _, enabled in
-                        applyLaunchAtLogin(enabled)
-                    }
+                Text("Launch CCX at login")
+                    .font(.system(size: 13, weight: .medium))
 
                 Spacer()
 
-                Button("Change Shortcut…", action: onOpenSettings)
-                    .buttonStyle(.bordered)
-                    .controlSize(.regular)
-                    .fixedSize()
+                Toggle("", isOn: $launchAtLogin)
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                    .onChange(of: launchAtLogin) { _, enabled in
+                        applyLaunchAtLogin(enabled)
+                    }
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
-            .cpxCardSurface(cornerRadius: 12)
+            .ccxCardSurface(cornerRadius: 12)
 
             Spacer(minLength: 0)
         }
@@ -607,7 +589,7 @@ private struct InteractionPillView: View {
     }
 }
 
-private struct KeycapComboView: View {
+struct KeycapComboView: View {
     let combo: HotKeyCombo
 
     private var tokens: [String] {
@@ -698,7 +680,7 @@ private struct OnboardingFooterBar: View {
                             .fixedSize()
 
                             if flow.requestedScreenRecording {
-                                Button("Relaunch CPX") {
+                                Button("Relaunch CCX") {
                                     AppRelauncher.relaunch()
                                 }
                                 .buttonStyle(.borderedProminent)
@@ -747,7 +729,7 @@ private struct OnboardingFooterBar: View {
 
 private extension View {
     @ViewBuilder
-    func cpxCardSurface(cornerRadius: CGFloat = 14) -> some View {
+    func ccxCardSurface(cornerRadius: CGFloat = 14) -> some View {
         if #available(macOS 26.0, *) {
             self
                 .glassEffect(.regular, in: .rect(cornerRadius: cornerRadius))

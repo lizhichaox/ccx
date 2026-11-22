@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
-"""Generate CPX's CHAOX-family app icons (SVG masters, macOS AppIcon set, and preview sheet).
+"""Generate CCX's CHAOX-family app icons (SVG masters, macOS AppIcon set, and preview sheet).
 
 Design rules aligned with `ipx/characters/chaox/marks.md`:
   - Three colors max (ground included):
       * Light: warm paper #F5F1E9, night ink #070809, REC crimson #D9383A
       * Dark:  night ink  #070809, warm paper #F5F1E9, REC crimson #FF5A5F
-  - Accent color falls on "CP" (Capture + Paste), while "X" stays in ink.
-  - Heavy italic glyphs match `ipx/src/chaox/redraw/italic.ts` (`GLYPH_P` and `GLYPH_X`,
-    cap height 76..124, STEM = 13.03, SLANT = 7.97) paired with a mathematically sheared
-    parametric heavy-italic "C" and subtle viewfinder corner brackets in faint ink.
+  - Accent color falls on "CC" (Control · Command), while "X" stays in ink.
+  - Heavy italic glyphs match `ipx/src/chaox/redraw/italic.ts` (`GLYPH_X`,
+    cap height 76..124, STEM = 13.03, SLANT = 7.97) paired with two mathematically
+    sheared parametric heavy-italic "C"s and subtle viewfinder corner brackets.
 
 Usage:
-  python3 scripts/generate-icons.py [--preview /tmp/cpx-icon-preview.png]
+  python3 scripts/generate-icons.py [--preview /tmp/ccx-icon-preview.png]
 """
 import argparse
 import json
 import math
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -31,18 +32,7 @@ CHROME_CANDIDATES = [
     "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
 ]
 
-# Verbatim P and X glyphs from ipx/src/chaox/redraw/italic.ts (200x200 space, y = 76..124).
-GLYPH_P = (
-    "M79.5332 124L87.502 76H108.221C111.783 76 114.783 76.7031 117.221 78.1094"
-    "C119.658 79.5156 121.408 81.4922 122.471 84.0391C123.533 86.5859 123.783 89.5625 123.221 92.9687"
-    "C122.658 96.4375 121.408 99.4297 119.471 101.945C117.549 104.445 115.096 106.375 112.111 107.734"
-    "C109.143 109.078 105.814 109.75 102.127 109.75H89.752L91.4395 99.625H101.189"
-    "C102.752 99.625 104.127 99.3594 105.314 98.8281C106.502 98.2812 107.463 97.5156 108.197 96.5312"
-    "C108.932 95.5312 109.408 94.3437 109.627 92.9687C109.846 91.5937 109.744 90.4219 109.322 89.4531"
-    "C108.916 88.4687 108.213 87.7187 107.213 87.2031C106.229 86.6719 104.971 86.4062 103.439 86.4062"
-    "H98.8457L92.5645 124H79.5332Z"
-)
-
+# Verbatim X glyph from ipx/src/chaox/redraw/italic.ts (200x200 space, y = 76..124).
 GLYPH_X = (
     "M144.221 76L149.752 89.9688H150.127L160.439 76H175.533L157.252 100L168.127 124H153.596"
     "L147.783 109.75H147.408L136.908 124H121.721L140.471 100L130.158 76H144.221Z"
@@ -167,15 +157,15 @@ def build_glyph_c(dx: float = 34.5) -> str:
     return "".join(commands)
 
 
-GLYPH_C = build_glyph_c(dx=34.5)
+GLYPH_C1 = build_glyph_c(dx=34.5)
+GLYPH_C2 = build_glyph_c(dx=78.0)
 
 # Horizontal adjustments relative to italic.ts source coordinates:
-#   C spans ~37.5 .. ~80.3
-#   P spans ~79.5 .. ~123.6  (+3.5 right breath from C -> 83.0 .. 127.1)
-#   X spans ~121.7 .. ~175.5 (+5.5 right to stay balanced after P -> 127.2 .. 181.0)
-P_DX = 3.5
-X_DX = 5.5
-WORD_LEFT = 37.4
+#   C1 spans ~38.35 .. ~80.24
+#   C2 spans ~81.85 .. ~123.74 (+4.2pt optical breath after C1)
+#   X  spans ~121.72 .. ~175.53 (+1.5 right so C2's open mouth pairs evenly with X)
+X_DX = 1.5
+WORD_LEFT = 38.35
 WORD_RIGHT = 175.533 + X_DX
 
 
@@ -205,8 +195,8 @@ def wordmark(ink: str, accent: str, small: bool) -> str:
     ty = 512.0 - 100.0 * scale
     return (
         f'<g transform="translate({tx:.2f} {ty:.2f}) scale({scale:.4f})">'
-        f'<path d="{GLYPH_C}" fill="{accent}"/>'
-        f'<path transform="translate({P_DX} 0)" d="{GLYPH_P}" fill="{accent}"/>'
+        f'<path d="{GLYPH_C1}" fill="{accent}"/>'
+        f'<path d="{GLYPH_C2}" fill="{accent}"/>'
         f'<path transform="translate({X_DX} 0)" d="{GLYPH_X}" fill="{ink}"/>'
         "</g>"
     )
@@ -260,7 +250,9 @@ def chrome_binary() -> str:
     sys.exit("generate-icons.py: Chrome/Chromium binary not found")
 
 
-def render_svg_to_png(chrome: str, work: str, svg: str, out_png: str, width: int, height: int) -> None:
+def render_svg_to_png(
+    chrome: str, work: str, profile_dir: str, svg: str, out_png: str, width: int, height: int
+) -> None:
     html_path = os.path.join(work, os.path.basename(out_png) + ".html")
     with open(html_path, "w", encoding="utf-8") as f:
         f.write(f'<!doctype html><html><body style="margin:0;overflow:hidden;background:transparent">{svg}</body></html>')
@@ -269,6 +261,9 @@ def render_svg_to_png(chrome: str, work: str, svg: str, out_png: str, width: int
             chrome,
             "--headless=new",
             "--disable-gpu",
+            f"--user-data-dir={profile_dir}",
+            "--no-first-run",
+            "--no-default-browser-check",
             "--hide-scrollbars",
             "--force-device-scale-factor=1",
             "--default-background-color=00000000",
@@ -282,12 +277,15 @@ def render_svg_to_png(chrome: str, work: str, svg: str, out_png: str, width: int
     )
 
 
-def render_html_to_png(chrome: str, html_path: str, out_png: str, width: int, height: int) -> None:
+def render_html_to_png(chrome: str, profile_dir: str, html_path: str, out_png: str, width: int, height: int) -> None:
     subprocess.run(
         [
             chrome,
             "--headless=new",
             "--disable-gpu",
+            f"--user-data-dir={profile_dir}",
+            "--no-first-run",
+            "--no-default-browser-check",
             "--hide-scrollbars",
             "--force-device-scale-factor=1",
             f"--window-size={width},{height}",
@@ -326,7 +324,7 @@ def write_contents_json() -> None:
         f.write("\n")
 
 
-def write_preview_sheet(chrome: str, work: str, out_png: str) -> None:
+def write_preview_sheet(chrome: str, work: str, profile_dir: str, out_png: str) -> None:
     html = f"""<!doctype html>
 <html>
 <head>
@@ -353,7 +351,7 @@ def write_preview_sheet(chrome: str, work: str, out_png: str) -> None:
 </style>
 </head>
 <body>
-  <h1>CPX — CHAOX App Icon Review</h1>
+  <h1>CCX — CHAOX App Icon Review</h1>
   <div class="grid">
     <div class="card">
       <div style="border-radius:46px;overflow:hidden;width:240px;height:240px;box-shadow:0 8px 24px rgba(0,0,0,0.12)">
@@ -382,7 +380,7 @@ def write_preview_sheet(chrome: str, work: str, out_png: str) -> None:
     html_path = os.path.join(work, "preview.html")
     with open(html_path, "w", encoding="utf-8") as f:
         f.write(html)
-    render_html_to_png(chrome, html_path, out_png, 920, 620)
+    render_html_to_png(chrome, profile_dir, html_path, out_png, 920, 620)
 
 
 def main() -> None:
@@ -400,6 +398,8 @@ def main() -> None:
 
     chrome = chrome_binary()
     with tempfile.TemporaryDirectory() as work:
+        profile_dir = os.path.join(work, "chrome-profile")
+        rendered: dict[tuple[str, int], str] = {}
         for points, scale in MAC_SIZES:
             px = points * scale
             suffix = "@2x" if scale == 2 else ""
@@ -407,10 +407,15 @@ def main() -> None:
                 dark_suffix = "-dark" if appearance == "dark" else ""
                 filename = f"icon_{points}x{points}{suffix}{dark_suffix}.png"
                 out_png = os.path.join(APPICON_DIR, filename)
-                render_svg_to_png(chrome, work, mac_plate_svg(appearance, px), out_png, px, px)
+                key = (appearance, px)
+                if key in rendered:
+                    shutil.copyfile(rendered[key], out_png)
+                else:
+                    render_svg_to_png(chrome, work, profile_dir, mac_plate_svg(appearance, px), out_png, px, px)
+                    rendered[key] = out_png
 
         if args.preview:
-            write_preview_sheet(chrome, work, args.preview)
+            write_preview_sheet(chrome, work, profile_dir, args.preview)
 
     write_contents_json()
     print(f"Generated Design/Icon SVG masters and 20 macOS icons in {os.path.relpath(APPICON_DIR, ROOT)}")

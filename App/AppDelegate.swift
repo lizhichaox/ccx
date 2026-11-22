@@ -1,14 +1,14 @@
 import AppKit
-import CPXCapture
-import CPXCore
-import CPXPin
+import CCXCapture
+import CCXCore
+import CCXPin
 import UniformTypeIdentifiers
 
 /// Owns the app-wide services and routes hotkeys, menu commands, and snip
 /// outcomes between the capture, pin, and clipboard modules.
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private static let hasCompletedOnboardingKey = "CPXHasCompletedOnboarding"
+    private static let hasCompletedOnboardingKey = "CCXHasCompletedOnboarding"
 
     private let clipboardStore: ClipboardStore
     private let pinManager: PinManager
@@ -52,11 +52,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hotKeyManager.onAction = { [weak self] action in
             self?.perform(action)
         }
-        HotKeyPreferences.registerAll(on: hotKeyManager)
+        hotKeyManager.registerDefaults()
 
         let menuBarController = MenuBarController(
             pinManager: pinManager,
-            hotKeyManager: hotKeyManager,
             clipboardStore: clipboardStore
         )
         menuBarController.delegate = self
@@ -80,7 +79,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Commands
 
-    private func perform(_ action: CPXHotKeyAction) {
+    private func perform(_ action: CCXHotKeyAction) {
         switch action {
         case .snip:
             startSnip()
@@ -176,12 +175,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Returns `CPX-yyyyMMdd-HHmmss.png` for the given date.
+    /// Returns `CCX-yyyyMMdd-HHmmss.png` for the given date.
     static func defaultPNGFileName(for date: Date) -> String {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.dateFormat = "yyyyMMdd-HHmmss"
-        return "CPX-\(formatter.string(from: date)).png"
+        return "CCX-\(formatter.string(from: date)).png"
     }
 
     // MARK: - Windows
@@ -189,9 +188,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func showOnboarding(startingAt step: OnboardingStep = .welcome) {
         if onboardingController == nil {
             onboardingController = OnboardingWindowController(
-                currentCombo: { [weak self] action in
-                    self?.hotKeyManager.currentCombo(for: action) ?? HotKeyPreferences.defaultCombo(for: action)
-                },
                 onComplete: {
                     UserDefaults.standard.set(true, forKey: Self.hasCompletedOnboardingKey)
                 },
@@ -201,9 +197,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         try? await Task.sleep(for: .milliseconds(220))
                         self?.startSnip()
                     }
-                },
-                onOpenSettings: { [weak self] in
-                    self?.showSettings()
                 }
             )
         }
@@ -212,39 +205,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func showSettings() {
         if settingsController == nil {
-            settingsController = SettingsWindowController(
-                currentCombo: { [weak self] action in
-                    self?.hotKeyManager.currentCombo(for: action) ?? HotKeyPreferences.defaultCombo(for: action)
-                },
-                updateCombo: { [weak self] action, combo in
-                    self?.updateHotKey(action, to: combo) ?? false
-                }
-            )
+            settingsController = SettingsWindowController()
         }
         settingsController?.show()
-    }
-
-    /// Re-registers `action` with `combo`, persisting it on success and
-    /// restoring the previous binding on failure.
-    private func updateHotKey(_ action: CPXHotKeyAction, to combo: HotKeyCombo) -> Bool {
-        let previous = hotKeyManager.currentCombo(for: action)
-        if previous == combo { return true }
-
-        let conflictsWithOtherAction = CPXHotKeyAction.allCases.contains { other in
-            other != action && hotKeyManager.currentCombo(for: other) == combo
-        }
-        guard !conflictsWithOtherAction else { return false }
-
-        hotKeyManager.unregister(action)
-        if hotKeyManager.register(action, combo: combo) {
-            HotKeyPreferences.save(combo, for: action)
-            menuBarController?.refresh()
-            return true
-        }
-        if let previous {
-            hotKeyManager.register(action, combo: previous)
-        }
-        return false
     }
 }
 

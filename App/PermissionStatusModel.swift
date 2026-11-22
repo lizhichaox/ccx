@@ -1,12 +1,12 @@
 import AppKit
-import CPXCore
+import CCXCore
 import Foundation
 
-/// Observable, periodically refreshed snapshot of CPX's TCC permissions,
+/// Observable, periodically refreshed snapshot of CCX's TCC permissions,
 /// shared by the onboarding and settings windows.
 @MainActor
 final class PermissionStatusModel: ObservableObject {
-    @Published private(set) var status: CPXPermissionStatus
+    @Published private(set) var status: CCXPermissionStatus
 
     nonisolated(unsafe) private var pollTask: Task<Void, Never>?
     nonisolated(unsafe) private var activeObserver: NSObjectProtocol?
@@ -30,7 +30,7 @@ final class PermissionStatusModel: ObservableObject {
     }
 
     /// Polls every 750ms and refreshes immediately whenever the user switches
-    /// back to CPX from System Settings.
+    /// back to CCX from System Settings.
     func startPolling() {
         pollTask?.cancel()
         pollTask = Task { [weak self] in

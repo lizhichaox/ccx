@@ -1,6 +1,6 @@
 import AppKit
 
-/// Standard CPX window that dismisses cleanly on `Esc` and `⌘W`, even when running
+/// Standard CCX window that dismisses cleanly on `Esc` and `⌘W`, even when running
 /// as an `.accessory` menu bar app without a main menu bar.
 @MainActor
 final class DismissibleWindow: NSWindow {

@@ -1,6 +1,6 @@
 import AppKit
-import CPXCore
-import CPXPin
+import CCXCore
+import CCXPin
 import SwiftUI
 
 /// Live state backing the menu bar Control-Center-style popover.
@@ -9,15 +9,14 @@ final class MenuBarPanelModel: ObservableObject {
     @Published private(set) var pinCount = 0
     @Published private(set) var arePinsHidden = false
     @Published private(set) var hasClickThroughPins = false
-    @Published private(set) var permissions: CPXPermissionStatus = PermissionManager.currentStatus()
+    @Published private(set) var permissions: CCXPermissionStatus = PermissionManager.currentStatus()
     @Published private(set) var recentSnips: [SnipHistoryEntry] = []
 
-    @Published private(set) var snipShortcut = HotKeyCombo.defaultSnip.displayString
+    let snipShortcut = HotKeyCombo.defaultSnip.displayString
     @Published private(set) var clipboardBadge = "Empty"
 
     func sync(
         pinManager: PinManager,
-        hotKeyManager: GlobalHotKeyManager,
         clipboardStore: ClipboardStore
     ) {
         pinCount = pinManager.pinCount
@@ -26,17 +25,12 @@ final class MenuBarPanelModel: ObservableObject {
         permissions = PermissionManager.currentStatus()
         recentSnips = Array(clipboardStore.history.prefix(4))
 
-        snipShortcut = comboString(.snip, on: hotKeyManager)
         switch clipboardStore.readPinPayload() {
         case .image: clipboardBadge = "Image"
         case let .color(sample): clipboardBadge = sample.hexString
         case .text: clipboardBadge = "Text"
         case nil: clipboardBadge = "Empty"
         }
-    }
-
-    private func comboString(_ action: CPXHotKeyAction, on manager: GlobalHotKeyManager) -> String {
-        (manager.currentCombo(for: action) ?? HotKeyPreferences.defaultCombo(for: action)).displayString
     }
 }
 
@@ -108,14 +102,14 @@ struct MenuBarPopoverView: View {
         .padding(11)
         .frame(width: 272)
         .fixedSize(horizontal: false, vertical: true)
-        .cpxPopoverSurface(cornerRadius: 15)
+        .ccxPopoverSurface(cornerRadius: 15)
     }
 }
 
 // MARK: - Header
 
 private struct HeaderStrip: View {
-    let permissions: CPXPermissionStatus
+    let permissions: CCXPermissionStatus
     let onOpenPermissions: () -> Void
 
     var body: some View {
@@ -127,7 +121,7 @@ private struct HeaderStrip: View {
                     .aspectRatio(contentMode: .fit)
                     .frame(width: 22, height: 22)
 
-                Text("CPX")
+                Text("CCX")
                     .font(.system(size: 13.5, weight: .semibold))
             }
 
@@ -140,7 +134,7 @@ private struct HeaderStrip: View {
 }
 
 private struct StatusBadge: View {
-    let permissions: CPXPermissionStatus
+    let permissions: CCXPermissionStatus
     let onTap: () -> Void
 
     @State private var isHovering = false
@@ -423,7 +417,7 @@ private struct PinControlPill: View {
 // MARK: - Utility Footer
 
 private struct UtilityFooterSection: View {
-    let permissions: CPXPermissionStatus
+    let permissions: CCXPermissionStatus
     let onOpenPermissions: () -> Void
     let onOpenSettings: () -> Void
     let onQuit: () -> Void
@@ -453,7 +447,7 @@ private struct UtilityFooterSection: View {
                 .padding(.vertical, 1)
 
             MenuActionRow(
-                title: "Quit CPX",
+                title: "Quit CCX",
                 symbol: "power",
                 shortcut: "⌘Q",
                 isDestructive: true,
@@ -526,7 +520,7 @@ private struct MenuActionRow: View {
 
 private extension View {
     @ViewBuilder
-    func cpxPopoverSurface(cornerRadius: CGFloat) -> some View {
+    func ccxPopoverSurface(cornerRadius: CGFloat) -> some View {
         if #available(macOS 26.0, *) {
             self
                 .glassEffect(.regular, in: .rect(cornerRadius: cornerRadius))

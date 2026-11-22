@@ -1,8 +1,8 @@
-# CPX
+# CCX
 
-**Capture + Paste + X** — A macOS screenshot, pinning, and screen recording tool.
+**Control · Command · X** (`⌃⌘X`) — A native macOS screenshot, annotation, floating pin, and screen recording tool.
 
-CPX is designed to deliver full Snipaste feature parity on macOS while extending the workflow with fast, high-quality screen recording.
+CCX is designed to deliver full Snipaste feature parity on macOS while extending the workflow with fast, high-quality screen recording.
 
 ## Planned Capabilities
 
@@ -23,4 +23,4 @@ CPX is designed to deliver full Snipaste feature parity on macOS while extending
 
 ## Status
 
-Early development — technical architecture and macOS stack research are currently underway.
+Active development — Smart Snip (`⌃⌘X`), non-destructive annotations, and floating pins are implemented; screen recording (`X`) is planned next.

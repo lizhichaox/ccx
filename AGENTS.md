@@ -4,7 +4,7 @@ Instructions for agents working in this repository.
 
 ## Project
 
-**CPX (Capture + Paste + X)** is a native macOS screenshot, floating pin, and screen recording utility.
+**CCX (Control · Command · X)** is a native macOS screenshot, floating pin, and screen recording utility.
 
 - **Capture (Snip)**: Full Snipaste parity — instant area/window/UI-element auto-detection, Retina HiDPI / Display P3 / HDR pixel magnifier and color picker (HEX / RGB / HSL), and a re-editable annotation canvas (shapes, arrows, freehand pen, highlighter, inline text, step counters, live GPU blur/mosaic, undo/redo).
 - **Paste (Pin)**: Always-on-top floating `NSPanel` windows across Spaces and full-screen apps with zoom, rotation/flip, opacity control, click-through mode, thumbnail collapse, pin groups, clipboard/snip history, and native `VisionKit` Live Text OCR / QR extraction.
@@ -37,7 +37,7 @@ Full `.app` generation, `MetalToolchain` shader compilation (`~/Library/Develope
    security find-certificate -c "Apple Development" -p | openssl x509 -noout -subject
    ```
 
-2. **Configure signing explicitly in `project.yml`** (XcodeGen defaults to Automatic signing, where passing only `CODE_SIGN_IDENTITY` fails with `"Signing for CPX requires a development team"`). Manual signing requires no provisioning profile on macOS since CPX is non-sandboxed and uses no restricted entitlements:
+2. **Configure signing explicitly in `project.yml`** (XcodeGen defaults to Automatic signing, where passing only `CODE_SIGN_IDENTITY` fails with `"Signing for CCX requires a development team"`). Manual signing requires no provisioning profile on macOS since CCX is non-sandboxed and uses no restricted entitlements:
 
    ```yaml
    settings:
@@ -51,34 +51,34 @@ Full `.app` generation, `MetalToolchain` shader compilation (`~/Library/Develope
 
    *(Alternative: `CODE_SIGN_STYLE: Automatic` with `DEVELOPMENT_TEAM` set and without overriding `CODE_SIGN_IDENTITY`. Never commit a personal `DEVELOPMENT_TEAM` into `project.yml`; pass it via `DEVELOPMENT_TEAM`, untracked `Config/LocalSigning.xcconfig`, or `scripts/build-and-run.sh` auto-detection. For external release distribution, sign with a `Developer ID Application` certificate + Hardened Runtime + `com.apple.security.device.audio-input`.)*
 
-3. **Generate, build, install to `/Applications/CPX.app`, and launch via LaunchServices** (launch as a real `.app` bundle in `/Applications` so macOS tracks TCC grants by `CFBundleIdentifier` and displays CPX in System Settings):
+3. **Generate, build, install to `/Applications/CCX.app`, and launch via LaunchServices** (launch as a real `.app` bundle in `/Applications` so macOS tracks TCC grants by `CFBundleIdentifier` and displays CCX in System Settings):
 
    ```bash
    ./scripts/build-and-run.sh
    # Optional flags: --build-only (compile without replacing/launching), --no-install (run from .build/xcode), --release
    ```
 
-   Under the hood, `scripts/build-and-run.sh` runs `xcodegen generate`, builds with `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer`, replaces `/Applications/CPX.app` atomically, registers it with LaunchServices, and launches `/Applications/CPX.app`.
+   Under the hood, `scripts/build-and-run.sh` runs `xcodegen generate`, builds with `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer`, replaces `/Applications/CCX.app` atomically, registers it with LaunchServices, and launches `/Applications/CCX.app`.
 
 4. **TCC & Bundle Requirements**:
    - **Non-App-Sandbox** (`com.apple.security.app-sandbox` omitted or `false`) — required for cross-app `AXUIElement` inspection and optional `CGEventTap`.
-   - Fixed `CFBundleIdentifier` (`com.lizhichaox.cpx`), `LSUIElement = true`, `NSApp.setActivationPolicy(.accessory)` (required for floating `NSPanel`s above other apps' full-screen Spaces), and `NSHighResolutionCapable = true`.
+   - Fixed `CFBundleIdentifier` (`com.lizhichaox.ccx`), `LSUIElement = true`, `NSApp.setActivationPolicy(.accessory)` (required for floating `NSPanel`s above other apps' full-screen Spaces), and `NSHighResolutionCapable = true`.
    - Include `NSScreenCaptureUsageDescription`, `NSAudioCaptureUsageDescription`, and `NSMicrophoneUsageDescription` in `Info.plist`.
    - Signing with the installed `Apple Development` identity keeps a stable Designated Requirement so **Screen Recording** and **Accessibility** TCC grants persist across rebuilds (never use ad-hoc `-` signing for local TCC testing).
-   - After the initial Screen & System Audio Recording grant, **quit and relaunch `CPX.app`** (macOS loads Screen Recording TCC only at process start). Reset during onboarding tests with `tccutil reset ScreenCapture com.lizhichaox.cpx`.
+   - After the initial Screen & System Audio Recording grant, **quit and relaunch `CCX.app`** (macOS loads Screen Recording TCC only at process start). Reset during onboarding tests with `tccutil reset ScreenCapture com.lizhichaox.ccx`.
    - Keep a runtime `MTLDevice.makeLibrary(source:)` fallback so shader tests run in headless/sandboxed environments without `MetalToolchain` access.
 
 ## Planned Architecture
 
 ```text
 project.yml            XcodeGen project manifest
-App/                   CPXApp target (Info.plist, entitlements, Assets, AppDelegate, MenuBar, TCC onboarding, Settings)
+App/                   CCXApp target (Info.plist, entitlements, Assets, AppDelegate, MenuBar, TCC onboarding, Settings)
 Packages/
-  CPXCore/             HiDPI/Notch/multi-display coordinate transforms (Quartz <-> AppKit), color math, Carbon hotkeys, history store
-  CPXCapture/          ScreenCaptureKit snapshot engine (15.0 + 26.0 HDR), CGWindowList + async AXUIElement detector, OverlayPanel, GPU magnifier
-  CPXAnnotate/         Non-destructive annotation scene graph, Metal/CoreImage live blur & mosaic, inline text, step counters, UndoManager, Smart Redact
-  CPXPin/              Floating PinPanel (.nonactivatingPanel, multi-Space/fullscreen), zoom/rotate/opacity/click-through/groups, VisionKit Live Text, Live PiP mirror
-  CPXRecord/           SCStream + CVMetalTextureCache compositor + AVAssetWriter/VideoToolbox (pause/resume, dual audio), macOS 27 Instant Replay & trim, GIF/WebP export
+  CCXCore/             HiDPI/Notch/multi-display coordinate transforms (Quartz <-> AppKit), color math, Carbon hotkeys, history store
+  CCXCapture/          ScreenCaptureKit snapshot engine (15.0 + 26.0 HDR), CGWindowList + async AXUIElement detector, OverlayPanel, GPU magnifier
+  CCXAnnotate/         Non-destructive annotation scene graph, Metal/CoreImage live blur & mosaic, inline text, step counters, UndoManager, Smart Redact
+  CCXPin/              Floating PinPanel (.nonactivatingPanel, multi-Space/fullscreen), zoom/rotate/opacity/click-through/groups, VisionKit Live Text, Live PiP mirror
+  CCXRecord/           SCStream + CVMetalTextureCache compositor + AVAssetWriter/VideoToolbox (pause/resume, dual audio), macOS 27 Instant Replay & trim, GIF/WebP export
 ```
 
 ## Engineering & Verification Guardrails
