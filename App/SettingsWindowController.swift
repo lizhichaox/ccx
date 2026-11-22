@@ -102,9 +102,7 @@ private struct SettingsView: View {
                     )
                 }
 
-                Text("\(Bundle.main.bundleIdentifier ?? "com.lizhichaox.cpx") · Local-only · Zero telemetry")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.tertiary)
+                SettingsFooter()
                     .frame(maxWidth: .infinity, alignment: .center)
                     .padding(.top, 2)
             }
@@ -114,6 +112,47 @@ private struct SettingsView: View {
         }
         .frame(width: 440)
         .fixedSize(horizontal: false, vertical: true)
+    }
+}
+
+private struct SettingsFooter: View {
+    private static let authorURL = URL(string: "https://lizhichao.com")!
+    @State private var isHoveringAuthor = false
+
+    var body: some View {
+        HStack(spacing: 0) {
+            Text("Made By ")
+                .foregroundStyle(.tertiary)
+
+            Button {
+                NSWorkspace.shared.open(Self.authorURL)
+            } label: {
+                Text("LIZHICHAO")
+                    .fontWeight(.semibold)
+                    .foregroundStyle(isHoveringAuthor ? Color.accentColor : Color.secondary)
+                    .underline(isHoveringAuthor)
+            }
+            .buttonStyle(.plain)
+            .onHover { hovering in
+                guard hovering != isHoveringAuthor else { return }
+                isHoveringAuthor = hovering
+                if hovering {
+                    NSCursor.pointingHand.push()
+                } else {
+                    NSCursor.pop()
+                }
+            }
+            .onDisappear {
+                if isHoveringAuthor {
+                    isHoveringAuthor = false
+                    NSCursor.pop()
+                }
+            }
+
+            Text(" with ❤️.")
+                .foregroundStyle(.tertiary)
+        }
+        .font(.system(size: 11))
     }
 }
 
