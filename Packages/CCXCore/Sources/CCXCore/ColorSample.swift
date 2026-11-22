@@ -145,44 +145,113 @@ public struct CCXColorSample: Equatable, Hashable, Sendable {
 
     /// Samples one pixel of `image` at pixel coordinates with a top-left origin.
     ///
-    /// Works for any source pixel format, bit depth, or color space by drawing the
-    /// single pixel into a 1x1 RGBA8 sRGB bitmap (color-managed conversion). Returns
-    /// `nil` when the coordinates fall outside the image.
+    /// Uses a zero-allocation direct byte read when the image is 8-bit sRGB RGBA/BGRA,
+    /// falling back to a reusable color-managed 1x1 sRGB `CGContext` for wide-gamut or
+    /// other pixel formats. Returns `nil` when the coordinates fall outside the image.
     public static func samplePixel(from image: CGImage, pixelX: Int, pixelY: Int) -> CCXColorSample? {
         guard pixelX >= 0, pixelY >= 0, pixelX < image.width, pixelY < image.height else { return nil }
+
+        if let direct = sampleDirectSRGBPixel(from: image, pixelX: pixelX, pixelY: pixelY) {
+            return direct
+        }
+
         guard let pixelImage = image.cropping(to: CGRect(x: pixelX, y: pixelY, width: 1, height: 1)),
-              let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)
+              let (r, g, b, alpha) = SampleContextCache.shared.sample(pixelImage: pixelImage)
         else { return nil }
 
-        var pixel = [UInt8](repeating: 0, count: 4)
-        let drawn = pixel.withUnsafeMutableBytes { buffer -> Bool in
-            guard let context = CGContext(
-                data: buffer.baseAddress,
-                width: 1,
-                height: 1,
-                bitsPerComponent: 8,
-                bytesPerRow: 4,
-                space: colorSpace,
-                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-            ) else { return false }
-            context.setBlendMode(.copy)
-            context.interpolationQuality = .none
-            context.draw(pixelImage, in: CGRect(x: 0, y: 0, width: 1, height: 1))
-            return true
-        }
-        guard drawn else { return nil }
+        return makeUnpremultipliedSample(r: r, g: g, b: b, alpha: alpha)
+    }
 
-        let alpha = pixel[3]
+    private static func sampleDirectSRGBPixel(from image: CGImage, pixelX: Int, pixelY: Int) -> CCXColorSample? {
+        guard image.bitsPerComponent == 8,
+              image.bitsPerPixel == 32,
+              image.colorSpace?.name == CGColorSpace.sRGB
+        else { return nil }
+
+        let byteOrder = CGBitmapInfo(rawValue: image.bitmapInfo.rawValue & CGBitmapInfo.byteOrderMask.rawValue)
+        let alphaInfo = image.alphaInfo
+
+        let isRGBA = (byteOrder.rawValue == 0 || byteOrder == .byteOrder32Big)
+            && (alphaInfo == .last || alphaInfo == .premultipliedLast || alphaInfo == .noneSkipLast)
+        let isBGRA = (byteOrder == .byteOrder32Little)
+            && (alphaInfo == .first || alphaInfo == .premultipliedFirst || alphaInfo == .noneSkipFirst)
+        guard isRGBA || isBGRA else { return nil }
+
+        guard let provider = image.dataProvider,
+              let cfData = provider.data,
+              let ptr = CFDataGetBytePtr(cfData)
+        else { return nil }
+
+        let offset = pixelY * image.bytesPerRow + pixelX * 4
+        guard offset >= 0, offset + 4 <= CFDataGetLength(cfData) else { return nil }
+
+        let b0 = ptr[offset]
+        let b1 = ptr[offset + 1]
+        let b2 = ptr[offset + 2]
+        let b3 = ptr[offset + 3]
+
+        let rawR = isRGBA ? b0 : b2
+        let rawG = b1
+        let rawB = isRGBA ? b2 : b0
+        let alpha: UInt8 = (alphaInfo == .noneSkipLast || alphaInfo == .noneSkipFirst) ? 255 : b3
+
+        let isPremultiplied = (alphaInfo == .premultipliedLast || alphaInfo == .premultipliedFirst)
+        if isPremultiplied {
+            return makeUnpremultipliedSample(r: rawR, g: rawG, b: rawB, alpha: alpha)
+        }
+        return CCXColorSample(red: rawR, green: rawG, blue: rawB, alpha: alpha, colorSpaceName: "sRGB")
+    }
+
+    private static func makeUnpremultipliedSample(r: UInt8, g: UInt8, b: UInt8, alpha: UInt8) -> CCXColorSample {
         func unpremultiply(_ value: UInt8) -> UInt8 {
             guard alpha > 0, alpha < 255 else { return alpha == 0 ? 0 : value }
             return UInt8(min(255, (Double(value) * 255 / Double(alpha)).rounded()))
         }
         return CCXColorSample(
-            red: unpremultiply(pixel[0]),
-            green: unpremultiply(pixel[1]),
-            blue: unpremultiply(pixel[2]),
+            red: unpremultiply(r),
+            green: unpremultiply(g),
+            blue: unpremultiply(b),
             alpha: alpha,
             colorSpaceName: "sRGB"
         )
+    }
+}
+
+private final class SampleContextCache: @unchecked Sendable {
+    static let shared = SampleContextCache()
+
+    private let lock = NSLock()
+    private let pixelBytes: UnsafeMutablePointer<UInt8>
+    private let context: CGContext?
+
+    private init() {
+        let bytes = UnsafeMutablePointer<UInt8>.allocate(capacity: 4)
+        bytes.initialize(repeating: 0, count: 4)
+        self.pixelBytes = bytes
+        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
+        self.context = CGContext(
+            data: bytes,
+            width: 1,
+            height: 1,
+            bitsPerComponent: 8,
+            bytesPerRow: 4,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        )
+    }
+
+    deinit {
+        pixelBytes.deallocate()
+    }
+
+    func sample(pixelImage: CGImage) -> (UInt8, UInt8, UInt8, UInt8)? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let context else { return nil }
+        pixelBytes.initialize(repeating: 0, count: 4)
+        context.setBlendMode(.copy)
+        context.interpolationQuality = .none
+        context.draw(pixelImage, in: CGRect(x: 0, y: 0, width: 1, height: 1))
+        return (pixelBytes[0], pixelBytes[1], pixelBytes[2], pixelBytes[3])
     }
 }

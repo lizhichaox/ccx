@@ -11,11 +11,30 @@ public enum ClipboardPinPayload: Sendable {
     case text(String)
 }
 
+/// Lightweight badge classification for the menu bar popover without decoding clipboard images.
+public enum ClipboardPinBadge: Equatable, Sendable {
+    case image
+    case color(CCXColorSample)
+    case text
+    case empty
+
+    public var displayText: String {
+        switch self {
+        case .image: "Image"
+        case let .color(sample): sample.hexString
+        case .text: "Text"
+        case .empty: "Empty"
+        }
+    }
+}
+
 /// One captured snip kept in the in-memory history.
 public struct SnipHistoryEntry: Identifiable, Sendable {
     public let id: UUID
     public let timestamp: Date
     public let image: CGImage
+    /// Pre-downsampled thumbnail (max 160px on longest side) for fast popover rendering.
+    public let thumbnail: CGImage
     /// Pixels per point of `image`.
     public let scale: CGFloat
     /// Captured area in AppKit global screen coordinates (points).
@@ -25,8 +44,37 @@ public struct SnipHistoryEntry: Identifiable, Sendable {
         self.id = id
         self.timestamp = timestamp
         self.image = image
+        self.thumbnail = Self.makeThumbnail(from: image, maxPixelDimension: 160)
         self.scale = scale
         self.screenRect = screenRect
+    }
+
+    private static func makeThumbnail(from image: CGImage, maxPixelDimension: CGFloat) -> CGImage {
+        let width = CGFloat(image.width)
+        let height = CGFloat(image.height)
+        let longest = max(width, height)
+        guard longest > maxPixelDimension, width > 0, height > 0 else {
+            return image
+        }
+        let scale = maxPixelDimension / longest
+        let targetWidth = max(1, Int((width * scale).rounded()))
+        let targetHeight = max(1, Int((height * scale).rounded()))
+        guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
+              let context = CGContext(
+                  data: nil,
+                  width: targetWidth,
+                  height: targetHeight,
+                  bitsPerComponent: 8,
+                  bytesPerRow: 0,
+                  space: colorSpace,
+                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+              )
+        else {
+            return image
+        }
+        context.interpolationQuality = .medium
+        context.draw(image, in: CGRect(x: 0, y: 0, width: targetWidth, height: targetHeight))
+        return context.makeImage() ?? image
     }
 }
 
@@ -39,27 +87,86 @@ public enum ClipboardStoreError: Error, Equatable {
 /// tests can supply `InMemoryClipboardPasteboard` when the pasteboard daemon is unavailable).
 @MainActor
 public protocol ClipboardPasteboard: AnyObject {
+    var changeCount: Int { get }
     func clearContents()
     func writeData(_ items: [(NSPasteboard.PasteboardType, Data)])
+    func writeLazyImage(png: Data, tiffProvider: @escaping @Sendable () -> Data?)
     func writeString(_ string: String)
+    func hasImageData() -> Bool
     func data(forType type: NSPasteboard.PasteboardType) -> Data?
     func string() -> String?
     func readImageFileURLs() -> [URL]
 }
 
+public extension ClipboardPasteboard {
+    func writeLazyImage(png: Data, tiffProvider: @escaping @Sendable () -> Data?) {
+        var items: [(NSPasteboard.PasteboardType, Data)] = [(.png, png)]
+        if let tiff = tiffProvider() {
+            items.append((.tiff, tiff))
+        }
+        writeData(items)
+    }
+}
+
+private final class LazyTIFFDataProvider: NSObject, NSPasteboardItemDataProvider, @unchecked Sendable {
+    private let lock = NSLock()
+    private var provider: (@Sendable () -> Data?)?
+    private var cachedTIFF: Data?
+
+    init(_ provider: @escaping @Sendable () -> Data?) {
+        self.provider = provider
+    }
+
+    func pasteboard(
+        _ pasteboard: NSPasteboard?,
+        item: NSPasteboardItem,
+        provideDataForType type: NSPasteboard.PasteboardType
+    ) {
+        guard type == .tiff else { return }
+        lock.lock()
+        let cached = cachedTIFF
+        let fn = provider
+        lock.unlock()
+
+        if let cached {
+            item.setData(cached, forType: .tiff)
+            return
+        }
+        if let data = fn?() {
+            lock.lock()
+            cachedTIFF = data
+            provider = nil
+            lock.unlock()
+            item.setData(data, forType: .tiff)
+        }
+    }
+
+    func pasteboardFinishedWithDataProvider(_ pasteboard: NSPasteboard) {
+        lock.lock()
+        provider = nil
+        cachedTIFF = nil
+        lock.unlock()
+    }
+}
+
 @MainActor
 private final class SystemClipboardPasteboard: ClipboardPasteboard {
     private let pasteboard: NSPasteboard
+    private var activeDataProvider: LazyTIFFDataProvider?
 
     init(_ pasteboard: NSPasteboard = .general) {
         self.pasteboard = pasteboard
     }
 
+    var changeCount: Int { pasteboard.changeCount }
+
     func clearContents() {
+        activeDataProvider = nil
         pasteboard.clearContents()
     }
 
     func writeData(_ items: [(NSPasteboard.PasteboardType, Data)]) {
+        activeDataProvider = nil
         let item = NSPasteboardItem()
         for (type, data) in items {
             item.setData(data, forType: type)
@@ -68,9 +175,24 @@ private final class SystemClipboardPasteboard: ClipboardPasteboard {
         pasteboard.writeObjects([item])
     }
 
+    func writeLazyImage(png: Data, tiffProvider: @escaping @Sendable () -> Data?) {
+        let item = NSPasteboardItem()
+        item.setData(png, forType: .png)
+        let provider = LazyTIFFDataProvider(tiffProvider)
+        activeDataProvider = provider
+        item.setDataProvider(provider, forTypes: [.tiff])
+        pasteboard.clearContents()
+        pasteboard.writeObjects([item])
+    }
+
     func writeString(_ string: String) {
+        activeDataProvider = nil
         pasteboard.clearContents()
         pasteboard.setString(string, forType: .string)
+    }
+
+    func hasImageData() -> Bool {
+        pasteboard.availableType(from: [.png, .tiff]) != nil
     }
 
     func data(forType type: NSPasteboard.PasteboardType) -> Data? {
@@ -93,28 +215,41 @@ private final class SystemClipboardPasteboard: ClipboardPasteboard {
 /// In-memory `ClipboardPasteboard` implementation for deterministic, isolated tests.
 @MainActor
 public final class InMemoryClipboardPasteboard: ClipboardPasteboard {
+    public private(set) var changeCount: Int = 0
     private var dataByType: [NSPasteboard.PasteboardType: Data] = [:]
     private var text: String?
-    public var imageFileURLs: [URL] = []
+    public var imageFileURLs: [URL] = [] {
+        didSet { changeCount += 1 }
+    }
 
     public init() {}
 
     public func clearContents() {
         dataByType.removeAll()
         text = nil
-        imageFileURLs.removeAll()
+        imageFileURLs = []
+        changeCount += 1
     }
 
     public func writeData(_ items: [(NSPasteboard.PasteboardType, Data)]) {
-        clearContents()
+        dataByType.removeAll()
+        text = nil
+        imageFileURLs = []
         for (type, data) in items {
             dataByType[type] = data
         }
+        changeCount += 1
     }
 
     public func writeString(_ string: String) {
-        clearContents()
+        dataByType.removeAll()
+        imageFileURLs = []
         text = string
+        changeCount += 1
+    }
+
+    public func hasImageData() -> Bool {
+        dataByType[.png] != nil || dataByType[.tiff] != nil
     }
 
     public func data(forType type: NSPasteboard.PasteboardType) -> Data? {
@@ -138,6 +273,7 @@ public final class ClipboardStore {
     public private(set) var history: [SnipHistoryEntry] = []
 
     private let pasteboard: any ClipboardPasteboard
+    private var cachedBadge: (changeCount: Int, badge: ClipboardPinBadge)?
 
     public init(maxHistoryCount: Int = 20) {
         self.maxHistoryCount = max(0, maxHistoryCount)
@@ -162,21 +298,49 @@ public final class ClipboardStore {
         history.removeAll()
     }
 
-    /// Writes PNG and TIFF representations tagged with `72 * scale` DPI so receiving apps
-    /// paste the image at its point size.
+    /// Writes PNG immediately and registers a lazy LZW-compressed TIFF provider (only
+    /// encoded if a receiving app explicitly requests TIFF).
     public func copyImage(_ image: CGImage, scale: CGFloat) {
-        var items: [(NSPasteboard.PasteboardType, Data)] = []
         if let png = Self.encode(image, type: .png, scale: scale) {
-            items.append((.png, png))
+            pasteboard.writeLazyImage(png: png) {
+                Self.encode(image, type: .tiff, scale: scale)
+            }
+            return
         }
         if let tiff = Self.encode(image, type: .tiff, scale: scale) {
-            items.append((.tiff, tiff))
+            pasteboard.writeData([(.tiff, tiff)])
+        } else {
+            pasteboard.writeData([])
         }
-        pasteboard.writeData(items)
     }
 
     public func copyText(_ text: String) {
         pasteboard.writeString(text)
+    }
+
+    /// Classifies the current pasteboard content without decoding full bitmap image payloads,
+    /// caching the result against `pasteboard.changeCount`.
+    public func peekPinBadge() -> ClipboardPinBadge {
+        let changeCount = pasteboard.changeCount
+        if let cached = cachedBadge, cached.changeCount == changeCount {
+            return cached.badge
+        }
+        let badge: ClipboardPinBadge
+        if pasteboard.hasImageData() || !pasteboard.readImageFileURLs().isEmpty {
+            badge = .image
+        } else if let string = pasteboard.string() {
+            if let color = CCXColorSample.parseHex(string) {
+                badge = .color(color)
+            } else if !string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                badge = .text
+            } else {
+                badge = .empty
+            }
+        } else {
+            badge = .empty
+        }
+        cachedBadge = (changeCount, badge)
+        return badge
     }
 
     /// Reads the pasteboard in priority order: bitmap image (PNG/TIFF data or an image
@@ -217,7 +381,7 @@ public final class ClipboardStore {
         return nil
     }
 
-    static func encode(_ image: CGImage, type: UTType, scale: CGFloat) -> Data? {
+    nonisolated static func encode(_ image: CGImage, type: UTType, scale: CGFloat) -> Data? {
         let data = NSMutableData()
         guard let destination = CGImageDestinationCreateWithData(
             data as CFMutableData, type.identifier as CFString, 1, nil

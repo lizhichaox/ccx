@@ -45,6 +45,7 @@ public final class SmartElementDetector {
     private let excludedWindowIDs: Set<CGWindowID>
     private let ownPID: pid_t = ProcessInfo.processInfo.processIdentifier
     private let axWorker: AXQueryWorker?
+    private var cachedPrimaryScreenHeight: CGFloat = 0
 
     /// - Parameters:
     ///   - excludingPID: optional process ID to exclude from Tier 1 detection (`nil` includes all visible windows, including CCX's).
@@ -70,6 +71,7 @@ public final class SmartElementDetector {
         let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
         let raw = (CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]]) ?? []
         let primaryHeight = CoordinateConverter.primaryScreenHeight(screens: NSScreen.screens.map(\.frame))
+        cachedPrimaryScreenHeight = primaryHeight
         windows = Self.parseWindowList(
             raw,
             excludingPID: excludedPID,
@@ -137,7 +139,9 @@ public final class SmartElementDetector {
             axWorker.cancelPending()
             return
         }
-        let primaryHeight = CoordinateConverter.primaryScreenHeight(screens: NSScreen.screens.map(\.frame))
+        let primaryHeight = cachedPrimaryScreenHeight > 0
+            ? cachedPrimaryScreenHeight
+            : CoordinateConverter.primaryScreenHeight(screens: NSScreen.screens.map(\.frame))
         axWorker.enqueue(
             AXQueryWorker.Request(
                 point: globalPoint,

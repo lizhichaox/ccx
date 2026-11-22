@@ -206,6 +206,25 @@ final class ColorSampleTests: XCTestCase {
         XCTAssertEqual(CCXColorSample.samplePixel(from: grayCtx.makeImage()!, pixelX: 0, pixelY: 0),
                        CCXColorSample(red: 255, green: 255, blue: 255))
     }
+
+    func testSamplePixelMatchesFastPathAndWideGamutFallback() {
+        let p3 = CGColorSpace(name: CGColorSpace.displayP3)!
+        let p3Ctx = CGContext(data: nil, width: 2, height: 2, bitsPerComponent: 8, bytesPerRow: 0,
+                              space: p3, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+        p3Ctx.setFillColor(CGColor(srgbRed: 0, green: 1, blue: 0, alpha: 1))
+        p3Ctx.fill(CGRect(x: 0, y: 0, width: 2, height: 2))
+        let p3Sample = CCXColorSample.samplePixel(from: p3Ctx.makeImage()!, pixelX: 1, pixelY: 1)
+        XCTAssertEqual(p3Sample?.green, 255)
+        XCTAssertEqual(p3Sample?.alpha, 255)
+
+        let srgbCtx = CGContext(data: nil, width: 4, height: 4, bitsPerComponent: 8, bytesPerRow: 0,
+                                space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)!
+        srgbCtx.setFillColor(CGColor(srgbRed: 12 / 255, green: 34 / 255, blue: 56 / 255, alpha: 1))
+        srgbCtx.fill(CGRect(x: 0, y: 0, width: 4, height: 4))
+        XCTAssertEqual(CCXColorSample.samplePixel(from: srgbCtx.makeImage()!, pixelX: 2, pixelY: 3),
+                       CCXColorSample(red: 12, green: 34, blue: 56, alpha: 255))
+    }
 }
 
 final class HotKeyComboTests: XCTestCase {
@@ -401,6 +420,35 @@ final class ClipboardStoreTests: XCTestCase {
             XCTAssertEqual(decoded?.1, 2)
             XCTAssertEqual(CCXColorSample.samplePixel(from: decoded!.0, pixelX: 4, pixelY: 4)?.red, 12)
         }
+    }
+
+    func testPeekPinBadgeAvoidsDecodeAndCachesByChangeCount() {
+        let pb = InMemoryClipboardPasteboard()
+        let store = ClipboardStore(pasteboard: pb)
+        XCTAssertEqual(store.peekPinBadge(), .empty)
+        XCTAssertEqual(store.peekPinBadge().displayText, "Empty")
+
+        store.copyText("#112233")
+        XCTAssertEqual(store.peekPinBadge(), .color(CCXColorSample(red: 0x11, green: 0x22, blue: 0x33)))
+        XCTAssertEqual(store.peekPinBadge().displayText, "#112233")
+
+        store.copyText("note")
+        XCTAssertEqual(store.peekPinBadge(), .text)
+
+        // Undecodable placeholder bytes still classify as .image without triggering ImageIO decode.
+        pb.writeData([(.png, Data([0x01, 0x02, 0x03]))])
+        XCTAssertEqual(store.peekPinBadge(), .image)
+    }
+
+    func testSnipHistoryEntryThumbnailDownsamplesLargeImages() {
+        let small = makeTestImage(width: 8, height: 8) { _, _ in (1, 2, 3, 255) }
+        let smallEntry = SnipHistoryEntry(image: small, scale: 2, screenRect: .zero)
+        XCTAssertEqual(smallEntry.thumbnail.width, 8)
+
+        let large = makeTestImage(width: 600, height: 300) { _, _ in (1, 2, 3, 255) }
+        let largeEntry = SnipHistoryEntry(image: large, scale: 2, screenRect: .zero)
+        XCTAssertEqual(largeEntry.thumbnail.width, 160)
+        XCTAssertEqual(largeEntry.thumbnail.height, 80)
     }
 }
 
