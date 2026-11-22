@@ -148,14 +148,10 @@ private struct SettingsIdentityHeader: View {
             CCXBrandIcon(size: 56)
 
             VStack(spacing: 2) {
-                HStack(alignment: .firstTextBaseline, spacing: 6) {
-                    Text("CCX")
-                        .font(.system(size: 18, weight: .bold))
-                    Text("v\(AppVersion.shortDisplay)")
-                        .font(.caption.weight(.medium))
-                        .foregroundStyle(.secondary)
-                }
                 Text("Control · Command · X")
+                    .font(.system(size: 13.5, weight: .semibold))
+                    .foregroundStyle(.primary)
+                Text("v\(AppVersion.shortDisplay)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
