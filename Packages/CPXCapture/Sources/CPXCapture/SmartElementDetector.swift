@@ -104,13 +104,17 @@ public final class SmartElementDetector {
     /// Requests the accessibility element frame under `globalPoint` (AppKit global coordinates).
     ///
     /// Requests are coalesced (latest point wins) and throttled to ~30 Hz on a background queue.
-    /// `completion` runs on the main actor with the refined rect (AppKit global) and the point it was
-    /// computed for, or is never called if AX is unavailable, times out, or yields an implausible rect.
+    /// `completion` runs on the main actor with the refined rect (AppKit global, or `nil` when no
+    /// plausible sub-element was found at `globalPoint`) and the point it was computed for.
     public func requestElementRect(
         at globalPoint: CGPoint,
-        completion: @escaping @MainActor @Sendable (CGRect, CGPoint) -> Void
+        completion: @escaping @MainActor @Sendable (CGRect?, CGPoint) -> Void
     ) {
-        guard let axWorker, let targetWindow = Self.hitTest(windows, at: globalPoint) else { return }
+        guard let axWorker else { return }
+        guard let targetWindow = Self.hitTest(windows, at: globalPoint) else {
+            axWorker.cancelPending()
+            return
+        }
         let primaryHeight = CoordinateConverter.primaryScreenHeight(screens: NSScreen.screens.map(\.frame))
         axWorker.enqueue(
             AXQueryWorker.Request(
@@ -163,15 +167,16 @@ final class AXQueryWorker: @unchecked Sendable {
 
     private let queue = DispatchQueue(label: "com.lizhichaox.cpx.ax-detector", qos: .userInteractive)
     private let excludedPID: pid_t
-    private var pending: (Request, @MainActor @Sendable (CGRect, CGPoint) -> Void)?
+    private var pending: (Request, @MainActor @Sendable (CGRect?, CGPoint) -> Void)?
     private var isScheduled = false
     private var lastQueryTime: TimeInterval = 0
+    private var cancelGeneration: UInt64 = 0
 
     init(excludedPID: pid_t) {
         self.excludedPID = excludedPID
     }
 
-    func enqueue(_ request: Request, completion: @escaping @MainActor @Sendable (CGRect, CGPoint) -> Void) {
+    func enqueue(_ request: Request, completion: @escaping @MainActor @Sendable (CGRect?, CGPoint) -> Void) {
         queue.async {
             self.pending = (request, completion)
             self.scheduleIfNeeded()
@@ -179,7 +184,10 @@ final class AXQueryWorker: @unchecked Sendable {
     }
 
     func cancelPending() {
-        queue.async { self.pending = nil }
+        queue.async {
+            self.cancelGeneration &+= 1
+            self.pending = nil
+        }
     }
 
     private func scheduleIfNeeded() {
@@ -195,12 +203,18 @@ final class AXQueryWorker: @unchecked Sendable {
         guard let (request, completion) = pending else { return }
         pending = nil
         lastQueryTime = ProcessInfo.processInfo.systemUptime
-        if let rect = query(request),
-           SmartElementDetector.isPlausibleElementRect(rect, containing: request.point, within: request.containerFrame) {
-            let point = request.point
-            DispatchQueue.main.async {
-                MainActor.assumeIsolated { completion(rect, point) }
-            }
+        let gen = cancelGeneration
+        let rawRect = query(request)
+        guard gen == cancelGeneration else {
+            scheduleIfNeeded()
+            return
+        }
+        let rect: CGRect? = rawRect.flatMap {
+            SmartElementDetector.isPlausibleElementRect($0, containing: request.point, within: request.containerFrame) ? $0 : nil
+        }
+        let point = request.point
+        DispatchQueue.main.async {
+            MainActor.assumeIsolated { completion(rect, point) }
         }
         scheduleIfNeeded()
     }

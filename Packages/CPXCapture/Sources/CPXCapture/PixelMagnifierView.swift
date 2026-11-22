@@ -18,6 +18,10 @@ final class PixelMagnifierView: NSView {
     private var format: ColorFormat = .hex
     private var positionText = ""
     private var sizeText = ""
+    private var lastPixelX: Int?
+    private var lastPixelY: Int?
+    private var lastFormat: ColorFormat?
+    private var lastSizeText: String?
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -31,6 +35,9 @@ final class PixelMagnifierView: NSView {
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
+    // Pass mouse events straight through to the overlay view so moving past the loupe never triggers exit/enter churn.
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
     /// Updates the magnifier around image pixel (`pixelX`, `pixelY`) (top-left origin).
     func update(
         image: CGImage,
@@ -40,6 +47,18 @@ final class PixelMagnifierView: NSView {
         format: ColorFormat,
         sizeText: String
     ) {
+        if gridImage != nil &&
+           lastPixelX == pixelX &&
+           lastPixelY == pixelY &&
+           lastFormat == format &&
+           lastSizeText == sizeText {
+            return
+        }
+        lastPixelX = pixelX
+        lastPixelY = pixelY
+        lastFormat = format
+        lastSizeText = sizeText
+
         let half = Self.gridPixels / 2
         let wanted = CGRect(x: pixelX - half, y: pixelY - half, width: Self.gridPixels, height: Self.gridPixels)
         let imageRect = CGRect(x: 0, y: 0, width: image.width, height: image.height)

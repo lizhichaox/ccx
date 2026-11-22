@@ -122,4 +122,110 @@ struct SnipOverlayViewTests {
         #expect(format == .hex)
         #expect(sample.red == 51 && sample.green == 102 && sample.blue == 153)
     }
+
+    @Test func hoverInsideRefinedElementNeverBouncesBackToTier1Window() throws {
+        let view = SnipOverlayView(snapshot: try makeSnapshot(), topInset: 0)
+        let windowRect = CGRect(x: 10, y: 10, width: 180, height: 80)
+        let elementRect = CGRect(x: 20, y: 20, width: 50, height: 40)
+        view.hoverRectProvider = { _ in windowRect }
+
+        view.mouseMoved(with: try makeMouseEvent(type: .mouseMoved, at: CGPoint(x: 30, y: 30)))
+        #expect(view.machine.highlightedRect == windowRect)
+
+        view.applyRefinedElementRect(elementRect, forGlobalPoint: CGPoint(x: 30, y: 30))
+        #expect(view.machine.highlightedRect == elementRect)
+
+        for pt in [CGPoint(x: 32, y: 31), CGPoint(x: 45, y: 40), CGPoint(x: 65, y: 55)] {
+            view.mouseMoved(with: try makeMouseEvent(type: .mouseMoved, at: pt))
+            #expect(view.machine.highlightedRect == elementRect)
+        }
+    }
+
+    @Test func hoverBridgesSmallGapAndSwitchesOrFallsBackCleanly() throws {
+        let view = SnipOverlayView(snapshot: try makeSnapshot(), topInset: 0)
+        let windowRect = CGRect(x: 10, y: 10, width: 180, height: 80)
+        let elementA = CGRect(x: 20, y: 20, width: 40, height: 30)
+        let elementB = CGRect(x: 70, y: 20, width: 40, height: 30)
+        view.hoverRectProvider = { _ in windowRect }
+
+        view.mouseMoved(with: try makeMouseEvent(type: .mouseMoved, at: CGPoint(x: 35, y: 35)))
+        view.applyRefinedElementRect(elementA, forGlobalPoint: CGPoint(x: 35, y: 35))
+        #expect(view.machine.highlightedRect == elementA)
+
+        // Step into 10pt gap between elementA and elementB: holds elementA without flashing windowRect.
+        let gapPoint = CGPoint(x: 65, y: 35)
+        view.mouseMoved(with: try makeMouseEvent(type: .mouseMoved, at: gapPoint))
+        #expect(view.machine.highlightedRect == elementA)
+
+        // Move into elementB (even > 8pt from elementA's query point) and receive refined elementB.
+        let pointB = CGPoint(x: 80, y: 35)
+        view.mouseMoved(with: try makeMouseEvent(type: .mouseMoved, at: pointB))
+        view.applyRefinedElementRect(elementB, forGlobalPoint: pointB)
+        #expect(view.machine.highlightedRect == elementB)
+
+        // Step back into empty gap and receive nil from AX: falls back cleanly to windowRect.
+        view.mouseMoved(with: try makeMouseEvent(type: .mouseMoved, at: gapPoint))
+        #expect(view.machine.highlightedRect == elementB)
+        view.applyRefinedElementRect(nil, forGlobalPoint: gapPoint)
+        #expect(view.machine.highlightedRect == windowRect)
+    }
+
+    @Test func nilAXResultDoesNotClearRefinedRectWhileCursorIsInside() throws {
+        let view = SnipOverlayView(snapshot: try makeSnapshot(), topInset: 0)
+        let windowRect = CGRect(x: 10, y: 10, width: 180, height: 80)
+        let elementRect = CGRect(x: 20, y: 20, width: 50, height: 40)
+        view.hoverRectProvider = { _ in windowRect }
+
+        let inside = CGPoint(x: 40, y: 35)
+        view.mouseMoved(with: try makeMouseEvent(type: .mouseMoved, at: inside))
+        view.applyRefinedElementRect(elementRect, forGlobalPoint: inside)
+        #expect(view.machine.highlightedRect == elementRect)
+
+        view.applyRefinedElementRect(nil, forGlobalPoint: inside)
+        #expect(view.machine.highlightedRect == elementRect)
+    }
+
+    @Test func leavingGapMarginOrWindowTransitionsToTier1Rect() throws {
+        let view = SnipOverlayView(snapshot: try makeSnapshot(), topInset: 0)
+        let window1 = CGRect(x: 10, y: 10, width: 100, height: 80)
+        let window2 = CGRect(x: 120, y: 10, width: 70, height: 80)
+        let element1 = CGRect(x: 15, y: 20, width: 30, height: 30)
+        view.hoverRectProvider = { pt in pt.x >= 120 ? window2 : window1 }
+
+        view.mouseMoved(with: try makeMouseEvent(type: .mouseMoved, at: CGPoint(x: 25, y: 35)))
+        view.applyRefinedElementRect(element1, forGlobalPoint: CGPoint(x: 25, y: 35))
+        #expect(view.machine.highlightedRect == element1)
+
+        // Beyond 24pt bridge margin inside window1 (element1.maxX == 45 -> x == 80 is +35pt).
+        view.mouseMoved(with: try makeMouseEvent(type: .mouseMoved, at: CGPoint(x: 80, y: 35)))
+        #expect(view.machine.highlightedRect == window1)
+
+        // Re-apply element1, then move directly into window2.
+        view.mouseMoved(with: try makeMouseEvent(type: .mouseMoved, at: CGPoint(x: 25, y: 35)))
+        view.applyRefinedElementRect(element1, forGlobalPoint: CGPoint(x: 25, y: 35))
+        #expect(view.machine.highlightedRect == element1)
+
+        view.mouseMoved(with: try makeMouseEvent(type: .mouseMoved, at: CGPoint(x: 140, y: 35)))
+        #expect(view.machine.highlightedRect == window2)
+    }
+
+    @Test func clickingInGapBridgeSelectsTier1WindowNotStaleElement() throws {
+        let view = SnipOverlayView(snapshot: try makeSnapshot(), topInset: 0)
+        let windowRect = CGRect(x: 10, y: 10, width: 180, height: 80)
+        let elementA = CGRect(x: 20, y: 20, width: 40, height: 30)
+        view.hoverRectProvider = { _ in windowRect }
+
+        view.mouseMoved(with: try makeMouseEvent(type: .mouseMoved, at: CGPoint(x: 35, y: 35)))
+        view.applyRefinedElementRect(elementA, forGlobalPoint: CGPoint(x: 35, y: 35))
+        #expect(view.machine.highlightedRect == elementA)
+
+        // Hover in the gap outside elementA (still bridged visually as elementA), then click.
+        let gapPoint = CGPoint(x: 65, y: 35)
+        view.mouseMoved(with: try makeMouseEvent(type: .mouseMoved, at: gapPoint))
+        #expect(view.machine.highlightedRect == elementA)
+
+        view.mouseDown(with: try makeMouseEvent(type: .leftMouseDown, at: gapPoint))
+        view.mouseUp(with: try makeMouseEvent(type: .leftMouseUp, at: gapPoint))
+        #expect(view.machine.selectionRect == windowRect)
+    }
 }

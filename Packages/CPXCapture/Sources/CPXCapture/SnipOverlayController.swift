@@ -82,12 +82,12 @@ final class SnipOverlayController {
             if snapshot.screenFrame.contains(mouse) { keyPanel = panel }
         }
 
+        for view in views { view.primeWithMouseLocation(mouse) }
         NSApp.activate()
         for panel in panels { panel.orderFrontRegardless() }
         let key = keyPanel ?? panels.first
         key?.makeKeyAndOrderFront(nil)
         if let key, let view = key.contentView { key.makeFirstResponder(view) }
-        for view in views { view.primeWithMouseLocation(mouse) }
     }
 
     /// Tears down all panels without reporting an outcome.
