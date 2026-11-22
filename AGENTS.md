@@ -68,6 +68,12 @@ Full `.app` generation, `MetalToolchain` shader compilation (`~/Library/Develope
    - After the initial Screen & System Audio Recording grant, **quit and relaunch `CCX.app`** (macOS loads Screen Recording TCC only at process start). Reset during onboarding tests with `tccutil reset ScreenCapture com.lizhichaox.ccx`.
    - Keep a runtime `MTLDevice.makeLibrary(source:)` fallback so shader tests run in headless/sandboxed environments without `MetalToolchain` access.
 
+### Versioning & Build Management
+
+- `project.yml` is the single source of truth for `MARKETING_VERSION` (`MAJOR.MINOR.PATCH`) and `CURRENT_PROJECT_VERSION` (integer build number), injected into `App/Info.plist` via `$(MARKETING_VERSION)` and `$(CURRENT_PROJECT_VERSION)`.
+- Bump `MARKETING_VERSION` according to change size using `./scripts/bump-version.sh <patch|minor|major|X.Y.Z>` (`patch` = fixes, UI polish, or performance tweaks; `minor` = new features or capability expansions; `major` = major milestones or breaking changes).
+- `./scripts/build-and-run.sh` automatically increments `CURRENT_PROJECT_VERSION` by `+1` on every build (pass `--no-bump` only for dry rebuilds that should not advance the build number).
+
 ## Planned Architecture
 
 ```text

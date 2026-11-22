@@ -3,7 +3,12 @@
 # replaces /Applications/CCX.app, and launches it through LaunchServices so
 # TCC grants are tracked cleanly by bundle ID.
 #
-# Usage: scripts/build-and-run.sh [--build-only] [--no-install] [--release]
+# Usage: scripts/build-and-run.sh [--build-only] [--no-install] [--no-bump] [--release]
+#
+# Versioning:
+#   Automatically increments CURRENT_PROJECT_VERSION in project.yml by +1 before
+#   each build (pass --no-bump to keep the current build number). Use
+#   scripts/bump-version.sh <patch|minor|major|X.Y.Z> to update MARKETING_VERSION.
 #
 # Signing (first match wins):
 #   1. DEVELOPMENT_TEAM environment variable.
@@ -16,16 +21,18 @@
 set -euo pipefail
 
 usage() {
-  sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
+  awk 'NR>1 { if (/^#/) { sub(/^# ?/, ""); print } else exit }' "$0"
 }
 
 BUILD_ONLY=0
 INSTALL_APP=1
+BUMP_BUILD=1
 CONFIGURATION=Debug
 for arg in "$@"; do
   case "$arg" in
     --build-only) BUILD_ONLY=1 ;;
     --no-install) INSTALL_APP=0 ;;
+    --no-bump) BUMP_BUILD=0 ;;
     --release) CONFIGURATION=Release ;;
     -h | --help)
       usage
@@ -54,6 +61,32 @@ ARCH="$(uname -m)"
 if ! command -v xcodegen >/dev/null 2>&1; then
   echo "error: xcodegen not found. Install it with: brew install xcodegen" >&2
   exit 1
+fi
+
+CURRENT_VERSION="$(awk -F: '/^[[:space:]]*MARKETING_VERSION:/ { gsub(/["'\''[:space:]]/, "", $2); print $2; exit }' project.yml)"
+CURRENT_BUILD="$(awk -F: '/^[[:space:]]*CURRENT_PROJECT_VERSION:/ { gsub(/["'\''[:space:]]/, "", $2); print $2; exit }' project.yml)"
+if [[ ! "$CURRENT_BUILD" =~ ^[0-9]+$ ]]; then
+  echo "error: invalid CURRENT_PROJECT_VERSION in project.yml: '$CURRENT_BUILD'" >&2
+  exit 1
+fi
+
+if [[ "$BUMP_BUILD" -eq 1 ]]; then
+  NEXT_BUILD=$((CURRENT_BUILD + 1))
+  TMP_PROJECT_YML="project.yml.tmp.$$"
+  trap 'rm -f "$TMP_PROJECT_YML"' EXIT
+  awk -v build="$NEXT_BUILD" '
+    !done && /^[[:space:]]*CURRENT_PROJECT_VERSION:/ {
+      sub(/:.*/, ": " build)
+      done = 1
+    }
+    { print }
+  ' project.yml > "$TMP_PROJECT_YML"
+  mv "$TMP_PROJECT_YML" project.yml
+  trap - EXIT
+  CURRENT_BUILD="$NEXT_BUILD"
+  echo "==> Version $CURRENT_VERSION (build $CURRENT_BUILD, +1)"
+else
+  echo "==> Version $CURRENT_VERSION (build $CURRENT_BUILD, no bump)"
 fi
 
 echo "==> Generating CCX.xcodeproj"
