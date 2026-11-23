@@ -61,14 +61,19 @@ public final class AnnotationDocument {
         return true
     }
 
-    /// Updates the style of the currently selected item (for example changing color or stroke preset).
+    /// Updates the style of the currently selected item, optionally pushing an undo snapshot first.
     @discardableResult
-    public func updateSelectedStyle(_ transform: (inout AnnotationStyle) -> Void) -> Bool {
+    public func updateSelectedStyle(recordUndo: Bool = true, _ transform: (inout AnnotationStyle) -> Void) -> Bool {
         guard let selectedID, let index = items.firstIndex(where: { $0.id == selectedID }) else { return false }
         var updated = items[index]
         transform(&updated.style)
-        guard updated.style != items[index].style else { return false }
-        beginMutationSnapshot()
+        if case let .mosaic(rect, _) = updated.kind {
+            updated.kind = .mosaic(rect, updated.style.mosaicMode)
+        }
+        guard updated != items[index] else { return false }
+        if recordUndo {
+            beginMutationSnapshot()
+        }
         items[index] = updated
         return true
     }

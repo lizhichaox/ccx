@@ -20,6 +20,8 @@ final class SnipActionToolbar: NSView {
     var onAction: ((SnipToolbarAction) -> Void)?
     var onToolSelected: ((AnnotationTool) -> Void)?
     var onStyleChanged: ((AnnotationStyle) -> Void)?
+    var onSizeChanged: ((StrokeSize) -> Void)?
+    var onSizeEditingStateChanged: ((Bool) -> Void)?
     var onDragMoved: ((CGPoint) -> Void)?
     var onDragStateChanged: ((Bool, CGPoint) -> Void)?
     var onResetPosition: (() -> Void)?
@@ -55,7 +57,8 @@ final class SnipActionToolbar: NSView {
     private let mosaicModeStack = NSStackView()
     private var colorButtons: [AnnotationColor: ColorSwatchButton] = [:]
     private var mosaicModeButtons: [MosaicMode: ModePillButton] = [:]
-    private var sizeButtons: [StrokePreset: SizeDotButton] = [:]
+    private let sizeSlider = StrokeSizeSlider()
+    var sizeSliderView: NSView { sizeSlider }
 
     override init(frame frameRect: NSRect) {
         let primaryContent = NSView(frame: .zero)
@@ -113,6 +116,9 @@ final class SnipActionToolbar: NSView {
         let hit = super.hitTest(point)
         if hit === dragHandle {
             return dragHandle
+        }
+        if hit === sizeSlider || hit?.isDescendant(of: sizeSlider) == true {
+            return sizeSlider
         }
         if let button = hit as? NSButton, button.isEnabled {
             return button
@@ -221,9 +227,8 @@ final class SnipActionToolbar: NSView {
             for (mode, button) in mosaicModeButtons {
                 button.isChosen = (mode == style.mosaicMode)
             }
-            for (preset, button) in sizeButtons {
-                button.isChosen = (preset == style.size)
-            }
+            sizeSlider.size = style.size
+            sizeSlider.previewColor = effectiveStyleTool.usesColor ? style.color : nil
         }
     }
 
@@ -336,23 +341,18 @@ final class SnipActionToolbar: NSView {
             mosaicModeStack.addArrangedSubview(button)
         }
 
-        let sizesStack = NSStackView()
-        sizesStack.orientation = .horizontal
-        sizesStack.alignment = .centerY
-        sizesStack.spacing = 2
-        for preset in StrokePreset.allCases {
-            let button = SizeDotButton(preset: preset)
-            button.target = self
-            button.action = #selector(sizePressed(_:))
-            sizeButtons[preset] = button
-            sizesStack.addArrangedSubview(button)
+        sizeSlider.onSizeChanged = { [weak self] newSize in
+            self?.onSizeChanged?(newSize)
+        }
+        sizeSlider.onEditingStateChanged = { [weak self] editing in
+            self?.onSizeEditingStateChanged?(editing)
         }
 
         let stack = NSStackView(views: [
             colorsStack,
             mosaicModeStack,
             Self.makeDivider(),
-            sizesStack,
+            sizeSlider,
         ])
         stack.orientation = .horizontal
         stack.alignment = .centerY
@@ -389,16 +389,9 @@ final class SnipActionToolbar: NSView {
         onStyleChanged?(updated)
     }
 
-    @objc private func sizePressed(_ sender: NSButton) {
-        guard let preset = (sender as? SizeDotButton)?.preset else { return }
-        var updated = currentStyle
-        updated.size = preset
-        onStyleChanged?(updated)
-    }
-
     // MARK: - Placement & Chrome Helpers
 
-    /// Anchors the toolbar below the selection (right-aligned), else above, else inside; clamped to `bounds`.
+    /// Anchors the toolbar centered horizontally below the selection, else above, else inside; clamped to `bounds`.
     static func frame(for selection: CGRect, in bounds: CGRect, topInset: CGFloat) -> CGRect {
         frame(for: selection, in: bounds, topInset: topInset, showsStyleBar: false)
     }
@@ -412,15 +405,20 @@ final class SnipActionToolbar: NSView {
         let size = showsStyleBar ? expandedSize : preferredSize
         let gap: CGFloat = 8
         let usableMaxY = bounds.maxY - topInset
-        var origin = CGPoint(x: selection.maxX - size.width, y: selection.minY - gap - size.height)
+        let maxX = max(bounds.minX, bounds.maxX - size.width)
+        let maxY = max(bounds.minY, usableMaxY - size.height)
+        var origin = CGPoint(
+            x: (selection.midX - size.width / 2).rounded(),
+            y: selection.minY - gap - size.height
+        )
         if origin.y < bounds.minY {
             origin.y = selection.maxY + gap
             if origin.y + size.height > usableMaxY {
                 origin.y = selection.minY + gap
             }
         }
-        origin.x = min(max(origin.x, bounds.minX), bounds.maxX - size.width)
-        origin.y = min(max(origin.y, bounds.minY), usableMaxY - size.height)
+        origin.x = min(max(origin.x, bounds.minX), maxX)
+        origin.y = min(max(origin.y, bounds.minY), maxY)
         return CGRect(origin: origin, size: size)
     }
 
@@ -677,51 +675,198 @@ private final class ColorSwatchButton: HoverButton {
     }
 }
 
-private final class SizeDotButton: HoverButton {
-    let preset: StrokePreset
-    var isChosen = false {
+private final class StrokeSizeSlider: NSView {
+    private static let trackMinX: CGFloat = 8
+    private static let trackMaxX: CGFloat = 92
+    private static let previewCenterX: CGFloat = 107
+
+    var onSizeChanged: ((StrokeSize) -> Void)?
+    var onEditingStateChanged: ((Bool) -> Void)?
+
+    var size: StrokeSize = .medium {
         didSet {
-            guard oldValue != isChosen else { return }
+            guard oldValue != size else { return }
+            updateTooltip()
             needsDisplay = true
         }
     }
 
-    init(preset: StrokePreset) {
-        self.preset = preset
-        super.init(frame: .zero)
-        title = ""
-        isBordered = false
-        toolTip = "Size \(preset.label)"
+    var previewColor: AnnotationColor? {
+        didSet {
+            guard oldValue != previewColor else { return }
+            needsDisplay = true
+        }
+    }
+
+    private var isHovering = false {
+        didSet {
+            guard oldValue != isHovering else { return }
+            needsDisplay = true
+        }
+    }
+
+    private var isDragging = false {
+        didSet {
+            guard oldValue != isDragging else { return }
+            needsDisplay = true
+        }
+    }
+
+    private var hoverArea: NSTrackingArea?
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
         translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
-            widthAnchor.constraint(equalToConstant: 24),
+            widthAnchor.constraint(equalToConstant: 118),
             heightAnchor.constraint(equalToConstant: 24),
         ])
+        updateTooltip()
     }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let hoverArea { removeTrackingArea(hoverArea) }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        hoverArea = area
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        isHovering = true
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        isHovering = false
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        isDragging = true
+        onEditingStateChanged?(true)
+        let nextSize = StrokeSize(progress: progress(for: event))
+        size = nextSize
+        onSizeChanged?(nextSize)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard isDragging else { return }
+        let nextSize = StrokeSize(progress: progress(for: event))
+        if nextSize != size {
+            size = nextSize
+            onSizeChanged?(nextSize)
+        }
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        guard isDragging else { return }
+        isDragging = false
+        onEditingStateChanged?(false)
+    }
+
+    private func progress(for event: NSEvent) -> CGFloat {
+        let local = convert(event.locationInWindow, from: nil)
+        let span = Self.trackMaxX - Self.trackMinX
+        guard span > 0 else { return 0.41 }
+        return min(max((local.x - Self.trackMinX) / span, 0), 1)
+    }
+
+    private func updateTooltip() {
+        toolTip = "Stroke Size: \(size.formattedLineWidth) pt (drag or scroll up/down)"
+    }
+
     override func draw(_ dirtyRect: NSRect) {
-        if isChosen || isHovering {
-            let bg = NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: 6, yRadius: 6)
-            (isChosen ? NSColor.white.withAlphaComponent(0.22) : NSColor.white.withAlphaComponent(0.11)).setFill()
-            bg.fill()
+        let midY = bounds.midY
+        let leftX = Self.trackMinX
+        let rightX = Self.trackMaxX
+        let leftRadius: CGFloat = 1.5
+        let rightRadius: CGFloat = 3.2
+        let knobX = leftX + (rightX - leftX) * size.progress
+
+        // Tapered capsule track communicating thinner -> thicker left-to-right.
+        let trackPath = NSBezierPath()
+        trackPath.appendArc(
+            withCenter: CGPoint(x: leftX, y: midY),
+            radius: leftRadius,
+            startAngle: 90,
+            endAngle: 270
+        )
+        trackPath.appendArc(
+            withCenter: CGPoint(x: rightX, y: midY),
+            radius: rightRadius,
+            startAngle: -90,
+            endAngle: 90
+        )
+        trackPath.close()
+
+        NSColor.white.withAlphaComponent(isHovering || isDragging ? 0.28 : 0.22).setFill()
+        trackPath.fill()
+
+        if size.progress > 0, let context = NSGraphicsContext.current?.cgContext {
+            context.saveGState()
+            trackPath.addClip()
+            NSColor.white.withAlphaComponent(0.78).setFill()
+            CGRect(x: 0, y: 0, width: knobX, height: bounds.height).fill()
+            context.restoreGState()
         }
 
-        let diameter: CGFloat = switch preset {
-        case .small: 6
-        case .medium: 9.5
-        case .large: 13
-        }
-        let dotRect = CGRect(
-            x: bounds.midX - diameter / 2,
-            y: bounds.midY - diameter / 2,
-            width: diameter,
-            height: diameter
+        // Draggable white circular knob.
+        let knobDiameter: CGFloat = isDragging ? 13 : 12
+        let knobRect = CGRect(
+            x: knobX - knobDiameter / 2,
+            y: midY - knobDiameter / 2,
+            width: knobDiameter,
+            height: knobDiameter
         )
-        (isChosen ? NSColor.white : NSColor.white.withAlphaComponent(0.8)).setFill()
+        if let context = NSGraphicsContext.current?.cgContext {
+            context.saveGState()
+            context.setShadow(
+                offset: CGSize(width: 0, height: -0.5),
+                blur: 2,
+                color: CGColor(gray: 0, alpha: 0.4)
+            )
+            NSColor.white.setFill()
+            NSBezierPath(ovalIn: knobRect).fill()
+            context.restoreGState()
+        } else {
+            NSColor.white.setFill()
+            NSBezierPath(ovalIn: knobRect).fill()
+        }
+        NSColor.black.withAlphaComponent(0.22).setStroke()
+        let knobBorder = NSBezierPath(ovalIn: knobRect.insetBy(dx: 0.4, dy: 0.4))
+        knobBorder.lineWidth = 0.8
+        knobBorder.stroke()
+
+        // Live thickness preview dot scaling from 4pt to 14pt.
+        let dotDiameter = 4 + 10 * size.progress
+        let dotRect = CGRect(
+            x: Self.previewCenterX - dotDiameter / 2,
+            y: midY - dotDiameter / 2,
+            width: dotDiameter,
+            height: dotDiameter
+        )
+        let dotColor = previewColor?.nsColor ?? .white
+        dotColor.setFill()
         NSBezierPath(ovalIn: dotRect).fill()
+
+        if previewColor == nil || previewColor == .white || previewColor == .charcoal {
+            let borderColor: NSColor = previewColor == .charcoal
+                ? NSColor.white.withAlphaComponent(0.4)
+                : NSColor.black.withAlphaComponent(0.22)
+            borderColor.setStroke()
+            let dotStroke = NSBezierPath(ovalIn: dotRect.insetBy(dx: 0.4, dy: 0.4))
+            dotStroke.lineWidth = 0.8
+            dotStroke.stroke()
+        }
     }
 }
 

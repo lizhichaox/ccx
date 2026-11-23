@@ -23,6 +23,10 @@ final class PixelMagnifierView: NSView {
         .font: NSFont.monospacedSystemFont(ofSize: 8.5, weight: .regular),
         .foregroundColor: NSColor.white.withAlphaComponent(0.55),
     ]
+    private static let hintAttributedString = NSAttributedString(
+        string: "C copy · ⇧ format",
+        attributes: hintAttributes
+    )
     private static let gridLinesPath: CGPath = {
         let side = gridSide
         let cell = cellSize
@@ -74,11 +78,11 @@ final class PixelMagnifierView: NSView {
         format: ColorFormat,
         sizeText: String
     ) {
-        if gridImage != nil &&
-           lastPixelX == pixelX &&
-           lastPixelY == pixelY &&
+        let pixelChanged = gridImage == nil || lastPixelX != pixelX || lastPixelY != pixelY
+        if !pixelChanged &&
            lastFormat == format &&
-           lastSizeText == sizeText {
+           lastSizeText == sizeText &&
+           sample == self.sample {
             return
         }
         lastPixelX = pixelX
@@ -86,19 +90,21 @@ final class PixelMagnifierView: NSView {
         lastFormat = format
         lastSizeText = sizeText
 
-        let half = Self.gridPixels / 2
-        let wanted = CGRect(x: pixelX - half, y: pixelY - half, width: Self.gridPixels, height: Self.gridPixels)
-        let imageRect = CGRect(x: 0, y: 0, width: image.width, height: image.height)
-        let visible = wanted.intersection(imageRect)
-        if visible.isNull || visible.isEmpty {
-            gridImage = nil
-        } else {
-            gridImage = image.cropping(to: visible)
-            gridOffset = CGPoint(x: visible.minX - wanted.minX, y: visible.minY - wanted.minY)
+        if pixelChanged {
+            let half = Self.gridPixels / 2
+            let wanted = CGRect(x: pixelX - half, y: pixelY - half, width: Self.gridPixels, height: Self.gridPixels)
+            let imageRect = CGRect(x: 0, y: 0, width: image.width, height: image.height)
+            let visible = wanted.intersection(imageRect)
+            if visible.isNull || visible.isEmpty {
+                gridImage = nil
+            } else {
+                gridImage = image.cropping(to: visible)
+                gridOffset = CGPoint(x: visible.minX - wanted.minX, y: visible.minY - wanted.minY)
+            }
+            self.positionText = "(\(pixelX), \(pixelY))"
         }
         self.sample = sample
         self.format = format
-        self.positionText = "(\(pixelX), \(pixelY))"
         self.sizeText = sizeText
         needsDisplay = true
     }
@@ -163,10 +169,7 @@ final class PixelMagnifierView: NSView {
             let text = sample.formatted(as: format)
             (text as NSString).draw(at: CGPoint(x: swatch.maxX + 5, y: swatch.minY - 1), withAttributes: Self.infoAttributes)
         }
-        ("C copy · ⇧ format" as NSString).draw(
-            at: CGPoint(x: 6, y: max(3, infoTop - 4 * lineHeight + 3)),
-            withAttributes: Self.hintAttributes
-        )
+        Self.hintAttributedString.draw(at: CGPoint(x: 6, y: max(3, infoTop - 4 * lineHeight + 3)))
     }
 
     /// Chooses a frame near `cursor` that stays inside `bounds` and below the top safe-area inset (Notch).

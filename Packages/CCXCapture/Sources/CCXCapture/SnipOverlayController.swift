@@ -6,6 +6,10 @@ import CCXCore
 final class SnipOverlayPanel: NSPanel {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
+
+    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect {
+        frameRect
+    }
 }
 
 /// Owns one `SnipOverlayPanel` per display for the duration of a snip session.
@@ -54,9 +58,10 @@ final class SnipOverlayController {
             uniquingKeysWith: { first, _ in first }
         )
         let mouse = NSEvent.mouseLocation
+        let activeIndex = Self.matchingSnapshotIndex(for: mouse, in: snapshots.map(\.screenFrame))
         var keyPanel: SnipOverlayPanel?
 
-        for snapshot in snapshots {
+        for (index, snapshot) in snapshots.enumerated() {
             let screen = screensByID[snapshot.displayID]
             let topInset = screen?.safeAreaInsets.top ?? 0
             let panel = SnipOverlayPanel(
@@ -65,17 +70,7 @@ final class SnipOverlayController {
                 backing: .buffered,
                 defer: false
             )
-            panel.level = .screenSaver
-            panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
-            panel.isOpaque = true
-            panel.backgroundColor = .black
-            panel.hasShadow = false
-            panel.isMovable = false
-            panel.hidesOnDeactivate = false
-            panel.isReleasedWhenClosed = false
-            panel.acceptsMouseMovedEvents = true
-            panel.animationBehavior = .none
-            panel.setFrame(snapshot.screenFrame, display: false)
+            Self.configurePanel(panel, frame: snapshot.screenFrame)
 
             let view = SnipOverlayView(
                 snapshot: snapshot,
@@ -84,13 +79,36 @@ final class SnipOverlayController {
                 previousSelectionRect: previousSelections[snapshot.displayID]
             )
             view.hoverRectProvider = { [weak self] global in self?.detector.windowRect(at: global) }
+            view.shouldQueryElementRect = { [weak self] global in
+                self?.detector.shouldRequestElementRect(at: global) ?? false
+            }
             view.elementRectRequester = { [weak self, weak view] global in
-                self?.detector.requestElementRect(at: global) { rect, point in
-                    view?.applyRefinedElementRect(rect, forGlobalPoint: point)
+                guard let self, let view else { return }
+                let epoch = view.axEpoch
+                self.detector.requestElementRect(at: global) { rect, point, isOverlay in
+                    view.applyRefinedElementRect(
+                        rect,
+                        forGlobalPoint: point,
+                        isOverlayElement: isOverlay,
+                        epoch: epoch
+                    )
                 }
+            }
+            view.cancelElementRectRequests = { [weak self] in
+                self?.detector.cancelPendingRequests()
             }
             view.onStyleUpdated = { [weak self] style in
                 self?.onStyleUpdated?(style)
+            }
+            view.onHoverActive = { [weak self, weak view] in
+                guard let self, let view else { return }
+                for other in self.views where other !== view && other.machine.isHovering {
+                    other.clearHover()
+                }
+            }
+            view.hasSiblingSelection = { [weak self, weak view] in
+                guard let self, let view else { return false }
+                return self.views.contains { $0 !== view && !$0.machine.isHovering }
             }
             view.onBeginInteraction = { [weak self, weak view] in
                 guard let self, let view else { return }
@@ -105,17 +123,53 @@ final class SnipOverlayController {
                 self.finish(action, from: view)
             }
             panel.contentView = view
+            panel.initialFirstResponder = view
+            panel.makeFirstResponder(view)
             panels.append(panel)
             views.append(view)
-            if snapshot.screenFrame.contains(mouse) { keyPanel = panel }
+            if index == activeIndex { keyPanel = panel }
         }
 
-        for view in views { view.primeWithMouseLocation(mouse) }
-        NSApp.activate()
+        for (index, view) in views.enumerated() {
+            view.primeWithMouseLocation(mouse, allowClosedEdge: index == activeIndex)
+        }
         for panel in panels { panel.orderFrontRegardless() }
         let key = keyPanel ?? panels.first
         key?.makeKeyAndOrderFront(nil)
-        if let key, let view = key.contentView { key.makeFirstResponder(view) }
+        if let key, let view = key.contentView {
+            key.makeFirstResponder(view)
+            (view as? SnipOverlayView)?.invalidateCursor()
+        }
+    }
+
+    /// Finds the display index containing `globalPoint`, preferring strict half-open containment
+    /// and falling back to inclusive edges so top Menu Bar / right-edge points still match.
+    nonisolated static func matchingSnapshotIndex(for globalPoint: CGPoint, in frames: [CGRect]) -> Int? {
+        if let strict = frames.firstIndex(where: { $0.contains(globalPoint) }) {
+            return strict
+        }
+        return frames.firstIndex { frame in
+            globalPoint.x >= frame.minX && globalPoint.x <= frame.maxX &&
+            globalPoint.y >= frame.minY && globalPoint.y <= frame.maxY
+        }
+    }
+
+    static func configurePanel(_ panel: SnipOverlayPanel, frame: CGRect) {
+        // Setting `isFloatingPanel` resets `level` to `.floating`, so assign `.screenSaver` afterward.
+        panel.isFloatingPanel = true
+        panel.level = .screenSaver
+        panel.becomesKeyOnlyIfNeeded = false
+        panel.worksWhenModal = true
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
+        panel.isOpaque = true
+        panel.backgroundColor = .black
+        panel.hasShadow = false
+        panel.isMovable = false
+        panel.hidesOnDeactivate = false
+        panel.isReleasedWhenClosed = false
+        panel.acceptsMouseMovedEvents = true
+        panel.animationBehavior = .none
+        panel.setFrame(frame, display: false)
     }
 
     /// Tears down all panels without reporting an outcome.
@@ -127,9 +181,14 @@ final class SnipOverlayController {
         for view in views {
             view.onFinish = nil
             view.onBeginInteraction = nil
+            view.onHoverActive = nil
+            view.hasSiblingSelection = nil
             view.shouldBecomeKeyOnHover = nil
             view.hoverRectProvider = nil
+            view.shouldQueryElementRect = nil
             view.elementRectRequester = nil
+            view.cancelElementRectRequests = nil
+            view.onStyleUpdated = nil
         }
         panels.removeAll()
         views.removeAll()

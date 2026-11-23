@@ -245,4 +245,80 @@ struct SelectionStateMachineTests {
         #expect(clamped)
         #expect(machine.selectionRect?.size == CGSize(width: 1, height: 1))
     }
+
+    @Test func microDragBelowClickThresholdSelectsDetectedRectWithoutZeroFlash() {
+        var machine = SelectionStateMachine(bounds: bounds)
+        let window = CGRect(x: 100, y: 100, width: 300, height: 200)
+        machine.updateHover(detectedRect: window)
+
+        machine.mouseDown(at: CGPoint(x: 150, y: 150))
+        // Holding mouse down before threshold keeps detected rect highlighted instead of flashing 0x0.
+        #expect(machine.highlightedRect == window)
+        #expect(machine.selectionRect == nil)
+
+        // Sub-threshold trackpad micro-drag (< 3pt) must remain a click.
+        machine.mouseDragged(to: CGPoint(x: 151.5, y: 150.8))
+        #expect(machine.highlightedRect == window)
+        #expect(machine.selectionRect == nil)
+
+        machine.mouseUp(at: CGPoint(x: 151.5, y: 150.8))
+        #expect(machine.state == .selected(rect: window))
+    }
+
+    @Test func outsideMicroDragKeepsPreviousSelection() {
+        let existing = CGRect(x: 100, y: 100, width: 200, height: 150)
+        var machine = selected(existing)
+
+        machine.mouseDown(at: CGPoint(x: 600, y: 600))
+        #expect(machine.highlightedRect == existing)
+        machine.mouseDragged(to: CGPoint(x: 602, y: 598.5))
+        #expect(machine.highlightedRect == existing)
+        machine.mouseUp(at: CGPoint(x: 602, y: 598.5))
+        #expect(machine.state == .selected(rect: existing))
+    }
+
+    @Test func dragPastThresholdThenBackToOriginProducesMinimumDragNotClick() {
+        var machine = SelectionStateMachine(bounds: bounds)
+        let window = CGRect(x: 100, y: 100, width: 300, height: 200)
+        machine.updateHover(detectedRect: window)
+
+        machine.mouseDown(at: CGPoint(x: 150, y: 150))
+        machine.mouseDragged(to: CGPoint(x: 250, y: 220))
+        #expect(machine.selectionRect == CGRect(x: 150, y: 150, width: 100, height: 70))
+
+        machine.mouseDragged(to: CGPoint(x: 150, y: 150))
+        machine.mouseUp(at: CGPoint(x: 150, y: 150))
+        #expect(machine.state == .selected(rect: CGRect(x: 150, y: 150, width: 1, height: 1)))
+    }
+
+    @Test func hoverNilNonStandardizedOutOfBoundsSelectAndEdgeMinimumSize() {
+        var machine = SelectionStateMachine(bounds: bounds)
+        machine.updateHover(detectedRect: CGRect(x: 300, y: 300, width: -100, height: -50))
+        #expect(machine.highlightedRect == CGRect(x: 200, y: 250, width: 100, height: 50))
+
+        machine.updateHover(detectedRect: CGRect(x: 200, y: 200, width: 0, height: 50))
+        #expect(machine.highlightedRect == nil)
+
+        machine.updateHover(detectedRect: CGRect(x: 100, y: 100, width: 50, height: 50))
+        machine.updateHover(detectedRect: nil)
+        #expect(machine.highlightedRect == nil)
+
+        // Out-of-bounds explicit select is ignored.
+        machine.select(CGRect(x: 5000, y: 5000, width: 50, height: 50))
+        #expect(machine.isHovering)
+
+        // Zero-height drag right at top-right edge enforces 1x1 clamped inside bounds.
+        machine.mouseDown(at: CGPoint(x: 1000, y: 800))
+        machine.mouseDragged(to: CGPoint(x: 990, y: 800))
+        machine.mouseUp(at: CGPoint(x: 990, y: 800))
+        #expect(machine.state == .selected(rect: CGRect(x: 990, y: 799, width: 10, height: 1)))
+    }
+
+    @Test func handlePointMatchesHandlePointsDictionary() {
+        let rect = CGRect(x: 40, y: 60, width: 200, height: 120)
+        let dict = SelectionStateMachine.handlePoints(for: rect)
+        for handle in ResizeHandle.allCases {
+            #expect(SelectionStateMachine.handlePoint(handle, for: rect) == dict[handle])
+        }
+    }
 }

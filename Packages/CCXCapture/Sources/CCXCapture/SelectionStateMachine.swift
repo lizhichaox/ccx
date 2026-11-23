@@ -58,6 +58,8 @@ public struct SelectionStateMachine: Sendable {
     private var pendingDetectedRect: CGRect?
     /// Selection that was active before an outside click started a new drag.
     private var previousSelection: CGRect?
+    /// Whether the current drag gesture has moved past `clickThreshold` at least once.
+    private var didExceedClickThreshold = false
 
     public init(bounds: CGRect) {
         self.bounds = bounds
@@ -66,19 +68,30 @@ public struct SelectionStateMachine: Sendable {
 
     // MARK: - Derived values
 
-    /// The user's selection (live while dragging, moving, or resizing), or `nil` while hovering.
+    /// The user's selection (live while dragging past `clickThreshold`, moving, or resizing), or `nil` while hovering.
     public var selectionRect: CGRect? {
         switch state {
         case .hovering: return nil
-        case let .dragging(origin, current): return Self.rect(from: origin, to: current)
+        case let .dragging(origin, current):
+            return didExceedClickThreshold ? Self.rect(from: origin, to: current) : nil
         case let .selected(rect), let .moving(rect, _), let .resizing(rect, _, _): return rect
         }
     }
 
-    /// The rectangle to highlight: the selection, or the detected element while hovering.
+    /// The rectangle to highlight: the selection, the pending click target before `clickThreshold`,
+    /// or the detected element while hovering.
     public var highlightedRect: CGRect? {
-        if case let .hovering(detected) = state { return detected }
-        return selectionRect
+        switch state {
+        case let .hovering(detected):
+            return detected
+        case let .dragging(origin, current):
+            if didExceedClickThreshold {
+                return Self.rect(from: origin, to: current)
+            }
+            return pendingDetectedRect ?? previousSelection
+        case let .selected(rect), let .moving(rect, _), let .resizing(rect, _, _):
+            return rect
+        }
     }
 
     public var isSelected: Bool {
@@ -105,15 +118,19 @@ public struct SelectionStateMachine: Sendable {
         case let .hovering(detected):
             pendingDetectedRect = detected
             previousSelection = nil
+            didExceedClickThreshold = false
             state = .dragging(origin: point, current: point)
         case let .selected(rect):
             if let handle = Self.hitTestHandle(at: point, rect: rect, radius: handleHitRadius) {
+                didExceedClickThreshold = false
                 state = .resizing(rect: rect, handle: handle, startPoint: point)
             } else if rect.contains(point) {
+                didExceedClickThreshold = false
                 state = .moving(rect: rect, startPoint: point)
             } else {
                 pendingDetectedRect = nil
                 previousSelection = rect
+                didExceedClickThreshold = false
                 state = .dragging(origin: point, current: point)
             }
         case .dragging, .moving, .resizing:
@@ -129,7 +146,13 @@ public struct SelectionStateMachine: Sendable {
         let point = Self.clampedPoint(rawPoint, in: bounds)
         switch state {
         case let .dragging(origin, current):
-            if moveOrigin {
+            if !didExceedClickThreshold {
+                guard abs(point.x - origin.x) >= clickThreshold || abs(point.y - origin.y) >= clickThreshold else {
+                    return
+                }
+                didExceedClickThreshold = true
+            }
+            if moveOrigin && current != origin {
                 let activeRect = Self.rect(from: origin, to: current)
                 let moved = Self.clampedOffset(
                     activeRect,
@@ -176,8 +199,7 @@ public struct SelectionStateMachine: Sendable {
         let point = Self.clampedPoint(rawPoint, in: bounds)
         switch state {
         case let .dragging(origin, current):
-            let dragMoved = current != origin
-            let isClick = !dragMoved &&
+            let isClick = !didExceedClickThreshold &&
                 abs(point.x - origin.x) < clickThreshold &&
                 abs(point.y - origin.y) < clickThreshold
             if isClick {
@@ -187,12 +209,13 @@ public struct SelectionStateMachine: Sendable {
                     state = .selected(rect: pendingDetectedRect ?? bounds)
                 }
             } else {
-                let finalPoint = dragMoved ? current : point
+                let finalPoint = didExceedClickThreshold ? current : point
                 let rect = Self.rect(from: origin, to: finalPoint)
                 state = .selected(rect: Self.enforceMinimumSize(rect, in: bounds))
             }
             pendingDetectedRect = nil
             previousSelection = nil
+            didExceedClickThreshold = false
         case let .moving(rect, _), let .resizing(rect, _, _):
             state = .selected(rect: Self.enforceMinimumSize(rect, in: bounds))
         case .hovering, .selected:
@@ -229,6 +252,9 @@ public struct SelectionStateMachine: Sendable {
     /// Selects an explicit rectangle (clamped to bounds).
     public mutating func select(_ rect: CGRect) {
         guard let clamped = Self.clampedRect(rect, in: bounds) else { return }
+        pendingDetectedRect = nil
+        previousSelection = nil
+        didExceedClickThreshold = false
         state = .selected(rect: clamped)
     }
 
@@ -236,31 +262,48 @@ public struct SelectionStateMachine: Sendable {
     public mutating func reset() {
         pendingDetectedRect = nil
         previousSelection = nil
+        didExceedClickThreshold = false
         state = .hovering(detectedRect: nil)
     }
 
     // MARK: - Geometry helpers
 
+    private static let hitTestOrder: [ResizeHandle] = [
+        .topLeft, .topRight, .bottomRight, .bottomLeft, .top, .right, .bottom, .left,
+    ]
+
+    /// Center of a single resize handle of `rect` without allocating a dictionary.
+    public static func handlePoint(_ handle: ResizeHandle, for rect: CGRect) -> CGPoint {
+        switch handle {
+        case .topLeft: CGPoint(x: rect.minX, y: rect.maxY)
+        case .top: CGPoint(x: rect.midX, y: rect.maxY)
+        case .topRight: CGPoint(x: rect.maxX, y: rect.maxY)
+        case .right: CGPoint(x: rect.maxX, y: rect.midY)
+        case .bottomRight: CGPoint(x: rect.maxX, y: rect.minY)
+        case .bottom: CGPoint(x: rect.midX, y: rect.minY)
+        case .bottomLeft: CGPoint(x: rect.minX, y: rect.minY)
+        case .left: CGPoint(x: rect.minX, y: rect.midY)
+        }
+    }
+
     /// Centers of the eight resize handles of `rect`.
     public static func handlePoints(for rect: CGRect) -> [ResizeHandle: CGPoint] {
         [
-            .topLeft: CGPoint(x: rect.minX, y: rect.maxY),
-            .top: CGPoint(x: rect.midX, y: rect.maxY),
-            .topRight: CGPoint(x: rect.maxX, y: rect.maxY),
-            .right: CGPoint(x: rect.maxX, y: rect.midY),
-            .bottomRight: CGPoint(x: rect.maxX, y: rect.minY),
-            .bottom: CGPoint(x: rect.midX, y: rect.minY),
-            .bottomLeft: CGPoint(x: rect.minX, y: rect.minY),
-            .left: CGPoint(x: rect.minX, y: rect.midY),
+            .topLeft: handlePoint(.topLeft, for: rect),
+            .top: handlePoint(.top, for: rect),
+            .topRight: handlePoint(.topRight, for: rect),
+            .right: handlePoint(.right, for: rect),
+            .bottomRight: handlePoint(.bottomRight, for: rect),
+            .bottom: handlePoint(.bottom, for: rect),
+            .bottomLeft: handlePoint(.bottomLeft, for: rect),
+            .left: handlePoint(.left, for: rect),
         ]
     }
 
     /// Returns the handle under `point`, preferring corners over edges.
     public static func hitTestHandle(at point: CGPoint, rect: CGRect, radius: CGFloat) -> ResizeHandle? {
-        let points = handlePoints(for: rect)
-        let order: [ResizeHandle] = [.topLeft, .topRight, .bottomRight, .bottomLeft, .top, .right, .bottom, .left]
-        for handle in order {
-            guard let center = points[handle] else { continue }
+        for handle in hitTestOrder {
+            let center = handlePoint(handle, for: rect)
             if abs(point.x - center.x) <= radius && abs(point.y - center.y) <= radius {
                 return handle
             }

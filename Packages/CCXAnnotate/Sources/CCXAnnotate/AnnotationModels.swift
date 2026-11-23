@@ -121,58 +121,75 @@ public struct AnnotationColor: Equatable, Hashable, Sendable {
     }
 }
 
-/// Three calibrated size presets shared by strokes, highlighter, mosaic, text, and counters.
-public enum StrokePreset: Int, CaseIterable, Sendable {
-    case small = 0
-    case medium = 1
-    case large = 2
+/// Continuous annotation thickness control ranging smoothly from minimum (`0`) to maximum (`1`),
+/// with `.small`, `.medium`, and `.large` reference anchors.
+public struct StrokeSize: Equatable, Hashable, Sendable {
+    public static let minLineWidth: CGFloat = 1.5
+    public static let maxLineWidth: CGFloat = 12.0
+    private static let lineWidthExponent: CGFloat = 1.6
 
-    public var label: String {
-        switch self {
-        case .small: "S"
-        case .medium: "M"
-        case .large: "L"
-        }
+    private let permille: Int
+
+    public var progress: CGFloat { CGFloat(permille) / 1000 }
+
+    public static let minimum = StrokeSize(progress: 0)
+    public static let maximum = StrokeSize(progress: 1)
+    public static let small = StrokeSize(progress: 0.23)
+    public static let medium = StrokeSize(progress: 0.41)
+    public static let large = StrokeSize(progress: 0.63)
+    public static let presets: [StrokeSize] = [.small, .medium, .large]
+
+    public init(progress: CGFloat) {
+        let safe = progress.isFinite ? progress : 0.41
+        let clamped = min(max(safe, 0), 1)
+        self.permille = Int((clamped * 1000).rounded())
+    }
+
+    public init(lineWidth: CGFloat) {
+        let safe = lineWidth.isFinite ? lineWidth : 4.0
+        let clamped = min(max(safe, Self.minLineWidth), Self.maxLineWidth)
+        let normalized = (clamped - Self.minLineWidth) / (Self.maxLineWidth - Self.minLineWidth)
+        self.init(progress: pow(normalized, 1 / Self.lineWidthExponent))
+    }
+
+    public func adjusted(byProgressDelta delta: CGFloat) -> StrokeSize {
+        guard delta.isFinite else { return self }
+        return StrokeSize(progress: progress + delta)
     }
 
     public var lineWidth: CGFloat {
-        switch self {
-        case .small: 2.5
-        case .medium: 4.0
-        case .large: 6.5
+        let raw = Self.minLineWidth + (Self.maxLineWidth - Self.minLineWidth) * pow(progress, Self.lineWidthExponent)
+        return (raw * 10).rounded() / 10
+    }
+
+    public var formattedLineWidth: String {
+        let tenths = Int((lineWidth * 10).rounded())
+        if tenths.isMultiple(of: 10) {
+            return "\(tenths / 10)"
         }
+        return "\(tenths / 10).\(tenths % 10)"
     }
 
     public var highlighterWidth: CGFloat {
-        switch self {
-        case .small: 14
-        case .medium: 22
-        case .large: 32
-        }
+        ((8 + 38 * pow(progress, 1.15)) * 2).rounded() / 2
     }
 
     public var fontSize: CGFloat {
-        switch self {
-        case .small: 15
-        case .medium: 21
-        case .large: 30
-        }
+        (11 + 35 * pow(progress, 1.35)).rounded()
     }
 
-    public var mosaicRadius: CGFloat {
-        switch self {
-        case .small: 10
-        case .medium: 18
-        case .large: 28
-        }
+    public var mosaicBlockSize: CGFloat {
+        CGFloat(max(4, min(24, Int(((4 + 20 * pow(progress, 1.3)) / 2).rounded()) * 2)))
     }
+
+    public var blurRadius: CGFloat {
+        CGFloat(max(6, min(32, Int(((6 + 26 * pow(progress, 1.15)) / 2).rounded()) * 2)))
+    }
+
+    public var mosaicRadius: CGFloat { mosaicBlockSize }
 
     public var counterDiameter: CGFloat {
-        switch self {
-        case .small: 24
-        case .medium: 30
-        case .large: 38
-        }
+        (18 + 34 * pow(progress, 1.15)).rounded()
     }
 }
 
@@ -192,12 +209,12 @@ public enum MosaicMode: String, CaseIterable, Sendable {
 /// Visual attributes applied to an annotation item.
 public struct AnnotationStyle: Equatable, Sendable {
     public var color: AnnotationColor
-    public var size: StrokePreset
+    public var size: StrokeSize
     public var mosaicMode: MosaicMode
 
     public init(
         color: AnnotationColor = .red,
-        size: StrokePreset = .medium,
+        size: StrokeSize = .medium,
         mosaicMode: MosaicMode = .pixelate
     ) {
         self.color = color
@@ -208,7 +225,7 @@ public struct AnnotationStyle: Equatable, Sendable {
 
 /// Interactive resize/endpoint handles on a selected annotation.
 public enum AnnotationHandle: Equatable, Hashable, Sendable {
-    case topLeft, topRight, bottomRight, bottomLeft
+    case topLeft, top, topRight, right, bottomRight, bottom, bottomLeft, left
     case start, end
 }
 
@@ -271,16 +288,31 @@ public struct AnnotationItem: Identifiable, Equatable, Sendable {
         }
     }
 
+    private static let handleHitOrder: [AnnotationHandle] = [
+        .topLeft, .topRight, .bottomRight, .bottomLeft,
+        .top, .right, .bottom, .left,
+        .start, .end,
+    ]
+
     public var handlePoints: [AnnotationHandle: CGPoint] {
         switch kind {
         case let .rectangle(raw), let .ellipse(raw), let .mosaic(raw, _):
             let rect = raw.standardized
-            return [
+            var points: [AnnotationHandle: CGPoint] = [
                 .topLeft: CGPoint(x: rect.minX, y: rect.maxY),
                 .topRight: CGPoint(x: rect.maxX, y: rect.maxY),
                 .bottomRight: CGPoint(x: rect.maxX, y: rect.minY),
                 .bottomLeft: CGPoint(x: rect.minX, y: rect.minY),
             ]
+            if rect.width >= 16 {
+                points[.top] = CGPoint(x: rect.midX, y: rect.maxY)
+                points[.bottom] = CGPoint(x: rect.midX, y: rect.minY)
+            }
+            if rect.height >= 16 {
+                points[.left] = CGPoint(x: rect.minX, y: rect.midY)
+                points[.right] = CGPoint(x: rect.maxX, y: rect.midY)
+            }
+            return points
         case let .arrow(start, end):
             return [.start: start, .end: end]
         case .pen, .highlighter, .text, .counter:
@@ -289,7 +321,9 @@ public struct AnnotationItem: Identifiable, Equatable, Sendable {
     }
 
     public func hitTestHandle(at point: CGPoint, radius: CGFloat = 7) -> AnnotationHandle? {
-        for (handle, center) in handlePoints {
+        let points = handlePoints
+        for handle in Self.handleHitOrder {
+            guard let center = points[handle] else { continue }
             if abs(point.x - center.x) <= radius && abs(point.y - center.y) <= radius {
                 return handle
             }
@@ -383,20 +417,18 @@ public struct AnnotationItem: Identifiable, Equatable, Sendable {
     }
 
     public func resized(handle: AnnotationHandle, to point: CGPoint, constrain: Bool) -> AnnotationItem {
+        resized(handle: handle, to: point, constrain: constrain, within: nil)
+    }
+
+    public func resized(handle: AnnotationHandle, to point: CGPoint, constrain: Bool, within bounds: CGRect?) -> AnnotationItem {
         var copy = self
         switch kind {
         case let .rectangle(raw):
-            if let anchor = Self.oppositeCorner(of: raw.standardized, for: handle) {
-                copy.kind = .rectangle(Self.constrainedRect(from: anchor, to: point, square: constrain))
-            }
+            copy.kind = .rectangle(Self.resizedRect(raw, handle: handle, to: point, constrain: constrain, within: bounds))
         case let .ellipse(raw):
-            if let anchor = Self.oppositeCorner(of: raw.standardized, for: handle) {
-                copy.kind = .ellipse(Self.constrainedRect(from: anchor, to: point, square: constrain))
-            }
+            copy.kind = .ellipse(Self.resizedRect(raw, handle: handle, to: point, constrain: constrain, within: bounds))
         case let .mosaic(raw, mode):
-            if let anchor = Self.oppositeCorner(of: raw.standardized, for: handle) {
-                copy.kind = .mosaic(Self.constrainedRect(from: anchor, to: point, square: constrain), mode)
-            }
+            copy.kind = .mosaic(Self.resizedRect(raw, handle: handle, to: point, constrain: constrain, within: bounds), mode)
         case let .arrow(start, end):
             switch handle {
             case .start:
@@ -413,6 +445,115 @@ public struct AnnotationItem: Identifiable, Equatable, Sendable {
     }
 
     // MARK: - Geometry Helpers
+
+    /// Resizes `rawRect` from `handle` toward `point`, supporting corner, single-edge, optional 1:1
+    /// square constraint, optional container `bounds` clamping, and a non-collapsing `minimumSize`.
+    public static func resizedRect(
+        _ rawRect: CGRect,
+        handle: AnnotationHandle,
+        to point: CGPoint,
+        constrain: Bool,
+        within bounds: CGRect? = nil,
+        minimumSize: CGFloat = 4
+    ) -> CGRect {
+        let rect = rawRect.standardized
+        let minBoundX = bounds?.minX
+        let maxBoundX = bounds?.maxX
+        let minBoundY = bounds?.minY
+        let maxBoundY = bounds?.maxY
+
+        switch handle {
+        case .topLeft, .topRight, .bottomRight, .bottomLeft:
+            guard let anchor = oppositeCorner(of: rect, for: handle) else { return rect }
+            if constrain {
+                let targetX = bounds.map { min(max(point.x, $0.minX), $0.maxX) } ?? point.x
+                let targetY = bounds.map { min(max(point.y, $0.minY), $0.maxY) } ?? point.y
+                let dx = targetX - anchor.x
+                let dy = targetY - anchor.y
+                let signX: CGFloat = dx >= 0 ? 1 : -1
+                let signY: CGFloat = dy >= 0 ? 1 : -1
+                let rawSide = max(abs(dx), abs(dy))
+                let side: CGFloat
+                if let bounds {
+                    let availX = dx >= 0 ? max(0, bounds.maxX - anchor.x) : max(0, anchor.x - bounds.minX)
+                    let availY = dy >= 0 ? max(0, bounds.maxY - anchor.y) : max(0, anchor.y - bounds.minY)
+                    let maxSide = min(availX, availY)
+                    let effectiveMin = min(minimumSize, maxSide)
+                    side = min(max(rawSide, effectiveMin), maxSide)
+                } else {
+                    side = max(rawSide, minimumSize)
+                }
+                let end = CGPoint(x: anchor.x + signX * side, y: anchor.y + signY * side)
+                return CGRect(
+                    x: min(anchor.x, end.x),
+                    y: min(anchor.y, end.y),
+                    width: abs(end.x - anchor.x),
+                    height: abs(end.y - anchor.y)
+                )
+            }
+            let (x, width) = axisInterval(anchor: anchor.x, target: point.x, minimumSize: minimumSize, minBound: minBoundX, maxBound: maxBoundX)
+            let (y, height) = axisInterval(anchor: anchor.y, target: point.y, minimumSize: minimumSize, minBound: minBoundY, maxBound: maxBoundY)
+            return CGRect(x: x, y: y, width: width, height: height)
+
+        case .top:
+            let (y, height) = axisInterval(anchor: rect.minY, target: point.y, minimumSize: minimumSize, minBound: minBoundY, maxBound: maxBoundY)
+            return CGRect(x: rect.minX, y: y, width: rect.width, height: height)
+
+        case .bottom:
+            let (y, height) = axisInterval(anchor: rect.maxY, target: point.y, minimumSize: minimumSize, minBound: minBoundY, maxBound: maxBoundY)
+            return CGRect(x: rect.minX, y: y, width: rect.width, height: height)
+
+        case .right:
+            let (x, width) = axisInterval(anchor: rect.minX, target: point.x, minimumSize: minimumSize, minBound: minBoundX, maxBound: maxBoundX)
+            return CGRect(x: x, y: rect.minY, width: width, height: rect.height)
+
+        case .left:
+            let (x, width) = axisInterval(anchor: rect.maxX, target: point.x, minimumSize: minimumSize, minBound: minBoundX, maxBound: maxBoundX)
+            return CGRect(x: x, y: rect.minY, width: width, height: rect.height)
+
+        case .start, .end:
+            return rect
+        }
+    }
+
+    private static func axisInterval(
+        anchor: CGFloat,
+        target: CGFloat,
+        minimumSize: CGFloat,
+        minBound: CGFloat?,
+        maxBound: CGFloat?
+    ) -> (origin: CGFloat, length: CGFloat) {
+        let clampedTarget: CGFloat = if let minBound, let maxBound {
+            min(max(target, minBound), maxBound)
+        } else {
+            target
+        }
+        let effectiveMin: CGFloat = if let minBound, let maxBound {
+            min(minimumSize, max(1, maxBound - minBound))
+        } else {
+            minimumSize
+        }
+        let delta = clampedTarget - anchor
+        if delta >= 0 {
+            var start = anchor
+            var end = anchor + max(delta, effectiveMin)
+            if let maxBound, end > maxBound {
+                end = maxBound
+                start = min(start, maxBound - effectiveMin)
+                if let minBound { start = max(start, minBound) }
+            }
+            return (start, max(0, end - start))
+        } else {
+            var start = anchor + min(delta, -effectiveMin)
+            var end = anchor
+            if let minBound, start < minBound {
+                start = minBound
+                end = max(end, minBound + effectiveMin)
+                if let maxBound { end = min(end, maxBound) }
+            }
+            return (start, max(0, end - start))
+        }
+    }
 
     /// Normalized rectangle spanned from `origin` to `current`, optionally constrained to a 1:1 square.
     public static func constrainedRect(from origin: CGPoint, to current: CGPoint, square: Bool) -> CGRect {
@@ -488,7 +629,7 @@ public struct AnnotationItem: Identifiable, Equatable, Sendable {
         case .topRight: CGPoint(x: rect.minX, y: rect.minY)
         case .bottomRight: CGPoint(x: rect.minX, y: rect.maxY)
         case .bottomLeft: CGPoint(x: rect.maxX, y: rect.maxY)
-        case .start, .end: nil
+        case .top, .right, .bottom, .left, .start, .end: nil
         }
     }
 

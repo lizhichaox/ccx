@@ -524,4 +524,656 @@ struct SnipOverlayViewTests {
         view.toolbar.onAction?(.scroll)
         #expect(actions == [.scroll(resized), .scroll(resized)])
     }
+
+    @Test func atomicCardHoverHighlightsWithoutQueryingAXAndOverlayFallbackAppliesAcrossDesktopAndWindows() throws {
+        let view = SnipOverlayView(snapshot: try makeSnapshot(size: CGSize(width: 1512, height: 982)), topInset: 0)
+        let cardRect = CGRect(x: 1142, y: 740, width: 352, height: 160)
+        let chromeRect = CGRect(x: 0, y: 34, width: 1000, height: 948)
+
+        var axQueries: [CGPoint] = []
+        view.hoverRectProvider = { pt in
+            if cardRect.contains(pt) { return cardRect }
+            if chromeRect.contains(pt) { return chromeRect }
+            return nil
+        }
+        view.shouldQueryElementRect = { pt in
+            !cardRect.contains(pt)
+        }
+        view.elementRectRequester = { pt in
+            axQueries.append(pt)
+        }
+
+        // Hovering an atomic Notification Center card highlights immediately and never invokes AX.
+        view.mouseMoved(with: try makeMouseEvent(type: .mouseMoved, at: CGPoint(x: 1250, y: 820)))
+        #expect(view.machine.highlightedRect == cardRect)
+        #expect(axQueries.isEmpty)
+
+        // Hovering over Desktop (no Tier 1 window) inside a fallback overlay still queries AX and accepts the overlay card.
+        let desktopOverlayPoint = CGPoint(x: 1250, y: 500)
+        let fallbackCard = CGRect(x: 1142, y: 420, width: 352, height: 162)
+        view.mouseMoved(with: try makeMouseEvent(type: .mouseMoved, at: desktopOverlayPoint))
+        #expect(axQueries == [desktopOverlayPoint])
+        view.applyRefinedElementRect(fallbackCard, forGlobalPoint: desktopOverlayPoint, isOverlayElement: true)
+        #expect(view.machine.highlightedRect == fallbackCard)
+
+        // Hovering near the edge of a narrower underlying window accepts an overlay element extending beyond it.
+        let edgePoint = CGPoint(x: 990, y: 300)
+        let overlappingOverlayCard = CGRect(x: 960, y: 240, width: 352, height: 162)
+        view.mouseMoved(with: try makeMouseEvent(type: .mouseMoved, at: edgePoint))
+        #expect(axQueries == [desktopOverlayPoint, edgePoint])
+        view.applyRefinedElementRect(overlappingOverlayCard, forGlobalPoint: edgePoint, isOverlayElement: true)
+        #expect(view.machine.highlightedRect == overlappingOverlayCard)
+    }
+
+    @Test func snipOverlayPanelConfiguredAsNonActivatingFloatingKeyPanel() {
+        let frame = CGRect(x: 0, y: 0, width: 800, height: 600)
+        let panel = SnipOverlayPanel(
+            contentRect: frame,
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        SnipOverlayController.configurePanel(panel, frame: frame)
+
+        #expect(panel.styleMask.contains(.nonactivatingPanel))
+        #expect(panel.isFloatingPanel)
+        #expect(panel.level == .screenSaver)
+        #expect(panel.frame == frame)
+        #expect(panel.becomesKeyOnlyIfNeeded == false)
+        #expect(panel.worksWhenModal)
+        #expect(panel.canBecomeKey)
+        #expect(!panel.canBecomeMain)
+        #expect(panel.collectionBehavior.contains(.canJoinAllSpaces))
+        #expect(panel.collectionBehavior.contains(.fullScreenAuxiliary))
+        #expect(panel.collectionBehavior.contains(.stationary))
+        #expect(panel.collectionBehavior.contains(.ignoresCycle))
+        #expect(panel.constrainFrameRect(frame, to: nil) == frame)
+    }
+
+    private func makeSnapshot(
+        scale: CGFloat = 2,
+        frame: CGRect
+    ) throws -> DisplaySnapshot {
+        let width = Int(frame.width * scale)
+        let height = Int(frame.height * scale)
+        let context = try #require(CGContext(
+            data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ))
+        context.setFillColor(red: 0.2, green: 0.4, blue: 0.6, alpha: 1)
+        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        let image = try #require(context.makeImage())
+        return DisplaySnapshot(
+            displayID: 2,
+            screenFrame: frame,
+            backingScaleFactor: scale,
+            image: image
+        )
+    }
+
+    @Test func staleAXRepliesDroppedByEpochStaleNilParentBounceAndOverlayRecheck() throws {
+        let view = SnipOverlayView(snapshot: try makeSnapshot(size: CGSize(width: 1000, height: 600)), topInset: 0)
+        let window1 = CGRect(x: 10, y: 10, width: 500, height: 400)
+        let window2 = CGRect(x: 550, y: 10, width: 400, height: 400)
+        let atomicCard = CGRect(x: 20, y: 20, width: 200, height: 120)
+        let elementA = CGRect(x: 250, y: 100, width: 40, height: 40)
+        let elementB = CGRect(x: 300, y: 100, width: 40, height: 40)
+        let parentG = CGRect(x: 230, y: 80, width: 140, height: 100)
+
+        var cancelCount = 0
+        view.cancelElementRectRequests = { cancelCount += 1 }
+        view.hoverRectProvider = { pt in
+            if atomicCard.contains(pt) { return atomicCard }
+            if window1.contains(pt) { return window1 }
+            if window2.contains(pt) { return window2 }
+            return nil
+        }
+        view.shouldQueryElementRect = { pt in !atomicCard.contains(pt) }
+
+        // 1. Stale epoch reply from window1 ignored after moving to window2.
+        view.mouseMoved(with: try makeMouseEvent(type: .mouseMoved, at: CGPoint(x: 260, y: 120)))
+        let window1Epoch = view.axEpoch
+        view.mouseMoved(with: try makeMouseEvent(type: .mouseMoved, at: CGPoint(x: 600, y: 120)))
+        #expect(view.axEpoch != window1Epoch)
+        #expect(cancelCount == 1)
+        view.applyRefinedElementRect(CGRect(x: 580, y: 100, width: 60, height: 50), forGlobalPoint: CGPoint(x: 600, y: 120), epoch: window1Epoch)
+        #expect(view.machine.highlightedRect == window2)
+
+        // 2. Sweeping elementA -> gap(pt1) -> elementB(pt2): stale nil from pt1 must not tear down gap bridge.
+        view.mouseMoved(with: try makeMouseEvent(type: .mouseMoved, at: CGPoint(x: 265, y: 120)))
+        let elemEpoch = view.axEpoch
+        view.applyRefinedElementRect(elementA, forGlobalPoint: CGPoint(x: 265, y: 120), epoch: elemEpoch)
+        #expect(view.machine.highlightedRect == elementA)
+
+        let gapPt = CGPoint(x: 295, y: 120)
+        let ptB = CGPoint(x: 310, y: 120)
+        view.mouseMoved(with: try makeMouseEvent(type: .mouseMoved, at: gapPt))
+        view.mouseMoved(with: try makeMouseEvent(type: .mouseMoved, at: ptB))
+        view.applyRefinedElementRect(nil, forGlobalPoint: gapPt, epoch: elemEpoch)
+        #expect(view.machine.highlightedRect == elementA)
+        view.applyRefinedElementRect(elementB, forGlobalPoint: ptB, epoch: elemEpoch)
+        #expect(view.machine.highlightedRect == elementB)
+
+        // 3. Stale outer container G queried outside elementB must not overwrite elementB when cursor is inside elementB.
+        view.applyRefinedElementRect(parentG, forGlobalPoint: CGPoint(x: 240, y: 90), epoch: elemEpoch)
+        #expect(view.machine.highlightedRect == elementB)
+
+        // 4. Non-overlay rect exceeding lastTier1LocalRect by > 2pt and degenerate/offscreen rects are rejected.
+        view.applyRefinedElementRect(CGRect(x: 0, y: 0, width: 600, height: 500), forGlobalPoint: ptB, epoch: elemEpoch)
+        #expect(view.machine.highlightedRect == elementB)
+        view.applyRefinedElementRect(CGRect(x: 1500, y: 1500, width: 50, height: 50), forGlobalPoint: ptB, epoch: elemEpoch)
+        #expect(view.machine.highlightedRect == elementB)
+
+        // 5. Moving onto an atomic card while an AX query is in flight cancels pending AX and rejects stale overlay replies.
+        view.mouseMoved(with: try makeMouseEvent(type: .mouseMoved, at: CGPoint(x: 330, y: 120)))
+        let beforeAtomicEpoch = view.axEpoch
+        let cancelsBeforeAtomic = cancelCount
+        view.mouseMoved(with: try makeMouseEvent(type: .mouseMoved, at: CGPoint(x: 100, y: 80)))
+        #expect(view.machine.highlightedRect == atomicCard)
+        #expect(view.axEpoch != beforeAtomicEpoch)
+        #expect(cancelCount == cancelsBeforeAtomic + 1)
+        view.applyRefinedElementRect(
+            CGRect(x: 10, y: 10, width: 300, height: 200),
+            forGlobalPoint: CGPoint(x: 100, y: 80),
+            isOverlayElement: true
+        )
+        #expect(view.machine.highlightedRect == atomicCard)
+    }
+
+    @Test func fallbackOverlayCardStableAcrossUnderlyingWindowBoundaryAndDesktopGaps() throws {
+        let view = SnipOverlayView(snapshot: try makeSnapshot(size: CGSize(width: 1512, height: 982)), topInset: 0)
+        let chromeRect = CGRect(x: 0, y: 0, width: 1000, height: 900)
+        let overlayRegion = CGRect(x: 950, y: 100, width: 562, height: 800)
+        let card1 = CGRect(x: 960, y: 400, width: 352, height: 160)
+        let card2 = CGRect(x: 960, y: 228, width: 352, height: 160) // 12pt gap below card1
+
+        var queries: [CGPoint] = []
+        view.hoverRectProvider = { pt in chromeRect.contains(pt) ? chromeRect : nil }
+        view.shouldQueryElementRect = { pt in overlayRegion.contains(pt) || chromeRect.contains(pt) }
+        view.elementRectRequester = { pt in queries.append(pt) }
+
+        // Apply fallback overlay card while cursor is over Chrome + card1.
+        view.mouseMoved(with: try makeMouseEvent(type: .mouseMoved, at: CGPoint(x: 990, y: 480)))
+        view.applyRefinedElementRect(card1, forGlobalPoint: CGPoint(x: 990, y: 480), isOverlayElement: true)
+        #expect(view.machine.highlightedRect == card1)
+
+        // Move across Chrome -> Desktop boundary while staying inside card1: must NOT flash bounds.
+        queries.removeAll()
+        view.mouseMoved(with: try makeMouseEvent(type: .mouseMoved, at: CGPoint(x: 1015, y: 480)))
+        #expect(view.machine.highlightedRect == card1)
+        #expect(queries == [CGPoint(x: 1015, y: 480)])
+
+        // Move into the 12pt gap between card1 and card2 over Desktop: gap bridge holds card1.
+        let gapPoint = CGPoint(x: 1100, y: 394)
+        view.mouseMoved(with: try makeMouseEvent(type: .mouseMoved, at: gapPoint))
+        #expect(view.machine.highlightedRect == card1)
+
+        // Receive card2 across the gap.
+        let card2Point = CGPoint(x: 1100, y: 350)
+        view.mouseMoved(with: try makeMouseEvent(type: .mouseMoved, at: card2Point))
+        view.applyRefinedElementRect(card2, forGlobalPoint: card2Point, isOverlayElement: true)
+        #expect(view.machine.highlightedRect == card2)
+
+        // Move completely outside fallback overlay region onto regular Desktop: drops card cleanly.
+        view.mouseMoved(with: try makeMouseEvent(type: .mouseMoved, at: CGPoint(x: 1200, y: 50)))
+        #expect(view.machine.highlightedRect == view.bounds)
+    }
+
+    @Test func negativeOriginDisplayTransformsEdgePrimingAndSnapshotMatching() throws {
+        let negativeFrame = CGRect(x: -1920, y: -200, width: 1920, height: 1080)
+        let primaryFrame = CGRect(x: 0, y: 0, width: 1512, height: 982)
+        let frames = [negativeFrame, primaryFrame]
+
+        // Shared border x == 0 belongs strictly to primary display; outer top/right edges fall back inclusively.
+        #expect(SnipOverlayController.matchingSnapshotIndex(for: CGPoint(x: 0, y: 500), in: frames) == 1)
+        #expect(SnipOverlayController.matchingSnapshotIndex(for: CGPoint(x: 1512, y: 982), in: frames) == 1)
+        #expect(SnipOverlayController.matchingSnapshotIndex(for: CGPoint(x: -1920, y: 880), in: frames) == 0)
+        #expect(SnipOverlayController.matchingSnapshotIndex(for: CGPoint(x: -500, y: 200), in: frames) == 0)
+
+        let snapshot = try makeSnapshot(scale: 2, frame: negativeFrame)
+        let view = SnipOverlayView(snapshot: snapshot, topInset: 0)
+        let globalWindow = CGRect(x: -1700, y: -100, width: 600, height: 400)
+        let globalElement = CGRect(x: -1650, y: -50, width: 200, height: 120)
+        var queriedGlobal: [CGPoint] = []
+        view.hoverRectProvider = { pt in globalWindow.contains(pt) ? globalWindow : nil }
+        view.elementRectRequester = { pt in queriedGlobal.append(pt) }
+
+        // Priming inside negative-origin display translates global -> local -> global accurately.
+        let globalCursor = CGPoint(x: -1600, y: 0)
+        view.primeWithMouseLocation(globalCursor)
+        #expect(view.machine.highlightedRect == CGRect(x: 220, y: 100, width: 600, height: 400))
+        #expect(queriedGlobal.count == 1)
+        #expect(abs(queriedGlobal[0].x - globalCursor.x) < 0.01 && abs(queriedGlobal[0].y - globalCursor.y) < 0.01)
+
+        view.applyRefinedElementRect(globalElement, forGlobalPoint: globalCursor)
+        #expect(view.machine.highlightedRect == CGRect(x: 270, y: 150, width: 200, height: 120))
+
+        // Inclusive top-edge prime succeeds when allowed, and off-display prime clears hover.
+        view.primeWithMouseLocation(CGPoint(x: -500, y: 880), allowClosedEdge: true)
+        #expect(!view.isMagnifierHidden)
+        view.primeWithMouseLocation(CGPoint(x: 100, y: 100), allowClosedEdge: false)
+        #expect(view.machine.highlightedRect == nil)
+        #expect(view.isMagnifierHidden)
+
+        // Cropped SnipResult maps local selection back to negative global screen coordinates.
+        let result = try #require(SnipOverlayController.makeResult(
+            localRect: CGRect(x: 270, y: 150, width: 200, height: 120),
+            snapshot: snapshot
+        ))
+        #expect(result.screenRect == globalElement)
+    }
+
+    @Test func mouseExitedResetSelectionAndKeyboardShortcutsClearHoverAndSiblings() throws {
+        let view = SnipOverlayView(
+            snapshot: try makeSnapshot(size: CGSize(width: 400, height: 300)),
+            topInset: 0,
+            previousSelectionRect: CGRect(x: 20, y: 20, width: 100, height: 80)
+        )
+        let windowRect = CGRect(x: 50, y: 50, width: 200, height: 150)
+        var hoverActiveCount = 0
+        var beginInteractionCount = 0
+        var cancelAXCount = 0
+        var actions: [OverlayAction] = []
+
+        view.hoverRectProvider = { pt in windowRect.contains(pt) ? windowRect : nil }
+        view.onHoverActive = { hoverActiveCount += 1 }
+        view.onBeginInteraction = { beginInteractionCount += 1 }
+        view.cancelElementRectRequests = { cancelAXCount += 1 }
+        view.onFinish = { actions.append($0) }
+
+        view.mouseMoved(with: try makeMouseEvent(type: .mouseMoved, at: CGPoint(x: 100, y: 100)))
+        #expect(hoverActiveCount == 1)
+        #expect(view.machine.highlightedRect == windowRect)
+        #expect(!view.isMagnifierHidden)
+        #expect(!view.isSizeLabelHidden)
+
+        // Exiting the display clears hover highlight, size label, magnifier, and cancels pending AX.
+        let exitEvent = try #require(NSEvent.enterExitEvent(
+            with: .mouseExited,
+            location: CGPoint(x: -5, y: 100),
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            eventNumber: 0,
+            trackingNumber: 0,
+            userData: nil
+        ))
+        view.mouseExited(with: exitEvent)
+        #expect(view.machine.highlightedRect == nil)
+        #expect(view.isMagnifierHidden)
+        #expect(view.isSizeLabelHidden)
+        #expect(cancelAXCount == 1)
+
+        // Cmd+A and R both call onBeginInteraction so sibling displays reset cleanly.
+        #expect(view.performKeyEquivalent(with: try makeKeyEvent(characters: "a", modifiers: [.command], keyCode: 0)))
+        #expect(beginInteractionCount == 1)
+        #expect(view.machine.selectionRect == view.bounds)
+
+        // resetSelection clears lastMousePoint so magnifier does not pop back open on an inactive display.
+        view.resetSelection()
+        #expect(view.machine.isHovering)
+        #expect(view.isMagnifierHidden)
+
+        view.keyDown(with: try makeKeyEvent(characters: "r", modifiers: [], keyCode: 15))
+        #expect(beginInteractionCount == 2)
+        #expect(view.machine.selectionRect == CGRect(x: 20, y: 20, width: 100, height: 80))
+
+        // cancelOperation forwards cleanly to .cancel instead of closing only a single NSPanel.
+        view.cancelOperation(nil)
+        #expect(actions == [.cancel])
+    }
+
+    @Test func mouseDownRequeriesFreshTier1SupportsMicroDragClickAndTinyBorderPathIsNonNull() throws {
+        let view = SnipOverlayView(snapshot: try makeSnapshot(size: CGSize(width: 400, height: 300)), topInset: 0)
+        let window1 = CGRect(x: 10, y: 10, width: 150, height: 200)
+        let window2 = CGRect(x: 200, y: 10, width: 150, height: 200)
+        let element1 = CGRect(x: 30, y: 30, width: 60, height: 40)
+        var axQueries: [CGPoint] = []
+
+        view.hoverRectProvider = { pt in
+            if window1.contains(pt) { return window1 }
+            if window2.contains(pt) { return window2 }
+            return nil
+        }
+        view.elementRectRequester = { pt in axQueries.append(pt) }
+
+        // Clicking an unprimed view queries fresh Tier 1 window instead of selecting full bounds.
+        view.mouseDown(with: try makeMouseEvent(type: .leftMouseDown, at: CGPoint(x: 250, y: 100)))
+        view.mouseUp(with: try makeMouseEvent(type: .leftMouseUp, at: CGPoint(x: 250, y: 100)))
+        #expect(view.machine.selectionRect == window2)
+
+        // Reset, hover element1, and step 1pt (< axRequeryDistance) across its right edge -> forces AX re-query.
+        view.resetSelection()
+        view.mouseMoved(with: try makeMouseEvent(type: .mouseMoved, at: CGPoint(x: 89.5, y: 50)))
+        view.applyRefinedElementRect(element1, forGlobalPoint: CGPoint(x: 89.5, y: 50))
+        #expect(view.machine.highlightedRect == element1)
+        axQueries.removeAll()
+        view.mouseMoved(with: try makeMouseEvent(type: .mouseMoved, at: CGPoint(x: 90.5, y: 50)))
+        #expect(axQueries == [CGPoint(x: 90.5, y: 50)])
+
+        // Click inside element1 with 1.5pt trackpad micro-drag still selects element1.
+        view.mouseMoved(with: try makeMouseEvent(type: .mouseMoved, at: CGPoint(x: 50, y: 50)))
+        view.mouseDown(with: try makeMouseEvent(type: .leftMouseDown, at: CGPoint(x: 50, y: 50)))
+        view.mouseDragged(with: try makeMouseEvent(type: .leftMouseDragged, at: CGPoint(x: 51.5, y: 50.5)))
+        view.mouseUp(with: try makeMouseEvent(type: .leftMouseUp, at: CGPoint(x: 51.5, y: 50.5)))
+        #expect(view.machine.selectionRect == element1)
+
+        // Flick-click directly onto window2 from hovered element1 without intermediate mouseMoved selects window2.
+        view.resetSelection()
+        view.mouseMoved(with: try makeMouseEvent(type: .mouseMoved, at: CGPoint(x: 50, y: 50)))
+        view.applyRefinedElementRect(element1, forGlobalPoint: CGPoint(x: 50, y: 50))
+        view.mouseDown(with: try makeMouseEvent(type: .leftMouseDown, at: CGPoint(x: 250, y: 100)))
+        view.mouseUp(with: try makeMouseEvent(type: .leftMouseUp, at: CGPoint(x: 250, y: 100)))
+        #expect(view.machine.selectionRect == window2)
+
+        // A 1x1 selection still produces a valid non-null borderLayer path (no CGRect.null inset bug).
+        view.resetSelection()
+        view.mouseDown(with: try makeMouseEvent(type: .leftMouseDown, at: CGPoint(x: 100, y: 100)))
+        view.mouseDragged(with: try makeMouseEvent(type: .leftMouseDragged, at: CGPoint(x: 120, y: 100)))
+        view.mouseDragged(with: try makeMouseEvent(type: .leftMouseDragged, at: CGPoint(x: 100, y: 100)))
+        view.mouseUp(with: try makeMouseEvent(type: .leftMouseUp, at: CGPoint(x: 100, y: 100)))
+        #expect(view.machine.selectionRect == CGRect(x: 100, y: 100, width: 1, height: 1))
+        let borderBox = try #require(view.borderLayerPath?.boundingBoxOfPath)
+        #expect(!borderBox.isNull && borderBox.minX.isFinite && borderBox.minY.isFinite)
+    }
+
+    @Test func sizeLabelClampsBelowNotchAndHidesOnFullBoundsHover() throws {
+        let size = CGSize(width: 1512, height: 982)
+        let topInset: CGFloat = 38
+        let view = SnipOverlayView(snapshot: try makeSnapshot(size: size), topInset: topInset)
+
+        // Full-display hover hides sizeLabel.
+        view.hoverRectProvider = { _ in nil }
+        view.mouseMoved(with: try makeMouseEvent(type: .mouseMoved, at: CGPoint(x: 500, y: 500)))
+        #expect(view.isSizeLabelHidden)
+
+        // Top-touching tall window keeps sizeLabel below topInset (not hidden behind hardware Notch).
+        let tallWindow = CGRect(x: 100, y: 100, width: 600, height: 882)
+        view.hoverRectProvider = { _ in tallWindow }
+        view.mouseMoved(with: try makeMouseEvent(type: .mouseMoved, at: CGPoint(x: 300, y: 400)))
+        #expect(!view.isSizeLabelHidden)
+        #expect(view.sizeLabelFrame.maxY <= size.height - topInset)
+        #expect(view.sizeLabelFrame.minY >= 0)
+
+        // Thin Menu Bar item entirely inside topInset places sizeLabel below the Notch.
+        let menuBarItem = CGRect(x: 600, y: 954, width: 120, height: 28)
+        view.hoverRectProvider = { _ in menuBarItem }
+        view.mouseMoved(with: try makeMouseEvent(type: .mouseMoved, at: CGPoint(x: 650, y: 968)))
+        #expect(!view.isSizeLabelHidden)
+        #expect(view.sizeLabelFrame.maxY <= size.height - topInset)
+        #expect(view.sizeLabelFrame.minY >= 0)
+    }
+
+    @Test func hoverColorCopyGuardsRightClickSiblingResetAndShiftStartupInit() throws {
+        let view = SnipOverlayView(
+            snapshot: try makeSnapshot(size: CGSize(width: 400, height: 300)),
+            topInset: 0,
+            initialShiftDown: true
+        )
+        var actions: [OverlayAction] = []
+        var beginCount = 0
+        var siblingHasSelection = true
+        view.onFinish = { actions.append($0) }
+        view.onBeginInteraction = {
+            beginCount += 1
+            siblingHasSelection = false
+        }
+        view.hasSiblingSelection = { siblingHasSelection }
+
+        view.primeWithMouseLocation(CGPoint(x: 100, y: 100))
+
+        // Shift already held on startup must NOT spuriously advance colorFormat from .hex -> .rgb.
+        let shiftStillHeld = try #require(NSEvent.keyEvent(
+            with: .flagsChanged, location: .zero, modifierFlags: [.shift],
+            timestamp: 0, windowNumber: 0, context: nil, characters: "", charactersIgnoringModifiers: "",
+            isARepeat: false, keyCode: 56
+        ))
+        view.flagsChanged(with: shiftStillHeld)
+
+        // Ctrl+C while hovering must NOT copy color.
+        view.keyDown(with: try makeKeyEvent(characters: "c", modifiers: [.control], keyCode: 8))
+        #expect(actions.isEmpty)
+
+        // Right-click while a sibling display has a selection resets the sibling instead of cancelling.
+        view.rightMouseDown(with: try makeMouseEvent(type: .rightMouseDown, at: CGPoint(x: 120, y: 120)))
+        #expect(beginCount == 1)
+        #expect(actions.isEmpty)
+
+        // Mid-drag C and Cmd+C must NOT abort drag with .copyColor.
+        view.mouseDown(with: try makeMouseEvent(type: .leftMouseDown, at: CGPoint(x: 50, y: 50)))
+        view.mouseDragged(with: try makeMouseEvent(type: .leftMouseDragged, at: CGPoint(x: 150, y: 150)))
+        view.keyDown(with: try makeKeyEvent(characters: "c", modifiers: [], keyCode: 8))
+        #expect(view.performKeyEquivalent(with: try makeKeyEvent(characters: "c", modifiers: [.command], keyCode: 8)) == false)
+        #expect(actions.isEmpty)
+        view.mouseUp(with: try makeMouseEvent(type: .leftMouseUp, at: CGPoint(x: 150, y: 150)))
+
+        // Return to hover and verify colorFormat is still .hex (not cycled on startup).
+        view.rightMouseDown(with: try makeMouseEvent(type: .rightMouseDown, at: CGPoint(x: 100, y: 100)))
+        view.keyDown(with: try makeKeyEvent(characters: "c", modifiers: [], keyCode: 8))
+        guard case let .copyColor(_, format) = actions.last else {
+            Issue.record("Expected .copyColor, got \(actions)")
+            return
+        }
+        #expect(format == .hex)
+    }
+
+    @Test func directResizeAndMoveWhileRectangleOrMosaicToolActiveAndModeSync() throws {
+        let view = SnipOverlayView(snapshot: try makeSnapshot(size: CGSize(width: 500, height: 400)), topInset: 0)
+        try selectRect(CGRect(x: 20, y: 20, width: 460, height: 360), on: view)
+
+        // 1. Activate Rectangle ("1") and draw a box.
+        view.keyDown(with: try makeKeyEvent(characters: "1", modifiers: [], keyCode: 18))
+        #expect(view.activeTool == .rectangle)
+        view.mouseDown(with: try makeMouseEvent(type: .leftMouseDown, at: CGPoint(x: 60, y: 60)))
+        view.mouseDragged(with: try makeMouseEvent(type: .leftMouseDragged, at: CGPoint(x: 160, y: 140)))
+        view.mouseUp(with: try makeMouseEvent(type: .leftMouseUp, at: CGPoint(x: 160, y: 140)))
+        #expect(view.annotations.items.count == 1)
+        let firstRectID = try #require(view.annotations.selectedID)
+
+        // Grab right-edge midpoint handle (160, 100) WITHOUT switching to .select -> resizes the same rectangle.
+        view.mouseDown(with: try makeMouseEvent(type: .leftMouseDown, at: CGPoint(x: 160, y: 100)))
+        view.mouseDragged(with: try makeMouseEvent(type: .leftMouseDragged, at: CGPoint(x: 200, y: 100)))
+        view.mouseUp(with: try makeMouseEvent(type: .leftMouseUp, at: CGPoint(x: 200, y: 100)))
+        #expect(view.annotations.items.count == 1)
+        #expect(view.annotations.selectedID == firstRectID)
+        #expect(view.annotations.selectedItem?.boundingBox == CGRect(x: 60, y: 60, width: 140, height: 80))
+
+        // Dragging rectangle's border (away from corner/midpoint handles) moves it without creating a new item.
+        view.mouseDown(with: try makeMouseEvent(type: .leftMouseDown, at: CGPoint(x: 60, y: 80)))
+        view.mouseDragged(with: try makeMouseEvent(type: .leftMouseDragged, at: CGPoint(x: 70, y: 90)))
+        view.mouseUp(with: try makeMouseEvent(type: .leftMouseUp, at: CGPoint(x: 70, y: 90)))
+        #expect(view.annotations.items.count == 1)
+        #expect(view.annotations.selectedItem?.boundingBox == CGRect(x: 70, y: 70, width: 140, height: 80))
+
+        // Dragging in its hollow interior draws a second rectangle.
+        view.mouseDown(with: try makeMouseEvent(type: .leftMouseDown, at: CGPoint(x: 110, y: 90)))
+        view.mouseDragged(with: try makeMouseEvent(type: .leftMouseDragged, at: CGPoint(x: 160, y: 120)))
+        view.mouseUp(with: try makeMouseEvent(type: .leftMouseUp, at: CGPoint(x: 160, y: 120)))
+        #expect(view.annotations.items.count == 2)
+
+        // 2. Switching to Mosaic ("6") clears previous selection cleanly and lets us draw & edit mosaics directly.
+        view.keyDown(with: try makeKeyEvent(characters: "6", modifiers: [], keyCode: 22))
+        #expect(view.activeTool == .mosaic)
+        #expect(view.annotations.selectedID == nil)
+
+        // Draw Mosaic 1 overlapping the first rectangle's outer border (70, 70) -> draws Mosaic instead of grabbing Rectangle.
+        view.mouseDown(with: try makeMouseEvent(type: .leftMouseDown, at: CGPoint(x: 65, y: 65)))
+        view.mouseDragged(with: try makeMouseEvent(type: .leftMouseDragged, at: CGPoint(x: 145, y: 105)))
+        view.mouseUp(with: try makeMouseEvent(type: .leftMouseUp, at: CGPoint(x: 145, y: 105)))
+        #expect(view.annotations.items.count == 3)
+        let mosaic1ID = try #require(view.annotations.selectedID)
+
+        // Immediately resize Mosaic 1 via its top-right corner handle while Mosaic tool stays active.
+        view.mouseDown(with: try makeMouseEvent(type: .leftMouseDown, at: CGPoint(x: 145, y: 105)))
+        view.mouseDragged(with: try makeMouseEvent(type: .leftMouseDragged, at: CGPoint(x: 175, y: 125)))
+        view.mouseUp(with: try makeMouseEvent(type: .leftMouseUp, at: CGPoint(x: 175, y: 125)))
+        #expect(view.annotations.items.count == 3)
+        #expect(view.annotations.selectedID == mosaic1ID)
+        #expect(view.annotations.selectedItem?.boundingBox == CGRect(x: 65, y: 65, width: 110, height: 60))
+
+        // Dragging inside Mosaic 1 moves it.
+        view.mouseDown(with: try makeMouseEvent(type: .leftMouseDown, at: CGPoint(x: 100, y: 95)))
+        view.mouseDragged(with: try makeMouseEvent(type: .leftMouseDragged, at: CGPoint(x: 120, y: 105)))
+        view.mouseUp(with: try makeMouseEvent(type: .leftMouseUp, at: CGPoint(x: 120, y: 105)))
+        #expect(view.annotations.items.count == 3)
+        #expect(view.annotations.selectedItem?.boundingBox == CGRect(x: 85, y: 75, width: 110, height: 60))
+
+        // Toggling Mosaic -> Blur via applyStyle syncs the item's `.mosaic(..., mode)` kind live.
+        view.applyStyle(AnnotationStyle(color: .red, size: .large, mosaicMode: .blur))
+        if case let .mosaic(_, mode)? = view.annotations.selectedItem?.kind {
+            #expect(mode == .blur)
+        } else {
+            Issue.record("Expected selected mosaic item")
+        }
+
+        // Draw Mosaic 2 in free space, then click Mosaic 1 to re-select it.
+        view.mouseDown(with: try makeMouseEvent(type: .leftMouseDown, at: CGPoint(x: 260, y: 200)))
+        view.mouseDragged(with: try makeMouseEvent(type: .leftMouseDragged, at: CGPoint(x: 360, y: 260)))
+        view.mouseUp(with: try makeMouseEvent(type: .leftMouseUp, at: CGPoint(x: 360, y: 260)))
+        #expect(view.annotations.items.count == 4)
+        #expect(view.annotations.selectedID != mosaic1ID)
+
+        view.mouseDown(with: try makeMouseEvent(type: .leftMouseDown, at: CGPoint(x: 100, y: 95)))
+        view.mouseUp(with: try makeMouseEvent(type: .leftMouseUp, at: CGPoint(x: 100, y: 95)))
+        #expect(view.annotations.selectedID == mosaic1ID)
+    }
+
+    @Test func strokeSizeSliderHitTestingDraggingAndUndoCoalescing() throws {
+        let view = SnipOverlayView(snapshot: try makeSnapshot(size: CGSize(width: 800, height: 600)), topInset: 0)
+        try selectRect(CGRect(x: 40, y: 80, width: 640, height: 440), on: view)
+        view.keyDown(with: try makeKeyEvent(characters: "1", modifiers: [], keyCode: 18))
+        view.layoutSubtreeIfNeeded()
+
+        // Draw an initial rectangle at default `.medium` size.
+        view.mouseDown(with: try makeMouseEvent(type: .leftMouseDown, at: CGPoint(x: 100, y: 160)))
+        view.mouseDragged(with: try makeMouseEvent(type: .leftMouseDragged, at: CGPoint(x: 240, y: 260)))
+        view.mouseUp(with: try makeMouseEvent(type: .leftMouseUp, at: CGPoint(x: 240, y: 260)))
+        #expect(view.annotations.selectedItem?.style.size == .medium)
+        view.layoutSubtreeIfNeeded()
+
+        var persistedSizes: [StrokeSize] = []
+        view.onStyleUpdated = { persistedSizes.append($0.size) }
+
+        let slider = view.toolbar.sizeSliderView
+        let toolbarBeforeDrag = view.toolbar.frame
+        let leftEndInView = slider.convert(CGPoint(x: 4, y: slider.bounds.midY), to: view)
+        let midInView = slider.convert(CGPoint(x: 50, y: slider.bounds.midY), to: view)
+        let rightEndInView = slider.convert(CGPoint(x: 96, y: slider.bounds.midY), to: view)
+        let midInToolbar = slider.convert(CGPoint(x: 50, y: slider.bounds.midY), to: view.toolbar)
+
+        #expect(view.toolbar.hitTest(midInView) === slider)
+        #expect(!view.toolbar.hitsDragRegion(midInToolbar))
+
+        // Drag slider from left end (.minimum) through middle to right end (.maximum).
+        slider.mouseDown(with: try makeMouseEvent(type: .leftMouseDown, at: leftEndInView))
+        #expect(view.currentStyle.size == .minimum)
+        #expect(view.annotations.selectedItem?.style.size == .minimum)
+
+        slider.mouseDragged(with: try makeMouseEvent(type: .leftMouseDragged, at: midInView))
+        #expect(view.currentStyle.size.progress > 0.3 && view.currentStyle.size.progress < 0.7)
+
+        slider.mouseDragged(with: try makeMouseEvent(type: .leftMouseDragged, at: rightEndInView))
+        slider.mouseUp(with: try makeMouseEvent(type: .leftMouseUp, at: rightEndInView))
+
+        #expect(view.currentStyle.size == .maximum)
+        #expect(view.annotations.selectedItem?.style.size == .maximum)
+        #expect(persistedSizes.last == .maximum)
+        #expect(view.toolbar.frame == toolbarBeforeDrag)
+
+        // Single Cmd+Z reverts the entire continuous slider drag back to `.medium`.
+        #expect(view.performKeyEquivalent(with: try makeKeyEvent(characters: "z", modifiers: [.command], keyCode: 6)))
+        #expect(view.annotations.selectedItem?.style.size == .medium)
+    }
+
+    @Test func scrollGestureAdjustsThicknessAcrossToolsRespectsInversionAndCoalescesUndo() throws {
+        let view = SnipOverlayView(snapshot: try makeSnapshot(size: CGSize(width: 800, height: 600)), topInset: 0)
+
+        // Ignored while hovering before a selection exists.
+        #expect(!view.handleScrollThickness(deltaY: 40))
+        #expect(view.currentStyle.size == .medium)
+
+        try selectRect(CGRect(x: 40, y: 80, width: 640, height: 440), on: view)
+
+        // Ignored in `.select` when no annotation is selected.
+        #expect(!view.handleScrollThickness(deltaY: 40))
+
+        // Active drawing tool accepts scroll even before an item is drawn, updates style + HUD, ignores momentum/horizontal.
+        view.keyDown(with: try makeKeyEvent(characters: "1", modifiers: [], keyCode: 18))
+        var persistedSizes: [StrokeSize] = []
+        view.onStyleUpdated = { persistedSizes.append($0.size) }
+
+        #expect(!view.handleScrollThickness(deltaY: 20, deltaX: 0, momentumPhase: .changed))
+        #expect(!view.handleScrollThickness(deltaY: 8, deltaX: 40))
+        #expect(view.handleScrollThickness(deltaY: 50, isPrecise: true, isDirectionInverted: false))
+        #expect(view.currentStyle.size.progress > StrokeSize.medium.progress)
+        #expect(persistedSizes.last == view.currentStyle.size)
+        #expect(!view.isSizeHUDHidden)
+        #expect(view.sizeHUDText.hasSuffix(" pt"))
+
+        // Draw a rectangle, then perform a Natural Scrolling physical-up gesture (negative deltaY with isDirectionInverted = true).
+        view.applyStrokeSize(.medium, recordUndo: false, showHUD: false)
+        view.mouseDown(with: try makeMouseEvent(type: .leftMouseDown, at: CGPoint(x: 100, y: 160)))
+        view.mouseDragged(with: try makeMouseEvent(type: .leftMouseDragged, at: CGPoint(x: 240, y: 260)))
+        view.mouseUp(with: try makeMouseEvent(type: .leftMouseUp, at: CGPoint(x: 240, y: 260)))
+        let beforeScroll = try #require(view.annotations.selectedItem?.style.size)
+        #expect(beforeScroll == .medium)
+
+        #expect(view.handleScrollThickness(deltaY: -40, isPrecise: true, isDirectionInverted: true, phase: .began))
+        #expect(view.handleScrollThickness(deltaY: -60, isPrecise: true, isDirectionInverted: true, phase: .changed))
+        #expect(view.handleScrollThickness(deltaY: 0, isPrecise: true, isDirectionInverted: true, phase: .ended))
+
+        let thickened = try #require(view.annotations.selectedItem?.style.size)
+        #expect(thickened.lineWidth > beforeScroll.lineWidth)
+        #expect(view.sizeHUDText == "\(thickened.formattedLineWidth) pt")
+
+        // Coalesced into 1 undo snapshot so single Cmd+Z returns straight to `.medium`.
+        #expect(view.performKeyEquivalent(with: try makeKeyEvent(characters: "z", modifiers: [.command], keyCode: 6)))
+        #expect(view.annotations.selectedItem?.style.size == .medium)
+
+        // Clamps cleanly at minimum and maximum bounds.
+        #expect(view.handleScrollThickness(deltaY: -1000, isPrecise: true, isDirectionInverted: false, phase: .began))
+        #expect(view.annotations.selectedItem?.style.size == .minimum)
+        #expect(view.sizeHUDText == "1.5 pt")
+        #expect(view.handleScrollThickness(deltaY: 0, isPrecise: true, isDirectionInverted: false, phase: .ended))
+
+        #expect(view.handleScrollThickness(deltaY: 1000, isPrecise: true, isDirectionInverted: false, phase: .began))
+        #expect(view.annotations.selectedItem?.style.size == .maximum)
+        #expect(view.sizeHUDText == "12 pt")
+        #expect(view.handleScrollThickness(deltaY: 0, isPrecise: true, isDirectionInverted: false, phase: .ended))
+
+        // Mosaic tool adjusts block/blur strength and formats HUD accordingly.
+        view.keyDown(with: try makeKeyEvent(characters: "6", modifiers: [], keyCode: 22))
+        view.applyStrokeSize(.small, recordUndo: false, showHUD: false)
+        view.mouseDown(with: try makeMouseEvent(type: .leftMouseDown, at: CGPoint(x: 300, y: 180)))
+        view.mouseDragged(with: try makeMouseEvent(type: .leftMouseDragged, at: CGPoint(x: 420, y: 280)))
+        view.mouseUp(with: try makeMouseEvent(type: .leftMouseUp, at: CGPoint(x: 420, y: 280)))
+
+        #expect(view.handleScrollThickness(deltaY: 5, isPrecise: false, isDirectionInverted: false, timestamp: 100))
+        let mosaicSize = try #require(view.annotations.selectedItem?.style.size)
+        #expect(mosaicSize.mosaicBlockSize > StrokeSize.small.mosaicBlockSize)
+        #expect(view.sizeHUDText == "Mosaic \(Int(mosaicSize.mosaicBlockSize.rounded()))")
+
+        view.applyStyle(AnnotationStyle(color: .red, size: mosaicSize, mosaicMode: .blur))
+        #expect(view.handleScrollThickness(deltaY: 5, isPrecise: false, isDirectionInverted: false, timestamp: 101))
+        let blurSize = try #require(view.annotations.selectedItem?.style.size)
+        #expect(blurSize.blurRadius >= mosaicSize.blurRadius)
+        #expect(view.sizeHUDText == "Blur \(Int(blurSize.blurRadius.rounded()))")
+
+        // Real NSEvent.scrollWheel path (when CGEvent conversion succeeds) routes through `scrollWheel(with:)`.
+        if let cgScroll = CGEvent(
+            scrollWheelEvent2Source: nil,
+            units: .pixel,
+            wheelCount: 2,
+            wheel1: -30,
+            wheel2: 0,
+            wheel3: 0
+        ), let nsScroll = NSEvent(cgEvent: cgScroll) {
+            let previousProgress = blurSize.progress
+            view.scrollWheel(with: nsScroll)
+            let afterNS = try #require(view.annotations.selectedItem?.style.size.progress)
+            #expect(afterNS != previousProgress)
+        }
+    }
 }

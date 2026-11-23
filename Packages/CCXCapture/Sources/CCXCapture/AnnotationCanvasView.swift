@@ -29,7 +29,7 @@ final class AnnotationCanvasView: NSView {
 
     /// Invalidates the union of the previous and current active item bounds so dragging stays localized.
     func invalidate(rect: CGRect?) {
-        let padded = rect?.insetBy(dx: -36, dy: -36)
+        let padded = rect?.insetBy(dx: -40, dy: -40)
         let dirty: CGRect?
         switch (lastDirtyRect, padded) {
         case let (.some(prev), .some(curr)):
@@ -54,7 +54,7 @@ final class AnnotationCanvasView: NSView {
     func invalidateActiveRegion() {
         lastDirtyRect = nil
         if let clipRect {
-            let target = clipRect.insetBy(dx: -36, dy: -36).intersection(bounds)
+            let target = clipRect.insetBy(dx: -40, dy: -40).intersection(bounds)
             if !target.isNull, !target.isEmpty {
                 setNeedsDisplay(target)
                 return
@@ -73,19 +73,28 @@ final class AnnotationCanvasView: NSView {
         let scale = backingScale
         let cache = mosaicCache
         let screenBounds = bounds
-        let cullPadding: CGFloat = 44
+        let cullPadding: CGFloat = 48
         for item in document.items where item.id != editingTextItemID {
             guard item.boundingBox.insetBy(dx: -cullPadding, dy: -cullPadding).intersects(dirtyRect) else {
                 continue
             }
-            AnnotationRenderer.draw(item, in: context, screenBounds: screenBounds) { mode, preset in
-                cache.filteredImage(mode: mode, preset: preset, backingScale: scale)
+            AnnotationRenderer.draw(item, in: context, screenBounds: screenBounds) { mode, size in
+                cache.filteredImage(mode: mode, size: size, backingScale: scale)
             }
         }
         if let draft = document.draft {
-            AnnotationRenderer.draw(draft, in: context, screenBounds: screenBounds) { mode, preset in
-                cache.filteredImage(mode: mode, preset: preset, backingScale: scale)
+            AnnotationRenderer.draw(draft, in: context, screenBounds: screenBounds) { mode, size in
+                cache.filteredImage(mode: mode, size: size, backingScale: scale)
             }
+        }
+        for item in document.items where item.id != editingTextItemID && item.id != document.selectedID {
+            if case let .mosaic(raw, _) = item.kind,
+               item.boundingBox.insetBy(dx: -cullPadding, dy: -cullPadding).intersects(dirtyRect) {
+                AnnotationRenderer.drawMosaicGuide(for: raw, isDraft: false, in: context)
+            }
+        }
+        if let draft = document.draft, case let .mosaic(raw, _) = draft.kind {
+            AnnotationRenderer.drawMosaicGuide(for: raw, isDraft: true, in: context)
         }
         context.restoreGState()
 

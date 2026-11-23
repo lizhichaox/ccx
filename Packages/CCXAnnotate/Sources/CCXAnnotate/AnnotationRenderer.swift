@@ -8,7 +8,7 @@ public enum AnnotationRenderer {
         _ item: AnnotationItem,
         in context: CGContext,
         screenBounds: CGRect,
-        mosaicImage: ((MosaicMode, StrokePreset) -> CGImage?)?
+        mosaicImage: ((MosaicMode, StrokeSize) -> CGImage?)?
     ) {
         context.saveGState()
         defer { context.restoreGState() }
@@ -57,6 +57,9 @@ public enum AnnotationRenderer {
             guard rect.width >= 1, rect.height >= 1 else { return }
             context.saveGState()
             context.clip(to: rect)
+            if mode == .pixelate {
+                context.interpolationQuality = .none
+            }
             if let filtered = mosaicImage?(mode, item.style.size) {
                 let visible = rect.intersection(screenBounds)
                 if !visible.isNull, !visible.isEmpty,
@@ -119,20 +122,75 @@ public enum AnnotationRenderer {
         context.saveGState()
         defer { context.restoreGState() }
 
-        let bounds = item.boundingBox.insetBy(dx: -4, dy: -4)
-        context.setStrokeColor(NSColor.systemBlue.withAlphaComponent(0.9).cgColor)
-        context.setLineWidth(1)
-        context.setLineDash(phase: 0, lengths: [4, 3])
-        context.stroke(bounds)
-        context.setLineDash(phase: 0, lengths: [])
+        let boundsToStroke: CGRect?
+        switch item.kind {
+        case .rectangle, .ellipse, .mosaic:
+            boundsToStroke = item.boundingBox
+        case .arrow:
+            boundsToStroke = nil
+        case .pen, .highlighter, .text, .counter:
+            boundsToStroke = item.boundingBox.insetBy(dx: -4, dy: -4)
+        }
+
+        if let bounds = boundsToStroke {
+            context.setStrokeColor(NSColor.white.withAlphaComponent(0.65).cgColor)
+            context.setLineWidth(1.75)
+            context.stroke(bounds)
+
+            context.setStrokeColor(NSColor.systemBlue.withAlphaComponent(0.95).cgColor)
+            context.setLineWidth(1)
+            context.setLineDash(phase: 0, lengths: [4, 3])
+            context.stroke(bounds)
+            context.setLineDash(phase: 0, lengths: [])
+        }
 
         for center in item.handlePoints.values {
-            let handleRect = CGRect(x: center.x - 4, y: center.y - 4, width: 8, height: 8)
+            let handleRect = CGRect(x: center.x - 4.5, y: center.y - 4.5, width: 9, height: 9)
+            context.saveGState()
+            context.setShadow(
+                offset: CGSize(width: 0, height: -0.5),
+                blur: 2,
+                color: CGColor(gray: 0, alpha: 0.35)
+            )
             context.setFillColor(NSColor.white.cgColor)
             context.fillEllipse(in: handleRect)
+            context.restoreGState()
+
             context.setStrokeColor(NSColor.systemBlue.cgColor)
             context.setLineWidth(1.5)
             context.strokeEllipse(in: handleRect)
+        }
+    }
+
+    /// Draws a live canvas-only dashed guide around a mosaic/blur box so users can spot and grab
+    /// redacted regions on light backgrounds. Never called during final export baking.
+    public static func drawMosaicGuide(for rect: CGRect, isDraft: Bool, in context: CGContext) {
+        let standardized = rect.standardized
+        guard standardized.width >= 1, standardized.height >= 1 else { return }
+        context.saveGState()
+        defer { context.restoreGState() }
+
+        let outline = standardized.insetBy(dx: 0.5, dy: 0.5)
+        if isDraft {
+            context.setStrokeColor(NSColor.white.withAlphaComponent(0.7).cgColor)
+            context.setLineWidth(2.0)
+            context.setLineDash(phase: 0, lengths: [5, 3])
+            context.stroke(outline)
+
+            context.setStrokeColor(NSColor.systemBlue.withAlphaComponent(0.95).cgColor)
+            context.setLineWidth(1.25)
+            context.setLineDash(phase: 0, lengths: [5, 3])
+            context.stroke(outline)
+        } else {
+            context.setStrokeColor(NSColor.black.withAlphaComponent(0.28).cgColor)
+            context.setLineWidth(1.5)
+            context.setLineDash(phase: 0, lengths: [4, 3])
+            context.stroke(outline)
+
+            context.setStrokeColor(NSColor.white.withAlphaComponent(0.72).cgColor)
+            context.setLineWidth(1.0)
+            context.setLineDash(phase: 0, lengths: [4, 3])
+            context.stroke(outline)
         }
     }
 
@@ -174,8 +232,8 @@ public enum AnnotationRenderer {
         context.scaleBy(x: sx, y: sy)
         context.translateBy(x: -localSelectionRect.minX, y: -localSelectionRect.minY)
         for item in document.items {
-            draw(item, in: context, screenBounds: screenBounds) { mode, preset in
-                mosaicCache?.filteredImage(mode: mode, preset: preset, backingScale: scale)
+            draw(item, in: context, screenBounds: screenBounds) { mode, size in
+                mosaicCache?.filteredImage(mode: mode, size: size, backingScale: scale)
             }
         }
         context.restoreGState()
@@ -203,7 +261,7 @@ public enum AnnotationRenderer {
         let py = ux
 
         let headLength = min(length * 0.72, max(14, lineWidth * 4.2))
-        let headHalfWidth = max(6, lineWidth * 1.75)
+        let headHalfWidth = min(headLength * 0.55, max(6, lineWidth * 1.75))
         let neckHalfWidth = max(0.8, lineWidth * 0.55)
         let tailHalfWidth = max(0.4, lineWidth * 0.22)
 

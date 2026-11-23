@@ -29,14 +29,18 @@ public final class SnipCoordinator {
         isSessionActive = true
         self.completion = completion
 
-        // Tier 1 window metadata and snapshots are read before overlays appear so all visible
-        // windows (including CCX's own guide, settings, and pins) are captured while overlays never show up.
+        // Capture screen geometry once on @MainActor so ScreenSnapshotEngine and SmartElementDetector
+        // share identical display frames and primaryScreenHeight, before overlays appear.
+        let geometries = ScreenSnapshotEngine.currentScreenGeometries()
         let detector = SmartElementDetector()
-        detector.refreshWindowList()
+        detector.refreshWindowList(screenFrames: geometries.values.map(\.frame))
 
         captureTask = Task { [weak self] in
             do {
-                let snapshots = try await ScreenSnapshotEngine.captureAllDisplays()
+                async let snapshotsTask = ScreenSnapshotEngine.capture(geometries: geometries)
+                async let overlayPrepTask: Void = detector.prepareOverlayElements()
+                let snapshots = try await snapshotsTask
+                await overlayPrepTask
                 guard let self, self.isSessionActive, !Task.isCancelled else { return }
                 PermissionManager.setScreenRecordingVerified(true)
                 self.presentOverlay(snapshots: snapshots, detector: detector)
