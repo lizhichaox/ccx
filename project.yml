@@ -28,6 +28,8 @@ packages:
     path: Packages/CCXCapture
   CCXPin:
     path: Packages/CCXPin
+  CCXRecord:
+    path: Packages/CCXRecord
 
 settings:
   base:
@@ -49,6 +51,7 @@ targets:
       - package: CCXAnnotate
       - package: CCXCapture
       - package: CCXPin
+      - package: CCXRecord
     settings:
       base:
         PRODUCT_NAME: CCX
@@ -56,8 +59,8 @@ targets:
         MACOSX_DEPLOYMENT_TARGET: "15.0"
         SWIFT_VERSION: "6.0"
         SWIFT_STRICT_CONCURRENCY: complete
-        MARKETING_VERSION: "0.3.3"
-        CURRENT_PROJECT_VERSION: 6
+        MARKETING_VERSION: "0.4.0"
+        CURRENT_PROJECT_VERSION: 7
         INFOPLIST_FILE: App/Info.plist
         GENERATE_INFOPLIST_FILE: NO
         CODE_SIGN_ENTITLEMENTS: App/CCX.entitlements
@@ -69,5 +72,13 @@ targets:
         ENABLE_PREVIEWS: NO
         DEAD_CODE_STRIPPING: YES
         LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/../Frameworks"
+      configs:
+        Debug:
+          ONLY_ACTIVE_ARCH: YES
+        Release:
+          ENABLE_HARDENED_RUNTIME: YES
+          ARCHS: "$(ARCHS_STANDARD)"
+          ONLY_ACTIVE_ARCH: NO
+          OTHER_CODE_SIGN_FLAGS: "--timestamp"
     scheme:
       gatherCoverageData: false

@@ -70,30 +70,63 @@ if [[ ! "$CURRENT_BUILD" =~ ^[0-9]+$ ]]; then
   exit 1
 fi
 
+TARGET_BUILD="$CURRENT_BUILD"
 if [[ "$BUMP_BUILD" -eq 1 ]]; then
-  NEXT_BUILD=$((CURRENT_BUILD + 1))
-  TMP_PROJECT_YML="project.yml.tmp.$$"
-  trap 'rm -f "$TMP_PROJECT_YML"' EXIT
-  awk -v build="$NEXT_BUILD" '
-    !done && /^[[:space:]]*CURRENT_PROJECT_VERSION:/ {
-      sub(/:.*/, ": " build)
-      done = 1
-    }
-    { print }
-  ' project.yml > "$TMP_PROJECT_YML"
-  mv "$TMP_PROJECT_YML" project.yml
-  trap - EXIT
-  CURRENT_BUILD="$NEXT_BUILD"
-  echo "==> Version $CURRENT_VERSION (build $CURRENT_BUILD, +1)"
+  TARGET_BUILD=$((CURRENT_BUILD + 1))
+  echo "==> Version $CURRENT_VERSION (building as build $TARGET_BUILD, +1 on success)"
 else
-  echo "==> Version $CURRENT_VERSION (build $CURRENT_BUILD, no bump)"
+  echo "==> Version $CURRENT_VERSION (build $TARGET_BUILD, no bump)"
 fi
 
 echo "==> Generating CCX.xcodeproj"
 xcodegen generate --spec project.yml --quiet
 
+# Resolve a valid, unexpired Apple Development Team ID when not provided explicitly.
+resolve_valid_apple_dev_team_id() {
+  local valid_hashes hash cert pem_file subject team
+  valid_hashes="$(security find-identity -v -p codesigning 2>/dev/null \
+    | awk '/Apple Development:/ { print $2 }' || true)"
+  [[ -n "$valid_hashes" ]] || return 1
+
+  pem_file="$(mktemp "${TMPDIR:-/tmp}/ccx-certs.XXXXXX")"
+  trap 'rm -f "$pem_file"' RETURN
+  security find-certificate -c "Apple Development" -a -p > "$pem_file" 2>/dev/null || return 1
+
+  # Inspect each PEM certificate block and pick the first unexpired one matching a valid signing identity.
+  local idx=0
+  while true; do
+    cert="$(awk -v target="$idx" '
+      /-----BEGIN CERTIFICATE-----/ { in_cert = 1; buf = $0 "\n"; next }
+      in_cert { buf = buf $0 "\n" }
+      /-----END CERTIFICATE-----/ {
+        if (count == target) { printf "%s", buf; exit }
+        count++; in_cert = 0; buf = ""
+      }
+    ' "$pem_file")"
+    [[ -n "$cert" ]] || break
+    idx=$((idx + 1))
+
+    if ! printf '%s' "$cert" | openssl x509 -noout -checkend 0 >/dev/null 2>&1; then
+      continue
+    fi
+    hash="$(printf '%s' "$cert" | openssl x509 -noout -fingerprint -sha1 2>/dev/null \
+      | sed -E 's/^.*=//; s/://g' | tr '[:lower:]' '[:upper:]' || true)"
+    [[ -n "$hash" ]] || continue
+    if ! printf '%s\n' "$valid_hashes" | grep -Fxq "$hash"; then
+      continue
+    fi
+    subject="$(printf '%s' "$cert" | openssl x509 -noout -subject 2>/dev/null || true)"
+    team="$(printf '%s\n' "$subject" | grep -Eo 'OU[[:space:]]*=[[:space:]]*[A-Z0-9]{10}' | head -n 1 | grep -Eo '[A-Z0-9]{10}$' || true)"
+    if [[ -n "$team" ]]; then
+      printf '%s\n' "$team"
+      return 0
+    fi
+  done
+  return 1
+}
+
 # Resolve signing settings.
-SIGNING_ARGS=()
+SIGNING_ARGS=("CURRENT_PROJECT_VERSION=$TARGET_BUILD")
 TEAM_ID="${DEVELOPMENT_TEAM:-}"
 if [[ -n "$TEAM_ID" ]]; then
   echo "==> Signing with DEVELOPMENT_TEAM=$TEAM_ID (environment)"
@@ -101,14 +134,12 @@ if [[ -n "$TEAM_ID" ]]; then
 elif [[ -f "$LOCAL_SIGNING_XCCONFIG" ]] && grep -Eq '^[[:space:]]*DEVELOPMENT_TEAM[[:space:]]*=[[:space:]]*[A-Z0-9]{10}' "$LOCAL_SIGNING_XCCONFIG"; then
   echo "==> Signing with DEVELOPMENT_TEAM from $LOCAL_SIGNING_XCCONFIG"
 else
-  CERT_SUBJECT="$(security find-certificate -c "Apple Development" -p 2>/dev/null | openssl x509 -noout -subject 2>/dev/null || true)"
-  # Handles both LibreSSL ("/OU=ABCDE12345/") and OpenSSL ("OU = ABCDE12345,") formats.
-  TEAM_ID="$(printf '%s\n' "$CERT_SUBJECT" | grep -Eo 'OU[[:space:]]*=[[:space:]]*[A-Z0-9]{10}' | head -n 1 | grep -Eo '[A-Z0-9]{10}$' || true)"
+  TEAM_ID="$(resolve_valid_apple_dev_team_id || true)"
   if [[ -n "$TEAM_ID" ]]; then
     echo "==> Signing with Apple Development certificate (Team ID $TEAM_ID)"
     SIGNING_ARGS+=("DEVELOPMENT_TEAM=$TEAM_ID")
   else
-    echo "warning: no \"Apple Development\" certificate found in the keychain." >&2
+    echo "warning: no valid \"Apple Development\" signing identity found in the keychain." >&2
     echo "warning: falling back to ad-hoc signing (CODE_SIGN_IDENTITY=-)." >&2
     echo "warning: Screen Recording / Accessibility grants will NOT persist across rebuilds." >&2
     SIGNING_ARGS+=("CODE_SIGN_IDENTITY=-" "CODE_SIGN_STYLE=Manual" "DEVELOPMENT_TEAM=")
@@ -129,6 +160,23 @@ if [[ ! -d "$APP_PATH" ]]; then
   echo "error: build succeeded but $APP_PATH is missing" >&2
   exit 1
 fi
+
+# Persist the bumped CURRENT_PROJECT_VERSION only after xcodebuild succeeds.
+if [[ "$BUMP_BUILD" -eq 1 ]]; then
+  TMP_PROJECT_YML="$(mktemp "${ROOT_DIR}/project.yml.tmp.XXXXXX")"
+  trap 'rm -f "$TMP_PROJECT_YML"' EXIT
+  awk -v build="$TARGET_BUILD" '
+    !done && /^[[:space:]]*CURRENT_PROJECT_VERSION:/ {
+      sub(/:.*/, ": " build)
+      done = 1
+    }
+    { print }
+  ' project.yml > "$TMP_PROJECT_YML"
+  mv "$TMP_PROJECT_YML" project.yml
+  trap - EXIT
+  CURRENT_BUILD="$TARGET_BUILD"
+  echo "==> Updated project.yml to build $CURRENT_BUILD"
+fi
 echo "==> Built $APP_PATH"
 
 if [[ "$BUILD_ONLY" -eq 1 ]]; then
@@ -138,24 +186,54 @@ fi
 # Quit any running instance before replacing or launching the app bundle.
 if pgrep -x CCX >/dev/null 2>&1; then
   echo "==> Quitting running CCX"
-  osascript -e 'tell application id "com.lizhichaox.ccx" to quit' >/dev/null 2>&1 || pkill -x CCX || true
+  osascript -e 'tell application id "com.lizhichaox.ccx" to quit' >/dev/null 2>&1 || true
   for _ in 1 2 3 4 5 6 7 8 9 10; do
     pgrep -x CCX >/dev/null 2>&1 || break
     sleep 0.3
   done
+  if pgrep -x CCX >/dev/null 2>&1; then
+    pkill -TERM -x CCX >/dev/null 2>&1 || true
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      pgrep -x CCX >/dev/null 2>&1 || break
+      sleep 0.2
+    done
+  fi
+  if pgrep -x CCX >/dev/null 2>&1; then
+    echo "error: running CCX instance did not exit (a recording or dialog may be open); quit CCX and retry." >&2
+    exit 1
+  fi
 fi
 
 LAUNCH_APP="$APP_PATH"
 if [[ "$INSTALL_APP" -eq 1 ]]; then
   mkdir -p "$INSTALL_DIR"
-  STAGING_APP="$INSTALL_DIR/.CCX.app.staging.$$"
-  trap 'rm -rf "$STAGING_APP"' EXIT
-  rm -rf "$STAGING_APP"
+  STAGING_DIR="$(mktemp -d "$INSTALL_DIR/.CCX.app.staging.XXXXXX")"
+  BACKUP_DIR=""
+  cleanup_install() {
+    if [[ -n "$BACKUP_DIR" && -d "$BACKUP_DIR/CCX.app" && ! -d "$INSTALLED_APP" ]]; then
+      mv "$BACKUP_DIR/CCX.app" "$INSTALLED_APP" >/dev/null 2>&1 || true
+    fi
+    rm -rf "$STAGING_DIR" ${BACKUP_DIR:+"$BACKUP_DIR"}
+  }
+  trap cleanup_install EXIT
+
+  STAGING_APP="$STAGING_DIR/CCX.app"
   echo "==> Installing to $INSTALLED_APP"
   ditto "$APP_PATH" "$STAGING_APP"
-  rm -rf "$INSTALLED_APP"
+
+  if [[ -e "$INSTALLED_APP" ]]; then
+    BACKUP_DIR="$(mktemp -d "$INSTALL_DIR/.CCX.app.backup.XXXXXX")"
+    mv "$INSTALLED_APP" "$BACKUP_DIR/CCX.app"
+  fi
   mv "$STAGING_APP" "$INSTALLED_APP"
+
+  if [[ -n "$BACKUP_DIR" ]]; then
+    rm -rf "$BACKUP_DIR"
+    BACKUP_DIR=""
+  fi
+  rm -rf "$STAGING_DIR"
   trap - EXIT
+
   if [[ -x "$LSREGISTER" ]]; then
     "$LSREGISTER" -f "$INSTALLED_APP" >/dev/null 2>&1 || true
   fi
@@ -163,4 +241,4 @@ if [[ "$INSTALL_APP" -eq 1 ]]; then
 fi
 
 echo "==> Launching $LAUNCH_APP"
-open "$LAUNCH_APP"
+open -- "$LAUNCH_APP"

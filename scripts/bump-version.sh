@@ -60,7 +60,7 @@ case "$1" in
     ;;
 esac
 
-TMP_FILE="$PROJECT_YML.tmp.$$"
+TMP_FILE="$(mktemp "${PROJECT_YML}.tmp.XXXXXX")"
 trap 'rm -f "$TMP_FILE"' EXIT
 awk -v ver="$NEW_VERSION" '
   !done && /^[[:space:]]*MARKETING_VERSION:/ {

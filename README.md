@@ -1,26 +1,163 @@
 # CCX
 
-**Control · Command · X** (`⌃⌘X`) — A native macOS screenshot, annotation, floating pin, and screen recording tool.
+**Control · Command · X** (`⌃⌘X`) — A fast, native Swift 6 macOS menu bar utility focused strictly on three core workflows: **Capture**, **Pin**, and **Record**.
 
-CCX is designed to deliver full Snipaste feature parity on macOS while extending the workflow with fast, high-quality screen recording.
+- **100% Native macOS**: Built with Swift 6, AppKit, SwiftUI, ScreenCaptureKit, Metal/CoreImage, AVFoundation/VideoToolbox, and Apple Vision — zero Electron, zero third-party runtime dependencies.
+- **100% Local & Private**: All screenshots, OCR text recognition, and recordings stay on your Mac. No accounts, no cloud uploads, no telemetry.
+- **Universal Binary**: Supports macOS 15.0 Sequoia and later on both Apple Silicon (`arm64`) and Intel (`x86_64`) Macs.
 
-## Planned Capabilities
+---
 
-### Capture (Smart Snip)
-- **Smart Auto-Detection**: Instant capture of regions, windows, and individual UI elements.
-- **Magnifier & Color Picker**: Pixel-accurate loupe and color inspection (HEX / RGB / HSL) with Retina HiDPI and wide-color support.
-- **Rich Annotations**: Vector and pixel editing tools including shapes, arrows, freehand drawing, text, step counters, highlighters, blur, and mosaic.
+## Core Features
 
-### Paste (Floating Pin Windows)
-- **Pin Anything**: Float screenshots, images, or clipboard content as always-on-top windows across macOS Spaces.
-- **Window Controls**: Smooth zoom, rotation, opacity adjustment, click-through mode, borders/shadows, and grouping.
-- **Quick Extraction**: Instant copy, save, and text recognition (OCR) directly from pinned windows.
+### 1. Capture (Smart Snip, Scroll Capture & Annotations)
+- **Instant Smart Auto-Detection (`⌃⌘X`)**: Freezes all displays via ScreenCaptureKit and automatically highlights windows and UI elements with non-blocking Accessibility queries.
+- **GPU Pixel Magnifier & Color Picker**: 120Hz GPU-composited pixel loupe with Retina HiDPI / Display P3 support and one-key color copy (`HEX`, `RGB`, `HSL`).
+- **Non-Destructive Annotations**: Rectangle, ellipse, arrow, freehand pen, highlighter, inline text, auto-incrementing step counters, and live GPU mosaic/blur with continuous stroke sizing and undo/redo.
+- **Scrolling Capture (`L`)**: Captures tall pages and documents with live preview, sticky header/sidebar detection, manual or auto-scroll, and memory-bounded stitching.
+- **Local OCR (`T`)**: On-device Apple Vision text recognition supporting Simplified Chinese, Traditional Chinese, and English.
 
-### X (Screen Recording & Extended Workflows)
-- **Screen Recording**: Region, window, and full-display recording to video (MP4/MOV) and GIF.
-- **Audio Capture**: Optional system audio and microphone recording.
-- **Extended Utilities**: Lightweight workflow tools built for speed and native macOS ergonomics.
+### 2. Pin (Always-on-Top Floating Windows)
+- **Float Across Spaces & Full-Screen Apps**: Pin snips, clipboard images, HEX color swatches, or text snippets as crisp floating `NSPanel`s.
+- **Interactive Controls**: Smooth GPU-accelerated zoom, 90° rotation, horizontal/vertical flip, opacity adjustment, thumbnail collapse, click-through mode (unlockable from the menu bar or context menu), and inline re-editable annotations on image pins.
+- **Recent Snips History**: Instant access to recent captures from the menu bar popover, persisted locally in a private user-only cache (`0700`/`0600`) with bounded memory usage and one-click clear.
 
-## Status
+### 3. Record (Screen Recording — MP4, MOV & GIF)
+- **Hardware-Accelerated Video & GIF**: Record any region or full display to `MP4` (H.264), `MOV` (HEVC), or memory-bounded `GIF` with adjustable recording border and live menu bar timer.
+- **Dual Audio & Pause/Resume**: Optional system audio and microphone narration with real-time mixing, true pause/resume timeline offsetting, graceful microphone fallback, and stream-interruption salvage.
+- **Non-Destructive Output**: Atomic Copy, Save, Quick Save, and Reveal in Finder actions that preserve your recording if a destination write fails.
 
-Active development — Smart Snip (`⌃⌘X`), non-destructive annotations, and floating pins are implemented; screen recording (`X`) is planned next.
+---
+
+## Installation
+
+1. Download the latest `CCX-0.4.0-macOS-universal.dmg` (or `.zip`).
+2. Open the disk image and drag **CCX.app** into **Applications**.
+3. Launch **CCX** from `/Applications` or Spotlight.
+
+> **Menu Bar App**: CCX runs in the macOS menu bar with no Dock icon. If CCX is already running, opening `CCX.app` again from `/Applications` or Spotlight brings up the Setup Guide (if permissions are still needed) or opens the menu bar popover.
+
+---
+
+## Permissions & Privacy
+
+CCX requests only the macOS permissions required for its three core features:
+
+| Permission | Required? | Purpose |
+| --- | --- | --- |
+| **Screen & System Audio Recording** | Required | Capturing screenshots, scrolling captures, screen recordings, and optional system audio. Relaunch CCX after granting for the first time. |
+| **Accessibility** | Optional | Fine-grained UI element auto-detection during Smart Snip and automatic scrolling during Scroll Capture. |
+| **Microphone** | Optional | Voice narration when microphone recording is enabled. |
+
+- CCX makes **zero network connections** and collects **no analytics or telemetry**.
+- Recent snip history is stored exclusively in `~/Library/Caches/com.lizhichaox.ccx/RecentSnips` with user-only permissions (`0700` directory, `0600` files) and can be cleared anytime from the popover or Settings.
+
+---
+
+## Keyboard Shortcuts
+
+### Global & Menu Bar
+| Shortcut | Action |
+| --- | --- |
+| `⌃⌘X` | Start Smart Snip |
+| Click menu bar icon | Open / close CCX popover (left or right click) |
+| `⌘,` | Open Settings (when popover is open) |
+| `Esc` / `⌘W` | Dismiss popover, Settings, or Setup Guide |
+| `⌘Q` | Quit CCX (from popover; confirms if recording is active) |
+
+### Smart Snip Overlay
+| Shortcut | Action |
+| --- | --- |
+| `Shift` (while hovering) | Cycle magnifier color format (`HEX` → `RGB` → `HSL`) |
+| `C` (while hovering) | Copy pixel color under cursor |
+| `R` (while hovering) | Recall previous selection on this display |
+| Drag (`Shift` / hold `Space`) | Select region (constrain square / move origin) |
+| `← ↑ → ↓` (`Shift` = 10pt) | Nudge selection or selected annotation |
+| `⌥` + `← ↑ → ↓` (`Shift` = 10pt) | Resize selection edges |
+| `⌘A` | Select entire display |
+| `1`–`8` / `V` | Select annotation tool / select-move tool |
+| `⌘Z` / `⇧⌘Z` | Undo / redo annotation |
+| `⌘D` / `Delete` | Duplicate / delete selected annotation |
+| `Return` | Finish and Pin |
+| `⌘C` | Copy to clipboard |
+| `⌘S` / `⇧⌘S` | Save PNG dialog / Quick Save PNG |
+| `T` | Extract and copy text (OCR) |
+| `L` | Start Scrolling Capture for selected region |
+| `R` (with selection) | Start Screen Recording for selected region |
+| `Esc` / `⌘W` | Cancel (or cancel inline text edit first) |
+
+### Scrolling Capture
+| Shortcut | Action |
+| --- | --- |
+| `Space` | Start / pause Auto-Scroll |
+| `Return` | Finish and Pin |
+| `⌘C` | Finish and Copy |
+| `⌘S` / `⇧⌘S` | Save PNG dialog / Quick Save PNG |
+| `T` | Extract and copy text (OCR) |
+| `Esc` / `⌘W` | Cancel scrolling capture (when HUD is focused) |
+
+### Floating Pins
+| Shortcut | Action |
+| --- | --- |
+| Scroll wheel / trackpad | Zoom in / out (`⌥` + Scroll adjusts opacity) |
+| `+` / `-` (`⌘+` / `⌘-`) | Zoom in / out |
+| `0` / `⌘0` | Reset zoom to 100% |
+| `⇧0` / `⇧⌘0` | Reset all transforms (zoom, rotation, flip, opacity) |
+| `R` / `⇧R` | Rotate 90° clockwise / counter-clockwise |
+| `H` / `V` | Flip horizontal / vertical |
+| `← ↑ → ↓` (`Shift` = 10pt) | Nudge floating pin |
+| `⌘C` | Copy pin content |
+| `⌘D` | Duplicate pin (or duplicate selected annotation while annotating) |
+| `⌘S` / `⇧⌘S` | Save PNG dialog / Quick Save PNG |
+| `Esc` | Cancel inline text → cancel annotation session → close pin |
+| `⌘W` | Close pin |
+
+### Screen Recording
+| Phase | Shortcuts |
+| --- | --- |
+| **Ready** | `Return` or `Space`: Start · `← ↑ → ↓` / `⌥` + Arrows: Nudge / resize · `⌘A`: Full display · `Esc` / `⌘W`: Cancel |
+| **Recording / Paused** | `Space`: Pause / resume · `Return`: Stop & finalize · `Esc` / `⌘W`: Discard (when HUD is focused) |
+| **Completed** | `Return` or `⇧⌘S`: Quick Save · `⌘C`: Copy file · `⌘S`: Save dialog · `Esc` / `⌘W`: Discard |
+
+---
+
+## Building from Source
+
+### Requirements
+- macOS 15.0+ with Xcode 16+ (Swift 6.0) and [XcodeGen](https://github.com/yonaskolb/XcodeGen) (`brew install xcodegen`).
+
+### Local Development Build & Launch
+```bash
+# Auto-detects your Apple Development signing identity (or copy Config/LocalSigning.xcconfig.example),
+# builds CCX.app, installs to /Applications/CCX.app, and launches via LaunchServices:
+./scripts/build-and-run.sh
+
+# Optional flags:
+./scripts/build-and-run.sh --build-only --no-bump
+```
+
+### Running Unit Tests
+```bash
+for pkg in CCXCore CCXAnnotate CCXCapture CCXPin CCXRecord; do
+  swift test --package-path "Packages/$pkg"
+done
+```
+
+### Public Release Packaging (Universal Binary + Hardened Runtime)
+```bash
+# Bump version in project.yml when preparing a release:
+./scripts/bump-version.sh 0.4.0
+
+# Build signed Universal Binary (arm64 + x86_64), verify dylibs/codesign/entitlements,
+# and emit dist/CCX-<version>-macOS-universal.{dmg,zip} + dist/SHA256SUMS.txt:
+./scripts/package-release.sh
+
+# Optional: notarize and staple with an Apple notarytool keychain profile:
+./scripts/package-release.sh --notarize "CCX-Notary"
+```
+
+---
+
+## License
+
+Copyright © 2026 Zhichao Li. All rights reserved.
