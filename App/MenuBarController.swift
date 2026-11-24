@@ -35,7 +35,7 @@ private final class MenuBarPanel: NSPanel {
 
     init() {
         super.init(
-            contentRect: NSRect(x: 0, y: 0, width: 304, height: 220),
+            contentRect: NSRect(x: 0, y: 0, width: 316, height: 220),
             styleMask: [.borderless, .nonactivatingPanel, .fullSizeContentView],
             backing: .buffered,
             defer: false
@@ -43,7 +43,6 @@ private final class MenuBarPanel: NSPanel {
         isFloatingPanel = true
         hidesOnDeactivate = false
         level = .popUpMenu
-        sharingType = .none
         backgroundColor = .clear
         isOpaque = false
         hasShadow = true
@@ -97,6 +96,7 @@ final class MenuBarController: NSObject, NSWindowDelegate {
 
     private var panel: MenuBarPanel?
     private var hostingView: NSHostingView<MenuBarPopoverView>?
+    private var pendingPopoverActionAnchor: NSRect?
 
     nonisolated(unsafe) private var globalMouseMonitor: Any?
     nonisolated(unsafe) private var localMouseMonitor: Any?
@@ -194,10 +194,77 @@ final class MenuBarController: NSObject, NSWindowDelegate {
         }
     }
 
-    /// Screen-coordinate frame of the menu bar status item button, used to anchor
-    /// auxiliary windows (such as Settings) right beneath the menu bar icon.
+    /// Screen-coordinate frame of the menu bar status item button.
     var statusButtonScreenFrame: NSRect? {
         statusItem.button?.window?.frame
+    }
+
+    /// Reliable display-consistent anchor frame for auxiliary windows (Settings / Setup Guide)
+    /// launched from the menu bar popover or app reopen. Prefers `statusButtonScreenFrame` when
+    /// it lives on the same display as the visible popover (or mouse cursor), falling back to the
+    /// visible popover's top anchor if the status bar button frame is stale on another display.
+    var popoverAnchorScreenFrame: NSRect? {
+        if let pendingPopoverActionAnchor {
+            return pendingPopoverActionAnchor
+        }
+        return resolvePopoverAnchorScreenFrame()
+    }
+
+    private var validStatusButtonScreenFrame: NSRect? {
+        guard let frame = statusButtonScreenFrame,
+              !frame.isNull,
+              frame.width > 0,
+              frame.height > 0,
+              frame.origin.x.isFinite,
+              frame.origin.y.isFinite,
+              NSScreen.screens.contains(where: { screen in
+                  let overlap = screen.frame.intersection(frame)
+                  return !overlap.isNull && !overlap.isEmpty && overlap.width > 0 && overlap.height > 0
+              })
+        else {
+            return nil
+        }
+        return frame
+    }
+
+    private func resolvePopoverAnchorScreenFrame() -> NSRect? {
+        if let panel, panel.isVisible {
+            let panelScreen = WindowScreenLocator.screen(for: panel.frame) ?? panel.screen
+            if let buttonFrame = validStatusButtonScreenFrame,
+               let buttonScreen = WindowScreenLocator.screen(for: buttonFrame),
+               WindowScreenLocator.isSameScreen(buttonScreen, panelScreen) {
+                return buttonFrame
+            }
+            return Self.panelTopAnchorFrame(for: panel.frame, on: panelScreen)
+        }
+
+        let cursorScreen = WindowScreenLocator.activeCursorScreen()
+        if let buttonFrame = validStatusButtonScreenFrame,
+           let buttonScreen = WindowScreenLocator.screen(for: buttonFrame),
+           WindowScreenLocator.isSameScreen(buttonScreen, cursorScreen) {
+            return buttonFrame
+        }
+        return nil
+    }
+
+    private static func panelTopAnchorFrame(for panelFrame: NSRect, on screen: NSScreen?) -> NSRect {
+        let desiredY = panelFrame.maxY + 6
+        let clampedY: CGFloat
+        if let screenFrame = screen?.frame {
+            let minY = screenFrame.minY
+            let maxY = max(minY, screenFrame.maxY - 2)
+            clampedY = min(max(desiredY, minY), maxY)
+        } else {
+            clampedY = desiredY
+        }
+        return NSRect(x: panelFrame.origin.x, y: clampedY, width: panelFrame.width, height: 1)
+    }
+
+    private func invokePopoverAction(_ action: () -> Void) {
+        pendingPopoverActionAnchor = resolvePopoverAnchorScreenFrame()
+        defer { pendingPopoverActionAnchor = nil }
+        hidePanel()
+        action()
     }
 
     /// Opens the popover when the status bar icon is currently visible on a display.
@@ -205,11 +272,7 @@ final class MenuBarController: NSObject, NSWindowDelegate {
     /// so callers can fall back to presenting Settings instead.
     @discardableResult
     func openPanelIfStatusButtonVisible() -> Bool {
-        guard let buttonFrame = statusButtonScreenFrame,
-              buttonFrame.width > 0,
-              buttonFrame.height > 0,
-              NSScreen.screens.contains(where: { $0.frame.intersects(buttonFrame) })
-        else {
+        guard validStatusButtonScreenFrame != nil else {
             return false
         }
         if panel?.isVisible != true {
@@ -328,12 +391,14 @@ final class MenuBarController: NSObject, NSWindowDelegate {
                     self?.delegate?.menuBarRequestedCloseAllPins()
                 },
                 onOpenPermissions: { [weak self] in
-                    self?.hidePanel()
-                    self?.delegate?.menuBarRequestedPermissionsGuide()
+                    self?.invokePopoverAction {
+                        self?.delegate?.menuBarRequestedPermissionsGuide()
+                    }
                 },
                 onOpenSettings: { [weak self] in
-                    self?.hidePanel()
-                    self?.delegate?.menuBarRequestedSettings()
+                    self?.invokePopoverAction {
+                        self?.delegate?.menuBarRequestedSettings()
+                    }
                 },
                 onQuit: { [weak self] in
                     self?.hidePanel()
@@ -343,6 +408,7 @@ final class MenuBarController: NSObject, NSWindowDelegate {
         )
 
         let hostingView = NSHostingView(rootView: rootView)
+        hostingView.safeAreaRegions = []
         hostingView.sizingOptions = [.intrinsicContentSize]
         hostingView.wantsLayer = true
         hostingView.layer?.backgroundColor = NSColor.clear.cgColor
@@ -367,13 +433,14 @@ final class MenuBarController: NSObject, NSWindowDelegate {
         var originX = buttonFrame.midX - size.width / 2
         var originY = buttonFrame.minY - 6 - size.height
 
-        if let visibleFrame = (buttonWindow.screen ?? NSScreen.main)?.visibleFrame {
-            let minX = visibleFrame.minX + 8
-            let maxX = max(minX, visibleFrame.maxX - size.width - 8)
-            let minY = visibleFrame.minY + 8
-            let maxY = max(minY, visibleFrame.maxY - size.height - 6)
-            originX = min(max(originX, minX), maxX)
-            originY = min(max(originY, minY), maxY)
+        if let visibleFrame = (WindowScreenLocator.screen(for: buttonFrame) ?? buttonWindow.screen)?.visibleFrame {
+            let origin = WindowScreenLocator.clampOrigin(
+                NSPoint(x: originX, y: originY),
+                windowSize: size,
+                to: visibleFrame
+            )
+            originX = origin.x
+            originY = origin.y
         }
 
         let targetFrame = NSRect(x: originX, y: originY, width: size.width, height: size.height)
@@ -509,8 +576,9 @@ final class MenuBarController: NSObject, NSWindowDelegate {
                         return true
                     }
                     if chars == "," {
-                        self.hidePanel()
-                        self.delegate?.menuBarRequestedSettings()
+                        self.invokePopoverAction {
+                            self.delegate?.menuBarRequestedSettings()
+                        }
                         return true
                     }
                     if chars == "q" {

@@ -8,6 +8,12 @@ enum OnboardingStep: Int, CaseIterable {
     case ready = 2
 }
 
+enum OnboardingAnchor: Equatable, Sendable {
+    case belowMenuBar(NSRect)
+    case centeredOnWindow(NSRect)
+    case centeredOnActiveScreen
+}
+
 @MainActor
 final class OnboardingFlowState: ObservableObject {
     static let springAnimation = Animation.spring(response: 0.30, dampingFraction: 0.86)
@@ -34,7 +40,7 @@ private struct SendableEventMonitorBox: @unchecked Sendable {
 /// Hosts the compact 3-page Guide & Permissions flow with native horizontal swipe paging.
 @MainActor
 final class OnboardingWindowController: NSObject, NSWindowDelegate {
-    private static let windowSize = NSSize(width: 440, height: 300)
+    private static let windowSize = NSSize(width: 464, height: 344)
 
     private enum GestureAxis {
         case horizontal
@@ -76,7 +82,7 @@ final class OnboardingWindowController: NSObject, NSWindowDelegate {
         }
     }
 
-    func show(startingAt step: OnboardingStep = .welcome, anchoredTo anchorRect: NSRect? = nil) {
+    func show(startingAt step: OnboardingStep = .welcome, anchor: OnboardingAnchor = .centeredOnActiveScreen) {
         flow.swipeOffset = 0
         flow.step = step
 
@@ -85,8 +91,11 @@ final class OnboardingWindowController: NSObject, NSWindowDelegate {
         model.refresh()
         model.startPolling()
 
-        if !window.isVisible {
-            position(window: window, anchoredTo: anchorRect)
+        let targetScreen = Self.targetScreen(for: anchor)
+        let currentScreen = window.screen ?? WindowScreenLocator.screen(for: window.frame)
+        let isOnDifferentScreen = targetScreen != nil && !WindowScreenLocator.isSameScreen(currentScreen, targetScreen)
+        if !window.isVisible || isOnDifferentScreen {
+            position(window: window, anchor: anchor, targetScreen: targetScreen)
         }
         installEventMonitor()
         NSApp.activate()
@@ -109,7 +118,9 @@ final class OnboardingWindowController: NSObject, NSWindowDelegate {
                 self?.onTrySnip()
             }
         )
-        let window = DismissibleWindow(contentViewController: NSHostingController(rootView: view))
+        let hosting = NSHostingController(rootView: view)
+        hosting.safeAreaRegions = []
+        let window = DismissibleWindow(contentViewController: hosting)
         window.title = "CCX"
         window.titleVisibility = .hidden
         window.titlebarAppearsTransparent = true
@@ -121,27 +132,49 @@ final class OnboardingWindowController: NSObject, NSWindowDelegate {
         return window
     }
 
-    private func position(window: NSWindow, anchoredTo anchorRect: NSRect?) {
-        let size = window.frame.size
-        guard let anchorRect else {
-            window.center()
-            return
+    private static func targetScreen(for anchor: OnboardingAnchor) -> NSScreen? {
+        switch anchor {
+        case .belowMenuBar(let anchorRect):
+            WindowScreenLocator.screen(for: anchorRect)
+        case .centeredOnWindow(let parentFrame):
+            WindowScreenLocator.screen(for: parentFrame)
+        case .centeredOnActiveScreen:
+            WindowScreenLocator.activeCursorScreen()
         }
+    }
 
-        let screen = NSScreen.screens.first { $0.frame.intersects(anchorRect) } ?? NSScreen.main
-        var originX = anchorRect.midX - size.width / 2
-        var originY = anchorRect.minY - 6 - size.height
+    private func position(window: NSWindow, anchor: OnboardingAnchor, targetScreen: NSScreen?) {
+        let size = window.frame.size
+        let screen = targetScreen ?? Self.targetScreen(for: anchor)
+
+        var origin: NSPoint
+        switch anchor {
+        case .belowMenuBar(let anchorRect):
+            origin = NSPoint(
+                x: (anchorRect.midX - size.width / 2).rounded(),
+                y: (anchorRect.minY - 6 - size.height).rounded()
+            )
+        case .centeredOnWindow(let parentFrame):
+            origin = NSPoint(
+                x: (parentFrame.midX - size.width / 2).rounded(),
+                y: (parentFrame.midY - size.height / 2).rounded()
+            )
+        case .centeredOnActiveScreen:
+            guard let visibleFrame = screen?.visibleFrame else {
+                window.center()
+                return
+            }
+            origin = NSPoint(
+                x: (visibleFrame.midX - size.width / 2).rounded(),
+                y: (visibleFrame.midY - size.height / 2).rounded()
+            )
+        }
 
         if let visibleFrame = screen?.visibleFrame {
-            let minX = visibleFrame.minX + 8
-            let maxX = max(minX, visibleFrame.maxX - size.width - 8)
-            let minY = visibleFrame.minY + 8
-            let maxY = max(minY, visibleFrame.maxY - size.height - 6)
-            originX = min(max(originX, minX), maxX)
-            originY = min(max(originY, minY), maxY)
+            origin = WindowScreenLocator.clampOrigin(origin, windowSize: size, to: visibleFrame)
         }
 
-        window.setFrameOrigin(NSPoint(x: originX, y: originY))
+        window.setFrame(NSRect(origin: origin, size: size), display: window.isVisible)
     }
 
     func windowWillClose(_ notification: Notification) {
@@ -404,20 +437,20 @@ private struct OnboardingView: View {
                     HStack(spacing: 0) {
                         WelcomeStepView()
                             .padding(.horizontal, 20)
-                            .padding(.top, 16)
-                            .padding(.bottom, 10)
+                            .padding(.top, 28)
+                            .padding(.bottom, 12)
                             .frame(width: pageWidth, height: proxy.size.height)
 
                         PermissionsStepView(model: model, flow: flow)
                             .padding(.horizontal, 20)
-                            .padding(.top, 16)
-                            .padding(.bottom, 10)
+                            .padding(.top, 28)
+                            .padding(.bottom, 12)
                             .frame(width: pageWidth, height: proxy.size.height)
 
                         ReadyStepView()
                             .padding(.horizontal, 20)
-                            .padding(.top, 16)
-                            .padding(.bottom, 10)
+                            .padding(.top, 28)
+                            .padding(.bottom, 12)
                             .frame(width: pageWidth, height: proxy.size.height)
                     }
                     .offset(x: -CGFloat(flow.step.rawValue) * pageWidth + flow.swipeOffset)
@@ -436,7 +469,7 @@ private struct OnboardingView: View {
                 .frame(height: 48)
             }
         }
-        .frame(width: 440, height: 300)
+        .frame(width: 464, height: 344)
     }
 }
 

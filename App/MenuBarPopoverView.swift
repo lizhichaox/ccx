@@ -190,7 +190,7 @@ struct MenuBarPopoverView: View {
         .padding(.top, 14)
         .padding(.horizontal, 14)
         .padding(.bottom, 10)
-        .frame(width: 304)
+        .frame(width: 316)
         .fixedSize(horizontal: false, vertical: true)
         .ccxPopoverSurface(cornerRadius: 16)
     }
@@ -415,7 +415,7 @@ private struct RecentSnipThumbnail: View {
             Image(decorative: entry.thumbnail, scale: 1.0)
                 .resizable()
                 .aspectRatio(contentMode: .fill)
-                .frame(width: 57.5, height: 38)
+                .frame(width: 60.5, height: 38)
                 .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
                 .overlay(alignment: .topTrailing) {
                     if isPinned {

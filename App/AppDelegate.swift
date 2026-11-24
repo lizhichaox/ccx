@@ -126,9 +126,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         if !PermissionManager.currentStatus().screenRecording {
-            showOnboarding(startingAt: .welcome)
+            showOnboarding(startingAt: .welcome, anchor: .centeredOnActiveScreen)
         } else if !UserDefaults.standard.bool(forKey: Self.hasCompletedOnboardingKey) {
-            showOnboarding(startingAt: .ready)
+            showOnboarding(startingAt: .ready, anchor: .centeredOnActiveScreen)
         }
     }
 
@@ -183,11 +183,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let step: OnboardingStep = UserDefaults.standard.bool(forKey: Self.hasCompletedOnboardingKey)
                 ? .permissions
                 : .welcome
-            showOnboarding(startingAt: step, anchoredTo: menuBarController?.statusButtonScreenFrame)
+            let anchor: OnboardingAnchor = menuBarController?.popoverAnchorScreenFrame.map { .belowMenuBar($0) }
+                ?? .centeredOnActiveScreen
+            showOnboarding(startingAt: step, anchor: anchor)
             return false
         }
         if menuBarController?.openPanelIfStatusButtonVisible() != true {
-            showSettings()
+            showSettings(anchoredTo: nil)
         }
         return false
     }
@@ -253,7 +255,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return false
         }
 
-        menuBarController?.hidePanel()
         toast.hide()
         pinManager.closeAllToolbars(commit: true)
         return true
@@ -833,7 +834,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Windows
 
-    private func showOnboarding(startingAt step: OnboardingStep = .welcome, anchoredTo anchorRect: NSRect? = nil) {
+    private func showOnboarding(
+        startingAt step: OnboardingStep = .welcome,
+        anchor: OnboardingAnchor = .centeredOnActiveScreen
+    ) {
         recordingCoordinator.cancelIfInReadyPhase()
         if onboardingController == nil {
             onboardingController = OnboardingWindowController(
@@ -848,10 +852,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             )
         }
-        onboardingController?.show(startingAt: step, anchoredTo: anchorRect)
+        onboardingController?.show(startingAt: step, anchor: anchor)
     }
 
-    private func showSettings() {
+    private func showSettings(anchoredTo anchorRect: NSRect? = nil) {
         recordingCoordinator.cancelIfInReadyPhase()
         let hasClearable = !clipboardStore.history.isEmpty || clipboardStore.hasPasteboardContent
         if settingsController == nil {
@@ -861,8 +865,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 onRetryHotKey: { [weak self] in
                     self?.retrySnipHotKeyRegistration() ?? false
                 },
-                onOpenGuide: { [weak self] in
-                    self?.menuBarRequestedPermissionsGuide()
+                onOpenGuide: { [weak self] settingsFrame in
+                    guard let self else { return }
+                    let status = PermissionManager.currentStatus()
+                    let allGranted = status.screenRecording && status.accessibility
+                    let anchor: OnboardingAnchor = settingsFrame.map { .centeredOnWindow($0) }
+                        ?? .centeredOnActiveScreen
+                    self.showOnboarding(
+                        startingAt: allGranted ? .welcome : .permissions,
+                        anchor: anchor
+                    )
                 },
                 onClearHistory: { [weak self] in
                     self?.menuBarRequestedClearHistory()
@@ -873,7 +885,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             settingsController?.updateHotKeyRegistered(hotKeyManager.isRegistered(.snip))
             settingsController?.updateHasClearableHistory(hasClearable)
         }
-        settingsController?.show(anchoredTo: menuBarController?.statusButtonScreenFrame)
+        settingsController?.show(anchoredTo: anchorRect)
     }
 }
 
@@ -952,13 +964,15 @@ extension AppDelegate: MenuBarControllerDelegate {
     func menuBarRequestedPermissionsGuide() {
         let status = PermissionManager.currentStatus()
         let allGranted = status.screenRecording && status.accessibility
+        let anchor: OnboardingAnchor = menuBarController?.popoverAnchorScreenFrame.map { .belowMenuBar($0) }
+            ?? .centeredOnActiveScreen
         showOnboarding(
             startingAt: allGranted ? .welcome : .permissions,
-            anchoredTo: menuBarController?.statusButtonScreenFrame
+            anchor: anchor
         )
     }
 
     func menuBarRequestedSettings() {
-        showSettings()
+        showSettings(anchoredTo: menuBarController?.popoverAnchorScreenFrame)
     }
 }

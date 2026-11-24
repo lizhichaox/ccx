@@ -20,15 +20,17 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     private let permissions = PermissionStatusModel()
     private let hotKeyState: SettingsHotKeyState
     private let onRetryHotKey: () -> Bool
-    private let onOpenGuide: () -> Void
+    private let onOpenGuide: (NSRect?) -> Void
     private let onClearHistory: () -> Void
     private var window: NSWindow?
+
+    var windowFrame: NSRect? { window?.frame }
 
     init(
         isSnipHotKeyRegistered: Bool = true,
         hasClearableHistory: Bool = false,
         onRetryHotKey: @escaping () -> Bool = { false },
-        onOpenGuide: @escaping () -> Void = {},
+        onOpenGuide: @escaping (NSRect?) -> Void = { _ in },
         onClearHistory: @escaping () -> Void = {}
     ) {
         self.hotKeyState = SettingsHotKeyState(
@@ -58,8 +60,24 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         self.window = window
         permissions.refresh()
         permissions.startPolling()
+
+        let targetScreen = anchorRect.flatMap { WindowScreenLocator.screen(for: $0) }
+            ?? WindowScreenLocator.activeCursorScreen()
+        let currentScreen = window.screen ?? WindowScreenLocator.screen(for: window.frame)
+        let shouldReposition: Bool
         if !window.isVisible {
-            position(window: window, anchoredTo: anchorRect)
+            shouldReposition = true
+        } else if anchorRect != nil,
+                  let targetScreen,
+                  !WindowScreenLocator.isSameScreen(currentScreen, targetScreen) {
+            shouldReposition = true
+        } else {
+            shouldReposition = false
+        }
+
+        syncWindowHeightToFit(preserveTopEdge: !shouldReposition)
+        if shouldReposition {
+            position(window: window, anchoredTo: anchorRect, targetScreen: targetScreen)
         }
         NSApp.activate()
         window.makeKeyAndOrderFront(nil)
@@ -75,13 +93,19 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
                 self.updateHotKeyRegistered(registered)
             },
             onOpenGuide: { [weak self] in
-                self?.onOpenGuide()
+                self?.onOpenGuide(self?.window?.frame)
             },
             onClearHistory: { [weak self] in
                 self?.onClearHistory()
+            },
+            onContentHeightChange: { [weak self] in
+                DispatchQueue.main.async { [weak self] in
+                    self?.syncWindowHeightToFit(preserveTopEdge: true)
+                }
             }
         )
         let hosting = NSHostingController(rootView: view)
+        hosting.safeAreaRegions = []
         hosting.sizingOptions = [.intrinsicContentSize]
         let window = DismissibleWindow(contentViewController: hosting)
         window.title = "CCX Settings"
@@ -96,35 +120,59 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         return window
     }
 
-    private func position(window: NSWindow, anchoredTo anchorRect: NSRect?) {
-        let size = window.frame.size
-        let screen = anchorRect.flatMap { rect in
-            NSScreen.screens.first { $0.frame.intersects(rect) }
-        } ?? NSScreen.main
+    private func syncWindowHeightToFit(preserveTopEdge: Bool) {
+        guard let window, let contentView = window.contentView else { return }
+        contentView.layoutSubtreeIfNeeded()
+        let fitting = contentView.fittingSize
+        guard fitting.width > 0, fitting.height > 0 else { return }
+        let currentContentSize = window.contentRect(forFrameRect: window.frame).size
+        guard abs(currentContentSize.width - fitting.width) > 0.5
+            || abs(currentContentSize.height - fitting.height) > 0.5
+        else { return }
 
-        var originX: CGFloat
-        var originY: CGFloat
+        if preserveTopEdge {
+            let targetFrameSize = window.frameRect(forContentRect: NSRect(origin: .zero, size: fitting)).size
+            var frame = window.frame
+            frame.origin.y += frame.height - targetFrameSize.height
+            frame.size = targetFrameSize
+            if let visibleFrame = (window.screen ?? WindowScreenLocator.screen(for: window.frame))?.visibleFrame {
+                let minY = visibleFrame.minY + 8
+                let maxY = max(minY, visibleFrame.maxY - frame.height - 6)
+                frame.origin.y = min(max(frame.origin.y, minY), maxY)
+            }
+            window.setFrame(frame, display: true)
+        } else {
+            window.setContentSize(fitting)
+        }
+    }
+
+    private func position(window: NSWindow, anchoredTo anchorRect: NSRect?, targetScreen: NSScreen?) {
+        let size = window.frame.size
+        let screen = targetScreen
+            ?? anchorRect.flatMap { WindowScreenLocator.screen(for: $0) }
+            ?? WindowScreenLocator.activeCursorScreen()
+
+        var origin: NSPoint
         if let anchorRect {
-            originX = anchorRect.midX - size.width / 2
-            originY = anchorRect.minY - 6 - size.height
+            origin = NSPoint(
+                x: (anchorRect.midX - size.width / 2).rounded(),
+                y: (anchorRect.minY - 6 - size.height).rounded()
+            )
         } else if let visibleFrame = screen?.visibleFrame {
-            originX = visibleFrame.maxX - size.width - 12
-            originY = visibleFrame.maxY - size.height - 8
+            origin = NSPoint(
+                x: (visibleFrame.midX - size.width / 2).rounded(),
+                y: (visibleFrame.midY - size.height / 2).rounded()
+            )
         } else {
             window.center()
             return
         }
 
         if let visibleFrame = screen?.visibleFrame {
-            let minX = visibleFrame.minX + 8
-            let maxX = max(minX, visibleFrame.maxX - size.width - 8)
-            let minY = visibleFrame.minY + 8
-            let maxY = max(minY, visibleFrame.maxY - size.height - 6)
-            originX = min(max(originX, minX), maxX)
-            originY = min(max(originY, minY), maxY)
+            origin = WindowScreenLocator.clampOrigin(origin, windowSize: size, to: visibleFrame)
         }
 
-        window.setFrameOrigin(NSPoint(x: originX, y: originY))
+        window.setFrame(NSRect(origin: origin, size: size), display: window.isVisible)
     }
 
     func windowWillClose(_ notification: Notification) {
@@ -138,6 +186,7 @@ private struct SettingsView: View {
     let onRetryHotKey: () -> Void
     let onOpenGuide: () -> Void
     let onClearHistory: () -> Void
+    let onContentHeightChange: () -> Void
     @State private var openedScreenRecordingSettings = false
 
     var body: some View {
@@ -224,10 +273,18 @@ private struct SettingsView: View {
                     .frame(maxWidth: .infinity, alignment: .center)
             }
             .padding(.horizontal, 16)
-            .padding(.top, 14)
-            .padding(.bottom, 12)
+            .padding(.top, 28)
+            .padding(.bottom, 16)
+            .fixedSize(horizontal: false, vertical: true)
+            .onGeometryChange(for: CGFloat.self) { proxy in
+                proxy.size.height
+            } action: { oldHeight, newHeight in
+                if abs(oldHeight - newHeight) > 0.5 {
+                    onContentHeightChange()
+                }
+            }
         }
-        .frame(width: 344)
+        .frame(width: 368)
         .fixedSize(horizontal: false, vertical: true)
     }
 }
@@ -241,6 +298,8 @@ private struct SettingsFooter: View {
             Text("100% local & private · Zero telemetry")
                 .font(.system(size: 10.5))
                 .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .fixedSize(horizontal: false, vertical: true)
 
             HStack(spacing: 0) {
                 Text("Made By ")
@@ -266,7 +325,10 @@ private struct SettingsFooter: View {
                     .foregroundStyle(.tertiary)
             }
             .font(.system(size: 11))
+            .lineLimit(1)
+            .fixedSize(horizontal: false, vertical: true)
         }
+        .fixedSize(horizontal: false, vertical: true)
     }
 }
 
@@ -345,6 +407,7 @@ private struct SnipShortcutRow: View {
                 Text("Shortcut is currently in use by another app.")
                     .font(.system(size: 10.5))
                     .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
                     .padding(.leading, 43)
                     .padding(.trailing, 10)
                     .padding(.bottom, 7)
@@ -389,6 +452,7 @@ private struct LaunchAtLoginRow: View {
                 Text("Approval required in System Settings → Login Items.")
                     .font(.system(size: 10.5))
                     .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
                     .padding(.leading, 43)
                     .padding(.trailing, 10)
                     .padding(.bottom, 7)
@@ -396,6 +460,7 @@ private struct LaunchAtLoginRow: View {
                 Text(errorMessage)
                     .font(.system(size: 10.5))
                     .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
                     .padding(.leading, 43)
                     .padding(.trailing, 10)
                     .padding(.bottom, 7)
@@ -461,6 +526,7 @@ private struct ScreenRecordingSettingRow: View {
                     Text(showRelaunch ? "Relaunch CCX after enabling." : "Already enabled?")
                         .font(.system(size: 10.5))
                         .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                     Spacer(minLength: 4)
                     Button(isChecking ? "Checking…" : "Verify", action: onVerify)
                         .buttonStyle(.bordered)
@@ -535,5 +601,85 @@ enum AppVersion {
 
     static var display: String {
         "Version \(shortDisplay)"
+    }
+}
+
+/// Multi-display screen lookup and clamping helpers shared by Settings, Setup Guide,
+/// and the menu bar popover so auxiliary windows always open on the intended display.
+@MainActor
+enum WindowScreenLocator {
+    static func screen(for rect: NSRect) -> NSScreen? {
+        let screens = NSScreen.screens
+        if !rect.isNull,
+           rect.origin.x.isFinite,
+           rect.origin.y.isFinite,
+           rect.size.width.isFinite,
+           rect.size.height.isFinite
+        {
+            let center = NSPoint(x: rect.midX, y: rect.midY)
+            if let containingCenter = screens.first(where: { $0.frame.contains(center) }) {
+                return containingCenter
+            }
+
+            var bestScreen: NSScreen?
+            var bestArea: CGFloat = 0
+            for candidate in screens {
+                let overlap = candidate.frame.intersection(rect)
+                guard !overlap.isNull, !overlap.isEmpty, overlap.width > 0, overlap.height > 0 else {
+                    continue
+                }
+                let area = overlap.width * overlap.height
+                if area > bestArea {
+                    bestArea = area
+                    bestScreen = candidate
+                }
+            }
+            if let bestScreen {
+                return bestScreen
+            }
+        }
+
+        return activeCursorScreen()
+    }
+
+    static func activeCursorScreen() -> NSScreen? {
+        let mouse = NSEvent.mouseLocation
+        return NSScreen.screens.first { $0.frame.contains(mouse) }
+            ?? NSScreen.main
+            ?? NSScreen.screens.first
+    }
+
+    static func isSameScreen(_ lhs: NSScreen?, _ rhs: NSScreen?) -> Bool {
+        guard let lhs, let rhs else { return lhs == nil && rhs == nil }
+        if lhs === rhs { return true }
+        if let lhsID = displayID(of: lhs), let rhsID = displayID(of: rhs) {
+            return lhsID == rhsID
+        }
+        return lhs == rhs
+    }
+
+    static func clampOrigin(
+        _ origin: NSPoint,
+        windowSize: NSSize,
+        to visibleFrame: NSRect,
+        horizontalInset: CGFloat = 8,
+        bottomInset: CGFloat = 8,
+        topInset: CGFloat = 6
+    ) -> NSPoint {
+        let minX = visibleFrame.minX + horizontalInset
+        let maxX = max(minX, visibleFrame.maxX - windowSize.width - horizontalInset)
+        let minY = visibleFrame.minY + bottomInset
+        let maxY = max(minY, visibleFrame.maxY - windowSize.height - topInset)
+        return NSPoint(
+            x: min(max(origin.x, minX), maxX),
+            y: min(max(origin.y, minY), maxY)
+        )
+    }
+
+    private static func displayID(of screen: NSScreen) -> CGDirectDisplayID? {
+        guard let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else {
+            return nil
+        }
+        return CGDirectDisplayID(number.uint32Value)
     }
 }
