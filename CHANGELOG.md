@@ -2,6 +2,12 @@
 
 All notable changes to **CCX (Control · Command · X)** are documented in this file.
 
+## [0.4.2] - 2026-11-24
+
+### Improved
+- **Scrollable Recent Snips Strip**: Synced the full bounded recent snip history (up to 20 snips) into the menu bar popover instead of truncating at 4 entries, keeping `RECENT SNIPS` consistent with the Pin tile's ready count and adding a compact count pill badge beside the section header.
+- **Fluid Horizontal Navigation**: Kept the centered static row for `≤ 4` snips and upgraded `> 4` snips to a smooth horizontal `ScrollView` with a natural 5th-thumbnail right-edge peek, dynamic horizontal edge-fade masking, hover-revealed translucent circular quick-step buttons for both trackpad and mouse users, and automatic scroll-to-leading reset when a new snip arrives.
+
 ## [0.4.1] - 2026-11-24
 
 ### Fixed
