@@ -2,6 +2,11 @@
 
 All notable changes to **CCX (Control · Command · X)** are documented in this file.
 
+## [0.4.3] - 2026-11-24
+
+### Fixed
+- **Recent Snips Thumbnail Hit-Testing**: Bounded each recent snip thumbnail inside a fixed `60.5 × 38` hit-test and accessibility container (with `.contentShape` and `.allowsHitTesting(false)` on the `.fill`-scaled image overlay) so ultra-wide or tall snips can no longer overflow their hit-test bounds and swallow hover or click events on neighboring thumbnails.
+
 ## [0.4.2] - 2026-11-24
 
 ### Improved
