@@ -3,7 +3,7 @@
 **Control · Command · X** (`⌃⌘X`) — A fast, native Swift 6 macOS menu bar utility focused strictly on three core workflows: **Capture**, **Pin**, and **Record**.
 
 - **100% Native macOS**: Built with Swift 6, AppKit, SwiftUI, ScreenCaptureKit, Metal/CoreImage, AVFoundation/VideoToolbox, and Apple Vision — zero Electron, zero third-party runtime dependencies.
-- **100% Local & Private**: All screenshots, OCR text recognition, and recordings stay on your Mac. No accounts, no cloud uploads, no telemetry.
+- **Local Captures & OCR · Zero Telemetry**: All screenshots, OCR text recognition, and recordings stay on your Mac. No accounts, no cloud uploads, no analytics or telemetry; optional in-app update checks connect only to GitHub Releases and can be disabled anytime in Settings.
 - **Universal Binary**: Supports macOS 15.0 Sequoia and later on both Apple Silicon (`arm64`) and Intel (`x86_64`) Macs.
 
 ---
@@ -32,11 +32,16 @@
 
 ## Installation
 
-1. Download the latest `CCX-0.4.4-macOS-universal.dmg` (or `.zip`).
+1. Download the latest `CCX-0.5.0-macOS-universal.dmg` (or `.zip`).
 2. Open the disk image and drag **CCX.app** into **Applications**.
 3. Launch **CCX** from `/Applications` or Spotlight.
 
 > **Menu Bar App**: CCX runs in the macOS menu bar with no Dock icon. If CCX is already running, opening `CCX.app` again from `/Applications` or Spotlight brings up the Setup Guide (if permissions are still needed) or opens the menu bar popover.
+
+### Verified In-App Updates
+
+- **One-Click Native Updates**: CCX includes a built-in, zero-dependency updater that checks GitHub Releases automatically once per day (toggleable anytime in **Settings → Updates**, with an on-demand **Check** button).
+- **Cryptographic Verification**: Every downloaded archive is verified against `SHA256SUMS.txt` using streaming SHA-256 and cryptographically validated with Apple's `Security` framework (`SecStaticCodeCheckValidity`) to confirm an Apple Developer ID signature, matching Bundle ID and Team ID, and Hardened Runtime before staging and atomically replacing `CCX.app`.
 
 ---
 
@@ -50,7 +55,8 @@ CCX requests only the macOS permissions required for its three core features:
 | **Accessibility** | Optional | Fine-grained UI element auto-detection during Smart Snip and automatic scrolling during Scroll Capture. |
 | **Microphone** | Optional | Voice narration when microphone recording is enabled. |
 
-- CCX makes **zero network connections** and collects **no analytics or telemetry**.
+- CCX collects **no analytics, crash reports, or telemetry** and never uploads your captures, OCR text, or recordings.
+- The only network traffic CCX makes is HTTPS requests to GitHub Releases (`api.github.com`, `github.com`, `*.githubusercontent.com`) when checking for or downloading app updates — automatic checks can be turned off completely in **Settings → Updates**.
 - Recent snip history is stored exclusively in `~/Library/Caches/com.lizhichaox.ccx/RecentSnips` with user-only permissions (`0700` directory, `0600` files) and can be cleared anytime from the popover or Settings.
 
 ---
@@ -147,7 +153,7 @@ done
 ### Public Release Packaging (Universal Binary + Hardened Runtime)
 ```bash
 # Bump version in project.yml when preparing a release:
-./scripts/bump-version.sh 0.4.4
+./scripts/bump-version.sh 0.5.0
 
 # Build signed Universal Binary (arm64 + x86_64), verify dylibs/codesign/entitlements,
 # and emit dist/CCX-<version>-macOS-universal.{dmg,zip} + dist/SHA256SUMS.txt:

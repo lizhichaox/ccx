@@ -2,6 +2,15 @@
 
 All notable changes to **CCX (Control · Command · X)** are documented in this file.
 
+## [0.5.0] - 2026-11-24
+
+### Added
+- **Verified Native In-App Updater (`CCXCore`)**: Added a zero-dependency macOS in-app updater backed by GitHub Releases with strict HTTPS host allowlisting across redirects, streaming SHA-256 verification against `SHA256SUMS.txt`, dynamic Apple Developer ID code-signature and Hardened Runtime validation (`SecStaticCodeCheckValidity`), install-location eligibility checks, pre-quit sibling staging, and rollback-safe atomic app replacement and relaunch.
+- **Settings & Menu Bar Popover Update UI**: Added an **Updates** row in **Settings** (automatic daily check toggle, manual **Check** / **Update** / **Cancel** / **Retry** controls, download progress bar, release notes & GitHub fallback links) and a compact, dismissible update banner in the menu bar popover (with a subtle badge dot on **Settings** when dismissed) that safely defers installation while a screen recording or save dialog is active.
+
+### Changed
+- Updated privacy copy in Settings, Setup Guide, and README to accurately note that captures and OCR remain completely local with zero telemetry while optional update checks connect only to GitHub Releases.
+
 ## [0.4.4] - 2026-11-24
 
 ### Added
