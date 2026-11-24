@@ -2,6 +2,15 @@
 
 All notable changes to **CCX (Control · Command · X)** are documented in this file.
 
+## [0.4.1] - 2026-11-24
+
+### Fixed
+- **Settings Window Bottom Clipping**: Disabled AppKit titlebar safe-area injection (`safeAreaRegions = []`) on `NSHostingController` so the window's intrinsic height matches the rendered SwiftUI layout without clipping the bottom footer, added explicit top/bottom padding (`28pt` top, `16pt` bottom), widened the window (`344pt` → `368pt`) to prevent row truncation in worst-case states, and ensured dynamic banners resize the window cleanly.
+- **Setup Guide (Onboarding) Layout & Spacing**: Disabled titlebar safe-area deduction in `OnboardingWindowController`, expanded the window from `440 × 300` to `464 × 344`, and increased per-step top/bottom padding (`28pt` top, `12pt` bottom) so all three steps have generous breathing room with zero cramping or text truncation.
+- **Menu Bar Popover Sizing**: Disabled safe-area injection defensively on `NSHostingView` and widened the popover (`304pt` → `316pt`, recent snip thumbnails `57.5pt` → `60.5pt`) so Quick Action tile badges always have ample horizontal breathing room.
+- **Multi-Display Window Placement**: Fixed opening the Setup Guide from Settings or the menu bar popover drifting onto a different external display by centering the Setup Guide over Settings when opened from Settings, resolving displays by center-point and largest intersection area (with active-cursor fallback), validating the menu bar popover's display anchor, and repositioning open Settings/Guide windows when triggered from another monitor.
+- **Capturable Menu Bar Popover**: Restored the ability to capture CCX's own menu bar popover via the global `⌃⌘X` shortcut by removing `sharingType = .none` from `MenuBarPanel` and keeping the popover open until the snip overlay takes focus (while still auto-hiding when launching Snip or Record from inside the popover).
+
 ## [0.4.0] - 2026-11-24
 
 ### Added
