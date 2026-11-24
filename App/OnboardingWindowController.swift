@@ -27,6 +27,10 @@ final class OnboardingFlowState: ObservableObject {
     }
 }
 
+private struct SendableEventMonitorBox: @unchecked Sendable {
+    let monitor: Any
+}
+
 /// Hosts the compact 3-page Guide & Permissions flow with native horizontal swipe paging.
 @MainActor
 final class OnboardingWindowController: NSObject, NSWindowDelegate {
@@ -61,7 +65,14 @@ final class OnboardingWindowController: NSObject, NSWindowDelegate {
 
     deinit {
         if let eventMonitor {
-            NSEvent.removeMonitor(eventMonitor)
+            let box = SendableEventMonitorBox(monitor: eventMonitor)
+            if Thread.isMainThread {
+                NSEvent.removeMonitor(box.monitor)
+            } else {
+                DispatchQueue.main.async {
+                    NSEvent.removeMonitor(box.monitor)
+                }
+            }
         }
     }
 
@@ -134,8 +145,17 @@ final class OnboardingWindowController: NSObject, NSWindowDelegate {
     }
 
     func windowWillClose(_ notification: Notification) {
+        if flow.step == .ready || model.status.screenRecording {
+            onComplete()
+        }
         model.stopPolling()
         removeEventMonitor()
+    }
+
+    func windowDidResignKey(_ notification: Notification) {
+        withAnimation(OnboardingFlowState.springAnimation) {
+            resetSwipeTracking()
+        }
     }
 
     // MARK: - Swipe & Keyboard Navigation
@@ -327,10 +347,26 @@ final class OnboardingWindowController: NSObject, NSWindowDelegate {
 @MainActor
 enum AppRelauncher {
     static func relaunch() {
+        let bundleURL = Bundle.main.bundleURL
+        guard bundleURL.pathExtension == "app",
+              FileManager.default.fileExists(atPath: bundleURL.path)
+        else {
+            NSSound.beep()
+            return
+        }
+
+        let pid = String(ProcessInfo.processInfo.processIdentifier)
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/sh")
-        // Wait for this process to exit, then reopen the bundle via LaunchServices.
-        process.arguments = ["-c", "sleep 1; /usr/bin/open \"$0\"", Bundle.main.bundlePath]
+        // Wait for this process to exit (bounded to 5s) before reopening via LaunchServices,
+        // avoiding both premature hotkey collisions and blind sleep races.
+        process.arguments = [
+            "-c",
+            "pid=$1; app=$2; i=0; while kill -0 \"$pid\" 2>/dev/null && [ $i -lt 50 ]; do /bin/sleep 0.1; i=$((i+1)); done; exec /usr/bin/open -- \"$app\"",
+            "ccx-relaunch",
+            pid,
+            bundleURL.path,
+        ]
         do {
             try process.run()
         } catch {
@@ -411,11 +447,15 @@ private struct WelcomeStepView: View {
         VStack(spacing: 16) {
             Spacer(minLength: 0)
 
-            VStack(spacing: 8) {
-                CCXBrandIcon(size: 50)
+            VStack(spacing: 6) {
+                CCXBrandIcon(size: 48)
 
                 Text("Control · Command · X")
                     .font(.system(size: 16, weight: .bold))
+
+                Text("100% local & private · No accounts, no telemetry")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
             }
 
             HStack(alignment: .center, spacing: 8) {
@@ -432,10 +472,10 @@ private struct WelcomeStepView: View {
                     detail: "Always on top"
                 )
                 FeatureBentoCard(
-                    symbol: "bolt.fill",
-                    tint: .teal,
-                    title: "Native Speed",
-                    detail: "Local & private"
+                    symbol: "record.circle.fill",
+                    tint: .red,
+                    title: "Screen Record",
+                    detail: "MP4, MOV & GIF"
                 )
             }
             .fixedSize(horizontal: false, vertical: true)
@@ -497,7 +537,8 @@ private struct PermissionsStepView: View {
                     title: "Screen Recording",
                     detail: "Capture displays & pixels",
                     granted: model.status.screenRecording,
-                    prominentAction: true
+                    prominentAction: true,
+                    isDisabled: model.isCheckingScreenRecording
                 ) {
                     flow.requestedScreenRecording = true
                     model.allowScreenRecording()
@@ -511,7 +552,8 @@ private struct PermissionsStepView: View {
                     title: "Accessibility",
                     detail: "Detect UI elements",
                     granted: model.status.accessibility,
-                    prominentAction: false
+                    prominentAction: false,
+                    isDisabled: false
                 ) {
                     model.allowAccessibility()
                 }
@@ -521,6 +563,7 @@ private struct PermissionsStepView: View {
             if !model.status.screenRecording {
                 ScreenRecordingHintStrip(
                     showRelaunch: flow.requestedScreenRecording,
+                    isVerifying: model.isCheckingScreenRecording,
                     onVerify: { model.verifyScreenRecordingLive() }
                 )
             }
@@ -538,6 +581,7 @@ private struct PermissionRow: View {
     let detail: String
     let granted: Bool
     let prominentAction: Bool
+    let isDisabled: Bool
     let onAllow: () -> Void
 
     var body: some View {
@@ -569,11 +613,13 @@ private struct PermissionRow: View {
                 Button("Allow", action: onAllow)
                     .buttonStyle(.borderedProminent)
                     .controlSize(.small)
+                    .disabled(isDisabled)
                     .fixedSize()
             } else {
                 Button("Allow", action: onAllow)
                     .buttonStyle(.bordered)
                     .controlSize(.small)
+                    .disabled(isDisabled)
                     .fixedSize()
             }
         }
@@ -596,20 +642,23 @@ private struct PermissionGrantedPill: View {
 
 private struct ScreenRecordingHintStrip: View {
     let showRelaunch: Bool
+    let isVerifying: Bool
     let onVerify: () -> Void
 
     var body: some View {
         HStack(spacing: 8) {
-            Text("Enable CCX in Screen Recording, then relaunch.")
+            Text("Enable CCX in Settings, then relaunch.")
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
-                .lineLimit(1)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
 
             Spacer(minLength: 6)
 
-            Button("Verify", action: onVerify)
+            Button(isVerifying ? "Checking…" : "Verify", action: onVerify)
                 .buttonStyle(.bordered)
                 .controlSize(.small)
+                .disabled(isVerifying)
                 .fixedSize()
 
             if showRelaunch {
@@ -655,14 +704,14 @@ private struct ReadyStepView: View {
                     symbol: "pin.fill",
                     tint: .indigo,
                     title: "Paste as Pin",
-                    trailing: { InteractionPillView(text: "Right-Click Icon") }
+                    trailing: { InteractionPillView(text: "Menu Bar · Pin") }
                 )
                 Divider().padding(.leading, 40)
                 GuideActionRow(
                     symbol: "text.viewfinder",
                     tint: .cyan,
-                    title: "Annotate & OCR",
-                    trailing: { InteractionPillView(text: "1–8 · T") }
+                    title: "Annotate, OCR & Record",
+                    trailing: { InteractionPillView(text: "1–8 · T · R") }
                 )
             }
             .ccxCardSurface(cornerRadius: 12)

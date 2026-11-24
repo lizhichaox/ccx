@@ -12,7 +12,7 @@ final class ToastHUD {
     private let background = NSVisualEffectView()
     private let iconView = NSImageView()
     private let label = NSTextField(labelWithString: "")
-    private var hideTask: Task<Void, Never>?
+    nonisolated(unsafe) private var hideTask: Task<Void, Never>?
 
     init() {
         panel = NSPanel(
@@ -25,6 +25,7 @@ final class ToastHUD {
         panel.backgroundColor = .clear
         panel.hasShadow = true
         panel.level = .statusBar
+        panel.sharingType = .none
         panel.ignoresMouseEvents = true
         panel.hidesOnDeactivate = false
         panel.isReleasedWhenClosed = false
@@ -49,6 +50,17 @@ final class ToastHUD {
         panel.contentView = background
     }
 
+    deinit {
+        hideTask?.cancel()
+    }
+
+    func hide() {
+        hideTask?.cancel()
+        hideTask = nil
+        panel.orderOut(nil)
+        panel.alphaValue = 0
+    }
+
     func show(_ message: String, symbolName: String = "checkmark.circle.fill") {
         hideTask?.cancel()
 
@@ -56,11 +68,15 @@ final class ToastHUD {
         label.sizeToFit()
         iconView.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil)
 
+        let screen = Self.screenUnderMouse()
+        let visible = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+
         let height: CGFloat = 36
         let horizontalPadding: CGFloat = 16
         let iconSize: CGFloat = 16
         let spacing: CGFloat = 8
-        let labelWidth = min(ceil(label.frame.width), 420)
+        let maxLabelWidth = max(120, min(420, visible.width - horizontalPadding * 2 - iconSize - spacing - 32))
+        let labelWidth = min(ceil(label.frame.width), maxLabelWidth)
         let width = horizontalPadding * 2 + iconSize + spacing + labelWidth
 
         iconView.frame = NSRect(x: horizontalPadding, y: (height - iconSize) / 2, width: iconSize, height: iconSize)
@@ -72,27 +88,48 @@ final class ToastHUD {
         )
         background.layer?.cornerRadius = height / 2
 
-        let screen = Self.screenUnderMouse()
-        let visible = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let minX = visible.minX + 16
+        let maxX = max(minX, visible.maxX - width - 16)
         let origin = NSPoint(
-            x: (visible.midX - width / 2).rounded(),
+            x: min(max((visible.midX - width / 2).rounded(), minX), maxX),
             y: (visible.minY + visible.height * 0.18).rounded()
         )
         panel.setFrame(NSRect(origin: origin, size: NSSize(width: width, height: height)), display: true)
 
-        panel.alphaValue = 0
-        panel.orderFrontRegardless()
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = Self.fadeInDuration
-            panel.animator().alphaValue = 1
+        let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        let wasVisible = panel.isVisible && panel.alphaValue > 0.1
+        if !wasVisible {
+            panel.alphaValue = reduceMotion ? 1 : 0
         }
+        panel.orderFrontRegardless()
+        if reduceMotion {
+            panel.alphaValue = 1
+        } else {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = wasVisible ? 0.08 : Self.fadeInDuration
+                panel.animator().alphaValue = 1
+            }
+        }
+
+        NSAccessibility.post(
+            element: NSApp as Any,
+            notification: .announcementRequested,
+            userInfo: [
+                .announcement: message,
+                .priority: NSAccessibilityPriorityLevel.medium.rawValue,
+            ]
+        )
 
         hideTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(Self.fadeInDuration + Self.holdDuration))
             guard !Task.isCancelled, let self else { return }
-            await NSAnimationContext.runAnimationGroup { context in
-                context.duration = Self.fadeOutDuration
-                self.panel.animator().alphaValue = 0
+            if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+                self.panel.alphaValue = 0
+            } else {
+                await NSAnimationContext.runAnimationGroup { context in
+                    context.duration = Self.fadeOutDuration
+                    self.panel.animator().alphaValue = 0
+                }
             }
             guard !Task.isCancelled else { return }
             self.panel.orderOut(nil)

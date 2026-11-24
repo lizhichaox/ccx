@@ -3,14 +3,54 @@ import CCXCore
 import ServiceManagement
 import SwiftUI
 
+@MainActor
+final class SettingsHotKeyState: ObservableObject {
+    @Published var isSnipRegistered: Bool
+    @Published var hasClearableHistory: Bool
+
+    init(isSnipRegistered: Bool = true, hasClearableHistory: Bool = false) {
+        self.isSnipRegistered = isSnipRegistered
+        self.hasClearableHistory = hasClearableHistory
+    }
+}
+
 /// Hosts the compact, single-screen Settings window: shortcut, launch at login, and permissions.
 @MainActor
 final class SettingsWindowController: NSObject, NSWindowDelegate {
     private let permissions = PermissionStatusModel()
+    private let hotKeyState: SettingsHotKeyState
+    private let onRetryHotKey: () -> Bool
+    private let onOpenGuide: () -> Void
+    private let onClearHistory: () -> Void
     private var window: NSWindow?
 
-    override init() {
+    init(
+        isSnipHotKeyRegistered: Bool = true,
+        hasClearableHistory: Bool = false,
+        onRetryHotKey: @escaping () -> Bool = { false },
+        onOpenGuide: @escaping () -> Void = {},
+        onClearHistory: @escaping () -> Void = {}
+    ) {
+        self.hotKeyState = SettingsHotKeyState(
+            isSnipRegistered: isSnipHotKeyRegistered,
+            hasClearableHistory: hasClearableHistory
+        )
+        self.onRetryHotKey = onRetryHotKey
+        self.onOpenGuide = onOpenGuide
+        self.onClearHistory = onClearHistory
         super.init()
+    }
+
+    func updateHotKeyRegistered(_ registered: Bool) {
+        if hotKeyState.isSnipRegistered != registered {
+            hotKeyState.isSnipRegistered = registered
+        }
+    }
+
+    func updateHasClearableHistory(_ hasHistory: Bool) {
+        if hotKeyState.hasClearableHistory != hasHistory {
+            hotKeyState.hasClearableHistory = hasHistory
+        }
     }
 
     func show(anchoredTo anchorRect: NSRect? = nil) {
@@ -26,8 +66,23 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     }
 
     private func makeWindow() -> NSWindow {
-        let view = SettingsView(permissions: permissions)
+        let view = SettingsView(
+            permissions: permissions,
+            hotKeyState: hotKeyState,
+            onRetryHotKey: { [weak self] in
+                guard let self else { return }
+                let registered = self.onRetryHotKey()
+                self.updateHotKeyRegistered(registered)
+            },
+            onOpenGuide: { [weak self] in
+                self?.onOpenGuide()
+            },
+            onClearHistory: { [weak self] in
+                self?.onClearHistory()
+            }
+        )
         let hosting = NSHostingController(rootView: view)
+        hosting.sizingOptions = [.intrinsicContentSize]
         let window = DismissibleWindow(contentViewController: hosting)
         window.title = "CCX Settings"
         window.titleVisibility = .hidden
@@ -79,6 +134,11 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
 
 private struct SettingsView: View {
     @ObservedObject var permissions: PermissionStatusModel
+    @ObservedObject var hotKeyState: SettingsHotKeyState
+    let onRetryHotKey: () -> Void
+    let onOpenGuide: () -> Void
+    let onClearHistory: () -> Void
+    @State private var openedScreenRecordingSettings = false
 
     var body: some View {
         ZStack(alignment: .top) {
@@ -96,16 +156,27 @@ private struct SettingsView: View {
                 SettingsIdentityHeader()
 
                 VStack(spacing: 0) {
-                    SnipShortcutRow()
+                    SnipShortcutRow(
+                        isRegistered: hotKeyState.isSnipRegistered,
+                        onRetry: onRetryHotKey
+                    )
                     Divider().padding(.leading, 42)
                     LaunchAtLoginRow()
                     Divider().padding(.leading, 42)
-                    PermissionSettingRow(
-                        symbol: "rectangle.dashed.badge.record",
-                        tint: .orange,
-                        title: "Screen Recording",
+                    ScreenRecordingSettingRow(
                         granted: permissions.status.screenRecording,
-                        openAction: permissions.openScreenRecordingSettings
+                        isChecking: permissions.isCheckingScreenRecording,
+                        showRelaunch: openedScreenRecordingSettings && !permissions.status.screenRecording,
+                        onOpen: {
+                            openedScreenRecordingSettings = true
+                            permissions.openScreenRecordingSettings()
+                        },
+                        onVerify: {
+                            permissions.verifyScreenRecordingLive()
+                        },
+                        onRelaunch: {
+                            AppRelauncher.relaunch()
+                        }
                     )
                     Divider().padding(.leading, 42)
                     PermissionSettingRow(
@@ -115,8 +186,39 @@ private struct SettingsView: View {
                         granted: permissions.status.accessibility,
                         openAction: permissions.openAccessibilitySettings
                     )
+                    Divider().padding(.leading, 42)
+                    PermissionSettingRow(
+                        symbol: "mic.fill",
+                        tint: .pink,
+                        title: "Microphone",
+                        granted: permissions.status.microphone,
+                        openAction: permissions.openMicrophoneSettings
+                    )
                 }
                 .ccxSettingsCard(cornerRadius: 12)
+
+                HStack(spacing: 8) {
+                    Button {
+                        onOpenGuide()
+                    } label: {
+                        Label("Setup Guide", systemImage: "book.closed")
+                            .font(.system(size: 11.5, weight: .medium))
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+
+                    Button {
+                        onClearHistory()
+                    } label: {
+                        Label("Clear Snip History", systemImage: "trash")
+                            .font(.system(size: 11.5, weight: .medium))
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(!hotKeyState.hasClearableHistory)
+                }
 
                 SettingsFooter()
                     .frame(maxWidth: .infinity, alignment: .center)
@@ -131,43 +233,40 @@ private struct SettingsView: View {
 }
 
 private struct SettingsFooter: View {
-    private static let authorURL = URL(string: "https://lizhichao.com")!
+    private static let authorURL = URL(string: "https://lizhichao.com")
     @State private var isHoveringAuthor = false
 
     var body: some View {
-        HStack(spacing: 0) {
-            Text("Made By ")
-                .foregroundStyle(.tertiary)
+        VStack(spacing: 3) {
+            Text("100% local & private · Zero telemetry")
+                .font(.system(size: 10.5))
+                .foregroundStyle(.secondary)
 
-            Button {
-                NSWorkspace.shared.open(Self.authorURL)
-            } label: {
-                Text("LIZHICHAO")
-                    .fontWeight(.semibold)
-                    .foregroundStyle(isHoveringAuthor ? Color.accentColor : Color.secondary)
-                    .underline(isHoveringAuthor)
-            }
-            .buttonStyle(.plain)
-            .onHover { hovering in
-                guard hovering != isHoveringAuthor else { return }
-                isHoveringAuthor = hovering
-                if hovering {
-                    NSCursor.pointingHand.push()
-                } else {
-                    NSCursor.pop()
-                }
-            }
-            .onDisappear {
-                if isHoveringAuthor {
-                    isHoveringAuthor = false
-                    NSCursor.pop()
-                }
-            }
+            HStack(spacing: 0) {
+                Text("Made By ")
+                    .foregroundStyle(.tertiary)
 
-            Text(" with ❤️.")
-                .foregroundStyle(.tertiary)
+                Button {
+                    if let url = Self.authorURL {
+                        NSWorkspace.shared.open(url)
+                    }
+                } label: {
+                    Text("LIZHICHAO")
+                        .fontWeight(.semibold)
+                        .foregroundStyle(isHoveringAuthor ? Color.accentColor : Color.secondary)
+                        .underline(isHoveringAuthor)
+                }
+                .buttonStyle(.plain)
+                .pointerStyle(.link)
+                .onHover { hovering in
+                    isHoveringAuthor = hovering
+                }
+
+                Text(" with ❤️.")
+                    .foregroundStyle(.tertiary)
+            }
+            .font(.system(size: 11))
         }
-        .font(.system(size: 11))
     }
 }
 
@@ -221,43 +320,164 @@ private struct SettingsRow<Trailing: View>: View {
 // MARK: - Rows
 
 private struct SnipShortcutRow: View {
+    let isRegistered: Bool
+    let onRetry: () -> Void
+
     var body: some View {
-        SettingsRow(symbol: "viewfinder", tint: .blue, title: "Snip Shortcut") {
-            KeycapComboView(combo: .defaultSnip)
+        VStack(alignment: .leading, spacing: 5) {
+            SettingsRow(
+                symbol: "viewfinder",
+                tint: isRegistered ? .blue : .orange,
+                title: "Snip Shortcut"
+            ) {
+                HStack(spacing: 6) {
+                    if !isRegistered {
+                        Button("Retry", action: onRetry)
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .fixedSize()
+                    }
+                    KeycapComboView(combo: .defaultSnip)
+                }
+            }
+
+            if !isRegistered {
+                Text("Shortcut is currently in use by another app.")
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.orange)
+                    .padding(.leading, 43)
+                    .padding(.trailing, 10)
+                    .padding(.bottom, 7)
+            }
         }
     }
 }
 
 private struct LaunchAtLoginRow: View {
-    @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
+    @State private var serviceStatus = SMAppService.mainApp.status
+    @State private var errorMessage: String?
+
+    private var toggleBinding: Binding<Bool> {
+        Binding(
+            get: { serviceStatus == .enabled },
+            set: { enabled in
+                apply(enabled)
+            }
+        )
+    }
 
     var body: some View {
-        SettingsRow(symbol: "power", tint: .teal, title: "Launch at Login") {
-            Toggle("", isOn: $launchAtLogin)
-                .labelsHidden()
-                .toggleStyle(.switch)
-                .controlSize(.small)
-                .onChange(of: launchAtLogin) { _, enabled in
-                    apply(enabled)
+        VStack(alignment: .leading, spacing: 4) {
+            SettingsRow(symbol: "power", tint: .teal, title: "Launch at Login") {
+                HStack(spacing: 6) {
+                    if serviceStatus == .requiresApproval {
+                        Button("Approve") {
+                            SMAppService.openSystemSettingsLoginItems()
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .fixedSize()
+                    }
+                    Toggle("", isOn: toggleBinding)
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
                 }
+            }
+
+            if serviceStatus == .requiresApproval {
+                Text("Approval required in System Settings → Login Items.")
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.orange)
+                    .padding(.leading, 43)
+                    .padding(.trailing, 10)
+                    .padding(.bottom, 7)
+            } else if let errorMessage {
+                Text(errorMessage)
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.red)
+                    .padding(.leading, 43)
+                    .padding(.trailing, 10)
+                    .padding(.bottom, 7)
+            }
         }
         .onAppear {
-            launchAtLogin = SMAppService.mainApp.status == .enabled
+            syncStatus()
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
-            launchAtLogin = SMAppService.mainApp.status == .enabled
+            syncStatus()
+        }
+    }
+
+    private func syncStatus() {
+        serviceStatus = SMAppService.mainApp.status
+        if serviceStatus == .enabled || serviceStatus == .notRegistered {
+            errorMessage = nil
         }
     }
 
     private func apply(_ enabled: Bool) {
+        errorMessage = nil
         do {
             if enabled {
                 try SMAppService.mainApp.register()
             } else {
                 try SMAppService.mainApp.unregister()
             }
+            serviceStatus = SMAppService.mainApp.status
         } catch {
-            launchAtLogin = SMAppService.mainApp.status == .enabled
+            serviceStatus = SMAppService.mainApp.status
+            errorMessage = "Could not update Launch at Login."
+        }
+    }
+}
+
+private struct ScreenRecordingSettingRow: View {
+    let granted: Bool
+    let isChecking: Bool
+    let showRelaunch: Bool
+    let onOpen: () -> Void
+    let onVerify: () -> Void
+    let onRelaunch: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            SettingsRow(
+                symbol: "rectangle.dashed.badge.record",
+                tint: granted ? .green : .orange,
+                title: "Screen Recording"
+            ) {
+                HStack(spacing: 6) {
+                    PermissionBadge(granted: granted)
+                    Button("Open", action: onOpen)
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .fixedSize()
+                }
+            }
+
+            if !granted {
+                HStack(spacing: 6) {
+                    Text(showRelaunch ? "Relaunch CCX after enabling." : "Already enabled?")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.secondary)
+                    Spacer(minLength: 4)
+                    Button(isChecking ? "Checking…" : "Verify", action: onVerify)
+                        .buttonStyle(.bordered)
+                        .controlSize(.mini)
+                        .disabled(isChecking)
+                        .fixedSize()
+                    if showRelaunch {
+                        Button("Relaunch", action: onRelaunch)
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.mini)
+                            .fixedSize()
+                    }
+                }
+                .padding(.leading, 43)
+                .padding(.trailing, 10)
+                .padding(.bottom, 7)
+            }
         }
     }
 }
