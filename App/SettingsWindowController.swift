@@ -7,19 +7,27 @@ import SwiftUI
 final class SettingsHotKeyState: ObservableObject {
     @Published var isSnipRegistered: Bool
     @Published var hasClearableHistory: Bool
+    @Published var recordingsFolderPath: String
 
-    init(isSnipRegistered: Bool = true, hasClearableHistory: Bool = false) {
+    init(
+        isSnipRegistered: Bool = true,
+        hasClearableHistory: Bool = false,
+        recordingsFolderPath: String = "~/Movies/CCX"
+    ) {
         self.isSnipRegistered = isSnipRegistered
         self.hasClearableHistory = hasClearableHistory
+        self.recordingsFolderPath = recordingsFolderPath
     }
 }
 
-/// Hosts the compact, single-screen Settings window: shortcut, launch at login, and permissions.
+/// Hosts the compact, single-screen Settings window: shortcut, launch at login, recordings folder, and permissions.
 @MainActor
 final class SettingsWindowController: NSObject, NSWindowDelegate {
     private let permissions = PermissionStatusModel()
     private let hotKeyState: SettingsHotKeyState
     private let onRetryHotKey: () -> Bool
+    private let onOpenRecordingsFolder: () -> Void
+    private let onChooseRecordingsFolder: () -> Void
     private let onOpenGuide: (NSRect?) -> Void
     private let onClearHistory: () -> Void
     private var window: NSWindow?
@@ -29,15 +37,21 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     init(
         isSnipHotKeyRegistered: Bool = true,
         hasClearableHistory: Bool = false,
+        recordingsFolderPath: String = "~/Movies/CCX",
         onRetryHotKey: @escaping () -> Bool = { false },
+        onOpenRecordingsFolder: @escaping () -> Void = {},
+        onChooseRecordingsFolder: @escaping () -> Void = {},
         onOpenGuide: @escaping (NSRect?) -> Void = { _ in },
         onClearHistory: @escaping () -> Void = {}
     ) {
         self.hotKeyState = SettingsHotKeyState(
             isSnipRegistered: isSnipHotKeyRegistered,
-            hasClearableHistory: hasClearableHistory
+            hasClearableHistory: hasClearableHistory,
+            recordingsFolderPath: recordingsFolderPath
         )
         self.onRetryHotKey = onRetryHotKey
+        self.onOpenRecordingsFolder = onOpenRecordingsFolder
+        self.onChooseRecordingsFolder = onChooseRecordingsFolder
         self.onOpenGuide = onOpenGuide
         self.onClearHistory = onClearHistory
         super.init()
@@ -52,6 +66,12 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     func updateHasClearableHistory(_ hasHistory: Bool) {
         if hotKeyState.hasClearableHistory != hasHistory {
             hotKeyState.hasClearableHistory = hasHistory
+        }
+    }
+
+    func updateRecordingsFolder(_ path: String) {
+        if hotKeyState.recordingsFolderPath != path {
+            hotKeyState.recordingsFolderPath = path
         }
     }
 
@@ -91,6 +111,12 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
                 guard let self else { return }
                 let registered = self.onRetryHotKey()
                 self.updateHotKeyRegistered(registered)
+            },
+            onOpenRecordingsFolder: { [weak self] in
+                self?.onOpenRecordingsFolder()
+            },
+            onChooseRecordingsFolder: { [weak self] in
+                self?.onChooseRecordingsFolder()
             },
             onOpenGuide: { [weak self] in
                 self?.onOpenGuide(self?.window?.frame)
@@ -184,6 +210,8 @@ private struct SettingsView: View {
     @ObservedObject var permissions: PermissionStatusModel
     @ObservedObject var hotKeyState: SettingsHotKeyState
     let onRetryHotKey: () -> Void
+    let onOpenRecordingsFolder: () -> Void
+    let onChooseRecordingsFolder: () -> Void
     let onOpenGuide: () -> Void
     let onClearHistory: () -> Void
     let onContentHeightChange: () -> Void
@@ -211,6 +239,12 @@ private struct SettingsView: View {
                     )
                     Divider().padding(.leading, 42)
                     LaunchAtLoginRow()
+                    Divider().padding(.leading, 42)
+                    RecordingsFolderRow(
+                        folderPath: hotKeyState.recordingsFolderPath,
+                        onChoose: onChooseRecordingsFolder,
+                        onOpen: onOpenRecordingsFolder
+                    )
                     Divider().padding(.leading, 42)
                     ScreenRecordingSettingRow(
                         granted: permissions.status.screenRecording,
@@ -494,6 +528,49 @@ private struct LaunchAtLoginRow: View {
             serviceStatus = SMAppService.mainApp.status
             errorMessage = "Could not update Launch at Login."
         }
+    }
+}
+
+private struct RecordingsFolderRow: View {
+    let folderPath: String
+    let onChoose: () -> Void
+    let onOpen: () -> Void
+
+    var body: some View {
+        HStack(spacing: 9) {
+            Image(systemName: "folder.fill")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(.orange)
+                .frame(width: 24, height: 24)
+                .background(Color.orange.opacity(0.14), in: RoundedRectangle(cornerRadius: 6.5, style: .continuous))
+
+            VStack(alignment: .leading, spacing: 1.5) {
+                Text("Recordings")
+                    .font(.system(size: 12.5, weight: .medium))
+                    .lineLimit(1)
+
+                Text(folderPath)
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            HStack(spacing: 6) {
+                Button("Choose…", action: onChoose)
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .fixedSize()
+                Button("Open", action: onOpen)
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .fixedSize()
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7.5)
+        .help("Default recordings folder: \(folderPath)")
     }
 }
 

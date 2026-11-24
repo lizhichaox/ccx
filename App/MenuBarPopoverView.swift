@@ -96,6 +96,7 @@ final class MenuBarPanelModel: ObservableObject {
 struct MenuBarPopoverActions {
     let onSnip: () -> Void
     let onRecord: () -> Void
+    let onOpenRecordingsFolder: () -> Void
     let onStopRecording: () -> Void
     let onTogglePauseRecording: () -> Void
     let onDiscardRecording: () -> Void
@@ -146,8 +147,10 @@ struct MenuBarPopoverView: View {
                         isBadgeDimmed: model.isPinBadgeDimmed,
                         symbol: "pin.fill",
                         tint: .indigo,
-                        onClear: model.hasClipboardContent ? actions.onClearClipboard : nil,
-                        clearTooltip: "Clear clipboard",
+                        accessorySymbol: "xmark.circle.fill",
+                        accessoryTooltip: "Clear clipboard",
+                        isAccessoryDestructive: true,
+                        onAccessory: model.hasClipboardContent ? actions.onClearClipboard : nil,
                         action: actions.onPastePin
                     )
                     QuickActionTile(
@@ -155,6 +158,11 @@ struct MenuBarPopoverView: View {
                         badge: "Video · GIF",
                         symbol: "record.circle.fill",
                         tint: .red,
+                        tooltip: "Record screen (MP4, MOV, or GIF)",
+                        accessorySymbol: "folder.fill",
+                        accessoryTooltip: "Open Recordings Folder",
+                        isAccessoryDestructive: false,
+                        onAccessory: actions.onOpenRecordingsFolder,
                         action: actions.onRecord
                     )
                 }
@@ -265,12 +273,14 @@ private struct QuickActionTile: View {
     let symbol: String
     let tint: Color
     var tooltip: String? = nil
-    var onClear: (() -> Void)? = nil
-    var clearTooltip: String = "Clear"
+    var accessorySymbol: String? = nil
+    var accessoryTooltip: String = ""
+    var isAccessoryDestructive = false
+    var onAccessory: (() -> Void)? = nil
     let action: () -> Void
 
     @State private var isHovering = false
-    @State private var isClearHovering = false
+    @State private var isAccessoryHovering = false
 
     var body: some View {
         Button(action: action) {
@@ -314,30 +324,34 @@ private struct QuickActionTile: View {
         .buttonStyle(.plain)
         .help(tooltip ?? title)
         .overlay(alignment: .topTrailing) {
-            if let onClear, isHovering {
-                Button(action: onClear) {
-                    Image(systemName: "xmark.circle.fill")
+            if let onAccessory, let accessorySymbol, isHovering {
+                Button(action: onAccessory) {
+                    Image(systemName: accessorySymbol)
                         .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(isClearHovering ? Color.red : Color.secondary)
+                        .foregroundStyle(
+                            isAccessoryHovering
+                                ? (isAccessoryDestructive ? Color.red : Color.accentColor)
+                                : Color.secondary
+                        )
                         .frame(width: 20, height: 20)
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .help(clearTooltip)
-                .accessibilityLabel(clearTooltip)
+                .help(accessoryTooltip)
+                .accessibilityLabel(accessoryTooltip)
                 .padding(2)
-                .onHover { isClearHovering = $0 }
+                .onHover { isAccessoryHovering = $0 }
             }
         }
         .contextMenu {
-            if let onClear {
-                Button(clearTooltip, action: onClear)
+            if let onAccessory {
+                Button(accessoryTooltip, action: onAccessory)
             }
         }
         .onHover { hovering in
             isHovering = hovering
             if !hovering {
-                isClearHovering = false
+                isAccessoryHovering = false
             }
         }
     }

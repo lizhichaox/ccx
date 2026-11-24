@@ -9,6 +9,7 @@ import SwiftUI
 protocol MenuBarControllerDelegate: AnyObject {
     func menuBarRequestedSnip()
     func menuBarRequestedRecord()
+    func menuBarRequestedOpenRecordingsFolder()
     func menuBarRequestedStopRecording()
     func menuBarRequestedTogglePauseRecording()
     func menuBarRequestedDiscardRecording()
@@ -353,6 +354,10 @@ final class MenuBarController: NSObject, NSWindowDelegate {
                 onRecord: { [weak self] in
                     self?.hidePanel()
                     self?.delegate?.menuBarRequestedRecord()
+                },
+                onOpenRecordingsFolder: { [weak self] in
+                    self?.hidePanel()
+                    self?.delegate?.menuBarRequestedOpenRecordingsFolder()
                 },
                 onStopRecording: { [weak self] in
                     self?.hidePanel()

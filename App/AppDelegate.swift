@@ -12,6 +12,7 @@ import UniformTypeIdentifiers
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private static let hasCompletedOnboardingKey = "CCXHasCompletedOnboarding"
     private static let lastSaveDirectoryKey = "CCXLastSaveDirectory"
+    private static let recordingsDirectoryKey = "CCXRecordingsDirectory"
     private nonisolated static let maxQuickSaveSuffixAttempts = 9_999
     private nonisolated static let maxRetainedPasteboardRecordings = 3
     private static let fileTimestampFormatter: DateFormatter = {
@@ -456,6 +457,123 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Desktop", isDirectory: true)
     }
 
+    private nonisolated static func normalizedDirectoryPath(_ path: String) -> String {
+        var normalized = path
+        while normalized.count > 1 && normalized.hasSuffix("/") {
+            normalized.removeLast()
+        }
+        return normalized
+    }
+
+    private nonisolated static func isRealDirectory(atPath path: String) -> Bool {
+        let normalized = normalizedDirectoryPath(path)
+        guard !normalized.isEmpty else { return false }
+        var st = stat()
+        return Darwin.lstat(normalized, &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR
+    }
+
+    private nonisolated static func isWritableRealDirectory(atPath path: String) -> Bool {
+        let normalized = normalizedDirectoryPath(path)
+        return isRealDirectory(atPath: normalized) && FileManager.default.isWritableFile(atPath: normalized)
+    }
+
+    private func defaultRecordingsDirectoryURL() -> URL {
+        FileManager.default.urls(for: .moviesDirectory, in: .userDomainMask).first?
+            .appendingPathComponent("CCX", isDirectory: true)
+            ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Movies/CCX", isDirectory: true)
+    }
+
+    private func preferredRecordingsDirectoryURL(createIfNeeded: Bool = false) -> URL {
+        if let savedPath = UserDefaults.standard.string(forKey: Self.recordingsDirectoryKey) {
+            let normalized = Self.normalizedDirectoryPath(savedPath)
+            if Self.isWritableRealDirectory(atPath: normalized) {
+                return URL(fileURLWithPath: normalized, isDirectory: true)
+            }
+        }
+
+        let defaultURL = defaultRecordingsDirectoryURL()
+        if createIfNeeded {
+            let normalized = Self.normalizedDirectoryPath(defaultURL.path)
+            var st = stat()
+            if Darwin.lstat(normalized, &st) != 0, errno == ENOENT {
+                try? FileManager.default.createDirectory(at: defaultURL, withIntermediateDirectories: true)
+            }
+            _ = Self.isRealDirectory(atPath: normalized)
+        }
+        return defaultURL
+    }
+
+    private func displayPathForDirectory(_ url: URL) -> String {
+        let path = Self.normalizedDirectoryPath(url.path)
+        let home = Self.normalizedDirectoryPath(NSHomeDirectory())
+        if path == home {
+            return "~"
+        }
+        let homePrefix = home + "/"
+        if path.hasPrefix(homePrefix) {
+            return "~/" + path.dropFirst(homePrefix.count)
+        }
+        return path
+    }
+
+    private func openRecordingsFolder() {
+        let directory = preferredRecordingsDirectoryURL(createIfNeeded: true)
+        settingsController?.updateRecordingsFolder(displayPathForDirectory(directory))
+        guard Self.isRealDirectory(atPath: directory.path),
+              NSWorkspace.shared.open(directory)
+        else {
+            toast.show("Could Not Open Recordings Folder", symbolName: "exclamationmark.triangle")
+            return
+        }
+    }
+
+    private func chooseRecordingsFolder() {
+        if isPresentingSavePanel {
+            NSApp.activate()
+            activeSavePanel?.makeKeyAndOrderFront(nil)
+            toast.show("Finish Current Save Dialog First", symbolName: "exclamationmark.circle")
+            return
+        }
+
+        let panel = NSOpenPanel()
+        panel.title = "Choose Recordings Folder"
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Choose"
+        let currentDirectory = preferredRecordingsDirectoryURL(createIfNeeded: true)
+        if Self.isRealDirectory(atPath: currentDirectory.path) {
+            panel.directoryURL = currentDirectory
+        }
+        panel.level = .modalPanel
+
+        isPresentingSavePanel = true
+        activeSavePanel = panel
+        NSApp.activate()
+
+        panel.begin { [weak self] response in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.isPresentingSavePanel = false
+                self.activeSavePanel = nil
+                defer { self.drainPendingRecordingSavesIfIdle() }
+
+                guard response == .OK, let url = panel.url else { return }
+                let normalizedPath = Self.normalizedDirectoryPath(url.path)
+                guard Self.isWritableRealDirectory(atPath: normalizedPath) else {
+                    self.toast.show("Selected Folder Cannot Be Used", symbolName: "exclamationmark.triangle")
+                    return
+                }
+
+                let validatedURL = URL(fileURLWithPath: normalizedPath, isDirectory: true)
+                UserDefaults.standard.set(normalizedPath, forKey: Self.recordingsDirectoryKey)
+                self.settingsController?.updateRecordingsFolder(self.displayPathForDirectory(validatedURL))
+                self.toast.show("Recordings Folder Updated", symbolName: "folder.fill")
+            }
+        }
+    }
+
     private func quickSavePNG(_ image: CGImage) {
         let directory = preferredSaveDirectoryURL()
         let stem = Self.defaultFileStem(for: Date())
@@ -595,7 +713,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let panel = NSSavePanel()
         panel.title = "Save \(result.format.label)"
-        panel.directoryURL = preferredSaveDirectoryURL()
+        let recordingsDirectory = preferredRecordingsDirectoryURL(createIfNeeded: true)
+        if Self.isRealDirectory(atPath: recordingsDirectory.path) {
+            panel.directoryURL = recordingsDirectory
+        }
         panel.allowedContentTypes = [result.format.utType]
         panel.canCreateDirectories = true
         panel.isExtensionHidden = false
@@ -617,7 +738,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     self.drainPendingRecordingSavesIfIdle()
                     return
                 }
-                UserDefaults.standard.set(url.deletingLastPathComponent().path, forKey: Self.lastSaveDirectoryKey)
 
                 let label = result.format.label
                 Task.detached(priority: .userInitiated) {
@@ -652,7 +772,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func quickSaveRecording(_ result: RecordingResult, revealInFinder: Bool) {
-        let directory = preferredSaveDirectoryURL()
+        let directory = preferredRecordingsDirectoryURL(createIfNeeded: true)
         let ext = result.format.fileExtension
         let stem = Self.defaultFileStem(for: Date())
         let label = result.format.label
@@ -660,7 +780,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         Task.detached(priority: .userInitiated) {
             do {
-                guard let targetURL = Self.nextUniqueURL(in: directory, stem: stem, fileExtension: ext) else {
+                guard Self.isWritableRealDirectory(atPath: directory.path),
+                      let targetURL = Self.nextUniqueURL(in: directory, stem: stem, fileExtension: ext)
+                else {
                     throw CocoaError(.fileWriteNoPermission)
                 }
                 try Self.moveRecordingAtomically(from: result.fileURL, to: targetURL)
@@ -858,12 +980,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func showSettings(anchoredTo anchorRect: NSRect? = nil) {
         recordingCoordinator.cancelIfInReadyPhase()
         let hasClearable = !clipboardStore.history.isEmpty || clipboardStore.hasPasteboardContent
+        let recordingsFolderPath = displayPathForDirectory(preferredRecordingsDirectoryURL(createIfNeeded: false))
         if settingsController == nil {
             settingsController = SettingsWindowController(
                 isSnipHotKeyRegistered: hotKeyManager.isRegistered(.snip),
                 hasClearableHistory: hasClearable,
+                recordingsFolderPath: recordingsFolderPath,
                 onRetryHotKey: { [weak self] in
                     self?.retrySnipHotKeyRegistration() ?? false
+                },
+                onOpenRecordingsFolder: { [weak self] in
+                    self?.openRecordingsFolder()
+                },
+                onChooseRecordingsFolder: { [weak self] in
+                    self?.chooseRecordingsFolder()
                 },
                 onOpenGuide: { [weak self] settingsFrame in
                     guard let self else { return }
@@ -884,6 +1014,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             settingsController?.updateHotKeyRegistered(hotKeyManager.isRegistered(.snip))
             settingsController?.updateHasClearableHistory(hasClearable)
+            settingsController?.updateRecordingsFolder(recordingsFolderPath)
         }
         settingsController?.show(anchoredTo: anchorRect)
     }
@@ -902,6 +1033,10 @@ extension AppDelegate: MenuBarControllerDelegate {
         scheduleDelayedLaunch(milliseconds: 120) { [weak self] in
             self?.startRecordSelection()
         }
+    }
+
+    func menuBarRequestedOpenRecordingsFolder() {
+        openRecordingsFolder()
     }
 
     func menuBarRequestedStopRecording() {
