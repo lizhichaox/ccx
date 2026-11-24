@@ -33,7 +33,7 @@
 
 ## Installation
 
-1. Download the latest `CCX-0.7.0-macOS-universal.dmg` (or `.zip`).
+1. Download the latest `CCX-0.8.0-macOS-universal.dmg` (or `.zip`).
 2. Open the disk image and drag **CCX.app** into **Applications**.
 3. Launch **CCX** from `/Applications` or Spotlight.
 
@@ -41,8 +41,8 @@
 
 ### Verified In-App Updates
 
-- **One-Click Native Updates**: CCX includes a built-in, zero-dependency updater that checks GitHub Releases automatically once per day (toggleable anytime in **Settings → Updates**, with an on-demand **Check** button).
-- **Cryptographic Verification**: Every downloaded archive is verified against `SHA256SUMS.txt` using streaming SHA-256 and cryptographically validated with Apple's `Security` framework (`SecStaticCodeCheckValidity`) to confirm an Apple Developer ID signature, matching Bundle ID and Team ID, and Hardened Runtime before staging and atomically replacing `CCX.app`.
+- **Seamless Background Updates**: CCX includes a built-in, zero-dependency updater that checks GitHub Releases automatically once per day (toggleable anytime in **Settings → Updates**, with an on-demand **Check** button). When automatic updates are enabled, new releases are pre-downloaded and verified quietly in the background, then installed seamlessly once CCX is completely idle (zero active Pins, captures, recordings, OCR tasks, save dialogs, or windows) or cleanly on disk when you quit — plus an instant zero-wait **Restart** button whenever you want to apply immediately.
+- **Cryptographic Verification**: Every downloaded archive is verified against `SHA256SUMS.txt` using streaming SHA-256 and cryptographically validated with Apple's `Security` framework (`SecStaticCodeCheckValidity`) — including a fresh signature re-verification immediately before staging and atomic replacement — to confirm an Apple Developer ID signature, matching Bundle ID and Team ID, and Hardened Runtime.
 
 ---
 
@@ -154,7 +154,7 @@ done
 ### Public Release Packaging (Universal Binary + Hardened Runtime)
 ```bash
 # Bump version in project.yml when preparing a release:
-./scripts/bump-version.sh 0.7.0
+./scripts/bump-version.sh 0.8.0
 
 # Build signed Universal Binary (arm64 + x86_64), verify dylibs/codesign/entitlements,
 # and emit dist/CCX-<version>-macOS-universal.{dmg,zip} + dist/SHA256SUMS.txt:

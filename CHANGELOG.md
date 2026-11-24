@@ -2,6 +2,16 @@
 
 All notable changes to **CCX (Control · Command · X)** are documented in this file.
 
+## [0.8.0] - 2026-11-24
+
+### Added
+- **Seamless Background Pre-Download & Silent Idle/Quit Auto-Update (`CCXCore`, `App`)**: Upgraded CCX's native in-app updater to automatically pre-download and cryptographically verify eligible GitHub Releases in the background into a new `.readyToInstall` state, then apply them seamlessly after a short idle debounce once no floating Pins, captures, recordings, OCR tasks, save dialogs, or CCX windows are open — or silently on disk without relaunching when you explicitly quit CCX.
+- **Zero-Wait Manual Restart & TOCTOU Signature Re-Verification**: Clicking **Restart** (**立即更新**) in **Settings** or the menu bar popover skips re-downloading, re-verifies the staged bundle's Apple Developer ID signature immediately before staging (falling back cleanly to a fresh download if the temporary payload was purged), and restarts immediately; added periodic 24-hour background update checks for long-running sessions.
+
+### Improved
+- **Bilingual Ready-to-Install Update UI**: Added single-line English (`en`) and Simplified Chinese (`zh-Hans`) `.readyToInstall` controls and hints across **Settings → Updates** and the menu bar popover banner, backed by automated `NSFont` pixel-width and updater state-machine regression tests.
+- **Capture Toolbar Button Order**: Swapped the **Save** and **Copy** buttons across the Smart Snip, Pin Annotation, and Scroll Capture toolbars so **Copy** sits in the more ergonomic trailing primary action slot.
+
 ## [0.7.0] - 2026-11-24
 
 ### Added
