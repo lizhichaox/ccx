@@ -665,4 +665,44 @@ struct CCXAnnotateTests {
             #expect(toolbar.dragHandleView.toolTip?.contains("拖动移动工具栏") == true)
         }
     }
+
+    @Test func toolbarSavePrecedesCopyInSnipAndPinPresets() throws {
+        let expectations: [(preset: AnnotationToolbarPreset, saveTooltip: String, actions: [AnnotationToolbarAction])] = [
+            (.snip, "Save (⌘S)", [.undo, .redo, .scroll, .record, .ocr, .pin, .save, .copy, .cancel]),
+            (.pin, "Save PNG (⌘S)", [.undo, .redo, .ocr, .save, .copy, .done, .cancel]),
+        ]
+
+        try CCXL10n.withLanguageForTesting(.en) {
+            for (preset, expectedSaveTooltip, expectedActions) in expectations {
+                let toolbar = AnnotationActionToolbar(preset: preset)
+                toolbar.update(
+                    activeTool: .select,
+                    style: AnnotationStyle(),
+                    showStyleBar: false,
+                    canUndo: true,
+                    canRedo: true
+                )
+                toolbar.layoutSubtreeIfNeeded()
+
+                let arranged = toolbar.primaryStack.arrangedSubviews
+                let saveIndex = try #require(arranged.firstIndex { ($0 as? NSButton)?.toolTip == expectedSaveTooltip })
+                let copyIndex = try #require(arranged.firstIndex { ($0 as? NSButton)?.toolTip == "Copy (⌘C)" })
+                #expect(saveIndex < copyIndex)
+                #expect(copyIndex == saveIndex + 1)
+
+                let saveButton = arranged[saveIndex]
+                let copyButton = arranged[copyIndex]
+                #expect(saveButton.frame.minX < copyButton.frame.minX)
+
+                var triggeredActions: [AnnotationToolbarAction] = []
+                toolbar.onAction = { triggeredActions.append($0) }
+                for case let button as NSButton in arranged where button.isEnabled {
+                    if let action = button.action {
+                        _ = button.sendAction(action, to: button.target)
+                    }
+                }
+                #expect(triggeredActions == expectedActions)
+            }
+        }
+    }
 }

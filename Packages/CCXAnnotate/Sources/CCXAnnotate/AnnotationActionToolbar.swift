@@ -68,7 +68,7 @@ public final class AnnotationActionToolbar: NSView {
 
     private let primarySurface: NSView
     private let styleSurface: NSView
-    private let primaryStack = NSStackView()
+    internal let primaryStack = NSStackView()
 
     private let dragHandle = ToolbarDragHandleView()
     public var dragHandleView: NSView { dragHandle }
@@ -384,11 +384,11 @@ public final class AnnotationActionToolbar: NSView {
             views.append(ToolbarIconButton(symbol: "pin", tooltip: CCXL10n.text("Pin (Return)", zh: "贴图 (Return)"), tint: .systemGreen, width: 32) { [weak self] in
                 self?.onAction?(.pin)
             })
-            views.append(ToolbarIconButton(symbol: "doc.on.doc", tooltip: CCXL10n.text("Copy (⌘C)", zh: "拷贝 (⌘C)"), tint: .white, width: 32) { [weak self] in
-                self?.onAction?(.copy)
-            })
             views.append(ToolbarIconButton(symbol: "square.and.arrow.down", tooltip: CCXL10n.text("Save (⌘S)", zh: "保存 (⌘S)"), tint: .white, width: 32) { [weak self] in
                 self?.onAction?(.save)
+            })
+            views.append(ToolbarIconButton(symbol: "doc.on.doc", tooltip: CCXL10n.text("Copy (⌘C)", zh: "拷贝 (⌘C)"), tint: .white, width: 32) { [weak self] in
+                self?.onAction?(.copy)
             })
             views.append(ToolbarIconButton(symbol: "xmark", tooltip: CCXL10n.text("Cancel (Esc)", zh: "取消 (Esc)"), tint: .systemRed, width: 32) { [weak self] in
                 self?.onAction?(.cancel)
@@ -398,11 +398,11 @@ public final class AnnotationActionToolbar: NSView {
             views.append(ToolbarIconButton(symbol: "text.viewfinder", tooltip: CCXL10n.text("Copy Text (OCR) (T)", zh: "识别文字 (OCR) (T)"), tint: .systemCyan, width: 30) { [weak self] in
                 self?.onAction?(.ocr)
             })
-            views.append(ToolbarIconButton(symbol: "doc.on.doc", tooltip: CCXL10n.text("Copy (⌘C)", zh: "拷贝 (⌘C)"), tint: .white, width: 32) { [weak self] in
-                self?.onAction?(.copy)
-            })
             views.append(ToolbarIconButton(symbol: "square.and.arrow.down", tooltip: CCXL10n.text("Save PNG (⌘S)", zh: "保存 PNG (⌘S)"), tint: .white, width: 32) { [weak self] in
                 self?.onAction?(.save)
+            })
+            views.append(ToolbarIconButton(symbol: "doc.on.doc", tooltip: CCXL10n.text("Copy (⌘C)", zh: "拷贝 (⌘C)"), tint: .white, width: 32) { [weak self] in
+                self?.onAction?(.copy)
             })
             views.append(ToolbarIconButton(symbol: "checkmark", tooltip: CCXL10n.text("Done (Return)", zh: "完成 (Return)"), tint: .systemGreen, width: 32) { [weak self] in
                 self?.onAction?(.done)

@@ -831,8 +831,8 @@ internal final class ScrollCaptureHUDPanel: NSPanel, NSWindowDelegate {
             divider,
             ocrBtn,
             pinBtn,
-            copyBtn,
             saveBtn,
+            copyBtn,
             cancelBtn,
         ]
         controlViewsForTesting = controls
