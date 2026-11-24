@@ -19,6 +19,7 @@ DerivedData/
 *.perspectivev3
 !default.perspectivev3
 xcuserdata/
+*.xcuserstate
 *.moved-aside
 *.xccheckout
 *.xcscmblueprint
@@ -42,7 +43,10 @@ Config/LocalSigning.xcconfig
 *.key
 *.cer
 *.mobileprovision
+*.jks
+*.keystore
 .env.*
+!.env.example
 
 # Swift Package Manager
 .build/

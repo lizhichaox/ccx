@@ -22,6 +22,10 @@ CCX is designed with a minimal attack surface and local-first privacy:
   - Apple `Security` framework code-signature verification (`SecStaticCodeCheckValidity`) confirming an Apple Developer ID signature, matching Bundle ID and Team ID, and Hardened Runtime
   - Fresh TOCTOU signature re-verification immediately before staging and rollback-safe atomic app replacement
 
+## Local Development Guardrails
+
+Enable the repository's built-in `pre-commit` and `pre-push` secret/local-config checks once per clone with `git config core.hooksPath .githooks`. These hooks run `scripts/check-secrets.sh` to block local env/signing files, hardcoded credentials or local home paths, and exact values from untracked `.env` or `Config/LocalSigning.xcconfig` files from being committed or pushed. You can also run `./scripts/check-secrets.sh --all` anytime to audit all tracked files.
+
 ## Reporting a Vulnerability
 
 If you discover a security vulnerability in CCX, **please do not open a public GitHub issue**.
