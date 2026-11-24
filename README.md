@@ -33,7 +33,7 @@
 
 ## Installation
 
-1. Download the latest `CCX-0.8.0-macOS-universal.dmg` (or `.zip`).
+1. Download the latest `CCX-0.8.1-macOS-universal.dmg` (or `.zip`).
 2. Open the disk image and drag **CCX.app** into **Applications**.
 3. Launch **CCX** from `/Applications` or Spotlight.
 
@@ -107,6 +107,9 @@ CCX requests only the macOS permissions required for its three core features:
 ### Floating Pins
 | Shortcut | Action |
 | --- | --- |
+| `E` / `Space` / Double-click | Open inline annotation toolbar on image pins (`E` or Double-click also closes; also via bottom-right hover button or **Show Toolbar** at top of right-click menu) |
+| `1`–`8` | Open inline annotation toolbar directly with that drawing tool |
+| `T` | Extract and copy text from image pin (OCR) |
 | Scroll wheel / trackpad | Zoom in / out (`⌥` + Scroll adjusts opacity) |
 | `+` / `-` (`⌘+` / `⌘-`) | Zoom in / out |
 | `0` / `⌘0` | Reset zoom to 100% |
@@ -154,7 +157,7 @@ done
 ### Public Release Packaging (Universal Binary + Hardened Runtime)
 ```bash
 # Bump version in project.yml when preparing a release:
-./scripts/bump-version.sh 0.8.0
+./scripts/bump-version.sh 0.8.1
 
 # Build signed Universal Binary (arm64 + x86_64), verify dylibs/codesign/entitlements,
 # and emit dist/CCX-<version>-macOS-universal.{dmg,zip} + dist/SHA256SUMS.txt:

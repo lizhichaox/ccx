@@ -2,6 +2,14 @@
 
 All notable changes to **CCX (Control · Command · X)** are documented in this file.
 
+## [0.8.1] - 2026-11-24
+
+### Improved
+- **Vibrant Visual Palette Polish (`App`)**: Refreshed the Menu Bar Popover, Settings, and Setup Guide with luminous Apple-calibrated gradient icon badges (`CCXIconBadge` / `CCXBadgePalette`), soft top surface tint washes, and crisp tinted hover/accent surfaces while preserving exact window dimensions and single-line English & Simplified Chinese layouts.
+- **Menu Bar Popover Contrast & Accents**: Upgraded the **Snip** / **Pin** / **Record** hero tiles (including vibrant circular tinted hover accessories for **Record**'s folder shortcut and **Pin**'s clipboard clear action, plus vivid orange conflict badges), brightened the **Recent Snips** header row with a crisp blue count capsule and tinted red **Clear** pill, lifted **Floating Pins** control accents, and refreshed the bottom **Ready / Guide · Settings · Quit** utility dock with filled tinted icons and crisper labels.
+- **Settings & Setup Guide Cohesion**: Upgraded all Settings row icons, Setup Guide bento cards, permission rows, and shortcut rows to the shared gradient icon badges, and added subtle vibrant symbol accents to the **Setup Guide** and **Clear Snip History** buttons in Settings.
+- **Pin Annotation Toolbar Summoning & Double-Click Reliability (`CCXPin`)**: Promoted **Show Toolbar** (**显示工具栏**, `E`) to the first item of every image pin's right-click context menu (including restoring from thumbnail mode), eliminated eager `performDrag` double-click swallowing with a 3pt drag threshold and resilient double-click detection, added an unobtrusive hover toolbar button in the bottom-right corner of image pins, and added direct `E` / `Space` / `1`–`8` / `T` shortcuts on focused image pins.
+
 ## [0.8.0] - 2026-11-24
 
 ### Added
