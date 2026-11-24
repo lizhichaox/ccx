@@ -16,7 +16,7 @@ final class MenuBarPanelModel: ObservableObject {
 
     @Published private(set) var snipShortcut = HotKeyCombo.defaultSnip.displayString
     @Published private(set) var isSnipHotKeyRegistered = true
-    @Published private(set) var pinBadge = "Empty"
+    @Published private(set) var pinBadge = CCXL10n.text("Empty", zh: "空")
     @Published private(set) var isPinBadgeDimmed = true
     @Published private(set) var hasClipboardContent = false
     @Published private(set) var pinnedHistoryIDs: Set<UUID> = []
@@ -82,13 +82,15 @@ final class MenuBarPanelModel: ObservableObject {
         let nextDimmed: Bool
         switch pinManager.pinTileStatus() {
         case .empty:
-            nextBadge = "Empty"
+            nextBadge = CCXL10n.text("Empty", zh: "空")
             nextDimmed = true
         case .allPinned:
-            nextBadge = "All Pinned"
+            nextBadge = CCXL10n.text("All Pinned", zh: "已全部贴图")
             nextDimmed = true
         case let .ready(count, primaryLabel):
-            nextBadge = count > 1 ? "\(count) Ready" : primaryLabel
+            nextBadge = count > 1
+                ? CCXL10n.text("\(count) Ready", zh: "\(count) 张待贴")
+                : primaryLabel
             nextDimmed = false
         }
         if pinBadge != nextBadge { pinBadge = nextBadge }
@@ -137,36 +139,41 @@ struct MenuBarPopoverView: View {
             } else {
                 HStack(spacing: 8) {
                     QuickActionTile(
-                        title: "Snip",
-                        badge: model.isSnipHotKeyRegistered ? model.snipShortcut : "Conflict",
+                        title: CCXL10n.text("Snip", zh: "截屏"),
+                        badge: model.isSnipHotKeyRegistered
+                            ? model.snipShortcut
+                            : CCXL10n.text("Conflict", zh: "冲突"),
                         isBadgeDimmed: !model.isSnipHotKeyRegistered,
                         symbol: "viewfinder",
                         tint: model.isSnipHotKeyRegistered ? .blue : .orange,
                         tooltip: model.isSnipHotKeyRegistered
-                            ? "Capture screen (\(model.snipShortcut))"
-                            : "Shortcut \(model.snipShortcut) is in use by another app — check Settings",
+                            ? CCXL10n.text("Capture screen (\(model.snipShortcut))", zh: "截屏 (\(model.snipShortcut))")
+                            : CCXL10n.text(
+                                "Shortcut \(model.snipShortcut) is in use by another app — check Settings",
+                                zh: "快捷键 \(model.snipShortcut) 已被其他应用占用，请在设置中修改"
+                            ),
                         action: actions.onSnip
                     )
                     QuickActionTile(
-                        title: "Pin",
+                        title: CCXL10n.text("Pin", zh: "贴图"),
                         badge: model.pinBadge,
                         isBadgeDimmed: model.isPinBadgeDimmed,
                         symbol: "pin.fill",
                         tint: .indigo,
                         accessorySymbol: "xmark.circle.fill",
-                        accessoryTooltip: "Clear clipboard",
+                        accessoryTooltip: CCXL10n.text("Clear clipboard", zh: "清空剪贴板"),
                         isAccessoryDestructive: true,
                         onAccessory: model.hasClipboardContent ? actions.onClearClipboard : nil,
                         action: actions.onPastePin
                     )
                     QuickActionTile(
-                        title: "Record",
-                        badge: "Video · GIF",
+                        title: CCXL10n.text("Record", zh: "录屏"),
+                        badge: CCXL10n.text("Video · GIF", zh: "视频 · GIF"),
                         symbol: "record.circle.fill",
                         tint: .red,
-                        tooltip: "Record screen (MP4, MOV, or GIF)",
+                        tooltip: CCXL10n.text("Record screen (MP4, MOV, or GIF)", zh: "录屏 (MP4、MOV 或 GIF)"),
                         accessorySymbol: "folder.fill",
-                        accessoryTooltip: "Open Recordings Folder",
+                        accessoryTooltip: CCXL10n.text("Open Recordings Folder", zh: "打开录屏目录"),
                         isAccessoryDestructive: false,
                         onAccessory: actions.onOpenRecordingsFolder,
                         action: actions.onRecord
@@ -228,7 +235,11 @@ private struct ActiveRecordingBanner: View {
                 Circle()
                     .fill(tint)
                     .frame(width: 8, height: 8)
-                Text(status.isPaused ? "Paused · \(status.format.label)" : "Recording · \(status.format.label)")
+                Text(
+                    status.isPaused
+                        ? CCXL10n.text("Paused · \(status.format.label)", zh: "已暂停 · \(status.format.label)")
+                        : CCXL10n.text("Recording · \(status.format.label)", zh: "录制中 · \(status.format.label)")
+                )
                     .font(.system(size: 12, weight: .semibold))
                 Spacer()
                 Text(status.formattedElapsed)
@@ -238,14 +249,14 @@ private struct ActiveRecordingBanner: View {
 
             HStack(spacing: 6) {
                 PinControlPill(
-                    title: status.isPaused ? "Resume" : "Pause",
+                    title: status.isPaused ? CCXL10n.text("Resume", zh: "继续") : CCXL10n.text("Pause", zh: "暂停"),
                     symbol: status.isPaused ? "play.fill" : "pause.fill",
                     tint: status.isPaused ? .cyan : .secondary,
                     isActive: status.isPaused,
                     action: onTogglePause
                 )
                 PinControlPill(
-                    title: "Stop",
+                    title: CCXL10n.text("Stop", zh: "停止"),
                     symbol: "stop.fill",
                     tint: .red,
                     isActive: true,
@@ -259,8 +270,8 @@ private struct ActiveRecordingBanner: View {
                         .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
                 }
                 .buttonStyle(.plain)
-                .help("Cancel Recording")
-                .accessibilityLabel("Cancel Recording")
+                .help(CCXL10n.text("Cancel Recording", zh: "取消录制"))
+                .accessibilityLabel(CCXL10n.text("Cancel Recording", zh: "取消录制"))
             }
         }
         .padding(10)
@@ -418,7 +429,7 @@ private struct RecentSnipsSection: View {
 
             ZStack {
                 HStack(spacing: 5) {
-                    Text("RECENT SNIPS")
+                    Text(CCXL10n.text("RECENT SNIPS", zh: "最近截屏"))
                         .font(.system(size: 9.5, weight: .semibold))
                         .foregroundStyle(.secondary)
                         .tracking(0.6)
@@ -431,7 +442,10 @@ private struct RecentSnipsSection: View {
                         .background(Color.primary.opacity(0.08), in: Capsule())
                 }
                 .accessibilityElement(children: .combine)
-                .accessibilityLabel("Recent snips, \(entries.count)")
+                .accessibilityLabel(CCXL10n.text(
+                    "Recent snips, \(entries.count)",
+                    zh: "最近截屏，共 \(entries.count) 张"
+                ))
 
                 HStack {
                     Spacer()
@@ -523,7 +537,7 @@ private struct ScrollableRecentSnipsStrip: View {
                 if isStripHovering && scrollEdgeState.canScrollLeft {
                     ScrollStepButton(
                         symbol: "chevron.left",
-                        label: "Scroll newer snips",
+                        label: CCXL10n.text("Scroll newer snips", zh: "查看较新截屏"),
                         action: { stepScroll(direction: -1) }
                     )
                     .padding(.leading, 2)
@@ -537,7 +551,7 @@ private struct ScrollableRecentSnipsStrip: View {
                 if isStripHovering && scrollEdgeState.canScrollRight {
                     ScrollStepButton(
                         symbol: "chevron.right",
-                        label: "Scroll older snips",
+                        label: CCXL10n.text("Scroll older snips", zh: "查看较早截屏"),
                         action: { stepScroll(direction: 1) }
                     )
                     .padding(.trailing, 2)
@@ -624,7 +638,7 @@ private struct RecentClearButton: View {
 
     var body: some View {
         Button(action: action) {
-            Text("Clear")
+            Text(CCXL10n.text("Clear", zh: "清空"))
                 .font(.system(size: 10, weight: .medium))
                 .foregroundStyle(isHovering ? Color.red : Color.secondary)
                 .padding(.horizontal, 6)
@@ -635,7 +649,7 @@ private struct RecentClearButton: View {
                 )
         }
         .buttonStyle(.plain)
-        .help("Clear recent snips and clipboard")
+        .help(CCXL10n.text("Clear recent snips and clipboard", zh: "清空最近截屏与剪贴板"))
         .onHover { isHovering = $0 }
     }
 }
@@ -681,8 +695,14 @@ private struct RecentSnipThumbnail: View {
         .buttonStyle(.plain)
         .frame(width: 60.5, height: 38)
         .contentShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
-        .help("\(entry.image.width) × \(entry.image.height) · \(isPinned ? "Already pinned" : "Click to pin")")
-        .accessibilityLabel("Recent snip \(entry.image.width) by \(entry.image.height), \(isPinned ? "already pinned" : "click to pin")")
+        .help(CCXL10n.text(
+            "\(entry.image.width) × \(entry.image.height) · \(isPinned ? "Already pinned" : "Click to pin")",
+            zh: "\(entry.image.width) × \(entry.image.height) · \(isPinned ? "已贴图" : "点击贴图")"
+        ))
+        .accessibilityLabel(CCXL10n.text(
+            "Recent snip \(entry.image.width) by \(entry.image.height), \(isPinned ? "already pinned" : "click to pin")",
+            zh: "最近截屏 \(entry.image.width) × \(entry.image.height)，\(isPinned ? "已贴图" : "点击贴图")"
+        ))
         .onHover { isHovering = $0 }
     }
 }
@@ -702,12 +722,12 @@ private struct FloatingPinsSection: View {
             Divider().opacity(0.45)
 
             HStack(spacing: 6) {
-                Text("FLOATING PINS")
+                Text(CCXL10n.text("FLOATING PINS", zh: "悬浮贴图"))
                     .font(.system(size: 9.5, weight: .semibold))
                     .foregroundStyle(.secondary)
                     .tracking(0.6)
 
-                Text("\(pinCount) active")
+                Text(CCXL10n.text("\(pinCount) active", zh: "\(pinCount) 个显示"))
                     .font(.system(size: 9.5, weight: .semibold).monospacedDigit())
                     .foregroundStyle(Color.accentColor)
                     .padding(.horizontal, 6)
@@ -719,7 +739,7 @@ private struct FloatingPinsSection: View {
             VStack(spacing: 6) {
                 HStack(spacing: 8) {
                     PinControlPill(
-                        title: arePinsHidden ? "Show All" : "Hide All",
+                        title: arePinsHidden ? CCXL10n.text("Show All", zh: "显示全部") : CCXL10n.text("Hide All", zh: "隐藏全部"),
                         symbol: arePinsHidden ? "eye" : "eye.slash",
                         tint: arePinsHidden ? .accentColor : .secondary,
                         isActive: arePinsHidden,
@@ -727,7 +747,7 @@ private struct FloatingPinsSection: View {
                     )
 
                     PinControlPill(
-                        title: "Close All",
+                        title: CCXL10n.text("Close All", zh: "关闭全部"),
                         symbol: "xmark.circle",
                         tint: .secondary,
                         isDestructive: true,
@@ -737,7 +757,7 @@ private struct FloatingPinsSection: View {
 
                 if hasClickThroughPins {
                     PinControlPill(
-                        title: "Unlock Click-Through",
+                        title: CCXL10n.text("Unlock Click-Through", zh: "解除穿透"),
                         symbol: "cursorarrow.click",
                         tint: .cyan,
                         isActive: true,
@@ -826,7 +846,10 @@ private struct UpdateAvailableBanner: View {
                         .font(.system(size: 13, weight: .semibold))
                         .foregroundStyle(.green)
 
-                    Text("Update v\(release.version.description)")
+                    Text(CCXL10n.text(
+                        "Update v\(release.version.description)",
+                        zh: "发现更新 v\(release.version.description)"
+                    ))
                         .font(.system(size: 11.5, weight: .semibold))
                         .foregroundStyle(.primary)
                         .lineLimit(1)
@@ -836,7 +859,7 @@ private struct UpdateAvailableBanner: View {
                     Button {
                         updateManager.installAvailableUpdate()
                     } label: {
-                        Text("Update")
+                        Text(CCXL10n.text("Update", zh: "更新"))
                             .font(.system(size: 10.5, weight: .semibold))
                             .foregroundStyle(.white)
                             .padding(.horizontal, 9)
@@ -856,17 +879,18 @@ private struct UpdateAvailableBanner: View {
                             .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
-                    .help("Dismiss update notice")
-                    .accessibilityLabel("Dismiss update notice")
+                    .help(CCXL10n.text("Dismiss update notice", zh: "关闭更新提示"))
+                    .accessibilityLabel(CCXL10n.text("Dismiss update notice", zh: "关闭更新提示"))
                 }
 
             case .downloading(_, let progress):
+                let pct = Int((progress * 100).rounded())
                 HStack(spacing: 8) {
                     Image(systemName: "arrow.down.circle.fill")
                         .font(.system(size: 13, weight: .semibold))
                         .foregroundStyle(Color.accentColor)
 
-                    Text("Downloading \(Int((progress * 100).rounded()))%")
+                    Text(CCXL10n.text("Downloading \(pct)%", zh: "下载中 \(pct)%"))
                         .font(.system(size: 11, weight: .medium).monospacedDigit())
                         .foregroundStyle(.primary)
                         .lineLimit(1)
@@ -887,15 +911,15 @@ private struct UpdateAvailableBanner: View {
                             .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
-                    .help("Cancel download")
-                    .accessibilityLabel("Cancel download")
+                    .help(CCXL10n.text("Cancel download", zh: "取消下载"))
+                    .accessibilityLabel(CCXL10n.text("Cancel download", zh: "取消下载"))
                 }
 
             case .verifying:
                 HStack(spacing: 8) {
                     ProgressView()
                         .controlSize(.mini)
-                    Text("Verifying…")
+                    Text(CCXL10n.text("Verifying…", zh: "校验中…"))
                         .font(.system(size: 11.5, weight: .medium))
                         .foregroundStyle(.primary)
                     Spacer(minLength: 0)
@@ -905,7 +929,7 @@ private struct UpdateAvailableBanner: View {
                 HStack(spacing: 8) {
                     ProgressView()
                         .controlSize(.mini)
-                    Text("Installing…")
+                    Text(CCXL10n.text("Installing…", zh: "安装中…"))
                         .font(.system(size: 11.5, weight: .medium))
                         .foregroundStyle(.primary)
                     Spacer(minLength: 0)
@@ -918,7 +942,7 @@ private struct UpdateAvailableBanner: View {
                             .font(.system(size: 12, weight: .semibold))
                             .foregroundStyle(.orange)
 
-                        Text("Update Failed")
+                        Text(CCXL10n.text("Update Failed", zh: "更新失败"))
                             .font(.system(size: 11.5, weight: .semibold))
                             .foregroundStyle(.primary)
                             .lineLimit(1)
@@ -928,7 +952,7 @@ private struct UpdateAvailableBanner: View {
                         Button {
                             updateManager.installAvailableUpdate()
                         } label: {
-                            Text("Retry")
+                            Text(CCXL10n.text("Retry", zh: "重试"))
                                 .font(.system(size: 10.5, weight: .semibold))
                                 .foregroundStyle(.white)
                                 .padding(.horizontal, 8)
@@ -959,8 +983,8 @@ private struct UpdateAvailableBanner: View {
                                 .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
-                        .help("Dismiss update error")
-                        .accessibilityLabel("Dismiss update error")
+                        .help(CCXL10n.text("Dismiss update error", zh: "关闭更新错误提示"))
+                        .accessibilityLabel(CCXL10n.text("Dismiss update error", zh: "关闭更新错误提示"))
                     }
 
                     Text(message)
@@ -1003,29 +1027,31 @@ private struct UtilityFooterSection: View {
             let allGranted = permissions.screenRecording && permissions.accessibility
             HStack(spacing: 6) {
                 UtilityDockButton(
-                    title: allGranted ? "Ready" : "Guide",
+                    title: allGranted ? CCXL10n.text("Ready", zh: "就绪") : CCXL10n.text("Guide", zh: "指南"),
                     symbol: allGranted ? "checkmark.shield" : "exclamationmark.triangle.fill",
                     symbolTint: allGranted ? .green : .orange,
                     needsAttention: !allGranted,
                     tooltip: allGranted
-                        ? "All permissions granted — click to open Guide"
-                        : "Setup needed — click to open Permissions & Guide",
+                        ? CCXL10n.text("All permissions granted — click to open Guide", zh: "权限已就绪，点击打开使用指南")
+                        : CCXL10n.text("Setup needed — click to open Permissions & Guide", zh: "需要授权，点击打开权限与使用指南"),
                     action: onOpenPermissions
                 )
 
                 UtilityDockButton(
-                    title: "Settings",
+                    title: CCXL10n.text("Settings", zh: "设置"),
                     symbol: "gearshape",
                     showBadgeDot: hasUpdateBadge,
-                    tooltip: hasUpdateBadge ? "Settings (⌘,) — Update available" : "Settings (⌘,)",
+                    tooltip: hasUpdateBadge
+                        ? CCXL10n.text("Settings (⌘,) — Update available", zh: "设置 (⌘,) · 有新版本可用")
+                        : CCXL10n.text("Settings (⌘,)", zh: "设置 (⌘,)"),
                     action: onOpenSettings
                 )
 
                 UtilityDockButton(
-                    title: "Quit",
+                    title: CCXL10n.text("Quit", zh: "退出"),
                     symbol: "power",
                     isDestructive: true,
-                    tooltip: "Quit CCX (⌘Q)",
+                    tooltip: CCXL10n.text("Quit CCX (⌘Q)", zh: "退出 CCX (⌘Q)"),
                     action: onQuit
                 )
             }

@@ -1,0 +1,4 @@
+"NSScreenCaptureUsageDescription" = "CCX captures the screen to create snips, floating pins, and screen recordings.";
+"NSAudioCaptureUsageDescription" = "CCX records system audio when you include it in a screen recording.";
+"NSMicrophoneUsageDescription" = "CCX records your microphone when you enable voice narration in a screen recording.";
+"NSHumanReadableCopyright" = "Copyright © 2026 Zhichao Li. All rights reserved.";

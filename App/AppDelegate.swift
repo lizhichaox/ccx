@@ -64,7 +64,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self else { return }
             let hasClickThrough = self.pinManager.hasClickThroughPins
             if hasClickThrough && !self.hadClickThroughPins {
-                self.toast.show("Click-Through On — Unlock in Menu Bar", symbolName: "cursorarrow.click")
+                self.toast.show(
+                    CCXL10n.text("Click-Through On — Unlock in Menu Bar", zh: "已开启穿透，可在菜单栏解除"),
+                    symbolName: "cursorarrow.click"
+                )
             }
             self.hadClickThroughPins = hasClickThrough
             self.menuBarController?.refresh()
@@ -98,7 +101,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return !self.recordingCoordinator.isSessionActive && !self.isPresentingSavePanel
         }
         updateManager.onBlockedByActiveSession = { [weak self] in
-            self?.toast.show("Finish Active Recording First", symbolName: "record.circle.fill")
+            self?.toast.show(
+                CCXL10n.text("Finish Active Recording First", zh: "请先结束当前录屏"),
+                symbolName: "record.circle.fill"
+            )
         }
         updateManager.onUserFacingError = { [weak self] message in
             self?.toast.show(message, symbolName: "exclamationmark.triangle")
@@ -140,7 +146,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         if !snipHotKeyRegistered {
             toast.show(
-                "\(currentSnipCombo.displayString) In Use by Another App",
+                CCXL10n.text(
+                    "\(currentSnipCombo.displayString) In Use by Another App",
+                    zh: "\(currentSnipCombo.displayString) 已被其他应用占用"
+                ),
                 symbolName: "exclamationmark.triangle"
             )
         }
@@ -161,17 +170,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         if recordingCoordinator.phase == .finalizing {
-            toast.show("Finishing Recording… Try Again Soon", symbolName: "hourglass")
+            toast.show(
+                CCXL10n.text("Finishing Recording… Try Again Soon", zh: "正在生成录屏，请稍后再试"),
+                symbolName: "hourglass"
+            )
             return .terminateCancel
         }
         if recordingCoordinator.isRecordingOrPaused {
             NSApp.activate()
             let alert = NSAlert()
             alert.alertStyle = .warning
-            alert.messageText = "Recording in Progress"
-            alert.informativeText = "Quitting CCX now will discard the active recording."
-            alert.addButton(withTitle: "Keep Recording")
-            alert.addButton(withTitle: "Discard & Quit")
+            alert.messageText = CCXL10n.text("Recording in Progress", zh: "正在录屏")
+            alert.informativeText = CCXL10n.text(
+                "Quitting CCX now will discard the active recording.",
+                zh: "现在退出 CCX 将丢弃当前正在录制的内容。"
+            )
+            alert.addButton(withTitle: CCXL10n.text("Keep Recording", zh: "继续录制"))
+            alert.addButton(withTitle: CCXL10n.text("Discard & Quit", zh: "丢弃并退出"))
             if alert.runModal() != .alertSecondButtonReturn {
                 return .terminateCancel
             }
@@ -242,10 +257,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let registered = hotKeyManager.register(.snip, combo: currentSnipCombo)
         syncHotKeyState(registered: registered)
         if registered {
-            toast.show("\(currentSnipCombo.displayString) Restored", symbolName: "checkmark.circle.fill")
+            toast.show(
+                CCXL10n.text(
+                    "\(currentSnipCombo.displayString) Restored",
+                    zh: "已恢复快捷键 \(currentSnipCombo.displayString)"
+                ),
+                symbolName: "checkmark.circle.fill"
+            )
         } else {
             toast.show(
-                "\(currentSnipCombo.displayString) Still In Use",
+                CCXL10n.text(
+                    "\(currentSnipCombo.displayString) Still In Use",
+                    zh: "\(currentSnipCombo.displayString) 仍被其他应用占用"
+                ),
                 symbolName: "exclamationmark.triangle"
             )
         }
@@ -279,7 +303,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             currentSnipCombo = combo
             HotKeyPreferences.saveCombo(combo, for: .snip)
             syncHotKeyState(registered: true)
-            toast.show("Shortcut Set to \(combo.displayString)", symbolName: "keyboard")
+            toast.show(
+                CCXL10n.text("Shortcut Set to \(combo.displayString)", zh: "快捷键已设为 \(combo.displayString)"),
+                symbolName: "keyboard"
+            )
             return nil
         case .conflict(let conflict):
             return conflict
@@ -292,7 +319,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             currentSnipCombo = combo
             HotKeyPreferences.saveCombo(combo, for: .snip)
             syncHotKeyState(registered: true)
-            toast.show("Shortcut Reset to \(HotKeyCombo.defaultSnip.displayString)", symbolName: "arrow.counterclockwise")
+            toast.show(
+                CCXL10n.text(
+                    "Shortcut Reset to \(HotKeyCombo.defaultSnip.displayString)",
+                    zh: "快捷键已重置为 \(HotKeyCombo.defaultSnip.displayString)"
+                ),
+                symbolName: "arrow.counterclockwise"
+            )
             return nil
         case .conflict(let conflict):
             return conflict
@@ -328,7 +361,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return false
         }
         if recordingCoordinator.isSessionActive {
-            toast.show("Finish Active Recording First", symbolName: "record.circle.fill")
+            toast.show(
+                CCXL10n.text("Finish Active Recording First", zh: "请先结束当前录屏"),
+                symbolName: "record.circle.fill"
+            )
             return false
         }
 
@@ -356,16 +392,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .pinned:
             break
         case .allAlreadyPinned:
-            toast.show("All Images Already Pinned", symbolName: "checkmark.circle")
+            toast.show(CCXL10n.text("All Images Already Pinned", zh: "所有图片均已贴图"), symbolName: "checkmark.circle")
         case .nothingAvailable:
-            toast.show("Nothing to Pin", symbolName: "exclamationmark.circle")
+            toast.show(CCXL10n.text("Nothing to Pin", zh: "剪贴板无可贴图内容"), symbolName: "exclamationmark.circle")
         }
         menuBarController?.refresh()
     }
 
     private func toggleAllPins() {
         guard pinManager.pinCount > 0 else {
-            toast.show("No Active Pins", symbolName: "pin.slash")
+            toast.show(CCXL10n.text("No Active Pins", zh: "当前无悬浮贴图"), symbolName: "pin.slash")
             return
         }
         pinManager.toggleVisibilityOfAllPins()
@@ -374,7 +410,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func unlockClickThroughPins() {
         guard pinManager.hasClickThroughPins else { return }
         pinManager.disableClickThroughForAllPins()
-        toast.show("Click-Through Disabled", symbolName: "cursorarrow.click")
+        toast.show(CCXL10n.text("Click-Through Disabled", zh: "已解除鼠标穿透"), symbolName: "cursorarrow.click")
     }
 
     // MARK: - Snip outcomes
@@ -385,12 +421,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let entry = record(result)
             let identity = entry?.pinIdentity ?? .image(ImageFingerprint(image: result.image))
             if !pinManager.pin(content: .image(result.image, scale: result.scale), at: result.screenRect, contentIdentity: identity) {
-                toast.show("Already Pinned", symbolName: "pin.fill")
+                toast.show(CCXL10n.text("Already Pinned", zh: "已贴图"), symbolName: "pin.fill")
             }
         case .copy(let result):
             let entry = record(result)
             clipboardStore.copyImage(result.image, scale: result.scale, historyEntryID: entry?.id)
-            toast.show("Copied to Clipboard")
+            toast.show(CCXL10n.text("Copied to Clipboard", zh: "已拷贝到剪贴板"))
         case .save(let result):
             record(result)
             presentSavePanel(for: result.image)
@@ -412,13 +448,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .copiedColor(let sample, let format):
             let text = sample.formatted(as: format)
             clipboardStore.copyText(text)
-            toast.show("Copied \(text)", symbolName: "eyedropper")
+            toast.show(CCXL10n.text("Copied \(text)", zh: "已拷贝 \(text)"), symbolName: "eyedropper")
         case .permissionDenied:
             menuBarController?.refresh()
-            toast.show("Screen Recording Needed", symbolName: "exclamationmark.triangle")
+            toast.show(CCXL10n.text("Screen Recording Needed", zh: "需要屏幕录制权限"), symbolName: "exclamationmark.triangle")
             showOnboarding(startingAt: .permissions)
         case .failed(let message):
-            toast.show("Capture Failed: \(Self.userFriendlyNotice(message))", symbolName: "exclamationmark.triangle")
+            let notice = Self.userFriendlyNotice(message)
+            toast.show(
+                CCXL10n.text("Capture Failed: \(notice)", zh: "截屏失败：\(notice)"),
+                symbolName: "exclamationmark.triangle"
+            )
         case .cancelled:
             break
         }
@@ -437,7 +477,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let progressTask = Task { @MainActor [weak self] in
                 try? await Task.sleep(for: .milliseconds(180))
                 guard !Task.isCancelled else { return }
-                self?.toast.show("Recognizing Text…", symbolName: "text.viewfinder")
+                self?.toast.show(CCXL10n.text("Recognizing Text…", zh: "正在识别文字…"), symbolName: "text.viewfinder")
             }
             defer { progressTask.cancel() }
 
@@ -446,10 +486,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 guard !Task.isCancelled else { return }
                 progressTask.cancel()
                 if text.isEmpty {
-                    self.toast.show("No Text Found", symbolName: "exclamationmark.circle")
+                    self.toast.show(CCXL10n.text("No Text Found", zh: "未识别到文字"), symbolName: "exclamationmark.circle")
                 } else {
                     self.clipboardStore.copyText(text)
-                    self.toast.show("Copied Text (OCR)", symbolName: "text.viewfinder")
+                    self.toast.show(CCXL10n.text("Copied Text (OCR)", zh: "已拷贝识别文字 (OCR)"), symbolName: "text.viewfinder")
                     self.menuBarController?.refresh()
                 }
             } catch is CancellationError {
@@ -457,7 +497,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             } catch {
                 guard !Task.isCancelled else { return }
                 progressTask.cancel()
-                self.toast.show("OCR Failed", symbolName: "exclamationmark.triangle")
+                self.toast.show(CCXL10n.text("OCR Failed", zh: "文字识别失败"), symbolName: "exclamationmark.triangle")
             }
         }
     }
@@ -468,12 +508,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if isPresentingSavePanel {
             NSApp.activate()
             activeSavePanel?.makeKeyAndOrderFront(nil)
-            toast.show("Finish Save Dialog First", symbolName: "exclamationmark.circle")
+            toast.show(CCXL10n.text("Finish Save Dialog First", zh: "请先完成当前保存窗口"), symbolName: "exclamationmark.circle")
             return
         }
 
         let panel = NSSavePanel()
-        panel.title = "Save Snip"
+        panel.title = CCXL10n.text("Save Snip", zh: "保存截屏")
         panel.directoryURL = preferredSaveDirectoryURL()
         panel.allowedContentTypes = [.png]
         panel.canCreateDirectories = true
@@ -502,14 +542,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         }
                         try ClipboardStore.writePNGDataAtomically(pngData, to: url)
                         await MainActor.run { [weak self] in
-                            self?.toast.show("Saved PNG", symbolName: "square.and.arrow.down")
+                            self?.toast.show(CCXL10n.text("Saved PNG", zh: "已保存 PNG"), symbolName: "square.and.arrow.down")
                         }
                     } catch {
                         let description = Self.userFriendlySaveError(error)
                         await MainActor.run {
                             let alert = NSAlert()
                             alert.alertStyle = .warning
-                            alert.messageText = "Could Not Save PNG"
+                            alert.messageText = CCXL10n.text("Could Not Save PNG", zh: "无法保存 PNG")
                             alert.informativeText = description
                             alert.runModal()
                         }
@@ -598,7 +638,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard Self.isRealDirectory(atPath: directory.path),
               NSWorkspace.shared.open(directory)
         else {
-            toast.show("Couldn't Open Recordings Folder", symbolName: "exclamationmark.triangle")
+            toast.show(CCXL10n.text("Couldn't Open Recordings Folder", zh: "无法打开录屏目录"), symbolName: "exclamationmark.triangle")
             return
         }
     }
@@ -607,17 +647,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if isPresentingSavePanel {
             NSApp.activate()
             activeSavePanel?.makeKeyAndOrderFront(nil)
-            toast.show("Finish Save Dialog First", symbolName: "exclamationmark.circle")
+            toast.show(CCXL10n.text("Finish Save Dialog First", zh: "请先完成当前保存窗口"), symbolName: "exclamationmark.circle")
             return
         }
 
         let panel = NSOpenPanel()
-        panel.title = "Choose Recordings Folder"
+        panel.title = CCXL10n.text("Choose Recordings Folder", zh: "选择录屏目录")
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.canCreateDirectories = true
         panel.allowsMultipleSelection = false
-        panel.prompt = "Choose"
+        panel.prompt = CCXL10n.text("Choose", zh: "选择")
         let currentDirectory = preferredRecordingsDirectoryURL(createIfNeeded: true)
         if Self.isRealDirectory(atPath: currentDirectory.path) {
             panel.directoryURL = currentDirectory
@@ -638,14 +678,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 guard response == .OK, let url = panel.url else { return }
                 let normalizedPath = Self.normalizedDirectoryPath(url.path)
                 guard Self.isWritableRealDirectory(atPath: normalizedPath) else {
-                    self.toast.show("Selected Folder Cannot Be Used", symbolName: "exclamationmark.triangle")
+                    self.toast.show(
+                        CCXL10n.text("Selected Folder Cannot Be Used", zh: "无法使用所选文件夹"),
+                        symbolName: "exclamationmark.triangle"
+                    )
                     return
                 }
 
                 let validatedURL = URL(fileURLWithPath: normalizedPath, isDirectory: true)
                 UserDefaults.standard.set(normalizedPath, forKey: Self.recordingsDirectoryKey)
                 self.settingsController?.updateRecordingsFolder(self.displayPathForDirectory(validatedURL))
-                self.toast.show("Recordings Folder Updated", symbolName: "folder.fill")
+                self.toast.show(CCXL10n.text("Recordings Folder Updated", zh: "已更新录屏目录"), symbolName: "folder.fill")
             }
         }
     }
@@ -657,7 +700,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Task.detached(priority: .userInitiated) {
             guard let targetURL = Self.nextUniqueURL(in: directory, stem: stem, fileExtension: "png") else {
                 await MainActor.run { [weak self] in
-                    self?.toast.show("Could Not Save PNG", symbolName: "exclamationmark.triangle")
+                    self?.toast.show(CCXL10n.text("Could Not Save PNG", zh: "无法保存 PNG"), symbolName: "exclamationmark.triangle")
                 }
                 return
             }
@@ -668,11 +711,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 try ClipboardStore.writePNGDataAtomically(pngData, to: targetURL)
                 let folderName = directory.lastPathComponent
                 await MainActor.run { [weak self] in
-                    self?.toast.show("Saved to \(folderName)", symbolName: "square.and.arrow.down")
+                    self?.toast.show(
+                        CCXL10n.text("Saved to \(folderName)", zh: "已保存到 \(folderName)"),
+                        symbolName: "square.and.arrow.down"
+                    )
                 }
             } catch {
                 await MainActor.run { [weak self] in
-                    self?.toast.show("Could Not Save PNG", symbolName: "exclamationmark.triangle")
+                    self?.toast.show(CCXL10n.text("Could Not Save PNG", zh: "无法保存 PNG"), symbolName: "exclamationmark.triangle")
                 }
             }
         }
@@ -729,10 +775,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             quickSaveRecording(result, revealInFinder: true)
         case .permissionDenied:
             menuBarController?.refresh()
-            toast.show("Screen Recording Needed", symbolName: "exclamationmark.triangle")
+            toast.show(CCXL10n.text("Screen Recording Needed", zh: "需要屏幕录制权限"), symbolName: "exclamationmark.triangle")
             showOnboarding(startingAt: .permissions)
         case .failed(let message):
-            toast.show("Recording Failed: \(Self.userFriendlyNotice(message))", symbolName: "exclamationmark.triangle")
+            let notice = Self.userFriendlyNotice(message)
+            toast.show(
+                CCXL10n.text("Recording Failed: \(notice)", zh: "录屏失败：\(notice)"),
+                symbolName: "exclamationmark.triangle"
+            )
         case .cancelled:
             break
         }
@@ -761,12 +811,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     guard let self else { return }
                     self.clipboardStore.copyFileURL(destURL)
                     self.menuBarController?.refresh()
-                    self.toast.show("Copied \(label)", symbolName: "doc.on.doc")
+                    self.toast.show(CCXL10n.text("Copied \(label)", zh: "已拷贝 \(label)"), symbolName: "doc.on.doc")
                 }
             } catch {
                 await MainActor.run { [weak self] in
                     guard let self else { return }
-                    self.toast.show("Copy Failed — Choose Save Location", symbolName: "exclamationmark.triangle")
+                    self.toast.show(
+                        CCXL10n.text("Copy Failed — Choose Save Location", zh: "拷贝失败，请选择保存位置"),
+                        symbolName: "exclamationmark.triangle"
+                    )
                     self.presentSavePanel(for: result)
                 }
             }
@@ -788,7 +841,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         let panel = NSSavePanel()
-        panel.title = "Save \(result.format.label)"
+        panel.title = CCXL10n.text("Save \(result.format.label)", zh: "保存 \(result.format.label)")
         let recordingsDirectory = preferredRecordingsDirectoryURL(createIfNeeded: true)
         if Self.isRealDirectory(atPath: recordingsDirectory.path) {
             panel.directoryURL = recordingsDirectory
@@ -820,7 +873,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     do {
                         try Self.moveRecordingAtomically(from: result.fileURL, to: url)
                         await MainActor.run { [weak self] in
-                            self?.toast.show("Saved \(label)", symbolName: "square.and.arrow.down")
+                            self?.toast.show(CCXL10n.text("Saved \(label)", zh: "已保存 \(label)"), symbolName: "square.and.arrow.down")
                             self?.drainPendingRecordingSavesIfIdle()
                         }
                     } catch {
@@ -830,10 +883,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                             NSApp.activate()
                             let alert = NSAlert()
                             alert.alertStyle = .warning
-                            alert.messageText = "Could Not Save \(label)"
-                            alert.informativeText = "\(description)\n\nYour recording has been preserved so you can choose another location."
-                            alert.addButton(withTitle: "Choose Another Location…")
-                            alert.addButton(withTitle: "Discard Recording")
+                            alert.messageText = CCXL10n.text("Could Not Save \(label)", zh: "无法保存 \(label)")
+                            alert.informativeText = CCXL10n.text(
+                                "\(description)\n\nYour recording has been preserved so you can choose another location.",
+                                zh: "\(description)\n\n已保留录屏文件，你可以选择其他保存位置。"
+                            )
+                            alert.addButton(withTitle: CCXL10n.text("Choose Another Location…", zh: "选择其他位置…"))
+                            alert.addButton(withTitle: CCXL10n.text("Discard Recording", zh: "丢弃录屏"))
                             if alert.runModal() == .alertFirstButtonReturn {
                                 self.presentSavePanel(for: result)
                             } else {
@@ -863,7 +919,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 try Self.moveRecordingAtomically(from: result.fileURL, to: targetURL)
                 await MainActor.run { [weak self] in
-                    self?.toast.show("Saved \(label) to \(folderName)", symbolName: "square.and.arrow.down")
+                    self?.toast.show(
+                        CCXL10n.text("Saved \(label) to \(folderName)", zh: "已保存 \(label) 到 \(folderName)"),
+                        symbolName: "square.and.arrow.down"
+                    )
                     if revealInFinder {
                         NSWorkspace.shared.activateFileViewerSelecting([targetURL])
                     }
@@ -871,7 +930,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             } catch {
                 await MainActor.run { [weak self] in
                     guard let self else { return }
-                    self.toast.show("Quick Save Failed — Choose Folder", symbolName: "exclamationmark.triangle")
+                    self.toast.show(
+                        CCXL10n.text("Quick Save Failed — Choose Folder", zh: "快速保存失败，请选择文件夹"),
+                        symbolName: "exclamationmark.triangle"
+                    )
                     self.presentSavePanel(for: result)
                 }
             }
@@ -1007,13 +1069,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if nsError.domain == NSCocoaErrorDomain {
             switch nsError.code {
             case CocoaError.fileWriteNoPermission.rawValue:
-                return "CCX does not have permission to write to the selected folder."
+                return CCXL10n.text(
+                    "CCX does not have permission to write to the selected folder.",
+                    zh: "CCX 没有权限写入所选文件夹。"
+                )
             case CocoaError.fileWriteOutOfSpace.rawValue:
-                return "There is not enough free disk space in the selected folder."
+                return CCXL10n.text(
+                    "There is not enough free disk space in the selected folder.",
+                    zh: "所选文件夹可用磁盘空间不足。"
+                )
             case CocoaError.fileWriteVolumeReadOnly.rawValue:
-                return "The selected disk or folder is read-only."
+                return CCXL10n.text(
+                    "The selected disk or folder is read-only.",
+                    zh: "所选磁盘或文件夹为只读状态。"
+                )
             case CocoaError.fileNoSuchFile.rawValue, CocoaError.fileReadNoSuchFile.rawValue:
-                return "The temporary file could not be found."
+                return CCXL10n.text(
+                    "The temporary file could not be found.",
+                    zh: "找不到临时文件。"
+                )
             default:
                 break
             }
@@ -1023,9 +1097,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private nonisolated static func userFriendlyNotice(_ message: String) -> String {
         let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return "An unexpected error occurred." }
+        guard !trimmed.isEmpty else {
+            return CCXL10n.text("An unexpected error occurred.", zh: "发生意外错误。")
+        }
         if trimmed.contains("Error Domain=") || trimmed.contains("NSCocoaErrorDomain") || trimmed.contains("NSPOSIXErrorDomain") {
-            return "The operation could not be completed. Please try again."
+            return CCXL10n.text("The operation could not be completed. Please try again.", zh: "操作未能完成，请重试。")
         }
         return trimmed
     }
@@ -1101,7 +1177,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 },
                 onClearHistory: { [weak self] in
                     self?.menuBarRequestedClearHistory()
-                    self?.toast.show("History & Clipboard Cleared", symbolName: "trash")
+                    self?.toast.show(
+                        CCXL10n.text("History & Clipboard Cleared", zh: "已清空记录与剪贴板"),
+                        symbolName: "trash"
+                    )
                 }
             )
         } else {
@@ -1163,7 +1242,7 @@ extension AppDelegate: MenuBarControllerDelegate {
     func menuBarRequestedPinHistoryEntry(_ entry: SnipHistoryEntry) {
         guard clipboardStore.history.contains(where: { $0.id == entry.id }) else { return }
         if !pinManager.pin(content: .image(entry.image, scale: entry.scale), at: nil, contentIdentity: entry.pinIdentity) {
-            toast.show("Already Pinned", symbolName: "pin.fill")
+            toast.show(CCXL10n.text("Already Pinned", zh: "已贴图"), symbolName: "pin.fill")
         }
     }
 

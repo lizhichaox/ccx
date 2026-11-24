@@ -77,7 +77,10 @@ final class MenuBarController: NSObject, NSWindowDelegate {
     private static func makeRecordingStatusIcon(symbolName: String, tintColor: NSColor) -> NSImage? {
         let symbolConfig = NSImage.SymbolConfiguration(pointSize: 13, weight: .semibold)
             .applying(NSImage.SymbolConfiguration(paletteColors: [tintColor]))
-        let image = NSImage(systemSymbolName: symbolName, accessibilityDescription: "Recording")?
+        let image = NSImage(
+            systemSymbolName: symbolName,
+            accessibilityDescription: CCXL10n.text("Recording", zh: "录制中")
+        )?
             .withSymbolConfiguration(symbolConfig)
         image?.isTemplate = false
         return image
@@ -531,12 +534,20 @@ final class MenuBarController: NSObject, NSWindowDelegate {
     private func updateStatusTooltip() {
         let nextTooltip: String
         if let recordingStatus {
-            let stateWord = recordingStatus.isPaused ? "Paused" : "Recording"
+            let stateWord = recordingStatus.isPaused
+                ? CCXL10n.text("Paused", zh: "已暂停")
+                : CCXL10n.text("Recording", zh: "录制中")
             nextTooltip = "CCX — \(stateWord) \(recordingStatus.format.label) (\(recordingStatus.formattedElapsed))"
         } else if pinManager.hasClickThroughPins {
-            nextTooltip = "CCX — Click-through pin active (click to unlock)"
+            nextTooltip = CCXL10n.text(
+                "CCX — Click-through pin active (click to unlock)",
+                zh: "CCX — 贴图穿透中（点击解除）"
+            )
         } else if pinManager.arePinsHidden {
-            nextTooltip = "CCX — \(pinManager.pinCount) pin(s) hidden (click to show)"
+            nextTooltip = CCXL10n.text(
+                "CCX — \(pinManager.pinCount) pin(s) hidden (click to show)",
+                zh: "CCX — 已隐藏 \(pinManager.pinCount) 个贴图（点击显示）"
+            )
         } else {
             nextTooltip = "CCX — Control · Command · X"
         }

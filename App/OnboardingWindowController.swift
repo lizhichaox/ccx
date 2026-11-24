@@ -495,7 +495,10 @@ private struct WelcomeStepView: View {
                 Text("Control · Command · X")
                     .font(.system(size: 16, weight: .bold))
 
-                Text("Local captures & OCR · No accounts, no telemetry")
+                Text(CCXL10n.text(
+                    "Local captures & OCR · No accounts, no telemetry",
+                    zh: "本地截屏与 OCR · 无需账号，零遥测"
+                ))
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             }
@@ -504,20 +507,20 @@ private struct WelcomeStepView: View {
                 FeatureBentoCard(
                     symbol: "viewfinder",
                     tint: .blue,
-                    title: "Smart Snip",
-                    detail: "Detect, draw & OCR"
+                    title: CCXL10n.text("Smart Snip", zh: "智能截屏"),
+                    detail: CCXL10n.text("Detect, draw & OCR", zh: "识别、标注与 OCR")
                 )
                 FeatureBentoCard(
                     symbol: "pin.fill",
                     tint: .indigo,
-                    title: "Floating Pins",
-                    detail: "Always on top"
+                    title: CCXL10n.text("Floating Pins", zh: "悬浮贴图"),
+                    detail: CCXL10n.text("Always on top", zh: "始终置顶显示")
                 )
                 FeatureBentoCard(
                     symbol: "record.circle.fill",
                     tint: .red,
-                    title: "Screen Record",
-                    detail: "MP4, MOV & GIF"
+                    title: CCXL10n.text("Screen Record", zh: "屏幕录制"),
+                    detail: CCXL10n.text("MP4, MOV & GIF", zh: "MP4、MOV 与 GIF")
                 )
             }
             .fixedSize(horizontal: false, vertical: true)
@@ -569,15 +572,15 @@ private struct PermissionsStepView: View {
         VStack(spacing: 12) {
             Spacer(minLength: 0)
 
-            Text("Permissions")
+            Text(CCXL10n.text("Permissions", zh: "权限设置"))
                 .font(.system(size: 16, weight: .bold))
 
             VStack(spacing: 0) {
                 PermissionRow(
                     symbol: "rectangle.dashed.badge.record",
                     tint: .blue,
-                    title: "Screen Recording",
-                    detail: "Capture displays & pixels",
+                    title: CCXL10n.text("Screen Recording", zh: "屏幕录制"),
+                    detail: CCXL10n.text("Capture displays & pixels", zh: "用于截屏、取色与录屏"),
                     granted: model.status.screenRecording,
                     prominentAction: true,
                     isDisabled: model.isCheckingScreenRecording
@@ -591,8 +594,8 @@ private struct PermissionsStepView: View {
                 PermissionRow(
                     symbol: "accessibility",
                     tint: .indigo,
-                    title: "Accessibility",
-                    detail: "Detect UI elements",
+                    title: CCXL10n.text("Accessibility", zh: "辅助功能"),
+                    detail: CCXL10n.text("Detect UI elements", zh: "自动识别窗口与界面元素"),
                     granted: model.status.accessibility,
                     prominentAction: false,
                     isDisabled: false
@@ -652,13 +655,13 @@ private struct PermissionRow: View {
             if granted {
                 PermissionGrantedPill()
             } else if prominentAction {
-                Button("Allow", action: onAllow)
+                Button(CCXL10n.text("Allow", zh: "授权"), action: onAllow)
                     .buttonStyle(.borderedProminent)
                     .controlSize(.small)
                     .disabled(isDisabled)
                     .fixedSize()
             } else {
-                Button("Allow", action: onAllow)
+                Button(CCXL10n.text("Allow", zh: "授权"), action: onAllow)
                     .buttonStyle(.bordered)
                     .controlSize(.small)
                     .disabled(isDisabled)
@@ -672,7 +675,7 @@ private struct PermissionRow: View {
 
 private struct PermissionGrantedPill: View {
     var body: some View {
-        Label("Granted", systemImage: "checkmark.circle.fill")
+        Label(CCXL10n.text("Granted", zh: "已授权"), systemImage: "checkmark.circle.fill")
             .font(.system(size: 11, weight: .semibold))
             .foregroundStyle(.green)
             .padding(.horizontal, 8)
@@ -689,7 +692,10 @@ private struct ScreenRecordingHintStrip: View {
 
     var body: some View {
         HStack(spacing: 8) {
-            Text("Enable CCX in Settings, then relaunch.")
+            Text(CCXL10n.text(
+                "Enable CCX in Settings, then relaunch.",
+                zh: "请在系统设置中启用 CCX 后重启"
+            ))
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
@@ -697,14 +703,17 @@ private struct ScreenRecordingHintStrip: View {
 
             Spacer(minLength: 6)
 
-            Button(isVerifying ? "Checking…" : "Verify", action: onVerify)
+            Button(
+                isVerifying ? CCXL10n.text("Checking…", zh: "验证中…") : CCXL10n.text("Verify", zh: "验证"),
+                action: onVerify
+            )
                 .buttonStyle(.bordered)
                 .controlSize(.small)
                 .disabled(isVerifying)
                 .fixedSize()
 
             if showRelaunch {
-                Button("Relaunch") {
+                Button(CCXL10n.text("Relaunch", zh: "重启")) {
                     AppRelauncher.relaunch()
                 }
                 .buttonStyle(.borderedProminent)
@@ -732,7 +741,7 @@ private struct ReadyStepView: View {
                     .font(.system(size: 16, weight: .semibold))
                     .foregroundStyle(.green)
 
-                Text("All Set")
+                Text(CCXL10n.text("All Set", zh: "准备就绪"))
                     .font(.system(size: 16, weight: .bold))
             }
 
@@ -740,21 +749,21 @@ private struct ReadyStepView: View {
                 GuideActionRow(
                     symbol: "viewfinder",
                     tint: .blue,
-                    title: "Smart Snip",
+                    title: CCXL10n.text("Smart Snip", zh: "智能截屏"),
                     trailing: { KeycapComboView(combo: flow.snipCombo) }
                 )
                 Divider().padding(.leading, 40)
                 GuideActionRow(
                     symbol: "pin.fill",
                     tint: .indigo,
-                    title: "Paste as Pin",
-                    trailing: { InteractionPillView(text: "Menu Bar · Pin") }
+                    title: CCXL10n.text("Paste as Pin", zh: "粘贴为贴图"),
+                    trailing: { InteractionPillView(text: CCXL10n.text("Menu Bar · Pin", zh: "菜单栏 · 贴图")) }
                 )
                 Divider().padding(.leading, 40)
                 GuideActionRow(
                     symbol: "text.viewfinder",
                     tint: .cyan,
-                    title: "Annotate, OCR & Record",
+                    title: CCXL10n.text("Annotate, OCR & Record", zh: "标注、OCR 与录屏"),
                     trailing: { InteractionPillView(text: "1–8 · T · R") }
                 )
             }
@@ -850,7 +859,7 @@ private struct OnboardingFooterBar: View {
         ZStack {
             HStack(spacing: 10) {
                 if flow.step != .welcome {
-                    Button("Back") {
+                    Button(CCXL10n.text("Back", zh: "上一步")) {
                         withAnimation(OnboardingFlowState.springAnimation) {
                             flow.goPrevious()
                         }
@@ -865,7 +874,7 @@ private struct OnboardingFooterBar: View {
                 HStack(spacing: 8) {
                     switch flow.step {
                     case .welcome:
-                        Button("Get Started") {
+                        Button(CCXL10n.text("Get Started", zh: "开始使用")) {
                             withAnimation(OnboardingFlowState.springAnimation) {
                                 flow.step = .permissions
                             }
@@ -876,13 +885,13 @@ private struct OnboardingFooterBar: View {
 
                     case .permissions:
                         if !model.status.screenRecording && flow.requestedScreenRecording {
-                            Button("Relaunch") {
+                            Button(CCXL10n.text("Relaunch", zh: "重启")) {
                                 AppRelauncher.relaunch()
                             }
                             .buttonStyle(.borderedProminent)
                             .fixedSize()
                         } else if model.status.screenRecording {
-                            Button("Continue") {
+                            Button(CCXL10n.text("Continue", zh: "下一步")) {
                                 withAnimation(OnboardingFlowState.springAnimation) {
                                     flow.step = .ready
                                 }
@@ -891,7 +900,7 @@ private struct OnboardingFooterBar: View {
                             .keyboardShortcut(.defaultAction)
                             .fixedSize()
                         } else {
-                            Button("Continue") {
+                            Button(CCXL10n.text("Continue", zh: "下一步")) {
                                 withAnimation(OnboardingFlowState.springAnimation) {
                                     flow.step = .ready
                                 }
@@ -901,11 +910,11 @@ private struct OnboardingFooterBar: View {
                         }
 
                     case .ready:
-                        Button("Done", action: onDone)
+                        Button(CCXL10n.text("Done", zh: "完成"), action: onDone)
                             .buttonStyle(.bordered)
                             .fixedSize()
 
-                        Button("Try Snip", action: onTrySnip)
+                        Button(CCXL10n.text("Try Snip", zh: "立即截屏"), action: onTrySnip)
                             .buttonStyle(.borderedProminent)
                             .keyboardShortcut(.defaultAction)
                             .fixedSize()
@@ -925,7 +934,7 @@ private struct OnboardingFooterBar: View {
                             .frame(width: flow.step == step ? 20 : 7, height: 7)
                     }
                     .buttonStyle(.plain)
-                    .accessibilityLabel("Step \(step.rawValue + 1)")
+                    .accessibilityLabel(CCXL10n.text("Step \(step.rawValue + 1)", zh: "第 \(step.rawValue + 1) 步"))
                 }
             }
         }
@@ -974,7 +983,7 @@ struct PermissionBadge: View {
 
     var body: some View {
         Label(
-            granted ? "Granted" : "Not Granted",
+            granted ? CCXL10n.text("Granted", zh: "已授权") : CCXL10n.text("Not Granted", zh: "未授权"),
             systemImage: granted ? "checkmark.circle.fill" : "exclamationmark.triangle.fill"
         )
         .labelStyle(.titleAndIcon)

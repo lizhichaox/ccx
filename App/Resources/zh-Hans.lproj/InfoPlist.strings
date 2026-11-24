@@ -1,0 +1,4 @@
+"NSScreenCaptureUsageDescription" = "CCX 需要录制屏幕以进行截屏、悬浮贴图和录屏。";
+"NSAudioCaptureUsageDescription" = "在录屏中开启系统音频时，CCX 需要录制系统音频。";
+"NSMicrophoneUsageDescription" = "在录屏中开启语音旁白时，CCX 需要使用麦克风。";
+"NSHumanReadableCopyright" = "版权所有 © 2026 Zhichao Li。保留所有权利。";

@@ -209,7 +209,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         hosting.safeAreaRegions = []
         hosting.sizingOptions = [.intrinsicContentSize]
         let window = DismissibleWindow(contentViewController: hosting)
-        window.title = "CCX Settings"
+        window.title = CCXL10n.text("CCX Settings", zh: "CCX 设置")
         window.titleVisibility = .hidden
         window.titlebarAppearsTransparent = true
         window.isMovableByWindowBackground = true
@@ -504,7 +504,7 @@ private struct SettingsView: View {
                         PermissionSettingRow(
                             symbol: "accessibility",
                             tint: .indigo,
-                            title: "Accessibility",
+                            title: CCXL10n.text("Accessibility", zh: "辅助功能"),
                             granted: permissions.status.accessibility,
                             openAction: permissions.openAccessibilitySettings
                         )
@@ -512,7 +512,7 @@ private struct SettingsView: View {
                         PermissionSettingRow(
                             symbol: "mic.fill",
                             tint: .pink,
-                            title: "Microphone",
+                            title: CCXL10n.text("Microphone", zh: "麦克风"),
                             granted: permissions.status.microphone,
                             openAction: permissions.openMicrophoneSettings
                         )
@@ -524,7 +524,7 @@ private struct SettingsView: View {
                     Button {
                         onOpenGuide()
                     } label: {
-                        Label("Setup Guide", systemImage: "book.closed")
+                        Label(CCXL10n.text("Setup Guide", zh: "使用指南"), systemImage: "book.closed")
                             .font(.system(size: 11.5, weight: .medium))
                             .frame(maxWidth: .infinity)
                     }
@@ -534,7 +534,7 @@ private struct SettingsView: View {
                     Button {
                         onClearHistory()
                     } label: {
-                        Label("Clear Snip History", systemImage: "trash")
+                        Label(CCXL10n.text("Clear Snip History", zh: "清空记录"), systemImage: "trash")
                             .font(.system(size: 11.5, weight: .medium))
                             .frame(maxWidth: .infinity)
                     }
@@ -575,7 +575,10 @@ private struct SettingsFooter: View {
 
     var body: some View {
         VStack(spacing: 3) {
-            Text("Local captures & OCR · Zero telemetry")
+            Text(CCXL10n.text(
+                "Local captures & OCR · Zero telemetry",
+                zh: "本地截屏与 OCR · 零遥测"
+            ))
                 .font(.system(size: 10.5))
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
@@ -691,9 +694,9 @@ private struct SnipShortcutRow: View {
         if liveModifiers.contains(.shift) { parts.append("⇧") }
         if liveModifiers.contains(.command) { parts.append("⌘") }
         if parts.isEmpty {
-            return "Press Keys"
+            return CCXL10n.text("Press Keys", zh: "按下快捷键")
         }
-        return parts.joined(separator: " ") + " + Key"
+        return parts.joined(separator: " ") + CCXL10n.text(" + Key", zh: " + 按键")
     }
 
     var body: some View {
@@ -701,7 +704,7 @@ private struct SnipShortcutRow: View {
             SettingsRow(
                 symbol: "viewfinder",
                 tint: iconTint,
-                title: "Snip Shortcut"
+                title: CCXL10n.text("Snip Shortcut", zh: "截屏快捷键")
             ) {
                 if isRecording {
                     HStack(spacing: 5) {
@@ -737,8 +740,8 @@ private struct SnipShortcutRow: View {
                                 .contentShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
                         }
                         .buttonStyle(.plain)
-                        .help("Cancel recording (Esc)")
-                        .accessibilityLabel("Cancel shortcut recording")
+                        .help(CCXL10n.text("Cancel recording (Esc)", zh: "取消录制 (Esc)"))
+                        .accessibilityLabel(CCXL10n.text("Cancel shortcut recording", zh: "取消录制快捷键"))
                         .onHover { isHoveringCancel = $0 }
                     }
                 } else {
@@ -760,8 +763,11 @@ private struct SnipShortcutRow: View {
                                     .contentShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
                             }
                             .buttonStyle(.plain)
-                            .help("Reset to default (\(HotKeyCombo.defaultSnip.displayString))")
-                            .accessibilityLabel("Reset shortcut to default")
+                            .help(CCXL10n.text(
+                                "Reset to default (\(HotKeyCombo.defaultSnip.displayString))",
+                                zh: "恢复默认快捷键 (\(HotKeyCombo.defaultSnip.displayString))"
+                            ))
+                            .accessibilityLabel(CCXL10n.text("Reset shortcut to default", zh: "恢复默认快捷键"))
                             .onHover { isHoveringReset = $0 }
                         }
 
@@ -782,8 +788,11 @@ private struct SnipShortcutRow: View {
                                 .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
                         }
                         .buttonStyle(.plain)
-                        .help("Click to customize shortcut")
-                        .accessibilityLabel("Snip shortcut \(combo.displayString). Click to customize.")
+                        .help(CCXL10n.text("Click to customize shortcut", zh: "点击自定义快捷键"))
+                        .accessibilityLabel(CCXL10n.text(
+                            "Snip shortcut \(combo.displayString). Click to customize.",
+                            zh: "截屏快捷键 \(combo.displayString)，点击自定义"
+                        ))
                         .onHover { isHoveringKeycaps = $0 }
                     }
                 }
@@ -799,7 +808,10 @@ private struct SnipShortcutRow: View {
                     .padding(.trailing, 10)
                     .padding(.bottom, 7)
             } else if isRecording {
-                Text("Press keys, or Esc to cancel.")
+                Text(CCXL10n.text(
+                    "Press keys, or Esc to cancel.",
+                    zh: "按下新快捷键，或按 Esc 取消"
+                ))
                     .font(.system(size: 10.5))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
@@ -809,13 +821,16 @@ private struct SnipShortcutRow: View {
                     .padding(.bottom, 7)
             } else if !isRegistered {
                 HStack(spacing: 6) {
-                    Text("\(combo.displayString) in use by another app.")
+                    Text(CCXL10n.text(
+                        "\(combo.displayString) in use by another app.",
+                        zh: "\(combo.displayString) 已被其他应用占用"
+                    ))
                         .font(.system(size: 10.5))
                         .foregroundStyle(.orange)
                         .lineLimit(1)
                         .fixedSize(horizontal: false, vertical: true)
                     Spacer(minLength: 4)
-                    Button("Retry", action: onRetry)
+                    Button(CCXL10n.text("Retry", zh: "重试"), action: onRetry)
                         .buttonStyle(.bordered)
                         .controlSize(.mini)
                         .fixedSize()
@@ -843,10 +858,10 @@ private struct LaunchAtLoginRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            SettingsRow(symbol: "power", tint: .teal, title: "Launch at Login") {
+            SettingsRow(symbol: "power", tint: .teal, title: CCXL10n.text("Launch at Login", zh: "开机自启")) {
                 HStack(spacing: 6) {
                     if serviceStatus == .requiresApproval {
-                        Button("Approve") {
+                        Button(CCXL10n.text("Approve", zh: "批准")) {
                             SMAppService.openSystemSettingsLoginItems()
                         }
                         .buttonStyle(.bordered)
@@ -861,7 +876,10 @@ private struct LaunchAtLoginRow: View {
             }
 
             if serviceStatus == .requiresApproval {
-                Text("Approve in System Settings → Login Items.")
+                Text(CCXL10n.text(
+                    "Approve in System Settings → Login Items.",
+                    zh: "请在系统设置 → 登录项中批准"
+                ))
                     .font(.system(size: 10.5))
                     .foregroundStyle(.orange)
                     .lineLimit(1)
@@ -906,7 +924,10 @@ private struct LaunchAtLoginRow: View {
             serviceStatus = SMAppService.mainApp.status
         } catch {
             serviceStatus = SMAppService.mainApp.status
-            errorMessage = "Couldn't update Launch at Login."
+            errorMessage = CCXL10n.text(
+                "Couldn't update Launch at Login.",
+                zh: "无法更新开机自启设置"
+            )
         }
     }
 }
@@ -925,7 +946,7 @@ private struct RecordingsFolderRow: View {
                 .background(Color.orange.opacity(0.14), in: RoundedRectangle(cornerRadius: 6.5, style: .continuous))
 
             VStack(alignment: .leading, spacing: 1.5) {
-                Text("Recordings")
+                Text(CCXL10n.text("Recordings", zh: "录屏目录"))
                     .font(.system(size: 12.5, weight: .medium))
                     .lineLimit(1)
 
@@ -938,11 +959,11 @@ private struct RecordingsFolderRow: View {
             .frame(maxWidth: .infinity, alignment: .leading)
 
             HStack(spacing: 6) {
-                Button("Choose…", action: onChoose)
+                Button(CCXL10n.text("Choose…", zh: "选择…"), action: onChoose)
                     .buttonStyle(.bordered)
                     .controlSize(.small)
                     .fixedSize()
-                Button("Open", action: onOpen)
+                Button(CCXL10n.text("Open", zh: "打开"), action: onOpen)
                     .buttonStyle(.bordered)
                     .controlSize(.small)
                     .fixedSize()
@@ -950,7 +971,7 @@ private struct RecordingsFolderRow: View {
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 7.5)
-        .help("Default recordings folder: \(folderPath)")
+        .help(CCXL10n.text("Default recordings folder: \(folderPath)", zh: "默认录屏目录：\(folderPath)"))
     }
 }
 
@@ -967,21 +988,27 @@ private struct UpdatesSettingRow: View {
     private var statusSubtitle: String {
         switch updateManager.state {
         case .idle:
-            return updateManager.automaticallyChecksForUpdates ? "Automatic" : "Manual"
+            return updateManager.automaticallyChecksForUpdates
+                ? CCXL10n.text("Automatic", zh: "自动检查")
+                : CCXL10n.text("Manual", zh: "手动检查")
         case .checking:
-            return "Checking…"
+            return CCXL10n.text("Checking…", zh: "检查中…")
         case .upToDate:
-            return "Up to date"
+            return CCXL10n.text("Up to date", zh: "已是最新")
         case .available(let release):
-            return "v\(release.version.description) available"
+            return CCXL10n.text(
+                "v\(release.version.description) available",
+                zh: "有新版本 v\(release.version.description)"
+            )
         case .downloading(_, let progress):
-            return "Downloading \(Int((progress * 100).rounded()))%"
+            let pct = Int((progress * 100).rounded())
+            return CCXL10n.text("Downloading \(pct)%", zh: "下载中 \(pct)%")
         case .verifying:
-            return "Verifying…"
+            return CCXL10n.text("Verifying…", zh: "校验中…")
         case .installing:
-            return "Installing…"
+            return CCXL10n.text("Installing…", zh: "安装中…")
         case .failed:
-            return "Update failed"
+            return CCXL10n.text("Update failed", zh: "更新失败")
         }
     }
 
@@ -1006,7 +1033,7 @@ private struct UpdatesSettingRow: View {
                     .background(iconTint.opacity(0.14), in: RoundedRectangle(cornerRadius: 6.5, style: .continuous))
 
                 VStack(alignment: .leading, spacing: 1.5) {
-                    Text("Updates")
+                    Text(CCXL10n.text("Updates", zh: "更新"))
                         .font(.system(size: 12.5, weight: .medium))
                         .lineLimit(1)
 
@@ -1028,7 +1055,7 @@ private struct UpdatesSettingRow: View {
                     Button {
                         NSWorkspace.shared.open(release.releaseURL)
                     } label: {
-                        Text("Release Notes ↗")
+                        Text(CCXL10n.text("Release Notes ↗", zh: "更新日志 ↗"))
                             .font(.system(size: 10.5, weight: .medium))
                             .foregroundStyle(Color.accentColor)
                             .lineLimit(1)
@@ -1053,7 +1080,7 @@ private struct UpdatesSettingRow: View {
                     Button {
                         NSWorkspace.shared.open(release?.releaseURL ?? AppUpdateURLPolicy.releasesPageURL)
                     } label: {
-                        Text("Open GitHub ↗")
+                        Text(CCXL10n.text("Open GitHub ↗", zh: "前往 GitHub ↗"))
                             .font(.system(size: 10.5, weight: .medium))
                             .foregroundStyle(Color.accentColor)
                             .lineLimit(1)
@@ -1077,7 +1104,7 @@ private struct UpdatesSettingRow: View {
         switch updateManager.state {
         case .idle, .upToDate:
             HStack(spacing: 6) {
-                Button("Check") {
+                Button(CCXL10n.text("Check", zh: "检查")) {
                     updateManager.checkForUpdates(userInitiated: true)
                 }
                 .buttonStyle(.bordered)
@@ -1088,7 +1115,7 @@ private struct UpdatesSettingRow: View {
 
         case .checking:
             HStack(spacing: 6) {
-                Button("Checking…") {}
+                Button(CCXL10n.text("Checking…", zh: "检查中…")) {}
                     .buttonStyle(.bordered)
                     .controlSize(.small)
                     .disabled(true)
@@ -1098,7 +1125,7 @@ private struct UpdatesSettingRow: View {
 
         case .available:
             HStack(spacing: 6) {
-                Button("Update") {
+                Button(CCXL10n.text("Update", zh: "更新")) {
                     updateManager.installAvailableUpdate()
                 }
                 .buttonStyle(.borderedProminent)
@@ -1112,7 +1139,7 @@ private struct UpdatesSettingRow: View {
                 ProgressView(value: progress)
                     .progressViewStyle(.linear)
                     .frame(width: 66)
-                Button("Cancel") {
+                Button(CCXL10n.text("Cancel", zh: "取消")) {
                     updateManager.cancelDownload()
                 }
                 .buttonStyle(.bordered)
@@ -1126,7 +1153,7 @@ private struct UpdatesSettingRow: View {
 
         case .failed(_, let release):
             HStack(spacing: 6) {
-                Button("Retry") {
+                Button(CCXL10n.text("Retry", zh: "重试")) {
                     if release != nil {
                         updateManager.installAvailableUpdate()
                     } else {
@@ -1146,7 +1173,7 @@ private struct UpdatesSettingRow: View {
             .labelsHidden()
             .toggleStyle(.switch)
             .controlSize(.small)
-            .help("Automatically check for updates daily")
+            .help(CCXL10n.text("Automatically check for updates daily", zh: "每天自动检查更新"))
     }
 }
 
@@ -1163,11 +1190,11 @@ private struct ScreenRecordingSettingRow: View {
             SettingsRow(
                 symbol: "rectangle.dashed.badge.record",
                 tint: granted ? .green : .orange,
-                title: "Screen Recording"
+                title: CCXL10n.text("Screen Recording", zh: "屏幕录制")
             ) {
                 HStack(spacing: 6) {
                     PermissionBadge(granted: granted)
-                    Button("Open", action: onOpen)
+                    Button(CCXL10n.text("Open", zh: "打开"), action: onOpen)
                         .buttonStyle(.bordered)
                         .controlSize(.small)
                         .fixedSize()
@@ -1176,19 +1203,26 @@ private struct ScreenRecordingSettingRow: View {
 
             if !granted {
                 HStack(spacing: 6) {
-                    Text(showRelaunch ? "Relaunch CCX after enabling." : "Already enabled?")
+                    Text(
+                        showRelaunch
+                            ? CCXL10n.text("Relaunch CCX after enabling.", zh: "授权后请重启 CCX")
+                            : CCXL10n.text("Already enabled?", zh: "已开启权限？")
+                    )
                         .font(.system(size: 10.5))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .fixedSize(horizontal: false, vertical: true)
                     Spacer(minLength: 4)
-                    Button(isChecking ? "Checking…" : "Verify", action: onVerify)
+                    Button(
+                        isChecking ? CCXL10n.text("Checking…", zh: "验证中…") : CCXL10n.text("Verify", zh: "验证"),
+                        action: onVerify
+                    )
                         .buttonStyle(.bordered)
                         .controlSize(.mini)
                         .disabled(isChecking)
                         .fixedSize()
                     if showRelaunch {
-                        Button("Relaunch", action: onRelaunch)
+                        Button(CCXL10n.text("Relaunch", zh: "重启"), action: onRelaunch)
                             .buttonStyle(.borderedProminent)
                             .controlSize(.mini)
                             .fixedSize()
@@ -1213,7 +1247,7 @@ private struct PermissionSettingRow: View {
         SettingsRow(symbol: symbol, tint: granted ? .green : tint, title: title) {
             HStack(spacing: 6) {
                 PermissionBadge(granted: granted)
-                Button("Open", action: openAction)
+                Button(CCXL10n.text("Open", zh: "打开"), action: openAction)
                     .buttonStyle(.bordered)
                     .controlSize(.small)
                     .fixedSize()
@@ -1254,7 +1288,7 @@ enum AppVersion {
     }
 
     static var display: String {
-        "Version \(shortDisplay)"
+        CCXL10n.text("Version \(shortDisplay)", zh: "版本 \(shortDisplay)")
     }
 }
 
