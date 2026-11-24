@@ -40,6 +40,10 @@ private final class MockAppUpdateTransport: AppUpdateTransport, @unchecked Senda
         lock.withLock { fetchedURLs.count }
     }
 
+    var downloadCount: Int {
+        lock.withLock { downloadedURLs.count }
+    }
+
     func fetchData(from url: URL, maxBytes: Int, userAgent: String) async throws -> Data {
         let outcome: FetchOutcome? = lock.withLock {
             fetchedURLs.append(url)
@@ -597,6 +601,7 @@ final class AppUpdaterTests: XCTestCase {
 
         let verifiedBox = AtomicBox<Bool>(false)
         let installedBox = AtomicBox<Bool>(false)
+        let relaunchBox = AtomicBox<Bool?>(nil)
         let canTerminateBox = AtomicBox<Bool>(false)
         let blockedCountBox = AtomicBox<Int>(0)
         let terminatedCountBox = AtomicBox<Int>(0)
@@ -619,14 +624,16 @@ final class AppUpdaterTests: XCTestCase {
                 XCTAssertEqual(teamID, "TESTTEAM01")
                 verifiedBox.value = true
             },
-            installHandler: { _, targetURL, _ in
+            installHandler: { _, targetURL, _, relaunch in
                 XCTAssertEqual(targetURL.path, fakeInstalledApp.path)
                 installedBox.value = true
+                relaunchBox.value = relaunch
             },
             canTerminateNow: { canTerminateBox.value },
             onBlockedByActiveSession: { blockedCountBox.value += 1 },
             terminateHandler: { terminatedCountBox.value += 1 }
         )
+        manager.automaticallyChecksForUpdates = false
 
         manager.checkForUpdates(userInitiated: true)
         await manager.waitForActiveTask()
@@ -652,6 +659,7 @@ final class AppUpdaterTests: XCTestCase {
 
         XCTAssertTrue(verifiedBox.value)
         XCTAssertTrue(installedBox.value)
+        XCTAssertEqual(relaunchBox.value, true)
         XCTAssertEqual(terminatedCountBox.value, 1)
     }
 
@@ -740,6 +748,7 @@ final class AppUpdaterTests: XCTestCase {
                 reportedErrors.value.append(message)
             }
         )
+        manager.automaticallyChecksForUpdates = false
 
         manager.checkForUpdates(userInitiated: true)
         await manager.waitForActiveTask()
@@ -887,6 +896,557 @@ final class AppUpdaterTests: XCTestCase {
         XCTAssertEqual(enMessages.count, zhMessages.count)
         for (en, zh) in zip(enMessages, zhMessages) {
             XCTAssertNotEqual(en, zh, "Expected Simplified Chinese localization distinct from English for '\(en)'")
+        }
+    }
+
+    // MARK: 9. Seamless Background Pre-Download & Silent Idle/Quit Installation
+
+    private func makePreDownloadFixtures() throws -> (
+        fakeInstalledApp: URL,
+        transport: MockAppUpdateTransport
+    ) {
+        let dir = try makeTempDirectory()
+        let fakeInstalledApp = dir.appendingPathComponent("CCX.app", isDirectory: true)
+        try FileManager.default.createDirectory(at: fakeInstalledApp, withIntermediateDirectories: true)
+
+        let zipBytes = Data("mock-ccx-0.5.0-universal-archive".utf8)
+        let zipSHA256 = SHA256.hash(data: zipBytes).map { String(format: "%02x", $0) }.joined()
+        let checksumsData = Data("\(zipSHA256)  CCX-0.5.0-macOS-universal.zip\n".utf8)
+
+        let transport = MockAppUpdateTransport()
+        transport.stubFetch(
+            url: AppUpdateURLPolicy.latestReleaseAPIURL,
+            outcome: .data(try makeReleaseJSON(tagName: "v0.5.0"))
+        )
+        transport.stubFetch(
+            url: URL(string: "https://github.com/lizhichaox/ccx/releases/download/v0.5.0/SHA256SUMS.txt")!,
+            outcome: .data(checksumsData)
+        )
+        transport.stubDownload(
+            url: URL(string: "https://github.com/lizhichaox/ccx/releases/download/v0.5.0/CCX-0.5.0-macOS-universal.zip")!,
+            outcome: .data(zipBytes, progressSteps: [0.3, 0.8])
+        )
+        return (fakeInstalledApp, transport)
+    }
+
+    @MainActor
+    func testAutoCheckPreDownloadsAndVerifiesIntoReadyToInstall() async throws {
+        let (fakeInstalledApp, transport) = try makePreDownloadFixtures()
+        let verifyCount = AtomicBox<Int>(0)
+        let installCount = AtomicBox<Int>(0)
+        let terminateCount = AtomicBox<Int>(0)
+
+        let manager = AppUpdateManager(
+            userDefaults: makeTestUserDefaults(),
+            currentVersion: AppSemanticVersion(major: 0, minor: 4, patch: 4),
+            currentBundleID: "com.lizhichaox.ccx",
+            currentBundleURL: fakeInstalledApp,
+            currentTeamIDProvider: { "TESTTEAM01" },
+            transport: transport,
+            checkInterval: 86_400,
+            idleInstallDebounceInterval: 0.05,
+            extractHandler: { _, destinationDir in
+                let extracted = destinationDir.appendingPathComponent("CCX.app", isDirectory: true)
+                try FileManager.default.createDirectory(at: extracted, withIntermediateDirectories: true)
+                return extracted
+            },
+            verifyHandler: { _, _, _, _ in
+                verifyCount.value += 1
+            },
+            installHandler: { _, _, _, _ in
+                installCount.value += 1
+            },
+            canTerminateNow: { true },
+            canInstallSilentlyNow: { false },
+            terminateHandler: { terminateCount.value += 1 }
+        )
+
+        XCTAssertTrue(manager.automaticallyChecksForUpdates)
+        let t0 = Date(timeIntervalSince1970: 1_700_000_000)
+        manager.checkForUpdatesInBackgroundIfDue(now: t0)
+        await manager.waitForActiveTask()
+
+        guard case .readyToInstall(let release) = manager.state else {
+            return XCTFail("Expected .readyToInstall after automatic pre-download, got \(manager.state)")
+        }
+        XCTAssertEqual(release.version, AppSemanticVersion(major: 0, minor: 5, patch: 0))
+        XCTAssertEqual(manager.availableRelease?.version, release.version)
+        XCTAssertTrue(manager.shouldShowPopoverBanner)
+        XCTAssertFalse(manager.isBusy)
+        XCTAssertEqual(verifyCount.value, 1)
+        XCTAssertEqual(installCount.value, 0)
+        XCTAssertEqual(terminateCount.value, 0)
+        XCTAssertEqual(transport.fetchCount, 2) // latest release + SHA256SUMS.txt
+        XCTAssertEqual(transport.downloadCount, 1)
+
+        // Subsequent periodic background check does not disrupt .readyToInstall or re-download
+        manager.checkForUpdatesInBackgroundIfDue(now: t0.addingTimeInterval(100_000))
+        await manager.waitForActiveTask()
+        XCTAssertEqual(transport.fetchCount, 2)
+        XCTAssertEqual(transport.downloadCount, 1)
+        if case .readyToInstall = manager.state {
+            // expected
+        } else {
+            XCTFail("Expected .readyToInstall to remain intact, got \(manager.state)")
+        }
+    }
+
+    @MainActor
+    func testBusyStateStaysInReadyToInstallWithoutTerminating() async throws {
+        let (fakeInstalledApp, transport) = try makePreDownloadFixtures()
+        let installCount = AtomicBox<Int>(0)
+        let terminateCount = AtomicBox<Int>(0)
+
+        let manager = AppUpdateManager(
+            userDefaults: makeTestUserDefaults(),
+            currentVersion: AppSemanticVersion(major: 0, minor: 4, patch: 4),
+            currentBundleID: "com.lizhichaox.ccx",
+            currentBundleURL: fakeInstalledApp,
+            currentTeamIDProvider: { "TESTTEAM01" },
+            transport: transport,
+            idleInstallDebounceInterval: 0.02,
+            extractHandler: { _, destinationDir in
+                let extracted = destinationDir.appendingPathComponent("CCX.app", isDirectory: true)
+                try FileManager.default.createDirectory(at: extracted, withIntermediateDirectories: true)
+                return extracted
+            },
+            verifyHandler: { _, _, _, _ in },
+            installHandler: { _, _, _, _ in installCount.value += 1 },
+            canTerminateNow: { true },
+            canInstallSilentlyNow: { false },
+            terminateHandler: { terminateCount.value += 1 }
+        )
+
+        manager.checkForUpdatesInBackgroundIfDue(now: Date())
+        await manager.waitForActiveTask()
+
+        manager.notifyActivityStateChanged()
+        try await Task.sleep(for: .milliseconds(80))
+        await manager.waitForIdleInstallTask()
+
+        if case .readyToInstall = manager.state {
+            // expected
+        } else {
+            XCTFail("Expected .readyToInstall while busy, got \(manager.state)")
+        }
+        XCTAssertEqual(installCount.value, 0)
+        XCTAssertEqual(terminateCount.value, 0)
+    }
+
+    @MainActor
+    func testTransitionToIdleTriggersSilentInstallAfterDebounce() async throws {
+        let (fakeInstalledApp, transport) = try makePreDownloadFixtures()
+        let canInstallSilently = AtomicBox<Bool>(false)
+        let verifyCount = AtomicBox<Int>(0)
+        let relaunchFlags = AtomicBox<[Bool]>([])
+        let terminateCount = AtomicBox<Int>(0)
+
+        let manager = AppUpdateManager(
+            userDefaults: makeTestUserDefaults(),
+            currentVersion: AppSemanticVersion(major: 0, minor: 4, patch: 4),
+            currentBundleID: "com.lizhichaox.ccx",
+            currentBundleURL: fakeInstalledApp,
+            currentTeamIDProvider: { "TESTTEAM01" },
+            transport: transport,
+            idleInstallDebounceInterval: 0.06,
+            extractHandler: { _, destinationDir in
+                let extracted = destinationDir.appendingPathComponent("CCX.app", isDirectory: true)
+                try FileManager.default.createDirectory(at: extracted, withIntermediateDirectories: true)
+                return extracted
+            },
+            verifyHandler: { _, _, _, _ in
+                verifyCount.value += 1
+            },
+            installHandler: { _, targetURL, _, relaunch in
+                XCTAssertEqual(targetURL.path, fakeInstalledApp.path)
+                relaunchFlags.value.append(relaunch)
+            },
+            canTerminateNow: { true },
+            canInstallSilentlyNow: { canInstallSilently.value },
+            terminateHandler: { terminateCount.value += 1 }
+        )
+
+        manager.checkForUpdatesInBackgroundIfDue(now: Date())
+        await manager.waitForActiveTask()
+        XCTAssertEqual(verifyCount.value, 1)
+        XCTAssertEqual(relaunchFlags.value, [])
+
+        // Transition to idle -> schedules debounce, re-verifies signature, installs with relaunch: true
+        canInstallSilently.value = true
+        manager.notifyActivityStateChanged()
+        await manager.waitForIdleInstallTask()
+
+        XCTAssertEqual(verifyCount.value, 2)
+        XCTAssertEqual(relaunchFlags.value, [true])
+        XCTAssertEqual(terminateCount.value, 1)
+        if case .installing = manager.state {
+            // expected
+        } else {
+            XCTFail("Expected .installing after silent idle install, got \(manager.state)")
+        }
+    }
+
+    @MainActor
+    func testActivityResumingBeforeDebounceCancelsSilentInstall() async throws {
+        let (fakeInstalledApp, transport) = try makePreDownloadFixtures()
+        let canInstallSilently = AtomicBox<Bool>(false)
+        let installCount = AtomicBox<Int>(0)
+        let terminateCount = AtomicBox<Int>(0)
+
+        let manager = AppUpdateManager(
+            userDefaults: makeTestUserDefaults(),
+            currentVersion: AppSemanticVersion(major: 0, minor: 4, patch: 4),
+            currentBundleID: "com.lizhichaox.ccx",
+            currentBundleURL: fakeInstalledApp,
+            currentTeamIDProvider: { "TESTTEAM01" },
+            transport: transport,
+            idleInstallDebounceInterval: 0.25,
+            extractHandler: { _, destinationDir in
+                let extracted = destinationDir.appendingPathComponent("CCX.app", isDirectory: true)
+                try FileManager.default.createDirectory(at: extracted, withIntermediateDirectories: true)
+                return extracted
+            },
+            verifyHandler: { _, _, _, _ in },
+            installHandler: { _, _, _, _ in installCount.value += 1 },
+            canTerminateNow: { true },
+            canInstallSilentlyNow: { canInstallSilently.value },
+            terminateHandler: { terminateCount.value += 1 }
+        )
+
+        manager.checkForUpdatesInBackgroundIfDue(now: Date())
+        await manager.waitForActiveTask()
+
+        // Become idle briefly, then resume activity before 250ms debounce elapses
+        canInstallSilently.value = true
+        manager.notifyActivityStateChanged()
+        try await Task.sleep(for: .milliseconds(40))
+        canInstallSilently.value = false
+        manager.notifyActivityStateChanged()
+
+        // Wait past the original debounce window
+        try await Task.sleep(for: .milliseconds(320))
+        await manager.waitForIdleInstallTask()
+
+        XCTAssertEqual(installCount.value, 0)
+        XCTAssertEqual(terminateCount.value, 0)
+        if case .readyToInstall = manager.state {
+            // expected
+        } else {
+            XCTFail("Expected .readyToInstall after debounce cancellation, got \(manager.state)")
+        }
+    }
+
+    @MainActor
+    func testApplyPreparedUpdateOnQuitInstallsWithoutRelaunchAndRespectsGuards() async throws {
+        let (fakeInstalledApp, transport) = try makePreDownloadFixtures()
+        let verifyCount = AtomicBox<Int>(0)
+        let relaunchFlags = AtomicBox<[Bool]>([])
+
+        let manager = AppUpdateManager(
+            userDefaults: makeTestUserDefaults(),
+            currentVersion: AppSemanticVersion(major: 0, minor: 4, patch: 4),
+            currentBundleID: "com.lizhichaox.ccx",
+            currentBundleURL: fakeInstalledApp,
+            currentTeamIDProvider: { "TESTTEAM01" },
+            transport: transport,
+            extractHandler: { _, destinationDir in
+                let extracted = destinationDir.appendingPathComponent("CCX.app", isDirectory: true)
+                try FileManager.default.createDirectory(at: extracted, withIntermediateDirectories: true)
+                return extracted
+            },
+            verifyHandler: { _, _, _, _ in verifyCount.value += 1 },
+            installHandler: { _, targetURL, _, relaunch in
+                XCTAssertEqual(targetURL.path, fakeInstalledApp.path)
+                relaunchFlags.value.append(relaunch)
+            },
+            canInstallSilentlyNow: { false }
+        )
+
+        manager.checkForUpdatesInBackgroundIfDue(now: Date())
+        await manager.waitForActiveTask()
+        XCTAssertEqual(verifyCount.value, 1)
+
+        // Auto-update OFF -> quit hook cleanly no-ops
+        manager.automaticallyChecksForUpdates = false
+        XCTAssertFalse(manager.applyPreparedUpdateOnQuitIfReady())
+        XCTAssertEqual(verifyCount.value, 1)
+        XCTAssertEqual(relaunchFlags.value, [])
+
+        // Auto-update ON -> quit hook synchronously re-verifies and installs with relaunch: false
+        manager.automaticallyChecksForUpdates = true
+        XCTAssertTrue(manager.applyPreparedUpdateOnQuitIfReady())
+        XCTAssertEqual(verifyCount.value, 2)
+        XCTAssertEqual(relaunchFlags.value, [false])
+        if case .installing = manager.state {
+            // expected
+        } else {
+            XCTFail("Expected .installing after quit install, got \(manager.state)")
+        }
+
+        // Already installing -> second invocation cleanly no-ops
+        XCTAssertFalse(manager.applyPreparedUpdateOnQuitIfReady())
+        XCTAssertEqual(relaunchFlags.value, [false])
+    }
+
+    @MainActor
+    func testManualInstallFromReadyToInstallSkipsRedownloadAndReverifies() async throws {
+        let (fakeInstalledApp, transport) = try makePreDownloadFixtures()
+        let verifyCount = AtomicBox<Int>(0)
+        let relaunchFlags = AtomicBox<[Bool]>([])
+        let terminateCount = AtomicBox<Int>(0)
+
+        let manager = AppUpdateManager(
+            userDefaults: makeTestUserDefaults(),
+            currentVersion: AppSemanticVersion(major: 0, minor: 4, patch: 4),
+            currentBundleID: "com.lizhichaox.ccx",
+            currentBundleURL: fakeInstalledApp,
+            currentTeamIDProvider: { "TESTTEAM01" },
+            transport: transport,
+            extractHandler: { _, destinationDir in
+                let extracted = destinationDir.appendingPathComponent("CCX.app", isDirectory: true)
+                try FileManager.default.createDirectory(at: extracted, withIntermediateDirectories: true)
+                return extracted
+            },
+            verifyHandler: { _, _, _, _ in verifyCount.value += 1 },
+            installHandler: { _, targetURL, _, relaunch in
+                XCTAssertEqual(targetURL.path, fakeInstalledApp.path)
+                relaunchFlags.value.append(relaunch)
+            },
+            canTerminateNow: { true },
+            canInstallSilentlyNow: { false },
+            terminateHandler: { terminateCount.value += 1 }
+        )
+
+        manager.checkForUpdatesInBackgroundIfDue(now: Date())
+        await manager.waitForActiveTask()
+
+        let fetchesAfterPrepare = transport.fetchCount
+        let downloadsAfterPrepare = transport.downloadCount
+        XCTAssertEqual(verifyCount.value, 1)
+
+        // Manual click "Restart" from .readyToInstall -> zero extra network fetches/downloads
+        manager.installAvailableUpdate()
+        await manager.waitForActiveTask()
+
+        XCTAssertEqual(transport.fetchCount, fetchesAfterPrepare)
+        XCTAssertEqual(transport.downloadCount, downloadsAfterPrepare)
+        XCTAssertEqual(verifyCount.value, 2)
+        XCTAssertEqual(relaunchFlags.value, [true])
+        XCTAssertEqual(terminateCount.value, 1)
+    }
+
+    @MainActor
+    func testManualInstallFromReadyToInstallFallsBackToFreshDownloadIfReverifyFails() async throws {
+        let (fakeInstalledApp, transport) = try makePreDownloadFixtures()
+        let verifyCount = AtomicBox<Int>(0)
+        let relaunchFlags = AtomicBox<[Bool]>([])
+        let terminateCount = AtomicBox<Int>(0)
+
+        let manager = AppUpdateManager(
+            userDefaults: makeTestUserDefaults(),
+            currentVersion: AppSemanticVersion(major: 0, minor: 4, patch: 4),
+            currentBundleID: "com.lizhichaox.ccx",
+            currentBundleURL: fakeInstalledApp,
+            currentTeamIDProvider: { "TESTTEAM01" },
+            transport: transport,
+            extractHandler: { _, destinationDir in
+                let extracted = destinationDir.appendingPathComponent("CCX.app", isDirectory: true)
+                try FileManager.default.createDirectory(at: extracted, withIntermediateDirectories: true)
+                return extracted
+            },
+            verifyHandler: { _, _, _, _ in
+                verifyCount.value += 1
+                // Simulate temp payload vanishing / failing TOCTOU re-verify on the 2nd check
+                if verifyCount.value == 2 {
+                    throw AppUpdateError.invalidBundleMetadata
+                }
+            },
+            installHandler: { _, _, _, relaunch in
+                relaunchFlags.value.append(relaunch)
+            },
+            canTerminateNow: { true },
+            canInstallSilentlyNow: { false },
+            terminateHandler: { terminateCount.value += 1 }
+        )
+
+        manager.checkForUpdatesInBackgroundIfDue(now: Date())
+        await manager.waitForActiveTask()
+        XCTAssertEqual(transport.downloadCount, 1)
+
+        manager.installAvailableUpdate()
+        await manager.waitForActiveTask()
+
+        // Re-verify failed -> cleaned up prepared payload -> fell back to fresh download + verify + install
+        XCTAssertEqual(transport.downloadCount, 2)
+        XCTAssertEqual(verifyCount.value, 3)
+        XCTAssertEqual(relaunchFlags.value, [true])
+        XCTAssertEqual(terminateCount.value, 1)
+    }
+
+    @MainActor
+    func testBackgroundPreDownloadFailureDegradesQuietlyToAvailable() async throws {
+        let dir = try makeTempDirectory()
+        let fakeInstalledApp = dir.appendingPathComponent("CCX.app", isDirectory: true)
+        try FileManager.default.createDirectory(at: fakeInstalledApp, withIntermediateDirectories: true)
+
+        let transport = MockAppUpdateTransport()
+        transport.stubFetch(
+            url: AppUpdateURLPolicy.latestReleaseAPIURL,
+            outcome: .data(try makeReleaseJSON(tagName: "v0.5.0"))
+        )
+        transport.stubFetch(
+            url: URL(string: "https://github.com/lizhichaox/ccx/releases/download/v0.5.0/SHA256SUMS.txt")!,
+            outcome: .error(AppUpdateError.networkUnavailable)
+        )
+
+        let reportedErrors = AtomicBox<[String]>([])
+        let manager = AppUpdateManager(
+            userDefaults: makeTestUserDefaults(),
+            currentVersion: AppSemanticVersion(major: 0, minor: 4, patch: 4),
+            currentBundleID: "com.lizhichaox.ccx",
+            currentBundleURL: fakeInstalledApp,
+            transport: transport,
+            onUserFacingError: { message in
+                reportedErrors.value.append(message)
+            }
+        )
+
+        manager.checkForUpdatesInBackgroundIfDue(now: Date())
+        await manager.waitForActiveTask()
+
+        guard case .available(let release) = manager.state else {
+            return XCTFail("Expected quiet degradation to .available, got \(manager.state)")
+        }
+        XCTAssertEqual(release.version, AppSemanticVersion(major: 0, minor: 5, patch: 0))
+        XCTAssertTrue(reportedErrors.value.isEmpty)
+    }
+
+    @MainActor
+    func testDisablingAutoCheckCancelsPendingSilentInstallTimer() async throws {
+        let (fakeInstalledApp, transport) = try makePreDownloadFixtures()
+        let installCount = AtomicBox<Int>(0)
+        let terminateCount = AtomicBox<Int>(0)
+
+        let manager = AppUpdateManager(
+            userDefaults: makeTestUserDefaults(),
+            currentVersion: AppSemanticVersion(major: 0, minor: 4, patch: 4),
+            currentBundleID: "com.lizhichaox.ccx",
+            currentBundleURL: fakeInstalledApp,
+            currentTeamIDProvider: { "TESTTEAM01" },
+            transport: transport,
+            idleInstallDebounceInterval: 0.25,
+            extractHandler: { _, destinationDir in
+                let extracted = destinationDir.appendingPathComponent("CCX.app", isDirectory: true)
+                try FileManager.default.createDirectory(at: extracted, withIntermediateDirectories: true)
+                return extracted
+            },
+            verifyHandler: { _, _, _, _ in },
+            installHandler: { _, _, _, _ in installCount.value += 1 },
+            canTerminateNow: { true },
+            canInstallSilentlyNow: { true },
+            terminateHandler: { terminateCount.value += 1 }
+        )
+
+        manager.checkForUpdatesInBackgroundIfDue(now: Date())
+        await manager.waitForActiveTask()
+
+        // Debounce timer is pending -> disable auto-check before it fires
+        try await Task.sleep(for: .milliseconds(40))
+        manager.automaticallyChecksForUpdates = false
+
+        try await Task.sleep(for: .milliseconds(320))
+        await manager.waitForIdleInstallTask()
+
+        XCTAssertEqual(installCount.value, 0)
+        XCTAssertEqual(terminateCount.value, 0)
+        if case .readyToInstall = manager.state {
+            // expected
+        } else {
+            XCTFail("Expected .readyToInstall after disabling auto-check, got \(manager.state)")
+        }
+    }
+
+    func testLaunchAtomicReplaceWithoutRelaunchSwapsBundlesCleanly() async throws {
+        let dir = try makeTempDirectory()
+        let targetApp = dir.appendingPathComponent("CCX.app", isDirectory: true)
+        let stagedApp = dir.appendingPathComponent(".CCX-update-test.app", isDirectory: true)
+        let cleanupDir = dir.appendingPathComponent("cleanup-staging", isDirectory: true)
+
+        try FileManager.default.createDirectory(at: targetApp, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: stagedApp, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: cleanupDir, withIntermediateDirectories: true)
+        try Data("v0.7.0".utf8).write(to: targetApp.appendingPathComponent("version.txt"))
+        try Data("v0.8.0".utf8).write(to: stagedApp.appendingPathComponent("version.txt"))
+
+        let sleeper = Process()
+        sleeper.executableURL = URL(fileURLWithPath: "/bin/sleep")
+        sleeper.arguments = ["0.15"]
+        try sleeper.run()
+
+        try AppUpdateInstaller.launchAtomicReplaceAndRelaunch(
+            stagedSiblingAppURL: stagedApp,
+            targetAppURL: targetApp,
+            cleanupDirectoryURL: cleanupDir,
+            currentPID: sleeper.processIdentifier,
+            relaunch: false
+        )
+
+        sleeper.waitUntilExit()
+
+        let deadline = Date().addingTimeInterval(3.0)
+        while Date() < deadline {
+            if let data = try? Data(contentsOf: targetApp.appendingPathComponent("version.txt")),
+               String(data: data, encoding: .utf8) == "v0.8.0",
+               !FileManager.default.fileExists(atPath: cleanupDir.path),
+               !FileManager.default.fileExists(atPath: stagedApp.path) {
+                return
+            }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        XCTFail("Expected atomic swap with relaunch: false to replace target and clean up staging dir")
+    }
+
+    @MainActor
+    func testReadyToInstallCopyFitsSingleLineInBothLanguages() {
+        let settingsHintFont = NSFont.systemFont(ofSize: 10.5)
+        let settingsLinkFont = NSFont.systemFont(ofSize: 10.5, weight: .medium)
+        let settingsSubRowBudget: CGFloat = 277.0 // 336 card - 43 leading - 10 trailing - 6 spacer
+
+        let popoverTitleFont = NSFont.systemFont(ofSize: 11.5, weight: .semibold)
+        let popoverButtonFont = NSFont.systemFont(ofSize: 10.5, weight: .semibold)
+        // 288 banner - 20 inner padding - 15 icon - 8 spacing - 8 spacing - 18 button horiz padding - 8 spacing - 18 close
+        let popoverCopyBudget: CGFloat = 193.0
+
+        for language in CCXLanguage.allCases {
+            CCXL10n.withLanguageForTesting(language) {
+                let notesLink = CCXL10n.text("Notes ↗", zh: "日志 ↗")
+                let autoHint = CCXL10n.text("Installs automatically when idle.", zh: "空闲或退出时自动平滑更新")
+                let manualHint = CCXL10n.text("Ready to install on restart.", zh: "点击即可快速重启完成更新")
+
+                let linkWidth = ceil(NSAttributedString(string: notesLink, attributes: [.font: settingsLinkFont]).size().width)
+                for hint in [autoHint, manualHint] {
+                    XCTAssertFalse(hint.contains("\n"))
+                    let hintWidth = ceil(NSAttributedString(string: hint, attributes: [.font: settingsHintFont]).size().width)
+                    XCTAssertLessThanOrEqual(
+                        hintWidth + linkWidth,
+                        settingsSubRowBudget,
+                        "[\(language.rawValue)] Settings sub-row '\(hint)' + '\(notesLink)' measured \(hintWidth + linkWidth)pt, exceeding \(settingsSubRowBudget)pt budget"
+                    )
+                }
+
+                let restartButton = CCXL10n.text("Restart", zh: "立即更新")
+                let buttonWidth = ceil(NSAttributedString(string: restartButton, attributes: [.font: popoverButtonFont]).size().width)
+                for version in ["0.8.0", "10.20.30"] {
+                    let popoverTitle = CCXL10n.text("v\(version) Ready", zh: "v\(version) 已就绪")
+                    XCTAssertFalse(popoverTitle.contains("\n"))
+                    let titleWidth = ceil(NSAttributedString(string: popoverTitle, attributes: [.font: popoverTitleFont]).size().width)
+                    XCTAssertLessThanOrEqual(
+                        titleWidth + buttonWidth,
+                        popoverCopyBudget,
+                        "[\(language.rawValue)] Popover banner '\(popoverTitle)' + '\(restartButton)' measured \(titleWidth + buttonWidth)pt, exceeding \(popoverCopyBudget)pt budget"
+                    )
+                }
+            }
         }
     }
 }

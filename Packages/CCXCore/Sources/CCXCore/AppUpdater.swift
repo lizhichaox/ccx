@@ -1016,12 +1016,13 @@ public enum AppUpdateInstaller {
 
     /// Spawns a detached `/bin/sh` helper using positional arguments (zero shell interpolation)
     /// that waits for `currentPID` to exit, atomically swaps the staged bundle into place with
-    /// rollback protection, refreshes LaunchServices, and relaunches the updated app.
+    /// rollback protection, refreshes LaunchServices, and optionally relaunches the updated app.
     public static func launchAtomicReplaceAndRelaunch(
         stagedSiblingAppURL: URL,
         targetAppURL: URL,
         cleanupDirectoryURL: URL,
-        currentPID: Int32 = ProcessInfo.processInfo.processIdentifier
+        currentPID: Int32 = ProcessInfo.processInfo.processIdentifier,
+        relaunch: Bool = true
     ) throws {
         let stagedPath = normalizedPath(stagedSiblingAppURL.path)
         let targetPath = normalizedPath(targetAppURL.path)
@@ -1048,6 +1049,7 @@ public enum AppUpdateInstaller {
         target=$3
         backup=$4
         cleanup=$5
+        relaunch=$6
         i=0
         while /bin/kill -0 "$pid" 2>/dev/null && [ "$i" -lt 100 ]; do
           /bin/sleep 0.1
@@ -1068,7 +1070,10 @@ public enum AppUpdateInstaller {
         fi
         /bin/rm -rf -- "$backup" "$cleanup"
         /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f -- "$target" >/dev/null 2>&1 || true
-        exec /usr/bin/open -- "$target"
+        if [ "$relaunch" = "1" ]; then
+          exec /usr/bin/open -- "$target"
+        fi
+        exit 0
         """
 
         let process = Process()
@@ -1082,6 +1087,7 @@ public enum AppUpdateInstaller {
             targetPath,
             backupPath,
             cleanupPath,
+            relaunch ? "1" : "0",
         ]
         process.standardInput = FileHandle.nullDevice
         process.standardOutput = FileHandle.nullDevice
@@ -1588,11 +1594,13 @@ public enum AppUpdateState: Equatable, Sendable {
     case available(AppReleaseInfo)
     case downloading(AppReleaseInfo, progress: Double)
     case verifying(AppReleaseInfo)
+    case readyToInstall(AppReleaseInfo)
     case installing(AppReleaseInfo)
     case failed(message: String, release: AppReleaseInfo?)
 }
 
-/// Coordinates background and manual update checks, verified downloads, and atomic installation.
+/// Coordinates background and manual update checks, verified pre-downloads,
+/// silent idle/quit installation, and zero-wait manual atomic restarts.
 @MainActor
 public final class AppUpdateManager: ObservableObject {
     public static let autoCheckKey = "CCXAutoCheckUpdates"
@@ -1614,25 +1622,59 @@ public final class AppUpdateManager: ObservableObject {
     public typealias InstallPreparedAppHandler = @Sendable (
         _ verifiedAppURL: URL,
         _ targetAppURL: URL,
-        _ cleanupDirectoryURL: URL
+        _ cleanupDirectoryURL: URL,
+        _ relaunch: Bool
     ) throws -> Void
+
+    private struct PreparedUpdate: Sendable {
+        let release: AppReleaseInfo
+        let verifiedAppURL: URL
+        let stagingDirURL: URL
+        let targetAppURL: URL
+    }
 
     @Published public private(set) var state: AppUpdateState = .idle
     @Published public var automaticallyChecksForUpdates: Bool {
         didSet {
             userDefaults.set(automaticallyChecksForUpdates, forKey: Self.autoCheckKey)
+            if !automaticallyChecksForUpdates {
+                cancelIdleInstallTask()
+                return
+            }
+            switch state {
+            case .readyToInstall:
+                scheduleSilentInstallIfIdle()
+            case .available(let release):
+                if let prepared = preparedUpdate, prepared.release.version == release.version {
+                    state = .readyToInstall(release)
+                    scheduleSilentInstallIfIdle()
+                } else if case .canInstallInPlace(let targetAppURL) = installEligibilityProvider(currentBundleURL) {
+                    startDownloadAndVerify(
+                        release: release,
+                        targetAppURL: targetAppURL,
+                        autoInstallImmediately: false,
+                        silentFailure: true
+                    )
+                }
+            case .idle, .checking, .upToDate, .downloading, .verifying, .installing, .failed:
+                break
+            }
         }
     }
     @Published public private(set) var lastCheckDate: Date?
     @Published public private(set) var dismissedBannerVersion: String?
 
-    /// Closure checked before downloading and again before terminating to prevent interrupting
+    /// Closure checked before installing and again before terminating to prevent interrupting
     /// an active recording or save dialog.
     public var canTerminateNow: () -> Bool
+    /// Closure checked before performing an automatic silent restart while idle.
+    /// Defaults to `{ false }` so callers opt in explicitly when no Pins, captures, recordings,
+    /// OCR jobs, save dialogs, or app windows are active.
+    public var canInstallSilentlyNow: () -> Bool
     /// Called when installation is deferred because `canTerminateNow()` returned `false`.
     public var onBlockedByActiveSession: () -> Void
     /// Called when user-initiated installation encounters a non-cancellation error or an
-    /// ineligible install location (never invoked for silent background checks).
+    /// ineligible install location (never invoked for silent background checks or pre-downloads).
     public var onUserFacingError: ((String) -> Void)?
     /// Called after the detached swap-and-relaunch helper is running to terminate the current app.
     public var terminateHandler: () -> Void
@@ -1644,14 +1686,19 @@ public final class AppUpdateManager: ObservableObject {
     private let currentTeamIDProvider: @Sendable () -> String?
     private let transport: any AppUpdateTransport
     private let checkInterval: TimeInterval
+    private let idleInstallDebounceInterval: TimeInterval
     private let installEligibilityProvider: @Sendable (URL) -> AppInstallEligibility
     private let extractHandler: ExtractZipHandler
     private let verifyHandler: VerifyDownloadedAppHandler
     private let installHandler: InstallPreparedAppHandler
 
-    private var activeTask: Task<Void, Never>?
+    nonisolated(unsafe) private var activeTask: Task<Void, Never>?
     private var activeTaskID = UUID()
-    private var activeStagingDirURL: URL?
+    nonisolated(unsafe) private var activeStagingDirURL: URL?
+    nonisolated(unsafe) private var preparedUpdate: PreparedUpdate?
+    nonisolated(unsafe) private var idleInstallTask: Task<Void, Never>?
+    private var idleInstallTaskID = UUID()
+    private var attemptedSilentInstallVersion: String?
 
     public init(
         userDefaults: UserDefaults = .standard,
@@ -1663,6 +1710,7 @@ public final class AppUpdateManager: ObservableObject {
         },
         transport: any AppUpdateTransport = URLSessionAppUpdateTransport(),
         checkInterval: TimeInterval = 86_400,
+        idleInstallDebounceInterval: TimeInterval = 3.0,
         installEligibilityProvider: @escaping @Sendable (URL) -> AppInstallEligibility = {
             AppUpdateInstaller.installEligibility(for: $0)
         },
@@ -1677,7 +1725,7 @@ public final class AppUpdateManager: ObservableObject {
                 expectedTeamID: teamID
             )
         },
-        installHandler: @escaping InstallPreparedAppHandler = { verifiedAppURL, targetAppURL, cleanupDirectoryURL in
+        installHandler: @escaping InstallPreparedAppHandler = { verifiedAppURL, targetAppURL, cleanupDirectoryURL, relaunch in
             let stagedURL = try AppUpdateInstaller.stageSiblingApp(
                 from: verifiedAppURL,
                 nextTo: targetAppURL
@@ -1686,7 +1734,8 @@ public final class AppUpdateManager: ObservableObject {
                 try AppUpdateInstaller.launchAtomicReplaceAndRelaunch(
                     stagedSiblingAppURL: stagedURL,
                     targetAppURL: targetAppURL,
-                    cleanupDirectoryURL: cleanupDirectoryURL
+                    cleanupDirectoryURL: cleanupDirectoryURL,
+                    relaunch: relaunch
                 )
             } catch {
                 try? FileManager.default.removeItem(at: stagedURL)
@@ -1694,6 +1743,7 @@ public final class AppUpdateManager: ObservableObject {
             }
         },
         canTerminateNow: @escaping @MainActor () -> Bool = { true },
+        canInstallSilentlyNow: @escaping @MainActor () -> Bool = { false },
         onBlockedByActiveSession: @escaping @MainActor () -> Void = {},
         onUserFacingError: (@MainActor (String) -> Void)? = nil,
         terminateHandler: @escaping @MainActor () -> Void = {}
@@ -1714,11 +1764,13 @@ public final class AppUpdateManager: ObservableObject {
         self.currentTeamIDProvider = currentTeamIDProvider
         self.transport = transport
         self.checkInterval = checkInterval
+        self.idleInstallDebounceInterval = max(0, idleInstallDebounceInterval)
         self.installEligibilityProvider = installEligibilityProvider
         self.extractHandler = extractHandler
         self.verifyHandler = verifyHandler
         self.installHandler = installHandler
         self.canTerminateNow = canTerminateNow
+        self.canInstallSilentlyNow = canInstallSilentlyNow
         self.onBlockedByActiveSession = onBlockedByActiveSession
         self.onUserFacingError = onUserFacingError
         self.terminateHandler = terminateHandler
@@ -1732,12 +1784,24 @@ public final class AppUpdateManager: ObservableObject {
         self.dismissedBannerVersion = userDefaults.string(forKey: Self.dismissedBannerVersionKey)
     }
 
-    /// The latest discovered release when available, in progress, or retained after a retryable failure.
+    deinit {
+        idleInstallTask?.cancel()
+        activeTask?.cancel()
+        if let stagingDir = activeStagingDirURL {
+            try? FileManager.default.removeItem(at: stagingDir)
+        }
+        if let preparedStagingDir = preparedUpdate?.stagingDirURL {
+            try? FileManager.default.removeItem(at: preparedStagingDir)
+        }
+    }
+
+    /// The latest discovered release when available, in progress, ready, or retained after a retryable failure.
     public var availableRelease: AppReleaseInfo? {
         switch state {
         case .available(let release),
              .downloading(let release, _),
              .verifying(let release),
+             .readyToInstall(let release),
              .installing(let release):
             return release
         case .failed(_, let release):
@@ -1750,7 +1814,7 @@ public final class AppUpdateManager: ObservableObject {
     /// Whether the menu bar popover should show the compact update banner.
     public var shouldShowPopoverBanner: Bool {
         switch state {
-        case .available(let release):
+        case .available(let release), .readyToInstall(let release):
             return dismissedBannerVersion != release.version.description
         case .downloading, .verifying, .installing:
             return true
@@ -1766,15 +1830,16 @@ public final class AppUpdateManager: ObservableObject {
         switch state {
         case .checking, .downloading, .verifying, .installing:
             return true
-        case .idle, .upToDate, .available, .failed:
+        case .idle, .upToDate, .available, .readyToInstall, .failed:
             return false
         }
     }
 
-    /// Runs a silent background check if automatic checks are enabled and `checkInterval` has elapsed.
+    /// Runs a silent background check if automatic checks are enabled, no update is already
+    /// prepared or in progress, and `checkInterval` has elapsed.
     public func checkForUpdatesInBackgroundIfDue(now: Date = Date()) {
         guard automaticallyChecksForUpdates else { return }
-        guard !isBusy else { return }
+        guard !isBusy, preparedUpdate == nil else { return }
         if let lastCheckDate, now.timeIntervalSince(lastCheckDate) < checkInterval {
             return
         }
@@ -1786,7 +1851,9 @@ public final class AppUpdateManager: ObservableObject {
         performCheckForUpdates(userInitiated: userInitiated, now: Date())
     }
 
-    /// Downloads, cryptographically verifies, stages, and launches atomic installation for `availableRelease`.
+    /// Installs `availableRelease`. When the update is already downloaded and verified
+    /// (`.readyToInstall`), skips downloading, re-verifies the bundle signature off the main thread
+    /// to prevent TOCTOU tampering, and relaunches immediately.
     public func installAvailableUpdate() {
         guard !isBusy, let release = availableRelease else { return }
 
@@ -1806,140 +1873,161 @@ public final class AppUpdateManager: ObservableObject {
             return
         }
 
-        let taskID = UUID()
-        activeTaskID = taskID
-        state = .downloading(release, progress: 0)
+        cancelIdleInstallTask()
 
-        let transport = self.transport
-        let userAgent = self.userAgent
-        let currentBundleID = self.currentBundleID
-        let currentTeamIDProvider = self.currentTeamIDProvider
-        let extractHandler = self.extractHandler
-        let verifyHandler = self.verifyHandler
-        let installHandler = self.installHandler
+        if let prepared = preparedUpdate, prepared.release.version == release.version {
+            let taskID = UUID()
+            activeTaskID = taskID
+            state = .verifying(release)
 
-        activeTask = Task { @MainActor [weak self] in
-            guard let self else { return }
-            defer {
-                if self.activeTaskID == taskID {
-                    self.activeTask = nil
-                }
-            }
+            let currentBundleID = self.currentBundleID
+            let currentTeamIDProvider = self.currentTeamIDProvider
+            let verifyHandler = self.verifyHandler
+            let installHandler = self.installHandler
 
-            var stagingDirURL: URL?
-            var handedOffToHelper = false
-            defer {
-                if !handedOffToHelper, let stagingDirURL {
-                    try? FileManager.default.removeItem(at: stagingDirURL)
-                }
-                if self.activeTaskID == taskID {
-                    self.activeStagingDirURL = nil
-                }
-            }
-
-            do {
-                let stagingDir = try AppUpdateInstaller.createPrivateStagingDirectory()
-                stagingDirURL = stagingDir
-                self.activeStagingDirURL = stagingDir
-
-                try Task.checkCancellation()
-
-                let checksumsData = try await transport.fetchData(
-                    from: release.checksumsDownloadURL,
-                    maxBytes: GitHubReleaseParser.maxMetadataBytes,
-                    userAgent: userAgent
-                )
-                try Task.checkCancellation()
-
-                guard let checksumsText = String(data: checksumsData, encoding: .utf8),
-                      let expectedSHA256 = AppUpdateChecksumVerifier.parseExpectedSHA256(
-                          forAssetName: release.zipAssetName,
-                          from: checksumsText
-                      )
-                else {
-                    throw AppUpdateError.missingChecksumEntry
-                }
-
-                let zipFileURL = stagingDir.appendingPathComponent(release.zipAssetName, isDirectory: false)
-                try await transport.downloadFile(
-                    from: release.zipDownloadURL,
-                    to: zipFileURL,
-                    maxBytes: GitHubReleaseParser.maxArchiveBytes,
-                    expectedBytesHint: release.zipAssetSize,
-                    userAgent: userAgent
-                ) { [weak self] progress in
-                    let clamped = min(max(progress, 0), 1)
-                    Task { @MainActor [weak self] in
-                        guard let self, self.activeTaskID == taskID else { return }
-                        if case .downloading = self.state {
-                            self.state = .downloading(release, progress: clamped)
-                        }
+            activeTask = Task { @MainActor [weak self] in
+                guard let self else { return }
+                defer {
+                    if self.activeTaskID == taskID {
+                        self.activeTask = nil
                     }
                 }
-                try Task.checkCancellation()
 
-                guard self.activeTaskID == taskID else { return }
-                self.state = .verifying(release)
+                let reverifySucceeded: Bool
+                do {
+                    try await Task.detached(priority: .userInitiated) {
+                        try Task.checkCancellation()
+                        let expectedTeamID = currentTeamIDProvider()
+                        try verifyHandler(prepared.verifiedAppURL, currentBundleID, release.version, expectedTeamID)
+                    }.value
+                    reverifySucceeded = true
+                } catch is CancellationError {
+                    if self.activeTaskID == taskID {
+                        self.state = self.preparedUpdate?.release.version == release.version
+                            ? .readyToInstall(release)
+                            : .available(release)
+                    }
+                    return
+                } catch let error as AppUpdateError where error == .cancelled {
+                    if self.activeTaskID == taskID {
+                        self.state = self.preparedUpdate?.release.version == release.version
+                            ? .readyToInstall(release)
+                            : .available(release)
+                    }
+                    return
+                } catch {
+                    reverifySucceeded = false
+                }
 
-                let extractDirURL = stagingDir.appendingPathComponent("extracted", isDirectory: true)
-                let verifiedAppURL = try await Task.detached(priority: .userInitiated) { () throws -> URL in
-                    try Task.checkCancellation()
-                    try AppUpdateChecksumVerifier.verifyFile(at: zipFileURL, expectedHex: expectedSHA256)
-                    try Task.checkCancellation()
+                guard !Task.isCancelled, self.activeTaskID == taskID else { return }
 
-                    try FileManager.default.createDirectory(
-                        at: extractDirURL,
-                        withIntermediateDirectories: true,
-                        attributes: [.posixPermissions: 0o700]
+                if !reverifySucceeded {
+                    self.clearPreparedUpdate()
+                    await self.runDownloadAndVerify(
+                        release: release,
+                        targetAppURL: targetAppURL,
+                        taskID: taskID,
+                        autoInstallImmediately: true,
+                        silentFailure: false
                     )
-                    let extractedAppURL = try extractHandler(zipFileURL, extractDirURL)
-                    try Task.checkCancellation()
-
-                    let expectedTeamID = currentTeamIDProvider()
-                    try verifyHandler(extractedAppURL, currentBundleID, release.version, expectedTeamID)
-                    return extractedAppURL
-                }.value
-
-                try Task.checkCancellation()
-                guard self.activeTaskID == taskID else { return }
+                    return
+                }
 
                 guard self.canTerminateNow() else {
                     self.onBlockedByActiveSession()
-                    self.state = .available(release)
+                    self.state = .readyToInstall(release)
                     return
                 }
 
                 self.state = .installing(release)
 
-                try await Task.detached(priority: .userInitiated) {
-                    try installHandler(verifiedAppURL, targetAppURL, stagingDir)
-                }.value
-
-                handedOffToHelper = true
-                self.activeStagingDirURL = nil
-                self.terminateHandler()
-            } catch is CancellationError {
-                if self.activeTaskID == taskID {
-                    self.state = .available(release)
-                }
-            } catch let error as AppUpdateError where error == .cancelled {
-                if self.activeTaskID == taskID {
-                    self.state = .available(release)
-                }
-            } catch {
-                if self.activeTaskID == taskID {
-                    let message = Self.friendlyErrorMessage(for: error)
-                    self.state = .failed(message: message, release: release)
-                    self.onUserFacingError?(message)
+                do {
+                    try await Task.detached(priority: .userInitiated) {
+                        try installHandler(prepared.verifiedAppURL, targetAppURL, prepared.stagingDirURL, true)
+                    }.value
+                    self.preparedUpdate = nil
+                    self.terminateHandler()
+                } catch is CancellationError {
+                    if self.activeTaskID == taskID {
+                        if FileManager.default.fileExists(atPath: prepared.verifiedAppURL.path) {
+                            self.state = .readyToInstall(release)
+                        } else {
+                            self.clearPreparedUpdate()
+                            self.state = .available(release)
+                        }
+                    }
+                } catch {
+                    if self.activeTaskID == taskID {
+                        self.clearPreparedUpdate()
+                        let message = Self.friendlyErrorMessage(for: error)
+                        self.state = .failed(message: message, release: release)
+                        self.onUserFacingError?(message)
+                    }
                 }
             }
+            return
+        }
+
+        startDownloadAndVerify(
+            release: release,
+            targetAppURL: targetAppURL,
+            autoInstallImmediately: true,
+            silentFailure: false
+        )
+    }
+
+    /// Re-evaluates whether a prepared `.readyToInstall` update can be installed silently while
+    /// CCX is completely idle, starting or cancelling the debounce timer accordingly.
+    public func notifyActivityStateChanged() {
+        scheduleSilentInstallIfIdle()
+    }
+
+    /// Synchronously applies a prepared `.readyToInstall` update during application termination
+    /// without relaunching CCX, so the user starts on the new version on their next launch.
+    @discardableResult
+    public func applyPreparedUpdateOnQuitIfReady() -> Bool {
+        guard automaticallyChecksForUpdates,
+              case .readyToInstall(let release) = state,
+              let prepared = preparedUpdate,
+              prepared.release.version == release.version
+        else {
+            return false
+        }
+
+        cancelIdleInstallTask()
+        activeTask?.cancel()
+        activeTask = nil
+        activeTaskID = UUID()
+
+        let targetAppURL: URL
+        switch installEligibilityProvider(currentBundleURL) {
+        case .canInstallInPlace(let url):
+            targetAppURL = url
+        case .manualRequired:
+            return false
+        }
+
+        do {
+            let expectedTeamID = currentTeamIDProvider()
+            try verifyHandler(prepared.verifiedAppURL, currentBundleID, release.version, expectedTeamID)
+            try installHandler(prepared.verifiedAppURL, targetAppURL, prepared.stagingDirURL, false)
+            preparedUpdate = nil
+            state = .installing(release)
+            return true
+        } catch {
+            if !FileManager.default.fileExists(atPath: prepared.verifiedAppURL.path) {
+                clearPreparedUpdate()
+            }
+            return false
         }
     }
 
-    /// Cancels any active download or verification, cleans up temporary staging files,
-    /// and restores `.available(release)`.
+    /// Cancels any active download, verification, or pending idle-install timer, cleans up
+    /// temporary in-flight staging files, and preserves `.readyToInstall` if already prepared
+    /// or restores `.available(release)`.
     public func cancelDownload() {
         let release = availableRelease
+        cancelIdleInstallTask()
         activeTask?.cancel()
         activeTask = nil
         activeTaskID = UUID()
@@ -1949,7 +2037,9 @@ public final class AppUpdateManager: ObservableObject {
             activeStagingDirURL = nil
         }
 
-        if let release {
+        if let prepared = preparedUpdate {
+            state = .readyToInstall(prepared.release)
+        } else if let release {
             state = .available(release)
         } else if case .checking = state {
             state = .idle
@@ -1964,17 +2054,362 @@ public final class AppUpdateManager: ObservableObject {
         dismissedBannerVersion = versionString
         userDefaults.set(versionString, forKey: Self.dismissedBannerVersionKey)
         if case .failed = state {
-            state = .available(release)
+            if preparedUpdate?.release.version == release.version {
+                state = .readyToInstall(release)
+            } else {
+                state = .available(release)
+            }
         }
     }
 
-    /// Awaits completion of any currently running check/install task (intended for deterministic tests).
+    /// Awaits completion of any currently running check/download/install task (for deterministic tests).
     internal func waitForActiveTask() async {
-        await activeTask?.value
+        while let task = activeTask {
+            await task.value
+        }
+    }
+
+    /// Awaits completion of any currently scheduled silent idle-install task (for deterministic tests).
+    internal func waitForIdleInstallTask() async {
+        while let task = idleInstallTask {
+            await task.value
+        }
     }
 
     private var userAgent: String {
         "CCX/\(currentVersion.description) (macOS)"
+    }
+
+    private func cancelIdleInstallTask() {
+        idleInstallTask?.cancel()
+        idleInstallTask = nil
+        idleInstallTaskID = UUID()
+    }
+
+    private func clearPreparedUpdate() {
+        if let prepared = preparedUpdate {
+            try? FileManager.default.removeItem(at: prepared.stagingDirURL)
+            preparedUpdate = nil
+        }
+    }
+
+    private func scheduleSilentInstallIfIdle() {
+        guard automaticallyChecksForUpdates,
+              case .readyToInstall(let release) = state,
+              let prepared = preparedUpdate,
+              prepared.release.version == release.version,
+              attemptedSilentInstallVersion != release.version.description
+        else {
+            cancelIdleInstallTask()
+            return
+        }
+
+        guard canInstallSilentlyNow() else {
+            cancelIdleInstallTask()
+            return
+        }
+
+        guard idleInstallTask == nil else { return }
+
+        let versionString = release.version.description
+        let timerID = UUID()
+        idleInstallTaskID = timerID
+        let debounceInterval = idleInstallDebounceInterval
+
+        idleInstallTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                if self.idleInstallTaskID == timerID {
+                    self.idleInstallTask = nil
+                }
+            }
+
+            if debounceInterval > 0 {
+                do {
+                    try await Task.sleep(for: .seconds(debounceInterval))
+                } catch {
+                    return
+                }
+            }
+
+            guard !Task.isCancelled,
+                  self.idleInstallTaskID == timerID,
+                  self.automaticallyChecksForUpdates,
+                  case .readyToInstall(let currentRelease) = self.state,
+                  currentRelease.version == release.version,
+                  let currentPrepared = self.preparedUpdate,
+                  currentPrepared.release.version == release.version,
+                  self.attemptedSilentInstallVersion != versionString,
+                  self.canInstallSilentlyNow(),
+                  self.canTerminateNow()
+            else {
+                return
+            }
+
+            await self.performSilentIdleInstall(prepared: currentPrepared, timerID: timerID)
+        }
+    }
+
+    private func performSilentIdleInstall(prepared: PreparedUpdate, timerID: UUID) async {
+        let release = prepared.release
+        let versionString = release.version.description
+
+        let targetAppURL: URL
+        switch installEligibilityProvider(currentBundleURL) {
+        case .canInstallInPlace(let url):
+            targetAppURL = url
+        case .manualRequired:
+            attemptedSilentInstallVersion = versionString
+            return
+        }
+
+        let currentBundleID = self.currentBundleID
+        let currentTeamIDProvider = self.currentTeamIDProvider
+        let verifyHandler = self.verifyHandler
+        let installHandler = self.installHandler
+
+        do {
+            try await Task.detached(priority: .utility) {
+                try Task.checkCancellation()
+                let expectedTeamID = currentTeamIDProvider()
+                try verifyHandler(prepared.verifiedAppURL, currentBundleID, release.version, expectedTeamID)
+            }.value
+        } catch is CancellationError {
+            return
+        } catch let error as AppUpdateError where error == .cancelled {
+            return
+        } catch {
+            guard !Task.isCancelled, idleInstallTaskID == timerID else { return }
+            attemptedSilentInstallVersion = versionString
+            clearPreparedUpdate()
+            if case .readyToInstall = state {
+                state = .available(release)
+            }
+            return
+        }
+
+        guard !Task.isCancelled,
+              idleInstallTaskID == timerID,
+              automaticallyChecksForUpdates,
+              case .readyToInstall(let currentRelease) = state,
+              currentRelease.version == release.version,
+              preparedUpdate?.release.version == release.version,
+              canInstallSilentlyNow(),
+              canTerminateNow()
+        else {
+            return
+        }
+
+        state = .installing(release)
+
+        do {
+            try await Task.detached(priority: .userInitiated) {
+                try installHandler(prepared.verifiedAppURL, targetAppURL, prepared.stagingDirURL, true)
+            }.value
+            preparedUpdate = nil
+            terminateHandler()
+        } catch {
+            attemptedSilentInstallVersion = versionString
+            if FileManager.default.fileExists(atPath: prepared.verifiedAppURL.path) {
+                state = .readyToInstall(release)
+            } else {
+                clearPreparedUpdate()
+                state = .available(release)
+            }
+        }
+    }
+
+    private func startDownloadAndVerify(
+        release: AppReleaseInfo,
+        targetAppURL: URL,
+        autoInstallImmediately: Bool,
+        silentFailure: Bool
+    ) {
+        cancelIdleInstallTask()
+        let taskID = UUID()
+        activeTaskID = taskID
+        state = .downloading(release, progress: 0)
+
+        activeTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                if self.activeTaskID == taskID {
+                    self.activeTask = nil
+                }
+            }
+            await self.runDownloadAndVerify(
+                release: release,
+                targetAppURL: targetAppURL,
+                taskID: taskID,
+                autoInstallImmediately: autoInstallImmediately,
+                silentFailure: silentFailure
+            )
+        }
+    }
+
+    private func runDownloadAndVerify(
+        release: AppReleaseInfo,
+        targetAppURL: URL,
+        taskID: UUID,
+        autoInstallImmediately: Bool,
+        silentFailure: Bool
+    ) async {
+        guard !Task.isCancelled, activeTaskID == taskID else { return }
+        state = .downloading(release, progress: 0)
+
+        let transport = self.transport
+        let userAgent = self.userAgent
+        let currentBundleID = self.currentBundleID
+        let currentTeamIDProvider = self.currentTeamIDProvider
+        let extractHandler = self.extractHandler
+        let verifyHandler = self.verifyHandler
+        let installHandler = self.installHandler
+
+        var stagingDirURL: URL?
+        var retainedStagingDir = false
+        defer {
+            if !retainedStagingDir, let stagingDirURL {
+                try? FileManager.default.removeItem(at: stagingDirURL)
+            }
+            if self.activeTaskID == taskID {
+                self.activeStagingDirURL = nil
+            }
+        }
+
+        do {
+            let stagingDir = try AppUpdateInstaller.createPrivateStagingDirectory()
+            stagingDirURL = stagingDir
+            self.activeStagingDirURL = stagingDir
+
+            try Task.checkCancellation()
+
+            let checksumsData = try await transport.fetchData(
+                from: release.checksumsDownloadURL,
+                maxBytes: GitHubReleaseParser.maxMetadataBytes,
+                userAgent: userAgent
+            )
+            try Task.checkCancellation()
+
+            guard let checksumsText = String(data: checksumsData, encoding: .utf8),
+                  let expectedSHA256 = AppUpdateChecksumVerifier.parseExpectedSHA256(
+                      forAssetName: release.zipAssetName,
+                      from: checksumsText
+                  )
+            else {
+                throw AppUpdateError.missingChecksumEntry
+            }
+
+            let zipFileURL = stagingDir.appendingPathComponent(release.zipAssetName, isDirectory: false)
+            try await transport.downloadFile(
+                from: release.zipDownloadURL,
+                to: zipFileURL,
+                maxBytes: GitHubReleaseParser.maxArchiveBytes,
+                expectedBytesHint: release.zipAssetSize,
+                userAgent: userAgent
+            ) { [weak self] progress in
+                let clamped = min(max(progress, 0), 1)
+                Task { @MainActor [weak self] in
+                    guard let self, self.activeTaskID == taskID else { return }
+                    if case .downloading = self.state {
+                        self.state = .downloading(release, progress: clamped)
+                    }
+                }
+            }
+            try Task.checkCancellation()
+
+            guard self.activeTaskID == taskID else { return }
+            self.state = .verifying(release)
+
+            let extractDirURL = stagingDir.appendingPathComponent("extracted", isDirectory: true)
+            let priority: TaskPriority = autoInstallImmediately ? .userInitiated : .utility
+            let verifiedAppURL = try await Task.detached(priority: priority) { () throws -> URL in
+                try Task.checkCancellation()
+                try AppUpdateChecksumVerifier.verifyFile(at: zipFileURL, expectedHex: expectedSHA256)
+                try Task.checkCancellation()
+
+                try FileManager.default.createDirectory(
+                    at: extractDirURL,
+                    withIntermediateDirectories: true,
+                    attributes: [.posixPermissions: 0o700]
+                )
+                let extractedAppURL = try extractHandler(zipFileURL, extractDirURL)
+                try Task.checkCancellation()
+
+                let expectedTeamID = currentTeamIDProvider()
+                try verifyHandler(extractedAppURL, currentBundleID, release.version, expectedTeamID)
+                try? FileManager.default.removeItem(at: zipFileURL)
+                return extractedAppURL
+            }.value
+
+            try Task.checkCancellation()
+            guard self.activeTaskID == taskID else { return }
+
+            if !autoInstallImmediately {
+                self.clearPreparedUpdate()
+                self.preparedUpdate = PreparedUpdate(
+                    release: release,
+                    verifiedAppURL: verifiedAppURL,
+                    stagingDirURL: stagingDir,
+                    targetAppURL: targetAppURL
+                )
+                retainedStagingDir = true
+                self.activeStagingDirURL = nil
+                self.state = .readyToInstall(release)
+                self.scheduleSilentInstallIfIdle()
+                return
+            }
+
+            guard self.canTerminateNow() else {
+                self.clearPreparedUpdate()
+                self.preparedUpdate = PreparedUpdate(
+                    release: release,
+                    verifiedAppURL: verifiedAppURL,
+                    stagingDirURL: stagingDir,
+                    targetAppURL: targetAppURL
+                )
+                retainedStagingDir = true
+                self.activeStagingDirURL = nil
+                self.state = .readyToInstall(release)
+                self.onBlockedByActiveSession()
+                return
+            }
+
+            self.state = .installing(release)
+
+            try await Task.detached(priority: .userInitiated) {
+                try installHandler(verifiedAppURL, targetAppURL, stagingDir, true)
+            }.value
+
+            retainedStagingDir = true
+            self.activeStagingDirURL = nil
+            self.terminateHandler()
+        } catch is CancellationError {
+            if self.activeTaskID == taskID {
+                if let prepared = self.preparedUpdate, prepared.release.version == release.version {
+                    self.state = .readyToInstall(release)
+                } else {
+                    self.state = .available(release)
+                }
+            }
+        } catch let error as AppUpdateError where error == .cancelled {
+            if self.activeTaskID == taskID {
+                if let prepared = self.preparedUpdate, prepared.release.version == release.version {
+                    self.state = .readyToInstall(release)
+                } else {
+                    self.state = .available(release)
+                }
+            }
+        } catch {
+            if self.activeTaskID == taskID {
+                if silentFailure {
+                    self.state = .available(release)
+                } else {
+                    let message = Self.friendlyErrorMessage(for: error)
+                    self.state = .failed(message: message, release: release)
+                    self.onUserFacingError?(message)
+                }
+            }
+        }
     }
 
     private func performCheckForUpdates(userInitiated: Bool, now: Date) {
@@ -1985,10 +2420,11 @@ public final class AppUpdateManager: ObservableObject {
             guard userInitiated else { return }
             activeTask?.cancel()
             activeTask = nil
-        case .idle, .upToDate, .available, .failed:
+        case .idle, .upToDate, .available, .readyToInstall, .failed:
             break
         }
 
+        cancelIdleInstallTask()
         let previousRelease = availableRelease
         let taskID = UUID()
         activeTaskID = taskID
@@ -2025,24 +2461,58 @@ public final class AppUpdateManager: ObservableObject {
 
                 switch result {
                 case .upToDate:
+                    self.clearPreparedUpdate()
                     self.state = .upToDate(checkedAt: now)
                 case .updateAvailable(let release):
                     if userInitiated {
                         self.dismissedBannerVersion = nil
                         self.userDefaults.removeObject(forKey: Self.dismissedBannerVersionKey)
                     }
-                    self.state = .available(release)
+
+                    if let prepared = self.preparedUpdate, prepared.release.version == release.version {
+                        self.preparedUpdate = PreparedUpdate(
+                            release: release,
+                            verifiedAppURL: prepared.verifiedAppURL,
+                            stagingDirURL: prepared.stagingDirURL,
+                            targetAppURL: prepared.targetAppURL
+                        )
+                        self.state = .readyToInstall(release)
+                        self.scheduleSilentInstallIfIdle()
+                        return
+                    }
+
+                    self.clearPreparedUpdate()
+                    if self.attemptedSilentInstallVersion != release.version.description {
+                        self.attemptedSilentInstallVersion = nil
+                    }
+
+                    if self.automaticallyChecksForUpdates,
+                       case .canInstallInPlace(let targetAppURL) = self.installEligibilityProvider(self.currentBundleURL) {
+                        await self.runDownloadAndVerify(
+                            release: release,
+                            targetAppURL: targetAppURL,
+                            taskID: taskID,
+                            autoInstallImmediately: false,
+                            silentFailure: !userInitiated
+                        )
+                    } else {
+                        self.state = .available(release)
+                    }
                 }
             } catch is CancellationError {
                 guard self.activeTaskID == taskID else { return }
-                if let previousRelease {
+                if let prepared = self.preparedUpdate {
+                    self.state = .readyToInstall(prepared.release)
+                } else if let previousRelease {
                     self.state = .available(previousRelease)
                 } else {
                     self.state = .idle
                 }
             } catch let error as AppUpdateError where error == .cancelled {
                 guard self.activeTaskID == taskID else { return }
-                if let previousRelease {
+                if let prepared = self.preparedUpdate {
+                    self.state = .readyToInstall(prepared.release)
+                } else if let previousRelease {
                     self.state = .available(previousRelease)
                 } else {
                     self.state = .idle
@@ -2054,6 +2524,8 @@ public final class AppUpdateManager: ObservableObject {
                         message: Self.friendlyErrorMessage(for: error),
                         release: previousRelease
                     )
+                } else if let prepared = self.preparedUpdate {
+                    self.state = .readyToInstall(prepared.release)
                 } else {
                     self.state = .idle
                 }
