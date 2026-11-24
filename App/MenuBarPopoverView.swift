@@ -208,6 +208,10 @@ struct MenuBarPopoverView: View {
             UtilityFooterSection(
                 permissions: model.permissions,
                 hasUpdateBadge: updateManager.availableRelease != nil && !updateManager.shouldShowPopoverBanner,
+                isUpdateReady: {
+                    if case .readyToInstall = updateManager.state { return true }
+                    return false
+                }(),
                 onOpenPermissions: actions.onOpenPermissions,
                 onOpenSettings: actions.onOpenSettings,
                 onQuit: actions.onQuit
@@ -828,15 +832,21 @@ private struct PinControlPill: View {
 private struct UpdateAvailableBanner: View {
     @ObservedObject var updateManager: AppUpdateManager
 
-    private var isFailedState: Bool {
-        if case .failed = updateManager.state {
-            return true
+    private var tint: Color {
+        switch updateManager.state {
+        case .available, .readyToInstall:
+            return .green
+        case .failed:
+            return .orange
+        case .downloading, .verifying, .installing:
+            return .accentColor
+        case .idle, .checking, .upToDate:
+            return .green
         }
-        return false
     }
 
     var body: some View {
-        let tint: Color = isFailedState ? .orange : .green
+        let tint = self.tint
 
         Group {
             switch updateManager.state {
@@ -923,6 +933,49 @@ private struct UpdateAvailableBanner: View {
                         .font(.system(size: 11.5, weight: .medium))
                         .foregroundStyle(.primary)
                     Spacer(minLength: 0)
+                }
+
+            case .readyToInstall(let release):
+                HStack(spacing: 8) {
+                    Image(systemName: "arrow.down.circle.fill")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(.green)
+
+                    Text(CCXL10n.text(
+                        "v\(release.version.description) Ready",
+                        zh: "v\(release.version.description) 已就绪"
+                    ))
+                        .font(.system(size: 11.5, weight: .semibold))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+
+                    Spacer(minLength: 4)
+
+                    Button {
+                        updateManager.installAvailableUpdate()
+                    } label: {
+                        Text(CCXL10n.text("Restart", zh: "立即更新"))
+                            .font(.system(size: 10.5, weight: .semibold))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 3.5)
+                            .background(Color.green, in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .fixedSize()
+
+                    Button {
+                        updateManager.dismissPopoverBanner()
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 9.5, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 18, height: 18)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help(CCXL10n.text("Dismiss update notice", zh: "关闭更新提示"))
+                    .accessibilityLabel(CCXL10n.text("Dismiss update notice", zh: "关闭更新提示"))
                 }
 
             case .installing:
@@ -1016,6 +1069,7 @@ private struct UpdateAvailableBanner: View {
 private struct UtilityFooterSection: View {
     let permissions: CCXPermissionStatus
     var hasUpdateBadge = false
+    var isUpdateReady = false
     let onOpenPermissions: () -> Void
     let onOpenSettings: () -> Void
     let onQuit: () -> Void
@@ -1042,7 +1096,9 @@ private struct UtilityFooterSection: View {
                     symbol: "gearshape",
                     showBadgeDot: hasUpdateBadge,
                     tooltip: hasUpdateBadge
-                        ? CCXL10n.text("Settings (⌘,) — Update available", zh: "设置 (⌘,) · 有新版本可用")
+                        ? (isUpdateReady
+                            ? CCXL10n.text("Settings (⌘,) — Update ready", zh: "设置 (⌘,) · 新版本已就绪")
+                            : CCXL10n.text("Settings (⌘,) — Update available", zh: "设置 (⌘,) · 有新版本可用"))
                         : CCXL10n.text("Settings (⌘,)", zh: "设置 (⌘,)"),
                     action: onOpenSettings
                 )

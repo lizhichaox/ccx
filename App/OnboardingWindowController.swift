@@ -54,6 +54,9 @@ final class OnboardingWindowController: NSObject, NSWindowDelegate {
     private let onTrySnip: () -> Void
     private var window: NSWindow?
 
+    var onWindowVisibilityChanged: ((Bool) -> Void)?
+    private(set) var isWindowVisible = false
+
     nonisolated(unsafe) private var eventMonitor: Any?
     private var accumulatedScrollX: CGFloat = 0
     private var accumulatedScrollY: CGFloat = 0
@@ -109,6 +112,10 @@ final class OnboardingWindowController: NSObject, NSWindowDelegate {
         installEventMonitor()
         NSApp.activate()
         window.makeKeyAndOrderFront(nil)
+        if !isWindowVisible {
+            isWindowVisible = true
+            onWindowVisibilityChanged?(true)
+        }
     }
 
     private func makeWindow() -> NSWindow {
@@ -120,11 +127,16 @@ final class OnboardingWindowController: NSObject, NSWindowDelegate {
                 self?.window?.close()
             },
             onTrySnip: { [weak self] in
-                self?.onComplete()
-                self?.window?.orderOut(nil)
-                self?.model.stopPolling()
-                self?.removeEventMonitor()
-                self?.onTrySnip()
+                guard let self else { return }
+                self.onComplete()
+                self.window?.orderOut(nil)
+                self.model.stopPolling()
+                self.removeEventMonitor()
+                if self.isWindowVisible {
+                    self.isWindowVisible = false
+                    self.onWindowVisibilityChanged?(false)
+                }
+                self.onTrySnip()
             }
         )
         let hosting = NSHostingController(rootView: view)
@@ -192,6 +204,10 @@ final class OnboardingWindowController: NSObject, NSWindowDelegate {
         }
         model.stopPolling()
         removeEventMonitor()
+        if isWindowVisible {
+            isWindowVisible = false
+            onWindowVisibilityChanged?(false)
+        }
     }
 
     func windowDidResignKey(_ notification: Notification) {

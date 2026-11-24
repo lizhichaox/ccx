@@ -57,6 +57,11 @@ private final class MenuBarPanel: NSPanel {
 @MainActor
 final class MenuBarController: NSObject, NSWindowDelegate {
     weak var delegate: MenuBarControllerDelegate?
+    var onPanelVisibilityChanged: ((Bool) -> Void)?
+
+    var isPanelVisible: Bool {
+        panel?.isVisible == true
+    }
 
     private struct StatusButtonRenderKey: Equatable {
         let isPaused: Bool
@@ -184,6 +189,8 @@ final class MenuBarController: NSObject, NSWindowDelegate {
             phaseTag = 2
         case .verifying:
             phaseTag = 3
+        case .readyToInstall:
+            phaseTag = 6
         case .installing:
             phaseTag = 4
         case .failed(_, let release):
@@ -382,10 +389,14 @@ final class MenuBarController: NSObject, NSWindowDelegate {
     private func showPanel() {
         syncModel()
         let panel = ensurePanel()
+        let wasVisible = panel.isVisible
         layoutAndPosition(panel: panel)
         installEventMonitors()
         panel.makeKeyAndOrderFront(nil)
         panel.invalidateShadow()
+        if !wasVisible {
+            onPanelVisibilityChanged?(true)
+        }
 
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
@@ -397,9 +408,13 @@ final class MenuBarController: NSObject, NSWindowDelegate {
     }
 
     func hidePanel() {
+        let wasVisible = isPanelVisible
         removeEventMonitors()
         statusItem.button?.highlight(false)
         panel?.orderOut(nil)
+        if wasVisible {
+            onPanelVisibilityChanged?(false)
+        }
     }
 
     private func ensurePanel() -> MenuBarPanel {
@@ -706,5 +721,11 @@ final class MenuBarController: NSObject, NSWindowDelegate {
             return
         }
         hidePanel()
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        removeEventMonitors()
+        statusItem.button?.highlight(false)
+        onPanelVisibilityChanged?(false)
     }
 }

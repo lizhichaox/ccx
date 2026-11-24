@@ -49,6 +49,8 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     private var window: NSWindow?
     nonisolated(unsafe) private var shortcutMonitor: Any?
 
+    var onWindowVisibilityChanged: ((Bool) -> Void)?
+    private(set) var isWindowVisible = false
     var windowFrame: NSRect? { window?.frame }
 
     init(
@@ -157,6 +159,10 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         }
         NSApp.activate()
         window.makeKeyAndOrderFront(nil)
+        if !isWindowVisible {
+            isWindowVisible = true
+            onWindowVisibilityChanged?(true)
+        }
     }
 
     private func makeWindow() -> NSWindow {
@@ -423,6 +429,10 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             stopRecordingShortcut()
         }
         permissions.stopPolling()
+        if isWindowVisible {
+            isWindowVisible = false
+            onWindowVisibilityChanged?(false)
+        }
     }
 }
 
@@ -979,17 +989,19 @@ private struct UpdatesSettingRow: View {
     @ObservedObject var updateManager: AppUpdateManager
 
     private var iconTint: Color {
-        if case .available = updateManager.state {
+        switch updateManager.state {
+        case .available, .readyToInstall:
             return .green
+        case .idle, .checking, .upToDate, .downloading, .verifying, .installing, .failed:
+            return .blue
         }
-        return .blue
     }
 
     private var statusSubtitle: String {
         switch updateManager.state {
         case .idle:
             return updateManager.automaticallyChecksForUpdates
-                ? CCXL10n.text("Automatic", zh: "自动检查")
+                ? CCXL10n.text("Automatic", zh: "自动更新")
                 : CCXL10n.text("Manual", zh: "手动检查")
         case .checking:
             return CCXL10n.text("Checking…", zh: "检查中…")
@@ -1005,6 +1017,11 @@ private struct UpdatesSettingRow: View {
             return CCXL10n.text("Downloading \(pct)%", zh: "下载中 \(pct)%")
         case .verifying:
             return CCXL10n.text("Verifying…", zh: "校验中…")
+        case .readyToInstall(let release):
+            return CCXL10n.text(
+                "v\(release.version.description) ready",
+                zh: "v\(release.version.description) 已就绪"
+            )
         case .installing:
             return CCXL10n.text("Installing…", zh: "安装中…")
         case .failed:
@@ -1014,7 +1031,7 @@ private struct UpdatesSettingRow: View {
 
     private var subtitleColor: Color {
         switch updateManager.state {
-        case .available:
+        case .available, .readyToInstall:
             return .green
         case .failed:
             return .red
@@ -1064,6 +1081,35 @@ private struct UpdatesSettingRow: View {
                     .buttonStyle(.plain)
                     .pointerStyle(.link)
                     Spacer(minLength: 0)
+                }
+                .padding(.leading, 43)
+                .padding(.trailing, 10)
+                .padding(.bottom, 7)
+
+            case .readyToInstall(let release):
+                HStack(spacing: 6) {
+                    Text(
+                        updateManager.automaticallyChecksForUpdates
+                            ? CCXL10n.text("Installs automatically when idle.", zh: "空闲或退出时自动平滑更新")
+                            : CCXL10n.text("Ready to install on restart.", zh: "点击即可快速重启完成更新")
+                    )
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+
+                    Spacer(minLength: 6)
+
+                    Button {
+                        NSWorkspace.shared.open(release.releaseURL)
+                    } label: {
+                        Text(CCXL10n.text("Notes ↗", zh: "日志 ↗"))
+                            .font(.system(size: 10.5, weight: .medium))
+                            .foregroundStyle(Color.accentColor)
+                            .lineLimit(1)
+                    }
+                    .buttonStyle(.plain)
+                    .pointerStyle(.link)
+                    .fixedSize()
                 }
                 .padding(.leading, 43)
                 .padding(.trailing, 10)
@@ -1134,6 +1180,17 @@ private struct UpdatesSettingRow: View {
                 autoCheckToggle
             }
 
+        case .readyToInstall:
+            HStack(spacing: 6) {
+                Button(CCXL10n.text("Restart", zh: "立即更新")) {
+                    updateManager.installAvailableUpdate()
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .fixedSize()
+                autoCheckToggle
+            }
+
         case .downloading(_, let progress):
             HStack(spacing: 6) {
                 ProgressView(value: progress)
@@ -1173,7 +1230,10 @@ private struct UpdatesSettingRow: View {
             .labelsHidden()
             .toggleStyle(.switch)
             .controlSize(.small)
-            .help(CCXL10n.text("Automatically check for updates daily", zh: "每天自动检查更新"))
+            .help(CCXL10n.text(
+                "Download and install updates automatically when idle",
+                zh: "空闲或退出时自动下载并平滑安装更新"
+            ))
     }
 }
 

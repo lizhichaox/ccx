@@ -39,6 +39,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var pendingLaunchTask: Task<Void, Never>?
     private var scheduledUpdateCheckTask: Task<Void, Never>?
     private var ocrTask: Task<Void, Never>?
+    private var ocrTaskID = UUID()
     private var isPresentingSavePanel = false
     private weak var activeSavePanel: NSSavePanel?
     private var pendingRecordingSaves: [RecordingResult] = []
@@ -71,6 +72,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             self.hadClickThroughPins = hasClickThrough
             self.menuBarController?.refresh()
+            self.updateManager.notifyActivityStateChanged()
         }
         pinManager.onRequestSavePNG = { [weak self] image in
             self?.presentSavePanel(for: image)
@@ -100,6 +102,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self else { return false }
             return !self.recordingCoordinator.isSessionActive && !self.isPresentingSavePanel
         }
+        updateManager.canInstallSilentlyNow = { [weak self] in
+            guard let self else { return false }
+            return !self.recordingCoordinator.isSessionActive
+                && !self.snipCoordinator.isSessionActive
+                && !self.isPresentingSavePanel
+                && self.pinManager.pinCount == 0
+                && self.ocrTask == nil
+                && self.menuBarController?.isPanelVisible != true
+                && self.settingsController?.isWindowVisible != true
+                && self.onboardingController?.isWindowVisible != true
+        }
         updateManager.onBlockedByActiveSession = { [weak self] in
             self?.toast.show(
                 CCXL10n.text("Finish Active Recording First", zh: "请先结束当前录屏"),
@@ -119,6 +132,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             updateManager: updateManager
         )
         menuBarController.delegate = self
+        menuBarController.onPanelVisibilityChanged = { [weak self] _ in
+            self?.updateManager.notifyActivityStateChanged()
+        }
         menuBarController.updateSnipHotKey(combo: currentSnipCombo, isRegistered: snipHotKeyRegistered)
         self.menuBarController = menuBarController
         clipboardStore.onHistoryChanged = { [weak self] in
@@ -129,6 +145,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         recordingCoordinator.onStatusChanged = { [weak self] status in
             self?.menuBarController?.updateRecordingStatus(status)
+            if status == nil {
+                self?.updateManager.notifyActivityStateChanged()
+            }
         }
         recordingCoordinator.onNotice = { [weak self] message, symbol in
             self?.toast.show(message, symbolName: symbol)
@@ -161,10 +180,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         scheduledUpdateCheckTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .seconds(15))
-            guard !Task.isCancelled, let self else { return }
-            self.scheduledUpdateCheckTask = nil
-            self.updateManager.checkForUpdatesInBackgroundIfDue()
+            do {
+                try await Task.sleep(for: .seconds(15))
+            } catch {
+                return
+            }
+            while !Task.isCancelled {
+                guard let self else { return }
+                self.updateManager.checkForUpdatesInBackgroundIfDue()
+                do {
+                    try await Task.sleep(for: .seconds(86_400))
+                } catch {
+                    return
+                }
+            }
         }
     }
 
@@ -213,6 +242,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         recordingCoordinator.cancelActiveSession()
         hotKeyManager.unregisterAll()
         clipboardStore.flushPendingPersistence()
+        _ = updateManager.applyPreparedUpdateOnQuitIfReady()
     }
 
     func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool {
@@ -378,6 +408,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         snipCoordinator.startSnip(mode: .snip) { [weak self] outcome in
             self?.handle(outcome)
         }
+        updateManager.notifyActivityStateChanged()
     }
 
     private func startRecordSelection() {
@@ -385,6 +416,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         snipCoordinator.startSnip(mode: .record) { [weak self] outcome in
             self?.handle(outcome)
         }
+        updateManager.notifyActivityStateChanged()
     }
 
     private func pinFromClipboard() {
@@ -463,6 +495,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             break
         }
         menuBarController?.refresh()
+        updateManager.notifyActivityStateChanged()
     }
 
     @discardableResult
@@ -472,6 +505,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func recognizeAndCopyText(from image: CGImage) {
         ocrTask?.cancel()
+        let taskID = UUID()
+        ocrTaskID = taskID
         ocrTask = Task { @MainActor [weak self] in
             guard let self else { return }
             let progressTask = Task { @MainActor [weak self] in
@@ -479,7 +514,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 guard !Task.isCancelled else { return }
                 self?.toast.show(CCXL10n.text("Recognizing Text…", zh: "正在识别文字…"), symbolName: "text.viewfinder")
             }
-            defer { progressTask.cancel() }
+            defer {
+                progressTask.cancel()
+                if self.ocrTaskID == taskID {
+                    self.ocrTask = nil
+                    self.updateManager.notifyActivityStateChanged()
+                }
+            }
 
             do {
                 let text = try await TextRecognizer.recognizeText(in: image)
@@ -500,6 +541,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.toast.show(CCXL10n.text("OCR Failed", zh: "文字识别失败"), symbolName: "exclamationmark.triangle")
             }
         }
+        updateManager.notifyActivityStateChanged()
     }
 
     // MARK: - Saving
@@ -523,6 +565,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         isPresentingSavePanel = true
         activeSavePanel = panel
+        updateManager.notifyActivityStateChanged()
         NSApp.activate()
 
         panel.begin { [weak self] response in
@@ -530,7 +573,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 guard let self else { return }
                 self.isPresentingSavePanel = false
                 self.activeSavePanel = nil
-                defer { self.drainPendingRecordingSavesIfIdle() }
+                defer {
+                    self.drainPendingRecordingSavesIfIdle()
+                    self.updateManager.notifyActivityStateChanged()
+                }
 
                 guard response == .OK, let url = panel.url else { return }
                 UserDefaults.standard.set(url.deletingLastPathComponent().path, forKey: Self.lastSaveDirectoryKey)
@@ -666,6 +712,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         isPresentingSavePanel = true
         activeSavePanel = panel
+        updateManager.notifyActivityStateChanged()
         NSApp.activate()
 
         panel.begin { [weak self] response in
@@ -673,7 +720,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 guard let self else { return }
                 self.isPresentingSavePanel = false
                 self.activeSavePanel = nil
-                defer { self.drainPendingRecordingSavesIfIdle() }
+                defer {
+                    self.drainPendingRecordingSavesIfIdle()
+                    self.updateManager.notifyActivityStateChanged()
+                }
 
                 guard response == .OK, let url = panel.url else { return }
                 let normalizedPath = Self.normalizedDirectoryPath(url.path)
@@ -761,6 +811,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         recordingCoordinator.startSession(region: region) { [weak self] outcome in
             self?.handleRecordingOutcome(outcome)
         }
+        updateManager.notifyActivityStateChanged()
     }
 
     private func handleRecordingOutcome(_ outcome: RecordingOutcome) {
@@ -787,6 +838,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             break
         }
         menuBarController?.refresh()
+        updateManager.notifyActivityStateChanged()
     }
 
     private func copyRecordingToPasteboard(_ result: RecordingResult) {
@@ -827,9 +879,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func drainPendingRecordingSavesIfIdle() {
-        guard !isPresentingSavePanel, !pendingRecordingSaves.isEmpty else { return }
-        let next = pendingRecordingSaves.removeFirst()
-        presentSavePanel(for: next)
+        guard !isPresentingSavePanel else { return }
+        if !pendingRecordingSaves.isEmpty {
+            let next = pendingRecordingSaves.removeFirst()
+            presentSavePanel(for: next)
+        } else {
+            updateManager.notifyActivityStateChanged()
+        }
     }
 
     private func presentSavePanel(for result: RecordingResult) {
@@ -854,6 +910,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         isPresentingSavePanel = true
         activeSavePanel = panel
+        updateManager.notifyActivityStateChanged()
         NSApp.activate()
 
         panel.begin { [weak self] response in
@@ -1114,7 +1171,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     ) {
         recordingCoordinator.cancelIfInReadyPhase()
         if onboardingController == nil {
-            onboardingController = OnboardingWindowController(
+            let controller = OnboardingWindowController(
                 snipCombo: currentSnipCombo,
                 onComplete: {
                     UserDefaults.standard.set(true, forKey: Self.hasCompletedOnboardingKey)
@@ -1126,6 +1183,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     }
                 }
             )
+            controller.onWindowVisibilityChanged = { [weak self] _ in
+                self?.updateManager.notifyActivityStateChanged()
+            }
+            onboardingController = controller
         } else {
             onboardingController?.updateSnipCombo(currentSnipCombo)
         }
@@ -1137,7 +1198,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let hasClearable = !clipboardStore.history.isEmpty || clipboardStore.hasPasteboardContent
         let recordingsFolderPath = displayPathForDirectory(preferredRecordingsDirectoryURL(createIfNeeded: false))
         if settingsController == nil {
-            settingsController = SettingsWindowController(
+            let controller = SettingsWindowController(
                 updateManager: updateManager,
                 snipCombo: currentSnipCombo,
                 isSnipHotKeyRegistered: hotKeyManager.isRegistered(.snip),
@@ -1183,6 +1244,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     )
                 }
             )
+            controller.onWindowVisibilityChanged = { [weak self] _ in
+                self?.updateManager.notifyActivityStateChanged()
+            }
+            settingsController = controller
         } else {
             settingsController?.updateSnipHotKey(
                 combo: currentSnipCombo,
