@@ -28,12 +28,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let recordingCoordinator: RecordingCoordinator
     private let hotKeyManager: GlobalHotKeyManager
     private let toast: ToastHUD
+    private let updateManager = AppUpdateManager()
 
     private var menuBarController: MenuBarController?
     private var onboardingController: OnboardingWindowController?
     private var settingsController: SettingsWindowController?
     private var hadClickThroughPins = false
     private var pendingLaunchTask: Task<Void, Never>?
+    private var scheduledUpdateCheckTask: Task<Void, Never>?
     private var ocrTask: Task<Void, Never>?
     private var isPresentingSavePanel = false
     private weak var activeSavePanel: NSSavePanel?
@@ -87,11 +89,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         RecordingCoordinator.cleanupTemporaryRecordings()
         DispatchQueue.global(qos: .utility).async {
             Self.cleanupPasteboardRecordings()
+            AppUpdateInstaller.cleanupStaleStagingDirectories()
+        }
+
+        updateManager.canTerminateNow = { [weak self] in
+            guard let self else { return false }
+            return !self.recordingCoordinator.isSessionActive && !self.isPresentingSavePanel
+        }
+        updateManager.onBlockedByActiveSession = { [weak self] in
+            self?.toast.show("Finish Active Recording First", symbolName: "record.circle.fill")
+        }
+        updateManager.onUserFacingError = { [weak self] message in
+            self?.toast.show(message, symbolName: "exclamationmark.triangle")
+        }
+        updateManager.terminateHandler = {
+            NSApp.terminate(nil)
         }
 
         let menuBarController = MenuBarController(
             pinManager: pinManager,
-            clipboardStore: clipboardStore
+            clipboardStore: clipboardStore,
+            updateManager: updateManager
         )
         menuBarController.delegate = self
         menuBarController.updateHotKeyRegistered(snipHotKeyRegistered)
@@ -131,6 +149,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else if !UserDefaults.standard.bool(forKey: Self.hasCompletedOnboardingKey) {
             showOnboarding(startingAt: .ready, anchor: .centeredOnActiveScreen)
         }
+
+        scheduledUpdateCheckTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(15))
+            guard !Task.isCancelled, let self else { return }
+            self.scheduledUpdateCheckTask = nil
+            self.updateManager.checkForUpdatesInBackgroundIfDue()
+        }
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -156,6 +181,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         pendingLaunchTask?.cancel()
         pendingLaunchTask = nil
+        scheduledUpdateCheckTask?.cancel()
+        scheduledUpdateCheckTask = nil
         ocrTask?.cancel()
         ocrTask = nil
         if let didBecomeActiveObserver {
@@ -983,6 +1010,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let recordingsFolderPath = displayPathForDirectory(preferredRecordingsDirectoryURL(createIfNeeded: false))
         if settingsController == nil {
             settingsController = SettingsWindowController(
+                updateManager: updateManager,
                 isSnipHotKeyRegistered: hotKeyManager.isRegistered(.snip),
                 hasClearableHistory: hasClearable,
                 recordingsFolderPath: recordingsFolderPath,

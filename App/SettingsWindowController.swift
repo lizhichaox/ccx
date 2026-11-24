@@ -20,11 +20,12 @@ final class SettingsHotKeyState: ObservableObject {
     }
 }
 
-/// Hosts the compact, single-screen Settings window: shortcut, launch at login, recordings folder, and permissions.
+/// Hosts the compact, single-screen Settings window: shortcut, launch at login, recordings folder, updates, and permissions.
 @MainActor
 final class SettingsWindowController: NSObject, NSWindowDelegate {
     private let permissions = PermissionStatusModel()
     private let hotKeyState: SettingsHotKeyState
+    private let updateManager: AppUpdateManager
     private let onRetryHotKey: () -> Bool
     private let onOpenRecordingsFolder: () -> Void
     private let onChooseRecordingsFolder: () -> Void
@@ -35,6 +36,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     var windowFrame: NSRect? { window?.frame }
 
     init(
+        updateManager: AppUpdateManager,
         isSnipHotKeyRegistered: Bool = true,
         hasClearableHistory: Bool = false,
         recordingsFolderPath: String = "~/Movies/CCX",
@@ -44,6 +46,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         onOpenGuide: @escaping (NSRect?) -> Void = { _ in },
         onClearHistory: @escaping () -> Void = {}
     ) {
+        self.updateManager = updateManager
         self.hotKeyState = SettingsHotKeyState(
             isSnipRegistered: isSnipHotKeyRegistered,
             hasClearableHistory: hasClearableHistory,
@@ -107,6 +110,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         let view = SettingsView(
             permissions: permissions,
             hotKeyState: hotKeyState,
+            updateManager: updateManager,
             onRetryHotKey: { [weak self] in
                 guard let self else { return }
                 let registered = self.onRetryHotKey()
@@ -209,6 +213,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
 private struct SettingsView: View {
     @ObservedObject var permissions: PermissionStatusModel
     @ObservedObject var hotKeyState: SettingsHotKeyState
+    @ObservedObject var updateManager: AppUpdateManager
     let onRetryHotKey: () -> Void
     let onOpenRecordingsFolder: () -> Void
     let onChooseRecordingsFolder: () -> Void
@@ -245,6 +250,8 @@ private struct SettingsView: View {
                         onChoose: onChooseRecordingsFolder,
                         onOpen: onOpenRecordingsFolder
                     )
+                    Divider().padding(.leading, 42)
+                    UpdatesSettingRow(updateManager: updateManager)
                     Divider().padding(.leading, 42)
                     ScreenRecordingSettingRow(
                         granted: permissions.status.screenRecording,
@@ -329,7 +336,7 @@ private struct SettingsFooter: View {
 
     var body: some View {
         VStack(spacing: 3) {
-            Text("100% local & private · Zero telemetry")
+            Text("Local captures & OCR · Zero telemetry")
                 .font(.system(size: 10.5))
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
@@ -571,6 +578,197 @@ private struct RecordingsFolderRow: View {
         .padding(.horizontal, 10)
         .padding(.vertical, 7.5)
         .help("Default recordings folder: \(folderPath)")
+    }
+}
+
+private struct UpdatesSettingRow: View {
+    @ObservedObject var updateManager: AppUpdateManager
+
+    private var iconTint: Color {
+        if case .available = updateManager.state {
+            return .green
+        }
+        return .blue
+    }
+
+    private var statusSubtitle: String {
+        switch updateManager.state {
+        case .idle:
+            return updateManager.automaticallyChecksForUpdates ? "Automatic" : "Manual"
+        case .checking:
+            return "Checking…"
+        case .upToDate:
+            return "Up to date"
+        case .available(let release):
+            return "v\(release.version.description) available"
+        case .downloading(_, let progress):
+            return "Downloading \(Int((progress * 100).rounded()))%…"
+        case .verifying:
+            return "Verifying…"
+        case .installing:
+            return "Installing…"
+        case .failed:
+            return "Update failed"
+        }
+    }
+
+    private var subtitleColor: Color {
+        switch updateManager.state {
+        case .available:
+            return .green
+        case .failed:
+            return .red
+        case .idle, .checking, .upToDate, .downloading, .verifying, .installing:
+            return .secondary
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 9) {
+                Image(systemName: "arrow.down.circle.fill")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(iconTint)
+                    .frame(width: 24, height: 24)
+                    .background(iconTint.opacity(0.14), in: RoundedRectangle(cornerRadius: 6.5, style: .continuous))
+
+                VStack(alignment: .leading, spacing: 1.5) {
+                    Text("Updates")
+                        .font(.system(size: 12.5, weight: .medium))
+                        .lineLimit(1)
+
+                    Text(statusSubtitle)
+                        .font(.system(size: 10.5).monospacedDigit())
+                        .foregroundStyle(subtitleColor)
+                        .lineLimit(1)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+                trailingControls
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 7.5)
+
+            switch updateManager.state {
+            case .available(let release):
+                HStack(spacing: 6) {
+                    Button {
+                        NSWorkspace.shared.open(release.releaseURL)
+                    } label: {
+                        Text("View Release Notes ↗")
+                            .font(.system(size: 10.5, weight: .medium))
+                            .foregroundStyle(Color.accentColor)
+                    }
+                    .buttonStyle(.plain)
+                    .pointerStyle(.link)
+                    Spacer(minLength: 0)
+                }
+                .padding(.leading, 43)
+                .padding(.trailing, 10)
+                .padding(.bottom, 7)
+
+            case .failed(let message, let release):
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(message)
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    Button {
+                        NSWorkspace.shared.open(release?.releaseURL ?? AppUpdateURLPolicy.releasesPageURL)
+                    } label: {
+                        Text("Open GitHub ↗")
+                            .font(.system(size: 10.5, weight: .medium))
+                            .foregroundStyle(Color.accentColor)
+                    }
+                    .buttonStyle(.plain)
+                    .pointerStyle(.link)
+                }
+                .padding(.leading, 43)
+                .padding(.trailing, 10)
+                .padding(.bottom, 7)
+
+            case .idle, .checking, .upToDate, .downloading, .verifying, .installing:
+                EmptyView()
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var trailingControls: some View {
+        switch updateManager.state {
+        case .idle, .upToDate:
+            HStack(spacing: 6) {
+                Button("Check") {
+                    updateManager.checkForUpdates(userInitiated: true)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .fixedSize()
+                autoCheckToggle
+            }
+
+        case .checking:
+            HStack(spacing: 6) {
+                Button("Checking…") {}
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(true)
+                    .fixedSize()
+                autoCheckToggle
+            }
+
+        case .available:
+            HStack(spacing: 6) {
+                Button("Update") {
+                    updateManager.installAvailableUpdate()
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .fixedSize()
+                autoCheckToggle
+            }
+
+        case .downloading(_, let progress):
+            HStack(spacing: 6) {
+                ProgressView(value: progress)
+                    .progressViewStyle(.linear)
+                    .frame(width: 66)
+                Button("Cancel") {
+                    updateManager.cancelDownload()
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .fixedSize()
+            }
+
+        case .verifying, .installing:
+            ProgressView()
+                .controlSize(.small)
+
+        case .failed(_, let release):
+            HStack(spacing: 6) {
+                Button("Retry") {
+                    if release != nil {
+                        updateManager.installAvailableUpdate()
+                    } else {
+                        updateManager.checkForUpdates(userInitiated: true)
+                    }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .fixedSize()
+                autoCheckToggle
+            }
+        }
+    }
+
+    private var autoCheckToggle: some View {
+        Toggle("", isOn: $updateManager.automaticallyChecksForUpdates)
+            .labelsHidden()
+            .toggleStyle(.switch)
+            .controlSize(.small)
+            .help("Automatically check for updates daily")
     }
 }
 

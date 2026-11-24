@@ -486,7 +486,7 @@ private struct WelcomeStepView: View {
                 Text("Control · Command · X")
                     .font(.system(size: 16, weight: .bold))
 
-                Text("100% local & private · No accounts, no telemetry")
+                Text("Local captures & OCR · No accounts, no telemetry")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             }

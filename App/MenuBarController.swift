@@ -2,6 +2,7 @@ import AppKit
 import CCXCore
 import CCXPin
 import CCXRecord
+import Combine
 import SwiftUI
 
 /// Commands issued from the status bar popover.
@@ -82,10 +83,19 @@ final class MenuBarController: NSObject, NSWindowDelegate {
         return image
     }
 
+    private struct UpdatePopoverLayoutKey: Equatable {
+        let showBanner: Bool
+        let hasBadge: Bool
+        let phaseTag: Int
+    }
+
     private let statusItem: NSStatusItem
     private let pinManager: PinManager
     private let clipboardStore: ClipboardStore
+    private let updateManager: AppUpdateManager
     private let model = MenuBarPanelModel()
+    private var updateCancellables = Set<AnyCancellable>()
+    private var lastUpdateLayoutKey: UpdatePopoverLayoutKey?
     private var recordingStatus: RecordingMenuBarStatus?
     private var lastStatusButtonKey: StatusButtonRenderKey?
     private var isShowingRecordingButton = false
@@ -107,10 +117,12 @@ final class MenuBarController: NSObject, NSWindowDelegate {
 
     init(
         pinManager: PinManager,
-        clipboardStore: ClipboardStore
+        clipboardStore: ClipboardStore,
+        updateManager: AppUpdateManager
     ) {
         self.pinManager = pinManager
         self.clipboardStore = clipboardStore
+        self.updateManager = updateManager
         self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         super.init()
 
@@ -133,6 +145,51 @@ final class MenuBarController: NSObject, NSWindowDelegate {
         }
 
         syncModel()
+        observeUpdateState()
+    }
+
+    private func observeUpdateState() {
+        lastUpdateLayoutKey = currentUpdateLayoutKey()
+        let handleChange: @MainActor () -> Void = { [weak self] in
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                let nextKey = self.currentUpdateLayoutKey()
+                guard nextKey != self.lastUpdateLayoutKey else { return }
+                self.lastUpdateLayoutKey = nextKey
+                if self.panel?.isVisible == true {
+                    self.refresh()
+                }
+            }
+        }
+        updateManager.$state
+            .sink { _ in handleChange() }
+            .store(in: &updateCancellables)
+        updateManager.$dismissedBannerVersion
+            .sink { _ in handleChange() }
+            .store(in: &updateCancellables)
+    }
+
+    private func currentUpdateLayoutKey() -> UpdatePopoverLayoutKey {
+        let phaseTag: Int
+        switch updateManager.state {
+        case .idle, .checking, .upToDate:
+            phaseTag = 0
+        case .available:
+            phaseTag = 1
+        case .downloading:
+            phaseTag = 2
+        case .verifying:
+            phaseTag = 3
+        case .installing:
+            phaseTag = 4
+        case .failed(_, let release):
+            phaseTag = release != nil ? 5 : 0
+        }
+        return UpdatePopoverLayoutKey(
+            showBanner: updateManager.shouldShowPopoverBanner,
+            hasBadge: updateManager.availableRelease != nil && !updateManager.shouldShowPopoverBanner,
+            phaseTag: phaseTag
+        )
     }
 
     func updateRecordingStatus(_ status: RecordingMenuBarStatus?) {
@@ -346,6 +403,7 @@ final class MenuBarController: NSObject, NSWindowDelegate {
 
         let rootView = MenuBarPopoverView(
             model: model,
+            updateManager: updateManager,
             actions: MenuBarPopoverActions(
                 onSnip: { [weak self] in
                     self?.hidePanel()

@@ -115,6 +115,7 @@ struct MenuBarPopoverActions {
 /// Refined Liquid Glass menu bar popover replacing the legacy `NSMenu`.
 struct MenuBarPopoverView: View {
     @ObservedObject var model: MenuBarPanelModel
+    @ObservedObject var updateManager: AppUpdateManager
     let actions: MenuBarPopoverActions
 
     var body: some View {
@@ -188,8 +189,13 @@ struct MenuBarPopoverView: View {
                 )
             }
 
+            if updateManager.shouldShowPopoverBanner {
+                UpdateAvailableBanner(updateManager: updateManager)
+            }
+
             UtilityFooterSection(
                 permissions: model.permissions,
+                hasUpdateBadge: updateManager.availableRelease != nil && !updateManager.shouldShowPopoverBanner,
                 onOpenPermissions: actions.onOpenPermissions,
                 onOpenSettings: actions.onOpenSettings,
                 onQuit: actions.onQuit
@@ -792,10 +798,194 @@ private struct PinControlPill: View {
     }
 }
 
+// MARK: - In-App Update Banner
+
+private struct UpdateAvailableBanner: View {
+    @ObservedObject var updateManager: AppUpdateManager
+
+    private var isFailedState: Bool {
+        if case .failed = updateManager.state {
+            return true
+        }
+        return false
+    }
+
+    var body: some View {
+        let tint: Color = isFailedState ? .orange : .green
+
+        Group {
+            switch updateManager.state {
+            case .available(let release):
+                HStack(spacing: 8) {
+                    Image(systemName: "arrow.down.circle.fill")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(.green)
+
+                    Text("Update v\(release.version.description)")
+                        .font(.system(size: 11.5, weight: .semibold))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+
+                    Spacer(minLength: 4)
+
+                    Button {
+                        updateManager.installAvailableUpdate()
+                    } label: {
+                        Text("Update")
+                            .font(.system(size: 10.5, weight: .semibold))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 3.5)
+                            .background(Color.green, in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .fixedSize()
+
+                    Button {
+                        updateManager.dismissPopoverBanner()
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 9.5, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 18, height: 18)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help("Dismiss update notice")
+                    .accessibilityLabel("Dismiss update notice")
+                }
+
+            case .downloading(_, let progress):
+                HStack(spacing: 8) {
+                    Image(systemName: "arrow.down.circle.fill")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(Color.accentColor)
+
+                    Text("Downloading \(Int((progress * 100).rounded()))%")
+                        .font(.system(size: 11, weight: .medium).monospacedDigit())
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+
+                    Spacer(minLength: 4)
+
+                    ProgressView(value: progress)
+                        .progressViewStyle(.linear)
+                        .frame(width: 64)
+
+                    Button {
+                        updateManager.cancelDownload()
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 9.5, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 18, height: 18)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help("Cancel download")
+                    .accessibilityLabel("Cancel download")
+                }
+
+            case .verifying:
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.mini)
+                    Text("Verifying…")
+                        .font(.system(size: 11.5, weight: .medium))
+                        .foregroundStyle(.primary)
+                    Spacer(minLength: 0)
+                }
+
+            case .installing:
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.mini)
+                    Text("Installing…")
+                        .font(.system(size: 11.5, weight: .medium))
+                        .foregroundStyle(.primary)
+                    Spacer(minLength: 0)
+                }
+
+            case .failed(let message, let release):
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(.orange)
+
+                        Text("Update Failed")
+                            .font(.system(size: 11.5, weight: .semibold))
+                            .foregroundStyle(.primary)
+                            .lineLimit(1)
+
+                        Spacer(minLength: 4)
+
+                        Button {
+                            updateManager.installAvailableUpdate()
+                        } label: {
+                            Text("Retry")
+                                .font(.system(size: 10.5, weight: .semibold))
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 3)
+                                .background(Color.orange, in: Capsule())
+                        }
+                        .buttonStyle(.plain)
+                        .fixedSize()
+
+                        Button {
+                            NSWorkspace.shared.open(release?.releaseURL ?? AppUpdateURLPolicy.releasesPageURL)
+                        } label: {
+                            Text("GitHub")
+                                .font(.system(size: 10.5, weight: .medium))
+                                .foregroundStyle(Color.accentColor)
+                        }
+                        .buttonStyle(.plain)
+                        .pointerStyle(.link)
+                        .fixedSize()
+
+                        Button {
+                            updateManager.dismissPopoverBanner()
+                        } label: {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 9.5, weight: .semibold))
+                                .foregroundStyle(.secondary)
+                                .frame(width: 18, height: 18)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .help("Dismiss update error")
+                        .accessibilityLabel("Dismiss update error")
+                    }
+
+                    Text(message)
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+            case .idle, .checking, .upToDate:
+                EmptyView()
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(tint.opacity(0.09))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(tint.opacity(0.26), lineWidth: 1)
+        )
+    }
+}
+
 // MARK: - Utility Dock
 
 private struct UtilityFooterSection: View {
     let permissions: CCXPermissionStatus
+    var hasUpdateBadge = false
     let onOpenPermissions: () -> Void
     let onOpenSettings: () -> Void
     let onQuit: () -> Void
@@ -820,7 +1010,8 @@ private struct UtilityFooterSection: View {
                 UtilityDockButton(
                     title: "Settings",
                     symbol: "gearshape",
-                    tooltip: "Settings (⌘,)",
+                    showBadgeDot: hasUpdateBadge,
+                    tooltip: hasUpdateBadge ? "Settings (⌘,) — Update available" : "Settings (⌘,)",
                     action: onOpenSettings
                 )
 
@@ -841,6 +1032,7 @@ private struct UtilityDockButton: View {
     let symbol: String
     var symbolTint: Color? = nil
     var needsAttention = false
+    var showBadgeDot = false
     var isDestructive = false
     let tooltip: String
     let action: () -> Void
@@ -853,6 +1045,14 @@ private struct UtilityDockButton: View {
                 Image(systemName: symbol)
                     .font(.system(size: 13.5, weight: .medium))
                     .foregroundStyle(resolvedSymbolColor)
+                    .overlay(alignment: .topTrailing) {
+                        if showBadgeDot {
+                            Circle()
+                                .fill(Color.green)
+                                .frame(width: 6, height: 6)
+                                .offset(x: 4, y: -2)
+                        }
+                    }
 
                 Text(title)
                     .font(.system(size: 10.5, weight: .medium))
