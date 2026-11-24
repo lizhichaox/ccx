@@ -53,6 +53,39 @@ public struct HotKeyCombo: Equatable, Hashable, Sendable, Codable {
         carbonModifiers: UInt32(controlKey | cmdKey)
     )
 
+    private static let functionKeyCodes: Set<UInt32> = [
+        UInt32(kVK_F1), UInt32(kVK_F2), UInt32(kVK_F3), UInt32(kVK_F4), UInt32(kVK_F5),
+        UInt32(kVK_F6), UInt32(kVK_F7), UInt32(kVK_F8), UInt32(kVK_F9), UInt32(kVK_F10),
+        UInt32(kVK_F11), UInt32(kVK_F12), UInt32(kVK_F13), UInt32(kVK_F14), UInt32(kVK_F15),
+        UInt32(kVK_F16), UInt32(kVK_F17), UInt32(kVK_F18), UInt32(kVK_F19), UInt32(kVK_F20),
+    ]
+
+    private static let modifierOnlyKeyCodes: Set<UInt32> = [
+        UInt32(kVK_Command), UInt32(kVK_RightCommand),
+        UInt32(kVK_Shift), UInt32(kVK_RightShift),
+        UInt32(kVK_Option), UInt32(kVK_RightOption),
+        UInt32(kVK_Control), UInt32(kVK_RightControl),
+        UInt32(kVK_CapsLock), UInt32(kVK_Function),
+    ]
+
+    /// Copy of this combo with `carbonModifiers` masked to `validCarbonModifierMask`.
+    public var normalized: HotKeyCombo {
+        HotKeyCombo(
+            keyCode: keyCode,
+            carbonModifiers: carbonModifiers & validCarbonModifierMask
+        )
+    }
+
+    /// Whether `keyCode` is a function key (`F1`–`F20`).
+    public var isFunctionKey: Bool {
+        Self.functionKeyCodes.contains(keyCode)
+    }
+
+    /// Whether `keyCode` is a standalone modifier key (Command, Shift, Option, Control, Caps Lock, or Fn).
+    public var isModifierOnlyKey: Bool {
+        Self.modifierOnlyKeyCodes.contains(keyCode)
+    }
+
     /// Converts AppKit modifier flags into a Carbon modifier mask.
     public static func carbonModifiers(from flags: NSEvent.ModifierFlags) -> UInt32 {
         var mask: UInt32 = 0
@@ -73,15 +106,200 @@ public struct HotKeyCombo: Equatable, Hashable, Sendable, Codable {
         return flags
     }
 
+    /// Canonical modifier symbols (`⌃`, `⌥`, `⇧`, `⌘`) followed by the key name token.
+    public var tokens: [String] {
+        var result: [String] = []
+        if carbonModifiers & UInt32(controlKey) != 0 { result.append("⌃") }
+        if carbonModifiers & UInt32(optionKey) != 0 { result.append("⌥") }
+        if carbonModifiers & UInt32(shiftKey) != 0 { result.append("⇧") }
+        if carbonModifiers & UInt32(cmdKey) != 0 { result.append("⌘") }
+        result.append(KeyCodeNames.name(for: keyCode))
+        return result
+    }
+
     /// Mac-style shortcut string, modifiers in canonical `⌃⌥⇧⌘` order, e.g. `⌃⌘X`.
     public var displayString: String {
-        var result = ""
-        if carbonModifiers & UInt32(controlKey) != 0 { result += "⌃" }
-        if carbonModifiers & UInt32(optionKey) != 0 { result += "⌥" }
-        if carbonModifiers & UInt32(shiftKey) != 0 { result += "⇧" }
-        if carbonModifiers & UInt32(cmdKey) != 0 { result += "⌘" }
-        result += KeyCodeNames.name(for: keyCode)
+        tokens.joined()
+    }
+}
+
+/// Describes why a candidate global hotkey cannot be assigned or registered.
+public enum HotKeyConflict: Equatable, Sendable, LocalizedError {
+    case modifierOnly
+    case missingModifier
+    case escapeNotAllowed
+    case systemShortcut(HotKeyCombo)
+    case reservedAppShortcut(HotKeyCombo, label: String)
+    case internalConflict(HotKeyCombo, action: CCXHotKeyAction)
+    case inUseByAnotherApp(HotKeyCombo)
+    case registrationFailed(HotKeyCombo, OSStatus)
+
+    public var errorDescription: String? {
+        switch self {
+        case .modifierOnly:
+            "Press a key along with ⌘, ⌃, or ⌥."
+        case .missingModifier:
+            "Include ⌘, ⌃, or ⌥ (or use a Function key F1–F20)."
+        case .escapeNotAllowed:
+            "Escape cannot be used as a global shortcut."
+        case .systemShortcut(let combo):
+            "\(combo.displayString) is used by a macOS system shortcut. Disable it in System Settings or choose another."
+        case .reservedAppShortcut(let combo, let label):
+            "\(combo.displayString) is reserved for \(label). Choose another shortcut."
+        case .internalConflict(let combo, let action):
+            "\(combo.displayString) is already assigned to \(action.displayName)."
+        case .inUseByAnotherApp(let combo):
+            "\(combo.displayString) is already in use by another app."
+        case .registrationFailed(let combo, let status):
+            "Could not register \(combo.displayString) (error \(status))."
+        }
+    }
+}
+
+/// Outcome of validated global hotkey registration.
+public enum HotKeyRegistrationResult: Equatable, Sendable {
+    case registered(HotKeyCombo)
+    case conflict(HotKeyConflict)
+}
+
+/// Validates shortcut structure and checks reserved app and active macOS symbolic shortcuts.
+public enum HotKeyConflictDetector {
+    /// Essential system & standard application shortcuts that must not be hijacked globally.
+    public static let reservedAppShortcuts: [HotKeyCombo: String] = [
+        HotKeyCombo(keyCode: UInt32(kVK_ANSI_C), carbonModifiers: UInt32(cmdKey)): "Copy",
+        HotKeyCombo(keyCode: UInt32(kVK_ANSI_V), carbonModifiers: UInt32(cmdKey)): "Paste",
+        HotKeyCombo(keyCode: UInt32(kVK_ANSI_X), carbonModifiers: UInt32(cmdKey)): "Cut",
+        HotKeyCombo(keyCode: UInt32(kVK_ANSI_Z), carbonModifiers: UInt32(cmdKey)): "Undo",
+        HotKeyCombo(keyCode: UInt32(kVK_ANSI_Z), carbonModifiers: UInt32(cmdKey | shiftKey)): "Redo",
+        HotKeyCombo(keyCode: UInt32(kVK_ANSI_A), carbonModifiers: UInt32(cmdKey)): "Select All",
+        HotKeyCombo(keyCode: UInt32(kVK_ANSI_S), carbonModifiers: UInt32(cmdKey)): "Save",
+        HotKeyCombo(keyCode: UInt32(kVK_ANSI_Q), carbonModifiers: UInt32(cmdKey)): "Quit",
+        HotKeyCombo(keyCode: UInt32(kVK_ANSI_Q), carbonModifiers: UInt32(cmdKey | shiftKey)): "Log Out",
+        HotKeyCombo(keyCode: UInt32(kVK_ANSI_W), carbonModifiers: UInt32(cmdKey)): "Close Window",
+        HotKeyCombo(keyCode: UInt32(kVK_ANSI_H), carbonModifiers: UInt32(cmdKey)): "Hide",
+        HotKeyCombo(keyCode: UInt32(kVK_ANSI_H), carbonModifiers: UInt32(cmdKey | optionKey)): "Hide Others",
+        HotKeyCombo(keyCode: UInt32(kVK_ANSI_M), carbonModifiers: UInt32(cmdKey)): "Minimize",
+        HotKeyCombo(keyCode: UInt32(kVK_ANSI_N), carbonModifiers: UInt32(cmdKey)): "New",
+        HotKeyCombo(keyCode: UInt32(kVK_ANSI_O), carbonModifiers: UInt32(cmdKey)): "Open",
+        HotKeyCombo(keyCode: UInt32(kVK_ANSI_P), carbonModifiers: UInt32(cmdKey)): "Print",
+        HotKeyCombo(keyCode: UInt32(kVK_ANSI_F), carbonModifiers: UInt32(cmdKey)): "Find",
+        HotKeyCombo(keyCode: UInt32(kVK_ANSI_T), carbonModifiers: UInt32(cmdKey)): "New Tab",
+        HotKeyCombo(keyCode: UInt32(kVK_ANSI_R), carbonModifiers: UInt32(cmdKey)): "Reload",
+        HotKeyCombo(keyCode: UInt32(kVK_ANSI_Comma), carbonModifiers: UInt32(cmdKey)): "Settings",
+        HotKeyCombo(keyCode: UInt32(kVK_ANSI_Period), carbonModifiers: UInt32(cmdKey)): "Cancel",
+        HotKeyCombo(keyCode: UInt32(kVK_Tab), carbonModifiers: UInt32(cmdKey)): "App Switcher",
+        HotKeyCombo(keyCode: UInt32(kVK_Tab), carbonModifiers: UInt32(cmdKey | shiftKey)): "App Switcher",
+        HotKeyCombo(keyCode: UInt32(kVK_Space), carbonModifiers: UInt32(cmdKey)): "Spotlight",
+        HotKeyCombo(keyCode: UInt32(kVK_Escape), carbonModifiers: UInt32(cmdKey | optionKey)): "Force Quit",
+        HotKeyCombo(keyCode: UInt32(kVK_ANSI_Q), carbonModifiers: UInt32(controlKey | cmdKey)): "Lock Screen",
+    ]
+
+    /// Queries Carbon `CopySymbolicHotKeys` for all currently enabled macOS system shortcuts.
+    public static func activeSystemSymbolicHotKeys() -> Set<HotKeyCombo> {
+        var unmanaged: Unmanaged<CFArray>?
+        guard CopySymbolicHotKeys(&unmanaged) == noErr,
+              let entries = unmanaged?.takeRetainedValue() as? [[String: Any]]
+        else {
+            return []
+        }
+
+        var result = Set<HotKeyCombo>()
+        result.reserveCapacity(entries.count)
+        for item in entries {
+            guard (item[kHISymbolicHotKeyEnabled] as? Bool) == true,
+                  let code = (item[kHISymbolicHotKeyCode] as? NSNumber)?.intValue,
+                  code >= 0,
+                  code < Int(UInt16.max),
+                  let mods = (item[kHISymbolicHotKeyModifiers] as? NSNumber)?.uint32Value
+            else {
+                continue
+            }
+            result.insert(
+                HotKeyCombo(
+                    keyCode: UInt32(code),
+                    carbonModifiers: mods & validCarbonModifierMask
+                )
+            )
+        }
         return result
+    }
+
+    /// Validates that `combo` has an allowed key and primary modifier structure for a global hotkey.
+    public static func validateStructure(_ combo: HotKeyCombo) -> HotKeyConflict? {
+        let normalized = combo.normalized
+        if normalized.isModifierOnlyKey {
+            return .modifierOnly
+        }
+        if normalized.keyCode == UInt32(kVK_Escape), normalized.carbonModifiers == 0 {
+            return .escapeNotAllowed
+        }
+        let primaryModifierMask = UInt32(cmdKey | controlKey | optionKey)
+        if !normalized.isFunctionKey && (normalized.carbonModifiers & primaryModifierMask) == 0 {
+            return .missingModifier
+        }
+        return nil
+    }
+
+    /// Runs structure validation, reserved app shortcut lookup, and active system symbolic hotkey lookup.
+    public static func checkPreRegistrationConflict(
+        _ combo: HotKeyCombo,
+        symbolicHotKeysProvider: () -> Set<HotKeyCombo> = activeSystemSymbolicHotKeys
+    ) -> HotKeyConflict? {
+        let normalized = combo.normalized
+        if let structureConflict = validateStructure(normalized) {
+            return structureConflict
+        }
+        if let label = reservedAppShortcuts[normalized] {
+            return .reservedAppShortcut(normalized, label: label)
+        }
+        let activeSystem = symbolicHotKeysProvider()
+        if activeSystem.contains(normalized) {
+            return .systemShortcut(normalized)
+        }
+        return nil
+    }
+}
+
+/// Persists customized hotkey bindings in `UserDefaults`, falling back to factory defaults on absence or corruption.
+public enum HotKeyPreferences {
+    public static let snipComboKey = "CCXSnipHotKeyCombo"
+
+    private static func storageKey(for action: CCXHotKeyAction) -> String {
+        switch action {
+        case .snip: snipComboKey
+        }
+    }
+
+    public static func loadCombo(
+        for action: CCXHotKeyAction,
+        from defaults: UserDefaults = .standard
+    ) -> HotKeyCombo {
+        guard let data = defaults.data(forKey: storageKey(for: action)),
+              let decoded = try? JSONDecoder().decode(HotKeyCombo.self, from: data)
+        else {
+            return action.defaultCombo
+        }
+        let normalized = decoded.normalized
+        guard HotKeyConflictDetector.validateStructure(normalized) == nil else {
+            return action.defaultCombo
+        }
+        return normalized
+    }
+
+    public static func saveCombo(
+        _ combo: HotKeyCombo,
+        for action: CCXHotKeyAction,
+        to defaults: UserDefaults = .standard
+    ) {
+        let normalized = combo.normalized
+        let key = storageKey(for: action)
+        if normalized == action.defaultCombo {
+            defaults.removeObject(forKey: key)
+            return
+        }
+        if let data = try? JSONEncoder().encode(normalized) {
+            defaults.set(data, forKey: key)
+        }
     }
 }
 
@@ -270,10 +488,7 @@ public final class GlobalHotKeyManager {
     /// case any previous binding of `action` is preserved.
     @discardableResult
     public func register(_ action: CCXHotKeyAction, combo: HotKeyCombo) -> Bool {
-        let normalized = HotKeyCombo(
-            keyCode: combo.keyCode,
-            carbonModifiers: combo.carbonModifiers & validCarbonModifierMask
-        )
+        let normalized = combo.normalized
         if combos[action] == normalized, hotKeyRefs[action] != nil {
             lastRegistrationStatus[action] = noErr
             return true
@@ -291,6 +506,40 @@ public final class GlobalHotKeyManager {
         if let previous { _ = registerCarbon(action, combo: previous) }
         if let failureStatus { lastRegistrationStatus[action] = failureStatus }
         return false
+    }
+
+    /// Validates structure, reserved shortcuts, active macOS symbolic hotkeys, internal duplicates,
+    /// and exclusive Carbon registration before applying `combo` to `action`.
+    /// On any conflict, the existing binding for `action` is left undisturbed.
+    @discardableResult
+    public func registerChecked(
+        _ action: CCXHotKeyAction,
+        combo: HotKeyCombo,
+        symbolicHotKeysProvider: () -> Set<HotKeyCombo> = HotKeyConflictDetector.activeSystemSymbolicHotKeys
+    ) -> HotKeyRegistrationResult {
+        let normalized = combo.normalized
+        if combos[action] == normalized, hotKeyRefs[action] != nil {
+            lastRegistrationStatus[action] = noErr
+            return .registered(normalized)
+        }
+        if let preConflict = HotKeyConflictDetector.checkPreRegistrationConflict(
+            normalized,
+            symbolicHotKeysProvider: symbolicHotKeysProvider
+        ) {
+            return .conflict(preConflict)
+        }
+        if let existing = combos.first(where: { $0.key != action && $0.value == normalized }) {
+            lastRegistrationStatus[action] = OSStatus(eventHotKeyExistsErr)
+            return .conflict(.internalConflict(normalized, action: existing.key))
+        }
+        if register(action, combo: normalized) {
+            return .registered(normalized)
+        }
+        let status = lastRegistrationStatus[action] ?? OSStatus(eventHotKeyExistsErr)
+        if status == OSStatus(eventHotKeyExistsErr) {
+            return .conflict(.inUseByAnotherApp(normalized))
+        }
+        return .conflict(.registrationFailed(normalized, status))
     }
 
     public func unregister(_ action: CCXHotKeyAction) {
@@ -333,7 +582,7 @@ public final class GlobalHotKeyManager {
             combo.carbonModifiers & validCarbonModifierMask,
             hotKeyID,
             GetApplicationEventTarget(),
-            0,
+            OptionBits(kEventHotKeyExclusive),
             &ref
         )
         lastRegistrationStatus[action] = status
