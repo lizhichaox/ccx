@@ -33,7 +33,7 @@
 
 ## Installation
 
-1. Download the latest `CCX-0.8.1-macOS-universal.dmg` (or `.zip`).
+1. Download the latest `CCX-0.8.2-macOS-universal.dmg` (or `.zip`).
 2. Open the disk image and drag **CCX.app** into **Applications**.
 3. Launch **CCX** from `/Applications` or Spotlight.
 
@@ -157,7 +157,7 @@ done
 ### Public Release Packaging (Universal Binary + Hardened Runtime)
 ```bash
 # Bump version in project.yml when preparing a release:
-./scripts/bump-version.sh 0.8.1
+./scripts/bump-version.sh 0.8.2
 
 # Build signed Universal Binary (arm64 + x86_64), verify dylibs/codesign/entitlements,
 # and emit dist/CCX-<version>-macOS-universal.{dmg,zip} + dist/SHA256SUMS.txt:

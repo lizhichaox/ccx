@@ -2,6 +2,13 @@
 
 All notable changes to **CCX (Control · Command · X)** are documented in this file.
 
+## [0.8.2] - 2026-11-24
+
+### Security
+- **In-App Updater Archive & Path Hardening (`CCXCore`)**: Added ZIP archive pre-inspection before `ditto` extraction (blocking excessive entry counts, oversized uncompressed payloads, path traversal, and unsafe symlinks), scoped atomic-updater staging and cleanup path guards to CCX-owned paths, and enforced a strict exact-host GitHub allowlist with repository release path validation.
+- **Symlink & File-Safety Defenses (`App`)**: Hardened PNG save-directory validation (`preferredSaveDirectoryURL`) to strip trailing slashes before `lstat`, updated Quick Save collision detection (`nextUniqueURL`) to treat dangling symlinks as occupied, enforced regular-file source and non-symlink destination `lstat` verification in `moveRecordingAtomically`, and restricted pasteboard recording cleanup (`prunePasteboardRecordings`, `clearPasteboardRecordings`, `cleanupPasteboardRecordings`) to `lstat`-verified user-owned regular files and symlinks before `unlink`.
+- **Release Script & Repository Hygiene**: Hardened `scripts/package-release.sh` to reject symlinked `.p8` App Store Connect API keys, warn when key file permissions are broader than `600`/`400`, and warn when Apple ID notarization passes `--password` on the command line; added explicit private-key, certificate, and `.env.*` ignore rules in `.gitignore`; and added `SECURITY.md` documenting supported versions, security architecture, and private vulnerability disclosure.
+
 ## [0.8.1] - 2026-11-24
 
 ### Improved
