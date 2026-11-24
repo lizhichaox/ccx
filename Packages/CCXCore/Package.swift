@@ -16,6 +16,7 @@ let package = Package(
                 .linkedFramework("Carbon"),
                 .linkedFramework("ApplicationServices"),
                 .linkedFramework("ScreenCaptureKit"),
+                .linkedFramework("Security"),
                 .linkedFramework("Vision"),
             ]
         ),
