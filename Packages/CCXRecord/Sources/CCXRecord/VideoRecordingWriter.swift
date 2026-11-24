@@ -1,4 +1,5 @@
 import AVFoundation
+import CCXCore
 import CoreMedia
 import CoreVideo
 import Foundation
@@ -16,17 +17,17 @@ public enum RecordingError: LocalizedError, Sendable {
     public var errorDescription: String? {
         switch self {
         case .unsupportedFormat:
-            "Unsupported recording format."
+            CCXL10n.text("Unsupported recording format.", zh: "不支持的录屏格式。")
         case .writerInitializationFailed(let reason):
-            "Could not initialize video writer: \(reason)"
+            CCXL10n.text("Could not initialize video writer: \(reason)", zh: "无法初始化视频写入器：\(reason)")
         case .writerStartFailed(let reason):
-            "Could not start writing recording: \(reason)"
+            CCXL10n.text("Could not start writing recording: \(reason)", zh: "无法开始写入录屏：\(reason)")
         case .encoderInitializationFailed:
-            "Could not initialize GIF encoder."
+            CCXL10n.text("Could not initialize GIF encoder.", zh: "无法初始化 GIF 编码器。")
         case .encoderFinalizeFailed:
-            "Could not finalize GIF file."
+            CCXL10n.text("Could not finalize GIF file.", zh: "无法生成 GIF 文件。")
         case .noFramesCaptured:
-            "No video frames were captured."
+            CCXL10n.text("No video frames were captured.", zh: "未捕获到视频画面。")
         }
     }
 }
@@ -115,7 +116,9 @@ public final class VideoRecordingWriter: @unchecked Sendable {
         guard pixelSize.width.isFinite, pixelSize.height.isFinite,
               pixelSize.width > 0, pixelSize.height > 0
         else {
-            throw RecordingError.writerInitializationFailed("Invalid video dimensions.")
+            throw RecordingError.writerInitializationFailed(
+                CCXL10n.text("Invalid video dimensions.", zh: "视频尺寸无效。")
+            )
         }
 
         self.outputURL = outputURL
@@ -171,7 +174,9 @@ public final class VideoRecordingWriter: @unchecked Sendable {
         let vInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
         vInput.expectsMediaDataInRealTime = true
         guard writer.canAdd(vInput) else {
-            throw RecordingError.writerInitializationFailed("Cannot add video input for requested dimensions.")
+            throw RecordingError.writerInitializationFailed(
+                CCXL10n.text("Cannot add video input for requested dimensions.", zh: "当前尺寸无法添加视频轨道。")
+            )
         }
         self.videoInput = vInput
 
@@ -198,7 +203,9 @@ public final class VideoRecordingWriter: @unchecked Sendable {
             let aInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
             aInput.expectsMediaDataInRealTime = true
             guard writer.canAdd(aInput) else {
-                throw RecordingError.writerInitializationFailed("Cannot add audio input to video writer.")
+                throw RecordingError.writerInitializationFailed(
+                    CCXL10n.text("Cannot add audio input to video writer.", zh: "无法添加音频轨道。")
+                )
             }
             writer.add(aInput)
             self.audioInput = aInput
@@ -210,10 +217,13 @@ public final class VideoRecordingWriter: @unchecked Sendable {
     public func start() throws {
         try queue.sync {
             guard !isFinished, writer.status == .unknown else {
-                throw RecordingError.writerStartFailed("Recording session has already started.")
+                throw RecordingError.writerStartFailed(
+                    CCXL10n.text("Recording session has already started.", zh: "录制会话已开始。")
+                )
             }
             guard writer.startWriting() else {
-                let reason = writer.error?.localizedDescription ?? "The video encoder could not start."
+                let reason = writer.error?.localizedDescription
+                    ?? CCXL10n.text("The video encoder could not start.", zh: "视频编码器无法启动。")
                 RecordingFileSecurity.removeRegularFileIfPresent(at: outputURL)
                 throw RecordingError.writerStartFailed(reason)
             }
@@ -360,7 +370,9 @@ public final class VideoRecordingWriter: @unchecked Sendable {
                         } else {
                             RecordingFileSecurity.removeRegularFileIfPresent(at: self.outputURL)
                             let error = writerError
-                                ?? RecordingError.writerStartFailed("Failed to finalize video recording.")
+                                ?? RecordingError.writerStartFailed(
+                                    CCXL10n.text("Failed to finalize video recording.", zh: "无法完成视频封装。")
+                                )
                             self.completeFinish(with: .failure(error))
                         }
                     }
@@ -452,7 +464,9 @@ public final class VideoRecordingWriter: @unchecked Sendable {
 
     private func reportWriterFailureIfNeeded() {
         guard writer.status == .failed else { return }
-        let error = writer.error ?? RecordingError.writerStartFailed("Video writer failed unexpectedly.")
+        let error = writer.error ?? RecordingError.writerStartFailed(
+            CCXL10n.text("Video writer failed unexpectedly.", zh: "视频写入意外失败。")
+        )
         let callback: (@Sendable (Error) -> Void)? = gate.withLock { state in
             guard !state.didReportError else { return nil }
             state.didReportError = true

@@ -39,6 +39,26 @@ final class ScrollCaptureController {
         case pin, copy, save, quickSave, ocr
     }
 
+    private enum ScrollStatus: Equatable {
+        case scrollDown
+        case starting
+        case autoScrolling
+        case reachedBottom
+        case maxHeight
+        case needsAccessibility
+
+        var displayText: String {
+            switch self {
+            case .scrollDown: CCXL10n.text("Scroll down", zh: "向下滚动")
+            case .starting: CCXL10n.text("Starting...", zh: "正在启动…")
+            case .autoScrolling: CCXL10n.text("Auto-scrolling", zh: "滚动中…")
+            case .reachedBottom: CCXL10n.text("Reached bottom", zh: "已到底部")
+            case .maxHeight: CCXL10n.text("Max height", zh: "已达最大高度")
+            case .needsAccessibility: CCXL10n.text("Needs Accessibility", zh: "需要辅助功能")
+            }
+        }
+    }
+
     private let request: ScrollCaptureRequest
     private let onFinish: (SnipOutcome) -> Void
     private let engine: ScrollCaptureEngine
@@ -57,7 +77,7 @@ final class ScrollCaptureController {
     private var pendingAutoScrollStart = false
     private var reachedHeightLimit = false
     private var initialPixelHeight: Int
-    private var statusText = "Scroll down"
+    private var status: ScrollStatus = .scrollDown
 
     init(request: ScrollCaptureRequest, onFinish: @escaping (SnipOutcome) -> Void) {
         self.request = request
@@ -110,7 +130,7 @@ final class ScrollCaptureController {
         hud.updateMetrics(
             width: request.initialImage.width,
             height: request.initialImage.height,
-            status: statusText,
+            status: status.displayText,
             accent: .active,
             isAutoScrolling: false
         )
@@ -171,15 +191,15 @@ final class ScrollCaptureController {
                 self.reachedHeightLimit = true
                 self.pendingAutoScrollStart = false
                 self.autoScroll.stop()
-                self.statusText = "Max height"
+                self.status = .maxHeight
                 accent = .warning
             } else if self.autoScroll.isRunning {
-                self.statusText = "Auto-scrolling"
+                self.status = .autoScrolling
                 accent = .autoScroll
             } else {
                 // Recover cleanly from prior "Reached bottom" / "Needs Accessibility" warning once manual scroll advances.
                 if progress.frameCount > 1 {
-                    self.statusText = "Scroll down"
+                    self.status = .scrollDown
                 }
                 accent = .active
             }
@@ -188,7 +208,7 @@ final class ScrollCaptureController {
             self.hudPanel?.updateMetrics(
                 width: progress.pixelWidth,
                 height: progress.pixelHeight,
-                status: self.statusText,
+                status: self.status.displayText,
                 accent: accent,
                 isAutoScrolling: self.autoScroll.isRunning
             )
@@ -206,26 +226,26 @@ final class ScrollCaptureController {
             guard let self, !self.isClosed else { return }
             let accent: ScrollCaptureVisualAccent = running ? .autoScroll : .active
             if running {
-                self.statusText = "Auto-scrolling"
-            } else if self.statusText == "Auto-scrolling" || self.statusText == "Starting..." {
-                self.statusText = "Scroll down"
+                self.status = .autoScrolling
+            } else if self.status == .autoScrolling || self.status == .starting {
+                self.status = .scrollDown
             }
             self.borderPanel?.setAccent(accent)
-            self.hudPanel?.updateAutoScroll(isRunning: running, status: self.statusText, accent: accent)
+            self.hudPanel?.updateAutoScroll(isRunning: running, status: self.status.displayText, accent: accent)
         }
 
         autoScroll.onReachedBottom = { [weak self] in
             guard let self, !self.isClosed else { return }
-            self.statusText = "Reached bottom"
+            self.status = .reachedBottom
             self.borderPanel?.setAccent(.warning)
-            self.hudPanel?.updateAutoScroll(isRunning: false, status: self.statusText, accent: .warning)
+            self.hudPanel?.updateAutoScroll(isRunning: false, status: self.status.displayText, accent: .warning)
         }
 
         autoScroll.onAccessibilityRequired = { [weak self] in
             guard let self, !self.isClosed else { return }
-            self.statusText = "Needs Accessibility"
+            self.status = .needsAccessibility
             self.borderPanel?.setAccent(.warning)
-            self.hudPanel?.updateAutoScroll(isRunning: false, status: self.statusText, accent: .warning)
+            self.hudPanel?.updateAutoScroll(isRunning: false, status: self.status.displayText, accent: .warning)
         }
     }
 
@@ -239,13 +259,13 @@ final class ScrollCaptureController {
         guard isStreamReady else {
             pendingAutoScrollStart.toggle()
             if pendingAutoScrollStart {
-                statusText = "Starting..."
+                status = .starting
                 borderPanel?.setAccent(.autoScroll)
-                hudPanel?.updateAutoScroll(isRunning: true, status: statusText, accent: .autoScroll)
+                hudPanel?.updateAutoScroll(isRunning: true, status: status.displayText, accent: .autoScroll)
             } else {
-                statusText = "Scroll down"
+                status = .scrollDown
                 borderPanel?.setAccent(.active)
-                hudPanel?.updateAutoScroll(isRunning: false, status: statusText, accent: .active)
+                hudPanel?.updateAutoScroll(isRunning: false, status: status.displayText, accent: .active)
             }
             return
         }
@@ -442,7 +462,10 @@ final class ScrollCaptureController {
               abs(matchingScreen.frame.width - request.displayFrame.width) <= 1,
               abs(matchingScreen.frame.height - request.displayFrame.height) <= 1
         else {
-            tearDown(outcome: .failed("Display configuration changed during scroll capture"))
+            tearDown(outcome: .failed(CCXL10n.text(
+                "Display configuration changed during scroll capture",
+                zh: "滚动截屏期间显示器配置发生变化"
+            )))
             return
         }
     }
@@ -626,7 +649,7 @@ internal final class ScrollCaptureHUDPanel: NSPanel, NSWindowDelegate {
         let initialWidth = captureRect.width.isFinite ? max(1, Int(captureRect.width.rounded())) : 1
         let initialHeight = captureRect.height.isFinite ? max(1, Int(captureRect.height.rounded())) : 1
         sizeLabel.stringValue = "\(initialWidth) × \(initialHeight)"
-        updateAutoScroll(isRunning: false, status: "Scroll down", accent: .active)
+        updateAutoScroll(isRunning: false, status: CCXL10n.text("Scroll down", zh: "向下滚动"), accent: .active)
     }
 
     func windowDidMove(_ notification: Notification) {
@@ -649,8 +672,12 @@ internal final class ScrollCaptureHUDPanel: NSPanel, NSWindowDelegate {
     func updateAutoScroll(isRunning: Bool, status: String, accent: ScrollCaptureVisualAccent) {
         dotView.layer?.backgroundColor = accent.nsColor.cgColor
         statusLabel.stringValue = status
-        statusLabel.toolTip = status == "Needs Accessibility"
-            ? "Enable Accessibility for CCX in System Settings to use Auto-Scroll, or scroll manually."
+        let needsAXStatus = CCXL10n.text("Needs Accessibility", zh: "需要辅助功能")
+        statusLabel.toolTip = (status == needsAXStatus || status == "Needs Accessibility")
+            ? CCXL10n.text(
+                "Enable Accessibility for CCX in System Settings to use Auto-Scroll, or scroll manually.",
+                zh: "请在系统设置中为 CCX 开启辅助功能以使用自动滚动，或手动滚动。"
+            )
             : nil
         switch accent {
         case .active:
@@ -763,28 +790,28 @@ internal final class ScrollCaptureHUDPanel: NSPanel, NSWindowDelegate {
         let ocrBtn = ScrollHUDIconButton(
             symbol: "text.viewfinder",
             tint: .systemCyan,
-            tip: "Copy Text (OCR) (T)",
+            tip: CCXL10n.text("Copy Text (OCR) (T)", zh: "识别文字 (OCR) (T)"),
             target: self,
             action: #selector(ocrPressed)
         )
         let pinBtn = ScrollHUDIconButton(
             symbol: "pin",
             tint: .systemGreen,
-            tip: "Pin (Return)",
+            tip: CCXL10n.text("Pin (Return)", zh: "贴图 (Return)"),
             target: self,
             action: #selector(pinPressed)
         )
         let copyBtn = ScrollHUDIconButton(
             symbol: "doc.on.doc",
             tint: .white,
-            tip: "Copy (⌘C)",
+            tip: CCXL10n.text("Copy (⌘C)", zh: "拷贝 (⌘C)"),
             target: self,
             action: #selector(copyPressed)
         )
         let saveBtn = ScrollHUDIconButton(
             symbol: "square.and.arrow.down",
             tint: .white,
-            tip: "Save PNG (⌘S)",
+            tip: CCXL10n.text("Save PNG (⌘S)", zh: "保存 PNG (⌘S)"),
             target: self,
             action: #selector(savePressed)
         )
@@ -792,7 +819,7 @@ internal final class ScrollCaptureHUDPanel: NSPanel, NSWindowDelegate {
             symbol: "xmark",
             tint: .systemRed,
             hoverTint: NSColor.systemRed.withAlphaComponent(0.22),
-            tip: "Cancel (Esc)",
+            tip: CCXL10n.text("Cancel (Esc)", zh: "取消 (Esc)"),
             target: self,
             action: #selector(cancelPressed)
         )
@@ -933,9 +960,9 @@ private final class ScrollAutoPillButton: NSButton {
         isRunningState = running
         let symbol = running ? "pause.fill" : "arrow.down.circle.fill"
         let config = NSImage.SymbolConfiguration(pointSize: 12, weight: .semibold)
-        let rawImage = NSImage(systemSymbolName: symbol, accessibilityDescription: "Auto Scroll")
+        let rawImage = NSImage(systemSymbolName: symbol, accessibilityDescription: CCXL10n.text("Auto Scroll", zh: "自动滚动"))
         image = rawImage?.withSymbolConfiguration(config) ?? rawImage
-        let title = running ? "Pause" : "Auto"
+        let title = running ? CCXL10n.text("Pause", zh: "暂停") : CCXL10n.text("Auto", zh: "自动滚动")
         attributedTitle = NSAttributedString(
             string: " \(title)",
             attributes: [
@@ -943,8 +970,12 @@ private final class ScrollAutoPillButton: NSButton {
                 .foregroundColor: running ? NSColor.black : NSColor.white,
             ]
         )
-        toolTip = running ? "Pause Auto-Scroll (Space)" : "Auto-Scroll Down (Space)"
-        setAccessibilityLabel(running ? "Pause Auto-Scroll" : "Auto-Scroll Down")
+        toolTip = running
+            ? CCXL10n.text("Pause Auto-Scroll (Space)", zh: "暂停自动滚动 (Space)")
+            : CCXL10n.text("Auto-Scroll Down (Space)", zh: "向下自动滚动 (Space)")
+        setAccessibilityLabel(running
+            ? CCXL10n.text("Pause Auto-Scroll", zh: "暂停自动滚动")
+            : CCXL10n.text("Auto-Scroll Down", zh: "向下自动滚动"))
         applyAppearance()
         invalidateIntrinsicContentSize()
     }

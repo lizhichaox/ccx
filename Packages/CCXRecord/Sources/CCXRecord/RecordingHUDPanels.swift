@@ -711,7 +711,7 @@ final class RecordingControlPanel: NSPanel, NSWindowDelegate {
     )
 
     private let spinner = NSProgressIndicator()
-    private let finalizingLabel = NSTextField(labelWithString: "Finalizing...")
+    private let finalizingLabel = NSTextField(labelWithString: CCXL10n.text("Finalizing...", zh: "正在生成…"))
 
     private let summaryLabel = NSTextField(labelWithString: "")
 
@@ -856,17 +856,27 @@ final class RecordingControlPanel: NSPanel, NSWindowDelegate {
             systemAudioButton.isEnabled = supportsAudio
             systemAudioButton.isActive = settings.effectiveSystemAudio
             systemAudioButton.toolTip = supportsAudio
-                ? (settings.effectiveSystemAudio ? "System Audio: On" : "System Audio: Off")
-                : "System Audio (MP4 / MOV only)"
+                ? (
+                    settings.effectiveSystemAudio
+                        ? CCXL10n.text("System Audio: On", zh: "系统音频：开启")
+                        : CCXL10n.text("System Audio: Off", zh: "系统音频：关闭")
+                )
+                : CCXL10n.text("System Audio (MP4 / MOV only)", zh: "系统音频（仅支持 MP4 / MOV）")
 
             micButton.isEnabled = supportsAudio
             micButton.isActive = settings.effectiveMicrophone
             micButton.toolTip = supportsAudio
-                ? (settings.effectiveMicrophone ? "Microphone: On" : "Microphone: Off")
-                : "Microphone (MP4 / MOV only)"
+                ? (
+                    settings.effectiveMicrophone
+                        ? CCXL10n.text("Microphone: On", zh: "麦克风：开启")
+                        : CCXL10n.text("Microphone: Off", zh: "麦克风：关闭")
+                )
+                : CCXL10n.text("Microphone (MP4 / MOV only)", zh: "麦克风（仅支持 MP4 / MOV）")
 
             cursorButton.isActive = settings.showsCursor
-            cursorButton.toolTip = settings.showsCursor ? "Mouse Cursor: Shown" : "Mouse Cursor: Hidden"
+            cursorButton.toolTip = settings.showsCursor
+                ? CCXL10n.text("Mouse Cursor: Shown", zh: "鼠标指针：显示")
+                : CCXL10n.text("Mouse Cursor: Hidden", zh: "鼠标指针：隐藏")
             spinner.stopAnimation(nil)
 
         case .recording:
@@ -877,7 +887,12 @@ final class RecordingControlPanel: NSPanel, NSWindowDelegate {
             timerLabel.stringValue = formatted
             recordingBadgeLabel.stringValue = badgeSummary(for: settings, paused: false)
             recordingBadgeLabel.textColor = NSColor.white.withAlphaComponent(0.76)
-            pauseResumeButton.configure(symbol: "pause.fill", tint: .white, tooltip: "Pause (Space)", isActive: false)
+            pauseResumeButton.configure(
+                symbol: "pause.fill",
+                tint: .white,
+                tooltip: CCXL10n.text("Pause (Space)", zh: "暂停 (Space)"),
+                isActive: false
+            )
             spinner.stopAnimation(nil)
 
         case .paused:
@@ -888,12 +903,19 @@ final class RecordingControlPanel: NSPanel, NSWindowDelegate {
             timerLabel.stringValue = formatted
             recordingBadgeLabel.stringValue = badgeSummary(for: settings, paused: true)
             recordingBadgeLabel.textColor = NSColor.systemOrange
-            pauseResumeButton.configure(symbol: "play.fill", tint: .systemCyan, tooltip: "Resume (Space)", isActive: true)
+            pauseResumeButton.configure(
+                symbol: "play.fill",
+                tint: .systemCyan,
+                tooltip: CCXL10n.text("Resume (Space)", zh: "继续 (Space)"),
+                isActive: true
+            )
             spinner.stopAnimation(nil)
 
         case .finalizing:
             mountActiveRow(finalizingRow)
-            finalizingLabel.stringValue = settings.format == .gif ? "Encoding GIF..." : "Saving \(settings.format.label)..."
+            finalizingLabel.stringValue = settings.format == .gif
+                ? CCXL10n.text("Encoding GIF...", zh: "正在生成 GIF…")
+                : CCXL10n.text("Saving \(settings.format.label)...", zh: "正在保存 \(settings.format.label)…")
             spinner.startAnimation(nil)
 
         case .completed(let result):
@@ -946,14 +968,20 @@ final class RecordingControlPanel: NSPanel, NSWindowDelegate {
     }
 
     private func badgeSummary(for settings: RecordingSettings, paused: Bool) -> String {
-        if paused { return "\(settings.format.label) · Paused" }
+        if paused {
+            return CCXL10n.text("\(settings.format.label) · Paused", zh: "\(settings.format.label) · 已暂停")
+        }
         let fps = settings.effectiveFPS
         guard settings.format.supportsAudio else { return "GIF · \(fps)fps" }
         switch (settings.effectiveSystemAudio, settings.effectiveMicrophone) {
-        case (true, true): return "\(settings.format.label) · \(fps)fps · Sys+Mic"
-        case (true, false): return "\(settings.format.label) · \(fps)fps · Audio"
-        case (false, true): return "\(settings.format.label) · \(fps)fps · Mic"
-        case (false, false): return "\(settings.format.label) · \(fps)fps · Mute"
+        case (true, true):
+            return CCXL10n.text("\(settings.format.label) · \(fps)fps · Sys+Mic", zh: "\(settings.format.label) · \(fps)fps · 系统+麦")
+        case (true, false):
+            return CCXL10n.text("\(settings.format.label) · \(fps)fps · Audio", zh: "\(settings.format.label) · \(fps)fps · 音频")
+        case (false, true):
+            return CCXL10n.text("\(settings.format.label) · \(fps)fps · Mic", zh: "\(settings.format.label) · \(fps)fps · 麦克风")
+        case (false, false):
+            return CCXL10n.text("\(settings.format.label) · \(fps)fps · Mute", zh: "\(settings.format.label) · \(fps)fps · 静音")
         }
     }
 
@@ -1036,13 +1064,13 @@ final class RecordingControlPanel: NSPanel, NSWindowDelegate {
 
         let startButton = PrimaryPillButton(
             symbol: "record.circle.fill",
-            title: "Start",
+            title: CCXL10n.text("Start", zh: "开始录制"),
             backgroundColor: .systemRed,
-            tooltip: "Start Recording (Return / Space)"
+            tooltip: CCXL10n.text("Start Recording (Return / Space)", zh: "开始录制 (Return / Space)")
         ) { [weak self] in
             self?.onStart?()
         }
-        let cancelButton = CloseIconButton(tooltip: "Cancel (Esc)") { [weak self] in
+        let cancelButton = CloseIconButton(tooltip: CCXL10n.text("Cancel (Esc)", zh: "取消 (Esc)")) { [weak self] in
             self?.onCancel?()
         }
 
@@ -1089,13 +1117,13 @@ final class RecordingControlPanel: NSPanel, NSWindowDelegate {
 
         let stopButton = PrimaryPillButton(
             symbol: "stop.fill",
-            title: "Stop",
+            title: CCXL10n.text("Stop", zh: "停止"),
             backgroundColor: .systemRed,
-            tooltip: "Stop Recording (Return)"
+            tooltip: CCXL10n.text("Stop Recording (Return)", zh: "停止录制 (Return)")
         ) { [weak self] in
             self?.onStop?()
         }
-        let discardButton = CloseIconButton(tooltip: "Cancel Recording (Esc)") { [weak self] in
+        let discardButton = CloseIconButton(tooltip: CCXL10n.text("Cancel Recording (Esc)", zh: "取消录制 (Esc)")) { [weak self] in
             self?.onCancel?()
         }
 
@@ -1133,7 +1161,7 @@ final class RecordingControlPanel: NSPanel, NSWindowDelegate {
         finalizingLabel.setContentHuggingPriority(.required, for: .horizontal)
         finalizingLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
 
-        let cancelButton = CloseIconButton(tooltip: "Cancel Finalizing") { [weak self] in
+        let cancelButton = CloseIconButton(tooltip: CCXL10n.text("Cancel Finalizing", zh: "取消保存")) { [weak self] in
             self?.onCancel?()
         }
 
@@ -1150,7 +1178,10 @@ final class RecordingControlPanel: NSPanel, NSWindowDelegate {
 
         let doneIcon = NSImageView()
         let doneConfig = NSImage.SymbolConfiguration(pointSize: 13, weight: .semibold)
-        doneIcon.image = NSImage(systemSymbolName: "checkmark.circle.fill", accessibilityDescription: "Recorded")?
+        doneIcon.image = NSImage(
+            systemSymbolName: "checkmark.circle.fill",
+            accessibilityDescription: CCXL10n.text("Recorded", zh: "录制完成")
+        )?
             .withSymbolConfiguration(doneConfig)
         doneIcon.contentTintColor = .systemGreen
         doneIcon.imageScaling = .scaleNone
@@ -1172,13 +1203,13 @@ final class RecordingControlPanel: NSPanel, NSWindowDelegate {
         summaryStack.spacing = 5
         summaryStack.setHuggingPriority(.required, for: .horizontal)
 
-        let copyButton = HUDIconOnlyButton(symbol: "doc.on.doc", tooltip: "Copy File (⌘C)") { [weak self] in
+        let copyButton = HUDIconOnlyButton(symbol: "doc.on.doc", tooltip: CCXL10n.text("Copy File (⌘C)", zh: "拷贝文件 (⌘C)")) { [weak self] in
             self?.onCopy?()
         }
-        let saveButton = HUDIconOnlyButton(symbol: "square.and.arrow.down", tooltip: "Save As (⌘S)") { [weak self] in
+        let saveButton = HUDIconOnlyButton(symbol: "square.and.arrow.down", tooltip: CCXL10n.text("Save As (⌘S)", zh: "另存为 (⌘S)")) { [weak self] in
             self?.onSave?()
         }
-        let revealButton = HUDIconOnlyButton(symbol: "folder", tooltip: "Save & Reveal in Finder") { [weak self] in
+        let revealButton = HUDIconOnlyButton(symbol: "folder", tooltip: CCXL10n.text("Save & Reveal in Finder", zh: "保存并在访达中显示")) { [weak self] in
             self?.onReveal?()
         }
         let actionsStack = NSStackView(views: [copyButton, saveButton, revealButton])
@@ -1189,13 +1220,13 @@ final class RecordingControlPanel: NSPanel, NSWindowDelegate {
 
         let quickSaveButton = PrimaryPillButton(
             symbol: "arrow.down.circle.fill",
-            title: "Quick Save",
+            title: CCXL10n.text("Quick Save", zh: "快速保存"),
             backgroundColor: .systemGreen,
-            tooltip: "Quick Save (Return / ⇧⌘S)"
+            tooltip: CCXL10n.text("Quick Save (Return / ⇧⌘S)", zh: "快速保存 (Return / ⇧⌘S)")
         ) { [weak self] in
             self?.onQuickSave?()
         }
-        let discardButton = CloseIconButton(tooltip: "Discard (Esc)") { [weak self] in
+        let discardButton = CloseIconButton(tooltip: CCXL10n.text("Discard (Esc)", zh: "丢弃 (Esc)")) { [weak self] in
             self?.onDiscard?()
         }
 
@@ -1444,10 +1475,11 @@ private final class FPSPickerControl: NSView {
         translatesAutoresizingMaskIntoConstraints = false
         setContentHuggingPriority(.required, for: .horizontal)
         setContentCompressionResistancePriority(.required, for: .horizontal)
-        toolTip = "Frame Rate"
+        let frameRateTitle = CCXL10n.text("Frame Rate", zh: "帧率")
+        toolTip = frameRateTitle
         setAccessibilityElement(true)
         setAccessibilityRole(.popUpButton)
-        setAccessibilityLabel("Frame Rate")
+        setAccessibilityLabel(frameRateTitle)
         setAccessibilityValue("60 fps")
 
         fpsLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
@@ -1456,7 +1488,7 @@ private final class FPSPickerControl: NSView {
         fpsLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
 
         let chevronConfig = NSImage.SymbolConfiguration(pointSize: 9, weight: .semibold)
-        chevronView.image = NSImage(systemSymbolName: "chevron.up.chevron.down", accessibilityDescription: "Frame Rate")?
+        chevronView.image = NSImage(systemSymbolName: "chevron.up.chevron.down", accessibilityDescription: frameRateTitle)?
             .withSymbolConfiguration(chevronConfig)
         chevronView.contentTintColor = NSColor.white.withAlphaComponent(0.65)
         chevronView.imageScaling = .scaleNone
@@ -1512,7 +1544,7 @@ private final class FPSPickerControl: NSView {
     override func mouseExited(with event: NSEvent) { isHovering = false }
 
     override func mouseDown(with event: NSEvent) {
-        let menu = NSMenu(title: "Frame Rate")
+        let menu = NSMenu(title: CCXL10n.text("Frame Rate", zh: "帧率"))
         menu.appearance = NSAppearance(named: .darkAqua)
         for fps in currentFormat.availableFPSOptions {
             let item = NSMenuItem(
@@ -1539,7 +1571,8 @@ private final class FPSPickerControl: NSView {
         self.currentFormat = format
         self.selectedFPS = selectedFPS
         fpsLabel.stringValue = "\(selectedFPS) fps"
-        toolTip = "Frame Rate: \(currentFormat.fpsOptionDescription(for: selectedFPS))"
+        let desc = currentFormat.fpsOptionDescription(for: selectedFPS)
+        toolTip = CCXL10n.text("Frame Rate: \(desc)", zh: "帧率：\(desc)")
         setAccessibilityValue(fpsLabel.stringValue)
         invalidateIntrinsicContentSize()
     }

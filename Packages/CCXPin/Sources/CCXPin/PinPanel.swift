@@ -101,7 +101,7 @@ public final class PinPanel: NSPanel, NSWindowDelegate {
         isOpaque = false
         backgroundColor = .clear
         animationBehavior = .none
-        title = "CCX Pin"
+        title = CCXL10n.text("CCX Pin", zh: "CCX 贴图")
         delegate = self
 
         pinView.panel = self
@@ -186,17 +186,30 @@ public final class PinPanel: NSPanel, NSWindowDelegate {
             if state.isThumbnail {
                 pinView.hideHUD()
             } else if previous.isClickThrough != state.isClickThrough {
-                pinView.showHUD(state.isClickThrough ? "Click-Through" : "Interactive")
+                pinView.showHUD(
+                    state.isClickThrough
+                        ? CCXL10n.text("Click-Through", zh: "鼠标穿透")
+                        : CCXL10n.text("Interactive", zh: "已解除穿透")
+                )
             } else if abs(previous.zoom - state.zoom) > 0.0001 {
                 pinView.showHUD("\(Int((state.zoom * 100).rounded()))%")
             } else if abs(previous.opacity - state.opacity) > 0.0001 {
-                pinView.showHUD("Opacity \(Int((state.opacity * 100).rounded()))%")
+                let pct = Int((state.opacity * 100).rounded())
+                pinView.showHUD(CCXL10n.text("Opacity \(pct)%", zh: "不透明度 \(pct)%"))
             } else if previous.rotationDegrees != state.rotationDegrees {
                 pinView.showHUD("\(state.rotationDegrees)°")
             } else if previous.isFlippedHorizontally != state.isFlippedHorizontally {
-                pinView.showHUD(state.isFlippedHorizontally ? "Flipped H" : "Unflipped H")
+                pinView.showHUD(
+                    state.isFlippedHorizontally
+                        ? CCXL10n.text("Flipped H", zh: "水平翻转")
+                        : CCXL10n.text("Unflipped H", zh: "取消水平翻转")
+                )
             } else if previous.isFlippedVertically != state.isFlippedVertically {
-                pinView.showHUD(state.isFlippedVertically ? "Flipped V" : "Unflipped V")
+                pinView.showHUD(
+                    state.isFlippedVertically
+                        ? CCXL10n.text("Flipped V", zh: "垂直翻转")
+                        : CCXL10n.text("Unflipped V", zh: "取消垂直翻转")
+                )
             }
         }
 
@@ -244,7 +257,7 @@ public final class PinPanel: NSPanel, NSWindowDelegate {
                 flipHorizontal: state.isFlippedHorizontally,
                 flipVertical: state.isFlippedVertically
             ) else {
-                flashHUD("Cannot Annotate")
+                flashHUD(CCXL10n.text("Cannot Annotate", zh: "无法标注"))
                 return
             }
             workingBaseImage = flattened
@@ -368,7 +381,7 @@ public final class PinPanel: NSPanel, NSWindowDelegate {
     public func resetAllTransforms() {
         if isToolbarVisible { closeToolbar(commit: true) }
         mutateState(anchor: frameCenter) { $0.resetAll() }
-        pinView.showHUD("Reset")
+        pinView.showHUD(CCXL10n.text("Reset", zh: "已重置"))
     }
 
     /// Displays a transient centered HUD pill over the pin (no-op in compact thumbnail mode).
@@ -608,64 +621,67 @@ public final class PinPanel: NSPanel, NSWindowDelegate {
     // MARK: - Context menu
 
     func makeContextMenu() -> NSMenu {
-        let menu = NSMenu(title: "Pin")
+        let menu = NSMenu(title: CCXL10n.text("Pin", zh: "贴图"))
         menu.autoenablesItems = false
-        menu.addItem(menuItem("Copy", #selector(copyPin(_:)), key: "c"))
+        menu.addItem(menuItem(CCXL10n.text("Copy", zh: "拷贝"), #selector(copyPin(_:)), key: "c"))
         switch content {
         case .image:
-            menu.addItem(menuItem("Copy Text (OCR)", #selector(recognizeTextFromMenu(_:))))
+            menu.addItem(menuItem(CCXL10n.text("Copy Text (OCR)", zh: "识别文字 (OCR)"), #selector(recognizeTextFromMenu(_:))))
         case .color:
-            menu.addItem(menuItem("Copy HEX", #selector(copyHexColor(_:))))
-            menu.addItem(menuItem("Copy RGB", #selector(copyRGBColor(_:))))
-            menu.addItem(menuItem("Copy HSL", #selector(copyHSLColor(_:))))
+            menu.addItem(menuItem(CCXL10n.text("Copy HEX", zh: "拷贝 HEX"), #selector(copyHexColor(_:))))
+            menu.addItem(menuItem(CCXL10n.text("Copy RGB", zh: "拷贝 RGB"), #selector(copyRGBColor(_:))))
+            menu.addItem(menuItem(CCXL10n.text("Copy HSL", zh: "拷贝 HSL"), #selector(copyHSLColor(_:))))
         case .text:
             break
         }
-        menu.addItem(menuItem("Save PNG", #selector(savePin(_:)), key: "s"))
-        let quickSave = menuItem("Quick Save PNG", #selector(quickSavePin(_:)), key: "s")
+        menu.addItem(menuItem(CCXL10n.text("Save PNG", zh: "保存 PNG"), #selector(savePin(_:)), key: "s"))
+        let quickSave = menuItem(CCXL10n.text("Quick Save PNG", zh: "快速保存 PNG"), #selector(quickSavePin(_:)), key: "s")
         quickSave.keyEquivalentModifierMask = [.command, .shift]
         menu.addItem(quickSave)
-        menu.addItem(menuItem("Duplicate", #selector(duplicatePin(_:)), key: "d"))
+        menu.addItem(menuItem(CCXL10n.text("Duplicate", zh: "创建副本"), #selector(duplicatePin(_:)), key: "d"))
         if canShowAnnotationToolbar && !state.isThumbnail {
             menu.addItem(menuItem(
-                isToolbarVisible ? "Done Annotating" : "Annotate",
+                isToolbarVisible
+                    ? CCXL10n.text("Done Annotating", zh: "完成标注")
+                    : CCXL10n.text("Annotate", zh: "标注"),
                 #selector(toggleAnnotationToolbarFromMenu(_:))
             ))
         }
         menu.addItem(.separator())
 
-        let resetZoomItem = menuItem("Reset Zoom (100%)", #selector(resetZoom(_:)), key: "0")
+        let resetZoomItem = menuItem(CCXL10n.text("Reset Zoom (100%)", zh: "实际大小 (100%)"), #selector(resetZoom(_:)), key: "0")
         resetZoomItem.isEnabled = !state.isThumbnail
         menu.addItem(resetZoomItem)
 
-        let rotateCW = menuItem("Rotate 90°", #selector(rotate90(_:)), key: "r")
+        let rotateCW = menuItem(CCXL10n.text("Rotate 90°", zh: "顺时针旋转 90°"), #selector(rotate90(_:)), key: "r")
         rotateCW.keyEquivalentModifierMask = []
         rotateCW.isEnabled = !state.isThumbnail
         menu.addItem(rotateCW)
 
-        let rotateCCW = menuItem("Rotate 90° CCW", #selector(rotate270(_:)), key: "r")
+        let rotateCCW = menuItem(CCXL10n.text("Rotate 90° CCW", zh: "逆时针旋转 90°"), #selector(rotate270(_:)), key: "r")
         rotateCCW.keyEquivalentModifierMask = [.shift]
         rotateCCW.isEnabled = !state.isThumbnail
         menu.addItem(rotateCCW)
 
-        let flipH = menuItem("Flip Horizontal", #selector(flipHorizontalFromMenu(_:)), key: "h")
+        let flipH = menuItem(CCXL10n.text("Flip Horizontal", zh: "水平翻转"), #selector(flipHorizontalFromMenu(_:)), key: "h")
         flipH.keyEquivalentModifierMask = []
         flipH.state = state.isFlippedHorizontally ? .on : .off
         flipH.isEnabled = !state.isThumbnail
         menu.addItem(flipH)
 
-        let flipV = menuItem("Flip Vertical", #selector(flipVerticalFromMenu(_:)), key: "v")
+        let flipV = menuItem(CCXL10n.text("Flip Vertical", zh: "垂直翻转"), #selector(flipVerticalFromMenu(_:)), key: "v")
         flipV.keyEquivalentModifierMask = []
         flipV.state = state.isFlippedVertically ? .on : .off
         flipV.isEnabled = !state.isThumbnail
         menu.addItem(flipV)
 
-        let resetAll = menuItem("Reset All Transforms", #selector(resetAllFromMenu(_:)), key: "0")
+        let resetAll = menuItem(CCXL10n.text("Reset All Transforms", zh: "重置全部变换"), #selector(resetAllFromMenu(_:)), key: "0")
         resetAll.keyEquivalentModifierMask = [.command, .shift]
         menu.addItem(resetAll)
 
-        let opacityItem = NSMenuItem(title: "Opacity", action: nil, keyEquivalent: "")
-        let opacityMenu = NSMenu(title: "Opacity")
+        let opacityTitle = CCXL10n.text("Opacity", zh: "不透明度")
+        let opacityItem = NSMenuItem(title: opacityTitle, action: nil, keyEquivalent: "")
+        let opacityMenu = NSMenu(title: opacityTitle)
         for percent in [100, 80, 60, 40, 20] {
             let item = menuItem("\(percent)%", #selector(setOpacityFromMenu(_:)), tag: percent)
             item.state = abs(state.opacity * 100 - CGFloat(percent)) < 1 ? .on : .off
@@ -675,29 +691,29 @@ public final class PinPanel: NSPanel, NSWindowDelegate {
         menu.addItem(opacityItem)
         menu.addItem(.separator())
 
-        let clickThrough = menuItem("Toggle Click-Through", #selector(toggleClickThroughFromMenu(_:)))
+        let clickThrough = menuItem(CCXL10n.text("Toggle Click-Through", zh: "鼠标穿透"), #selector(toggleClickThroughFromMenu(_:)))
         clickThrough.state = state.isClickThrough ? .on : .off
         menu.addItem(clickThrough)
-        let thumbnail = menuItem("Toggle Thumbnail", #selector(toggleThumbnailFromMenu(_:)))
+        let thumbnail = menuItem(CCXL10n.text("Toggle Thumbnail", zh: "缩略图模式"), #selector(toggleThumbnailFromMenu(_:)))
         thumbnail.state = state.isThumbnail ? .on : .off
         menu.addItem(thumbnail)
-        let showBorder = menuItem("Show Border", #selector(toggleBorderFromMenu(_:)))
+        let showBorder = menuItem(CCXL10n.text("Show Border", zh: "显示边框"), #selector(toggleBorderFromMenu(_:)))
         showBorder.state = state.showsBorder ? .on : .off
         menu.addItem(showBorder)
-        let showShadow = menuItem("Show Shadow", #selector(toggleShadowFromMenu(_:)))
+        let showShadow = menuItem(CCXL10n.text("Show Shadow", zh: "显示阴影"), #selector(toggleShadowFromMenu(_:)))
         showShadow.state = state.showsShadow ? .on : .off
         menu.addItem(showShadow)
         menu.addItem(.separator())
-        menu.addItem(menuItem("Close Pin", #selector(closePin(_:)), key: "w"))
+        menu.addItem(menuItem(CCXL10n.text("Close Pin", zh: "关闭贴图"), #selector(closePin(_:)), key: "w"))
         let clickThroughCount = clickThroughCountProvider?() ?? 0
         if clickThroughCount > 0 {
             menu.addItem(menuItem(
-                "Unlock Click-Through Pins (\(clickThroughCount))",
+                CCXL10n.text("Unlock Click-Through Pins (\(clickThroughCount))", zh: "解除全部穿透 (\(clickThroughCount))"),
                 #selector(unlockAllClickThroughPins(_:))
             ))
         }
-        menu.addItem(menuItem("Hide All Pins", #selector(hideAllPins(_:))))
-        menu.addItem(menuItem("Close All Pins", #selector(closeAllPins(_:))))
+        menu.addItem(menuItem(CCXL10n.text("Hide All Pins", zh: "隐藏全部贴图"), #selector(hideAllPins(_:))))
+        menu.addItem(menuItem(CCXL10n.text("Close All Pins", zh: "关闭全部贴图"), #selector(closeAllPins(_:))))
         return menu
     }
 
@@ -857,7 +873,12 @@ final class PinContentView: NSView {
         addSubview(hudView)
 
         setAccessibilityElement(true)
-        setAccessibilityHelp("Drag to move, scroll to zoom, double-click to annotate, right-click for options")
+        setAccessibilityHelp(
+            CCXL10n.text(
+                "Drag to move, scroll to zoom, double-click to annotate, right-click for options",
+                zh: "拖动移动，滚轮缩放，双击标注，右键打开选项"
+            )
+        )
     }
 
     @available(*, unavailable)
@@ -997,20 +1018,23 @@ final class PinContentView: NSView {
         switch panel.content {
         case .image:
             setAccessibilityRole(.image)
-            baseLabel = "Pinned image"
+            baseLabel = CCXL10n.text("Pinned image", zh: "贴图图片")
         case let .text(text):
             setAccessibilityRole(.staticText)
             let preview = String(text.trimmingCharacters(in: .whitespacesAndNewlines).prefix(48))
-            baseLabel = preview.isEmpty ? "Pinned text" : "Pinned text: \(preview)"
+            baseLabel = preview.isEmpty
+                ? CCXL10n.text("Pinned text", zh: "贴图文本")
+                : CCXL10n.text("Pinned text: \(preview)", zh: "贴图文本：\(preview)")
         case let .color(sample):
             setAccessibilityRole(.colorWell)
-            baseLabel = "Pinned color \(sample.hexString)"
+            baseLabel = CCXL10n.text("Pinned color \(sample.hexString)", zh: "贴图颜色 \(sample.hexString)")
         }
         var qualifiers: [String] = []
-        if panel.state.isClickThrough { qualifiers.append("click-through") }
-        if panel.state.isThumbnail { qualifiers.append("thumbnail") }
-        if panel.activeAnnotationController != nil { qualifiers.append("annotating") }
-        let fullLabel = qualifiers.isEmpty ? baseLabel : "\(baseLabel), \(qualifiers.joined(separator: ", "))"
+        if panel.state.isClickThrough { qualifiers.append(CCXL10n.text("click-through", zh: "鼠标穿透")) }
+        if panel.state.isThumbnail { qualifiers.append(CCXL10n.text("thumbnail", zh: "缩略图")) }
+        if panel.activeAnnotationController != nil { qualifiers.append(CCXL10n.text("annotating", zh: "标注中")) }
+        let separator = CCXL10n.text(", ", zh: "，")
+        let fullLabel = qualifiers.isEmpty ? baseLabel : "\(baseLabel)\(separator)\(qualifiers.joined(separator: separator))"
         if accessibilityLabel() != fullLabel {
             setAccessibilityLabel(fullLabel)
         }

@@ -329,75 +329,132 @@ struct CCXRecordTests {
     }
 
     @Test @MainActor func controlPanelFPSSelectionAndZeroOverflowLayoutAcrossAllPhases() {
-        let initialSettings = RecordingSettings(format: .mp4, capturesSystemAudio: true, capturesMicrophone: true)
-        let panel = RecordingControlPanel(
-            captureRect: CGRect(x: 200, y: 200, width: 600, height: 400),
-            visibleFrame: CGRect(x: 0, y: 0, width: 1440, height: 900),
-            settings: initialSettings
-        )
+        CCXL10n.withLanguageForTesting(.en) {
+            let initialSettings = RecordingSettings(format: .mp4, capturesSystemAudio: true, capturesMicrophone: true)
+            let panel = RecordingControlPanel(
+                captureRect: CGRect(x: 200, y: 200, width: 600, height: 400),
+                visibleFrame: CGRect(x: 0, y: 0, width: 1440, height: 900),
+                settings: initialSettings
+            )
 
-        var latestSettings = initialSettings
-        panel.onSettingsChanged = { updated in
-            latestSettings = updated
-            panel.update(phase: .ready, settings: updated, elapsedSeconds: 0)
+            var latestSettings = initialSettings
+            panel.onSettingsChanged = { updated in
+                latestSettings = updated
+                panel.update(phase: .ready, settings: updated, elapsedSeconds: 0)
+            }
+
+            // Default MP4 offers video FPS choices and starts at 60 fps.
+            #expect(panel.fpsBadgeText == "60 fps")
+            #expect(panel.availableFPSMenuOptions == [24, 30, 60])
+            assertCleanHUDLayout(in: panel)
+
+            panel.selectFPS(30)
+            #expect(latestSettings.videoFPS == 30)
+            #expect(panel.fpsBadgeText == "30 fps")
+            assertCleanHUDLayout(in: panel)
+
+            // Switching to GIF offers GIF FPS choices (defaulting to 15 fps) without losing videoFPS.
+            panel.selectFormat(.gif)
+            #expect(panel.fpsBadgeText == "15 fps")
+            #expect(panel.availableFPSMenuOptions == [10, 15, 20, 30])
+            assertCleanHUDLayout(in: panel)
+
+            panel.selectFPS(20)
+            #expect(latestSettings.gifFPS == 20)
+            #expect(panel.fpsBadgeText == "20 fps")
+            assertCleanHUDLayout(in: panel)
+
+            // Switching back to MOV/MP4 preserves the chosen videoFPS (30 fps).
+            panel.selectFormat(.mov)
+            #expect(panel.fpsBadgeText == "30 fps")
+            assertCleanHUDLayout(in: panel)
+
+            // Recording & paused phases embed selected FPS in badge text without overflow.
+            panel.update(phase: .recording, settings: latestSettings, elapsedSeconds: 12)
+            #expect(panel.recordingBadgeText == "MOV · 30fps · Sys+Mic")
+            assertCleanHUDLayout(in: panel)
+
+            panel.update(phase: .paused, settings: latestSettings, elapsedSeconds: 12)
+            #expect(panel.recordingBadgeText == "MOV · Paused")
+            assertCleanHUDLayout(in: panel)
+
+            var gifRecording = latestSettings
+            gifRecording.format = .gif
+            panel.update(phase: .recording, settings: gifRecording, elapsedSeconds: 4)
+            #expect(panel.recordingBadgeText == "GIF · 20fps")
+            assertCleanHUDLayout(in: panel)
+
+            // Finalizing phase.
+            panel.update(phase: .finalizing, settings: latestSettings, elapsedSeconds: 12)
+            assertCleanHUDLayout(in: panel)
+
+            // Completed phase with long summary stays cleanly inside container bounds.
+            let longResult = RecordingResult(
+                fileURL: URL(fileURLWithPath: "/tmp/long-test.mov"),
+                format: .mov,
+                duration: 754,
+                fileSizeBytes: 128 * 1024 * 1024,
+                pixelSize: CGSize(width: 1920, height: 1080),
+                screenRect: CGRect(x: 200, y: 200, width: 600, height: 400)
+            )
+            panel.update(phase: .completed(longResult), settings: latestSettings, elapsedSeconds: 754)
+            assertCleanHUDLayout(in: panel)
         }
+    }
 
-        // Default MP4 offers video FPS choices and starts at 60 fps.
-        #expect(panel.fpsBadgeText == "60 fps")
-        #expect(panel.availableFPSMenuOptions == [24, 30, 60])
-        assertCleanHUDLayout(in: panel)
+    @Test @MainActor func simplifiedChineseHUDLayoutDescriptionsAndErrorsFitWithoutOverflow() {
+        CCXL10n.withLanguageForTesting(.zhHans) {
+            #expect(RecordingFormat.mp4.detailDescription == "H.264 视频")
+            #expect(RecordingFormat.mov.detailDescription == "HEVC 视频")
+            #expect(RecordingFormat.gif.detailDescription == "动图")
+            #expect(RecordingFormat.mp4.fpsOptionDescription(for: 60) == "60 fps · 流畅")
+            #expect(RecordingFormat.gif.fpsOptionDescription(for: 15) == "15 fps · 均衡")
 
-        panel.selectFPS(30)
-        #expect(latestSettings.videoFPS == 30)
-        #expect(panel.fpsBadgeText == "30 fps")
-        assertCleanHUDLayout(in: panel)
+            let settings = RecordingSettings(
+                format: .mov,
+                videoFPS: 30,
+                gifFPS: 15,
+                capturesSystemAudio: true,
+                capturesMicrophone: true
+            )
+            let panel = RecordingControlPanel(
+                captureRect: CGRect(x: 200, y: 200, width: 600, height: 400),
+                visibleFrame: CGRect(x: 0, y: 0, width: 1440, height: 900),
+                settings: settings
+            )
+            defer { panel.tearDown() }
 
-        // Switching to GIF offers GIF FPS choices (defaulting to 15 fps) without losing videoFPS.
-        panel.selectFormat(.gif)
-        #expect(panel.fpsBadgeText == "15 fps")
-        #expect(panel.availableFPSMenuOptions == [10, 15, 20, 30])
-        assertCleanHUDLayout(in: panel)
+            assertCleanHUDLayout(in: panel)
 
-        panel.selectFPS(20)
-        #expect(latestSettings.gifFPS == 20)
-        #expect(panel.fpsBadgeText == "20 fps")
-        assertCleanHUDLayout(in: panel)
+            panel.update(phase: .recording, settings: settings, elapsedSeconds: 12)
+            #expect(panel.recordingBadgeText == "MOV · 30fps · 系统+麦")
+            assertCleanHUDLayout(in: panel)
 
-        // Switching back to MOV/MP4 preserves the chosen videoFPS (30 fps).
-        panel.selectFormat(.mov)
-        #expect(panel.fpsBadgeText == "30 fps")
-        assertCleanHUDLayout(in: panel)
+            panel.update(phase: .paused, settings: settings, elapsedSeconds: 12)
+            #expect(panel.recordingBadgeText == "MOV · 已暂停")
+            assertCleanHUDLayout(in: panel)
 
-        // Recording & paused phases embed selected FPS in badge text without overflow.
-        panel.update(phase: .recording, settings: latestSettings, elapsedSeconds: 12)
-        #expect(panel.recordingBadgeText == "MOV · 30fps · Sys+Mic")
-        assertCleanHUDLayout(in: panel)
+            panel.update(phase: .finalizing, settings: settings, elapsedSeconds: 12)
+            assertCleanHUDLayout(in: panel)
 
-        panel.update(phase: .paused, settings: latestSettings, elapsedSeconds: 12)
-        #expect(panel.recordingBadgeText == "MOV · Paused")
-        assertCleanHUDLayout(in: panel)
+            let result = RecordingResult(
+                fileURL: URL(fileURLWithPath: "/tmp/zh-test.mov"),
+                format: .mov,
+                duration: 754,
+                fileSizeBytes: 128 * 1024 * 1024,
+                pixelSize: CGSize(width: 1920, height: 1080),
+                screenRect: CGRect(x: 200, y: 200, width: 600, height: 400)
+            )
+            panel.update(phase: .completed(result), settings: settings, elapsedSeconds: 754)
+            assertCleanHUDLayout(in: panel)
 
-        var gifRecording = latestSettings
-        gifRecording.format = .gif
-        panel.update(phase: .recording, settings: gifRecording, elapsedSeconds: 4)
-        #expect(panel.recordingBadgeText == "GIF · 20fps")
-        assertCleanHUDLayout(in: panel)
-
-        // Finalizing phase.
-        panel.update(phase: .finalizing, settings: latestSettings, elapsedSeconds: 12)
-        assertCleanHUDLayout(in: panel)
-
-        // Completed phase with long summary stays cleanly inside container bounds.
-        let longResult = RecordingResult(
-            fileURL: URL(fileURLWithPath: "/tmp/long-test.mov"),
-            format: .mov,
-            duration: 754,
-            fileSizeBytes: 128 * 1024 * 1024,
-            pixelSize: CGSize(width: 1920, height: 1080),
-            screenRect: CGRect(x: 200, y: 200, width: 600, height: 400)
-        )
-        panel.update(phase: .completed(longResult), settings: latestSettings, elapsedSeconds: 754)
-        assertCleanHUDLayout(in: panel)
+            #expect(RecordingError.noFramesCaptured.errorDescription == "未捕获到视频画面。")
+            #expect(RecordingError.encoderFinalizeFailed.errorDescription == "无法生成 GIF 文件。")
+            let startErr = NSError(domain: SCStreamError.errorDomain, code: SCStreamError.Code.failedToStart.rawValue)
+            #expect(RecordingCoordinator.userFacingErrorMessage(for: startErr) == "无法开始录屏，请重试。")
+            let diskFull = NSError(domain: NSCocoaErrorDomain, code: NSFileWriteOutOfSpaceError)
+            #expect(RecordingCoordinator.userFacingErrorMessage(for: diskFull) == "磁盘空间不足，无法保存录屏。")
+        }
     }
 
     @MainActor
@@ -1138,22 +1195,24 @@ struct CCXRecordTests {
         #expect(weakEngine == nil)
 
         // User-facing error mapping translates technical SCStream/AVFoundation/POSIX codes to clear copy.
-        let startErr = NSError(domain: SCStreamError.errorDomain, code: SCStreamError.Code.failedToStart.rawValue)
-        let startMsg = RecordingCoordinator.userFacingErrorMessage(for: startErr)
-        #expect(!startMsg.contains("SCStreamErrorDomain"))
-        #expect(startMsg.contains("start screen recording"))
+        CCXL10n.withLanguageForTesting(.en) {
+            let startErr = NSError(domain: SCStreamError.errorDomain, code: SCStreamError.Code.failedToStart.rawValue)
+            let startMsg = RecordingCoordinator.userFacingErrorMessage(for: startErr)
+            #expect(!startMsg.contains("SCStreamErrorDomain"))
+            #expect(startMsg.contains("start screen recording"))
 
-        let audioErr = NSError(domain: SCStreamError.errorDomain, code: SCStreamError.Code.failedToStartMicrophoneCapture.rawValue)
-        #expect(RecordingCoordinator.userFacingErrorMessage(for: audioErr).contains("audio"))
+            let audioErr = NSError(domain: SCStreamError.errorDomain, code: SCStreamError.Code.failedToStartMicrophoneCapture.rawValue)
+            #expect(RecordingCoordinator.userFacingErrorMessage(for: audioErr).contains("audio"))
 
-        let diskFullCocoa = NSError(domain: NSCocoaErrorDomain, code: NSFileWriteOutOfSpaceError)
-        #expect(RecordingCoordinator.userFacingErrorMessage(for: diskFullCocoa).contains("disk space"))
+            let diskFullCocoa = NSError(domain: NSCocoaErrorDomain, code: NSFileWriteOutOfSpaceError)
+            #expect(RecordingCoordinator.userFacingErrorMessage(for: diskFullCocoa).contains("disk space"))
 
-        let diskFullAV = NSError(domain: AVFoundationErrorDomain, code: AVError.Code.diskFull.rawValue)
-        #expect(RecordingCoordinator.userFacingErrorMessage(for: diskFullAV).contains("disk space"))
+            let diskFullAV = NSError(domain: AVFoundationErrorDomain, code: AVError.Code.diskFull.rawValue)
+            #expect(RecordingCoordinator.userFacingErrorMessage(for: diskFullAV).contains("disk space"))
 
-        let diskFullPOSIX = NSError(domain: NSPOSIXErrorDomain, code: Int(ENOSPC))
-        #expect(RecordingCoordinator.userFacingErrorMessage(for: diskFullPOSIX).contains("disk space"))
+            let diskFullPOSIX = NSError(domain: NSPOSIXErrorDomain, code: Int(ENOSPC))
+            #expect(RecordingCoordinator.userFacingErrorMessage(for: diskFullPOSIX).contains("disk space"))
+        }
 
         // 5K/6K display proportional H.264 4096px cap vs HEVC 8192px & GIF 1280px cap.
         let fiveKRegion = RecordingRegion(

@@ -70,17 +70,17 @@ public enum RecordingFormat: String, CaseIterable, Codable, Sendable {
         switch self {
         case .gif:
             switch fps {
-            case 10: "10 fps · Compact"
-            case 15: "15 fps · Balanced"
-            case 20: "20 fps · Smooth"
-            case 30: "30 fps · High"
+            case 10: CCXL10n.text("10 fps · Compact", zh: "10 fps · 精简")
+            case 15: CCXL10n.text("15 fps · Balanced", zh: "15 fps · 均衡")
+            case 20: CCXL10n.text("20 fps · Smooth", zh: "20 fps · 流畅")
+            case 30: CCXL10n.text("30 fps · High", zh: "30 fps · 高帧率")
             default: "\(fps) fps"
             }
         case .mp4, .mov:
             switch fps {
-            case 24: "24 fps · Compact"
-            case 30: "30 fps · Standard"
-            case 60: "60 fps · Smooth"
+            case 24: CCXL10n.text("24 fps · Compact", zh: "24 fps · 精简")
+            case 30: CCXL10n.text("30 fps · Standard", zh: "30 fps · 标准")
+            case 60: CCXL10n.text("60 fps · Smooth", zh: "60 fps · 流畅")
             default: "\(fps) fps"
             }
         }
@@ -88,9 +88,9 @@ public enum RecordingFormat: String, CaseIterable, Codable, Sendable {
 
     public var detailDescription: String {
         switch self {
-        case .mp4: "H.264 Video"
-        case .mov: "HEVC Video"
-        case .gif: "Animated Image"
+        case .mp4: CCXL10n.text("H.264 Video", zh: "H.264 视频")
+        case .mov: CCXL10n.text("HEVC Video", zh: "HEVC 视频")
+        case .gif: CCXL10n.text("Animated Image", zh: "动图")
         }
     }
 }

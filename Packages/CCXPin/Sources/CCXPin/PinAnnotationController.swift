@@ -847,7 +847,7 @@ final class PinAnnotationController: NSObject, NSTextFieldDelegate {
         field.font = NSFont.systemFont(ofSize: max(6, style.size.fontSize * zoomY), weight: .bold)
         field.textColor = style.color.nsColor
         field.stringValue = initialText
-        field.placeholderString = "Text"
+        field.placeholderString = CCXL10n.text("Text", zh: "输入文字")
         field.delegate = self
         field.wantsLayer = true
         field.layer?.cornerRadius = 4

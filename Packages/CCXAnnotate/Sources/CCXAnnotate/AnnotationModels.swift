@@ -1,4 +1,5 @@
 import AppKit
+import CCXCore
 import CoreGraphics
 import Foundation
 import os
@@ -41,15 +42,15 @@ public enum AnnotationTool: String, CaseIterable, Sendable {
 
     public var displayName: String {
         switch self {
-        case .select: "Select / Move"
-        case .rectangle: "Rectangle"
-        case .ellipse: "Ellipse"
-        case .arrow: "Arrow"
-        case .pen: "Freehand Pen"
-        case .highlighter: "Highlighter"
-        case .mosaic: "Mosaic / Blur"
-        case .text: "Text"
-        case .counter: "Step Counter"
+        case .select: CCXL10n.text("Select / Move", zh: "选择 / 移动")
+        case .rectangle: CCXL10n.text("Rectangle", zh: "矩形")
+        case .ellipse: CCXL10n.text("Ellipse", zh: "椭圆")
+        case .arrow: CCXL10n.text("Arrow", zh: "箭头")
+        case .pen: CCXL10n.text("Freehand Pen", zh: "画笔")
+        case .highlighter: CCXL10n.text("Highlighter", zh: "荧光笔")
+        case .mosaic: CCXL10n.text("Mosaic / Blur", zh: "马赛克 / 模糊")
+        case .text: CCXL10n.text("Text", zh: "文字")
+        case .counter: CCXL10n.text("Step Counter", zh: "序号")
         }
     }
 
@@ -96,9 +97,11 @@ public enum AnnotationTool: String, CaseIterable, Sendable {
         case .mosaic:
             switch mosaicMode {
             case .pixelate:
-                return "Mosaic \(Int(size.mosaicBlockSize.rounded()))"
+                let block = Int(size.mosaicBlockSize.rounded())
+                return CCXL10n.text("Mosaic \(block)", zh: "马赛克 \(block)")
             case .blur:
-                return "Blur \(Int(size.blurRadius.rounded()))"
+                let radius = Int(size.blurRadius.rounded())
+                return CCXL10n.text("Blur \(radius)", zh: "模糊 \(radius)")
             }
         }
     }
@@ -223,8 +226,8 @@ public enum MosaicMode: String, CaseIterable, Sendable {
 
     public var label: String {
         switch self {
-        case .pixelate: "Mosaic"
-        case .blur: "Blur"
+        case .pixelate: CCXL10n.text("Mosaic", zh: "马赛克")
+        case .blur: CCXL10n.text("Blur", zh: "模糊")
         }
     }
 }

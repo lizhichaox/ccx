@@ -1,4 +1,5 @@
 import AVFoundation
+import CCXCore
 import CoreMedia
 import CoreVideo
 import Foundation
@@ -46,7 +47,10 @@ public final class ScreenRecordingEngine {
         // Fallback gracefully when microphone is enabled & authorized, but no audio input device exists.
         if effectiveSettings.effectiveMicrophone, AVCaptureDevice.default(for: .audio) == nil {
             effectiveSettings.capturesMicrophone = false
-            onNotice?("No Mic Found — Recording No Mic", "mic.slash")
+            onNotice?(
+                CCXL10n.text("No Mic Found — Recording No Mic", zh: "未检测到麦克风，将无麦录制"),
+                "mic.slash"
+            )
         }
 
         try prepareOutputPipeline(for: effectiveSettings)
@@ -64,7 +68,9 @@ public final class ScreenRecordingEngine {
         }
         guard let display = content.displays.first(where: { $0.displayID == region.displayID }) else {
             cancel()
-            throw RecordingError.writerStartFailed("Display is no longer available.")
+            throw RecordingError.writerStartFailed(
+                CCXL10n.text("Display is no longer available.", zh: "显示器已不可用。")
+            )
         }
 
         let excluded = excludingWindowIDs.isEmpty
@@ -82,7 +88,10 @@ public final class ScreenRecordingEngine {
                 videoWriter?.cancelAndWait()
                 videoWriter = nil
                 effectiveSettings.capturesMicrophone = false
-                onNotice?("Mic Unavailable — No Mic Audio", "mic.slash")
+                onNotice?(
+                    CCXL10n.text("Mic Unavailable — No Mic Audio", zh: "麦克风不可用，将无麦录制"),
+                    "mic.slash"
+                )
                 do {
                     try prepareOutputPipeline(for: effectiveSettings)
                     try await startStream(filter: filter, runSettings: effectiveSettings)

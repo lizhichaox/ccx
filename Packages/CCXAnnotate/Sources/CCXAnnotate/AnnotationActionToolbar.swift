@@ -1,4 +1,5 @@
 import AppKit
+import CCXCore
 
 /// Action commands triggered from the floating annotation toolbar.
 public enum AnnotationToolbarAction: Sendable {
@@ -110,13 +111,13 @@ public final class AnnotationActionToolbar: NSView {
         )
         self.undoButton = ToolbarIconButton(
             symbol: "arrow.uturn.backward",
-            tooltip: "Undo (⌘Z)",
+            tooltip: CCXL10n.text("Undo (⌘Z)", zh: "撤销 (⌘Z)"),
             tint: .white,
             width: 28
         )
         self.redoButton = ToolbarIconButton(
             symbol: "arrow.uturn.forward",
-            tooltip: "Redo (⇧⌘Z)",
+            tooltip: CCXL10n.text("Redo (⇧⌘Z)", zh: "重做 (⇧⌘Z)"),
             tint: .white,
             width: 28
         )
@@ -363,7 +364,7 @@ public final class AnnotationActionToolbar: NSView {
             views.append(ToolbarIconButton(
                 symbol: "arrow.up.and.down.square",
                 fallbackSymbol: "arrow.up.arrow.down",
-                tooltip: "Scroll Capture (L)",
+                tooltip: CCXL10n.text("Scroll Capture (L)", zh: "滚动截屏 (L)"),
                 tint: .systemMint,
                 width: 30
             ) { [weak self] in
@@ -371,42 +372,42 @@ public final class AnnotationActionToolbar: NSView {
             })
             views.append(ToolbarIconButton(
                 symbol: "record.circle",
-                tooltip: "Record Area (R)",
+                tooltip: CCXL10n.text("Record Area (R)", zh: "录制区域 (R)"),
                 tint: .systemRed,
                 width: 30
             ) { [weak self] in
                 self?.onAction?(.record)
             })
-            views.append(ToolbarIconButton(symbol: "text.viewfinder", tooltip: "Copy Text (OCR) (T)", tint: .systemCyan, width: 30) { [weak self] in
+            views.append(ToolbarIconButton(symbol: "text.viewfinder", tooltip: CCXL10n.text("Copy Text (OCR) (T)", zh: "识别文字 (OCR) (T)"), tint: .systemCyan, width: 30) { [weak self] in
                 self?.onAction?(.ocr)
             })
-            views.append(ToolbarIconButton(symbol: "pin", tooltip: "Pin (Return)", tint: .systemGreen, width: 32) { [weak self] in
+            views.append(ToolbarIconButton(symbol: "pin", tooltip: CCXL10n.text("Pin (Return)", zh: "贴图 (Return)"), tint: .systemGreen, width: 32) { [weak self] in
                 self?.onAction?(.pin)
             })
-            views.append(ToolbarIconButton(symbol: "doc.on.doc", tooltip: "Copy (⌘C)", tint: .white, width: 32) { [weak self] in
+            views.append(ToolbarIconButton(symbol: "doc.on.doc", tooltip: CCXL10n.text("Copy (⌘C)", zh: "拷贝 (⌘C)"), tint: .white, width: 32) { [weak self] in
                 self?.onAction?(.copy)
             })
-            views.append(ToolbarIconButton(symbol: "square.and.arrow.down", tooltip: "Save (⌘S)", tint: .white, width: 32) { [weak self] in
+            views.append(ToolbarIconButton(symbol: "square.and.arrow.down", tooltip: CCXL10n.text("Save (⌘S)", zh: "保存 (⌘S)"), tint: .white, width: 32) { [weak self] in
                 self?.onAction?(.save)
             })
-            views.append(ToolbarIconButton(symbol: "xmark", tooltip: "Cancel (Esc)", tint: .systemRed, width: 32) { [weak self] in
+            views.append(ToolbarIconButton(symbol: "xmark", tooltip: CCXL10n.text("Cancel (Esc)", zh: "取消 (Esc)"), tint: .systemRed, width: 32) { [weak self] in
                 self?.onAction?(.cancel)
             })
 
         case .pin:
-            views.append(ToolbarIconButton(symbol: "text.viewfinder", tooltip: "Copy Text (OCR) (T)", tint: .systemCyan, width: 30) { [weak self] in
+            views.append(ToolbarIconButton(symbol: "text.viewfinder", tooltip: CCXL10n.text("Copy Text (OCR) (T)", zh: "识别文字 (OCR) (T)"), tint: .systemCyan, width: 30) { [weak self] in
                 self?.onAction?(.ocr)
             })
-            views.append(ToolbarIconButton(symbol: "doc.on.doc", tooltip: "Copy (⌘C)", tint: .white, width: 32) { [weak self] in
+            views.append(ToolbarIconButton(symbol: "doc.on.doc", tooltip: CCXL10n.text("Copy (⌘C)", zh: "拷贝 (⌘C)"), tint: .white, width: 32) { [weak self] in
                 self?.onAction?(.copy)
             })
-            views.append(ToolbarIconButton(symbol: "square.and.arrow.down", tooltip: "Save PNG (⌘S)", tint: .white, width: 32) { [weak self] in
+            views.append(ToolbarIconButton(symbol: "square.and.arrow.down", tooltip: CCXL10n.text("Save PNG (⌘S)", zh: "保存 PNG (⌘S)"), tint: .white, width: 32) { [weak self] in
                 self?.onAction?(.save)
             })
-            views.append(ToolbarIconButton(symbol: "checkmark", tooltip: "Done (Return)", tint: .systemGreen, width: 32) { [weak self] in
+            views.append(ToolbarIconButton(symbol: "checkmark", tooltip: CCXL10n.text("Done (Return)", zh: "完成 (Return)"), tint: .systemGreen, width: 32) { [weak self] in
                 self?.onAction?(.done)
             })
-            views.append(ToolbarIconButton(symbol: "xmark", tooltip: "Cancel Edits (Esc)", tint: .systemRed, width: 32) { [weak self] in
+            views.append(ToolbarIconButton(symbol: "xmark", tooltip: CCXL10n.text("Cancel Edits (Esc)", zh: "取消编辑 (Esc)"), tint: .systemRed, width: 32) { [weak self] in
                 self?.onAction?(.cancel)
             })
         }
@@ -759,7 +760,7 @@ private final class ColorSwatchButton: HoverButton {
         title = ""
         isBordered = false
         toolTip = color.hex
-        setAccessibilityLabel("Annotation Color \(color.hex)")
+        setAccessibilityLabel(CCXL10n.text("Annotation Color \(color.hex)", zh: "标注颜色 \(color.hex)"))
         translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
             widthAnchor.constraint(equalToConstant: 22),
@@ -842,7 +843,7 @@ private final class StrokeSizeSlider: NSView {
         super.init(frame: frameRect)
         translatesAutoresizingMaskIntoConstraints = false
         setAccessibilityRole(.slider)
-        setAccessibilityLabel("Annotation Size")
+        setAccessibilityLabel(CCXL10n.text("Annotation Size", zh: "标注粗细"))
         NSLayoutConstraint.activate([
             widthAnchor.constraint(equalToConstant: 118),
             heightAnchor.constraint(equalToConstant: 24),
@@ -945,7 +946,7 @@ private final class StrokeSizeSlider: NSView {
 
     private func updateTooltip() {
         let label = activeTool.formattedSizeHUDLabel(for: size, mosaicMode: mosaicMode)
-        toolTip = "\(label) (drag or scroll up/down)"
+        toolTip = CCXL10n.text("\(label) (drag or scroll up/down)", zh: "\(label)（拖动或上下滚动调整）")
         setAccessibilityValue(label)
     }
 
@@ -1101,8 +1102,8 @@ private final class ToolbarDragHandleView: NSView {
         super.init(frame: frameRect)
         wantsLayer = true
         layer?.cornerRadius = 6
-        toolTip = "Drag to move toolbar (double-click to reset)"
-        setAccessibilityLabel("Move Annotation Toolbar")
+        toolTip = CCXL10n.text("Drag to move toolbar (double-click to reset)", zh: "拖动移动工具栏（双击重置位置）")
+        setAccessibilityLabel(CCXL10n.text("Move Annotation Toolbar", zh: "移动标注工具栏"))
         translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
             widthAnchor.constraint(equalToConstant: 16),

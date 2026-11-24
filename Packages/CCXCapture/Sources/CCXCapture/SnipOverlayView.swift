@@ -1159,7 +1159,7 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
         field.font = NSFont.systemFont(ofSize: style.size.fontSize, weight: .bold)
         field.textColor = style.color.nsColor
         field.stringValue = initialText
-        field.placeholderString = "Text"
+        field.placeholderString = CCXL10n.text("Text", zh: "输入文字")
         field.delegate = self
         field.wantsLayer = true
         field.layer?.cornerRadius = 4

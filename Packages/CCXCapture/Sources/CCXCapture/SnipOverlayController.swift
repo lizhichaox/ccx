@@ -239,16 +239,17 @@ final class SnipOverlayController {
             }
             return result
         }
+        let renderError = CCXL10n.text("Could not render selected region", zh: "无法渲染选区图像")
         let outcome: SnipOutcome
         switch action {
         case let .pin(rect):
-            outcome = renderResult(for: rect).map(SnipOutcome.pin) ?? .failed("Could not render selected region")
+            outcome = renderResult(for: rect).map(SnipOutcome.pin) ?? .failed(renderError)
         case let .copy(rect):
-            outcome = renderResult(for: rect).map(SnipOutcome.copy) ?? .failed("Could not render selected region")
+            outcome = renderResult(for: rect).map(SnipOutcome.copy) ?? .failed(renderError)
         case let .save(rect):
-            outcome = renderResult(for: rect).map(SnipOutcome.save) ?? .failed("Could not render selected region")
+            outcome = renderResult(for: rect).map(SnipOutcome.save) ?? .failed(renderError)
         case let .quickSave(rect):
-            outcome = renderResult(for: rect).map(SnipOutcome.quickSave) ?? .failed("Could not render selected region")
+            outcome = renderResult(for: rect).map(SnipOutcome.quickSave) ?? .failed(renderError)
         case let .scroll(rect):
             let initialResult = Self.makeResult(localRect: rect, snapshot: view.snapshot)
             if initialResult != nil {
@@ -266,11 +267,11 @@ final class SnipOverlayController {
                 )
                 onRequestScrollCapture(request)
             } else {
-                onFinish(.failed("Could not render selected region"))
+                onFinish(.failed(renderError))
             }
             return
         case let .ocr(rect):
-            outcome = renderResult(for: rect).map(SnipOutcome.ocr) ?? .failed("Could not render selected region")
+            outcome = renderResult(for: rect).map(SnipOutcome.ocr) ?? .failed(renderError)
         case let .record(rect):
             let standardized = rect.standardized
             let localBounds = CGRect(origin: .zero, size: view.snapshot.screenFrame.size)

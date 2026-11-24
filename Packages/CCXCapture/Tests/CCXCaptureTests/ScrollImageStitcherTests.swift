@@ -1,3 +1,4 @@
+import CCXCore
 import CoreGraphics
 import CoreVideo
 import Foundation
@@ -850,22 +851,33 @@ struct ScrollImageStitcherTests {
 
     @MainActor
     @Test func userFacingSnapshotErrorsAndAutoScrollStepGuards() {
-        let noDisplaysMsg = ScreenSnapshotEngine.userFacingErrorMessage(for: ScreenSnapshotError.noDisplays)
-        #expect(noDisplaysMsg == "No active display was found.")
-        #expect(!ScreenSnapshotError.noDisplays.localizedDescription.contains("CCXCapture"))
-
-        let captureFailedMsg = ScreenSnapshotEngine.userFacingErrorMessage(for: ScreenSnapshotError.captureFailed)
-        #expect(captureFailedMsg == "Could not capture the screen. Please try again.")
-
         let systemStopped = NSError(domain: SCStreamErrorDomain, code: SCStreamError.systemStoppedStream.rawValue)
-        #expect(ScreenSnapshotEngine.userFacingErrorMessage(for: systemStopped) == "Screen capture was stopped by the system.")
-
         let userDeclined = NSError(domain: SCStreamErrorDomain, code: SCStreamError.userDeclined.rawValue)
-        #expect(ScreenSnapshotEngine.isPermissionDeniedError(userDeclined))
-        #expect(ScreenSnapshotEngine.userFacingErrorMessage(for: userDeclined) == "Screen Recording permission is required.")
-
         let genericOpaque = NSError(domain: "com.example.test", code: 99)
-        #expect(ScreenSnapshotEngine.userFacingErrorMessage(for: genericOpaque) == "Could not capture the screen. Please try again.")
+
+        CCXL10n.withLanguageForTesting(.en) {
+            let noDisplaysMsg = ScreenSnapshotEngine.userFacingErrorMessage(for: ScreenSnapshotError.noDisplays)
+            #expect(noDisplaysMsg == "No active display was found.")
+            #expect(!ScreenSnapshotError.noDisplays.localizedDescription.contains("CCXCapture"))
+
+            let captureFailedMsg = ScreenSnapshotEngine.userFacingErrorMessage(for: ScreenSnapshotError.captureFailed)
+            #expect(captureFailedMsg == "Could not capture the screen. Please try again.")
+
+            #expect(ScreenSnapshotEngine.userFacingErrorMessage(for: systemStopped) == "Screen capture was stopped by the system.")
+
+            #expect(ScreenSnapshotEngine.isPermissionDeniedError(userDeclined))
+            #expect(ScreenSnapshotEngine.userFacingErrorMessage(for: userDeclined) == "Screen Recording permission is required.")
+
+            #expect(ScreenSnapshotEngine.userFacingErrorMessage(for: genericOpaque) == "Could not capture the screen. Please try again.")
+        }
+
+        CCXL10n.withLanguageForTesting(.zhHans) {
+            #expect(ScreenSnapshotEngine.userFacingErrorMessage(for: ScreenSnapshotError.noDisplays) == "未找到可用显示器。")
+            #expect(ScreenSnapshotEngine.userFacingErrorMessage(for: ScreenSnapshotError.captureFailed) == "无法截取屏幕，请重试。")
+            #expect(ScreenSnapshotEngine.userFacingErrorMessage(for: systemStopped) == "屏幕捕获已被系统停止。")
+            #expect(ScreenSnapshotEngine.userFacingErrorMessage(for: userDeclined) == "需要屏幕录制权限。")
+            #expect(ScreenSnapshotEngine.userFacingErrorMessage(for: genericOpaque) == "无法截取屏幕，请重试。")
+        }
 
         #expect(AutoScrollDriver.scrollStepLines(for: .nan) == 2)
         #expect(AutoScrollDriver.scrollStepLines(for: .infinity) == 2)

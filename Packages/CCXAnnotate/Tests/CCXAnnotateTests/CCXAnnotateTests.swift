@@ -1,4 +1,5 @@
 import AppKit
+import CCXCore
 import CoreGraphics
 import Testing
 @testable import CCXAnnotate
@@ -386,10 +387,12 @@ struct CCXAnnotateTests {
             }
         }
 
-        #expect(AnnotationTool.pen.formattedSizeHUDLabel(for: .medium, mosaicMode: .pixelate) == "4 pt")
-        #expect(AnnotationTool.counter.formattedSizeHUDLabel(for: .minimum, mosaicMode: .pixelate) == "18 px")
-        #expect(AnnotationTool.mosaic.formattedSizeHUDLabel(for: .medium, mosaicMode: .pixelate) == "Mosaic 10")
-        #expect(AnnotationTool.mosaic.formattedSizeHUDLabel(for: .medium, mosaicMode: .blur) == "Blur 16")
+        CCXL10n.withLanguageForTesting(.en) {
+            #expect(AnnotationTool.pen.formattedSizeHUDLabel(for: .medium, mosaicMode: .pixelate) == "4 pt")
+            #expect(AnnotationTool.counter.formattedSizeHUDLabel(for: .minimum, mosaicMode: .pixelate) == "18 px")
+            #expect(AnnotationTool.mosaic.formattedSizeHUDLabel(for: .medium, mosaicMode: .pixelate) == "Mosaic 10")
+            #expect(AnnotationTool.mosaic.formattedSizeHUDLabel(for: .medium, mosaicMode: .blur) == "Blur 16")
+        }
 
         let doc = AnnotationDocument()
         let first = AnnotationItem(kind: .rectangle(CGRect(x: 10, y: 10, width: 30, height: 20)), style: AnnotationStyle())
@@ -572,24 +575,94 @@ struct CCXAnnotateTests {
         #expect(doc.items.isEmpty) // Single undo reverted commit directly (no phantom snapshot).
 
         // Toolbar tooltip adapts to active tool & cancelDragging resets drag cleanly.
-        let toolbar = AnnotationActionToolbar(preset: .snip)
-        toolbar.update(
-            activeTool: .mosaic,
-            style: AnnotationStyle(color: .red, size: .medium, mosaicMode: .blur),
-            showStyleBar: true,
-            canUndo: false,
-            canRedo: false
-        )
-        #expect(toolbar.sizeSliderToolTip?.hasPrefix("Blur ") == true)
-        toolbar.update(
-            activeTool: .counter,
-            style: AnnotationStyle(color: .red, size: .medium, mosaicMode: .pixelate),
-            showStyleBar: true,
-            canUndo: false,
-            canRedo: false
-        )
-        #expect(toolbar.sizeSliderToolTip?.contains("px") == true)
-        toolbar.cancelDragging()
-        #expect(!toolbar.isDragging)
+        CCXL10n.withLanguageForTesting(.en) {
+            let toolbar = AnnotationActionToolbar(preset: .snip)
+            toolbar.update(
+                activeTool: .mosaic,
+                style: AnnotationStyle(color: .red, size: .medium, mosaicMode: .blur),
+                showStyleBar: true,
+                canUndo: false,
+                canRedo: false
+            )
+            #expect(toolbar.sizeSliderToolTip?.hasPrefix("Blur ") == true)
+            toolbar.update(
+                activeTool: .counter,
+                style: AnnotationStyle(color: .red, size: .medium, mosaicMode: .pixelate),
+                showStyleBar: true,
+                canUndo: false,
+                canRedo: false
+            )
+            #expect(toolbar.sizeSliderToolTip?.contains("px") == true)
+            toolbar.cancelDragging()
+            #expect(!toolbar.isDragging)
+        }
+    }
+
+    @Test func localizedToolNamesHUDLabelsAndToolbarLayoutInBothLanguages() {
+        for language in CCXLanguage.allCases {
+            CCXL10n.withLanguageForTesting(language) {
+                for preset in [AnnotationToolbarPreset.snip, .pin] {
+                    let toolbar = AnnotationActionToolbar(preset: preset)
+                    toolbar.update(
+                        activeTool: .mosaic,
+                        style: AnnotationStyle(color: .red, size: .medium, mosaicMode: .pixelate),
+                        showStyleBar: true,
+                        canUndo: true,
+                        canRedo: true
+                    )
+                    toolbar.layoutSubtreeIfNeeded()
+                    let bounds = toolbar.primarySurfaceBounds
+                    let frames = toolbar.primaryControlFrames
+                    #expect(!frames.isEmpty)
+                    for frame in frames {
+                        #expect(frame.minX >= -0.5 && frame.maxX <= bounds.width + 0.5)
+                        #expect(frame.minY >= -0.5 && frame.maxY <= bounds.height + 0.5)
+                    }
+                    for pair in zip(frames, frames.dropFirst()) {
+                        #expect(pair.0.maxX <= pair.1.minX + 0.5)
+                    }
+                }
+
+                // Mode pills fit comfortably inside their 56pt fixed pill button width in both languages.
+                let pillFont = NSFont.systemFont(ofSize: 11.5, weight: .semibold)
+                for mode in MosaicMode.allCases {
+                    let measured = (mode.label as NSString).size(withAttributes: [.font: pillFont]).width
+                    #expect(measured <= 48)
+                }
+
+                // All tool display names are non-empty and single-line.
+                for tool in AnnotationTool.allCases {
+                    #expect(!tool.displayName.isEmpty)
+                    #expect(!tool.displayName.contains("\n"))
+                }
+            }
+        }
+
+        CCXL10n.withLanguageForTesting(.zhHans) {
+            #expect(AnnotationTool.select.displayName == "选择 / 移动")
+            #expect(AnnotationTool.rectangle.displayName == "矩形")
+            #expect(AnnotationTool.ellipse.displayName == "椭圆")
+            #expect(AnnotationTool.arrow.displayName == "箭头")
+            #expect(AnnotationTool.pen.displayName == "画笔")
+            #expect(AnnotationTool.highlighter.displayName == "荧光笔")
+            #expect(AnnotationTool.mosaic.displayName == "马赛克 / 模糊")
+            #expect(AnnotationTool.text.displayName == "文字")
+            #expect(AnnotationTool.counter.displayName == "序号")
+            #expect(MosaicMode.pixelate.label == "马赛克")
+            #expect(MosaicMode.blur.label == "模糊")
+            #expect(AnnotationTool.mosaic.formattedSizeHUDLabel(for: .medium, mosaicMode: .pixelate) == "马赛克 10")
+            #expect(AnnotationTool.mosaic.formattedSizeHUDLabel(for: .medium, mosaicMode: .blur) == "模糊 16")
+
+            let toolbar = AnnotationActionToolbar(preset: .snip)
+            toolbar.update(
+                activeTool: .mosaic,
+                style: AnnotationStyle(color: .red, size: .medium, mosaicMode: .blur),
+                showStyleBar: true,
+                canUndo: false,
+                canRedo: false
+            )
+            #expect(toolbar.sizeSliderToolTip?.hasPrefix("模糊 ") == true)
+            #expect(toolbar.dragHandleView.toolTip?.contains("拖动移动工具栏") == true)
+        }
     }
 }

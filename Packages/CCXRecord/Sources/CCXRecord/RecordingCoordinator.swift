@@ -270,11 +270,17 @@ public final class RecordingCoordinator {
                     }
                     if !granted {
                         runSettings.capturesMicrophone = false
-                        self.onNotice?("Mic Denied — Recording No Mic", "mic.slash")
+                        self.onNotice?(
+                            CCXL10n.text("Mic Denied — Recording No Mic", zh: "未授权麦克风，将无麦录制"),
+                            "mic.slash"
+                        )
                     }
                 case .denied, .restricted:
                     runSettings.capturesMicrophone = false
-                    self.onNotice?("Mic Off in Settings — No Mic Audio", "mic.slash")
+                    self.onNotice?(
+                        CCXL10n.text("Mic Off in Settings — No Mic Audio", zh: "系统设置已禁用麦克风，将无麦录制"),
+                        "mic.slash"
+                    )
                 @unknown default:
                     runSettings.capturesMicrophone = false
                 }
@@ -308,7 +314,10 @@ public final class RecordingCoordinator {
             }
             newEngine.onLimitReached = { [weak self] in
                 guard let self, self.isSessionActive, self.sessionGeneration == generation, self.isRecordingOrPaused else { return }
-                self.onNotice?("GIF Frame Limit — Finalizing…", "film")
+                self.onNotice?(
+                    CCXL10n.text("GIF Frame Limit — Finalizing…", zh: "GIF 已达帧数上限，正在生成…"),
+                    "film"
+                )
                 self.stopActiveRecording()
             }
             newEngine.onUnexpectedStop = { [weak self] error in
@@ -319,7 +328,10 @@ public final class RecordingCoordinator {
                     self.tearDown(outcome: .permissionDenied, deleteStagedFile: true)
                 } else if self.isRecordingOrPaused {
                     if !Self.isUserStoppedStreamError(error) {
-                        self.onNotice?("Recording Interrupted — Saving…", "exclamationmark.triangle")
+                        self.onNotice?(
+                            CCXL10n.text("Recording Interrupted — Saving…", zh: "录屏意外中断，正在保存已录片段…"),
+                            "exclamationmark.triangle"
+                        )
                     }
                     self.stopActiveRecording()
                 } else {
@@ -524,7 +536,10 @@ public final class RecordingCoordinator {
         guard isSessionActive, let currentRegion = region else { return }
         guard let matchedScreen = Self.exactScreen(for: currentRegion.displayID) else {
             if phase == .ready && !isStartingRecording {
-                onNotice?("Display Disconnected", "display.trianglebadge.exclamationmark")
+                onNotice?(
+                    CCXL10n.text("Display Disconnected", zh: "显示器已断开"),
+                    "display.trianglebadge.exclamationmark"
+                )
                 cancelActiveSession()
             } else if let fallbackScreen = NSScreen.main {
                 controlPanel?.updateVisibleFrame(fallbackScreen.visibleFrame)
@@ -805,48 +820,54 @@ public final class RecordingCoordinator {
            let code = SCStreamError.Code(rawValue: nsError.code) {
             switch code {
             case .userDeclined:
-                return "Screen Recording permission is required."
+                return CCXL10n.text("Screen Recording permission is required.", zh: "需要屏幕录制权限。")
             case .missingEntitlements:
-                return "Recording permission is unavailable. Try relaunching CCX."
+                return CCXL10n.text(
+                    "Recording permission is unavailable. Try relaunching CCX.",
+                    zh: "录屏权限不可用，请重新打开 CCX。"
+                )
             case .failedToStartAudioCapture, .failedToStartMicrophoneCapture:
-                return "Could not start audio capture. Check your audio device or record without audio."
+                return CCXL10n.text(
+                    "Could not start audio capture. Check your audio device or record without audio.",
+                    zh: "无法采集音频，请检查音频设备或静音录制。"
+                )
             case .noDisplayList, .noWindowList, .noCaptureSource:
-                return "The selected display is no longer available."
+                return CCXL10n.text("The selected display is no longer available.", zh: "所选显示器已不可用。")
             case .systemStoppedStream:
-                return "Recording was stopped by macOS."
+                return CCXL10n.text("Recording was stopped by macOS.", zh: "录屏已被 macOS 停止。")
             case .failedToStart, .attemptToStartStreamState:
-                return "Could not start screen recording. Please try again."
+                return CCXL10n.text("Could not start screen recording. Please try again.", zh: "无法开始录屏，请重试。")
             default:
-                return "Screen recording was interrupted by macOS."
+                return CCXL10n.text("Screen recording was interrupted by macOS.", zh: "录屏被 macOS 中断。")
             }
         }
 
         if nsError.domain == NSCocoaErrorDomain {
             if nsError.code == NSFileWriteOutOfSpaceError {
-                return "Not enough disk space to save the recording."
+                return CCXL10n.text("Not enough disk space to save the recording.", zh: "磁盘空间不足，无法保存录屏。")
             }
             if nsError.code == NSFileWriteNoPermissionError || nsError.code == NSFileReadNoPermissionError {
-                return "CCX does not have permission to write the recording file."
+                return CCXL10n.text("CCX does not have permission to write the recording file.", zh: "CCX 没有权限写入录屏文件。")
             }
         }
 
         if nsError.domain == NSPOSIXErrorDomain {
             if nsError.code == Int(ENOSPC) {
-                return "Not enough disk space to save the recording."
+                return CCXL10n.text("Not enough disk space to save the recording.", zh: "磁盘空间不足，无法保存录屏。")
             }
             if nsError.code == Int(EACCES) || nsError.code == Int(EPERM) {
-                return "CCX does not have permission to write the recording file."
+                return CCXL10n.text("CCX does not have permission to write the recording file.", zh: "CCX 没有权限写入录屏文件。")
             }
         }
 
         if nsError.domain == AVFoundationErrorDomain {
             if nsError.code == AVError.Code.diskFull.rawValue {
-                return "Not enough disk space to save the recording."
+                return CCXL10n.text("Not enough disk space to save the recording.", zh: "磁盘空间不足，无法保存录屏。")
             }
             if nsError.code == AVError.Code.deviceWasDisconnected.rawValue {
-                return "A recording device was disconnected. Please try again."
+                return CCXL10n.text("A recording device was disconnected. Please try again.", zh: "录制设备已断开，请重试。")
             }
-            return "Could not encode the video recording. Please try again."
+            return CCXL10n.text("Could not encode the video recording. Please try again.", zh: "无法编码录屏视频，请重试。")
         }
 
         return error.localizedDescription

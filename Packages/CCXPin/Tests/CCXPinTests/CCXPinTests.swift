@@ -207,6 +207,16 @@ final class PinPanelAndManagerTests: XCTestCase {
         }
     }
 
+    nonisolated override func setUp() {
+        super.setUp()
+        CCXL10n.setLanguageOverrideForTesting(.en)
+    }
+
+    nonisolated override func tearDown() {
+        CCXL10n.setLanguageOverrideForTesting(nil)
+        super.tearDown()
+    }
+
     private func makeStore() -> (ClipboardStore, InMemoryClipboardPasteboard) {
         let pb = InMemoryClipboardPasteboard()
         return (ClipboardStore(pasteboard: pb), pb)
@@ -1455,5 +1465,85 @@ final class PinPanelAndManagerTests: XCTestCase {
         panel.toolbarViewForTesting?.onStyleChanged?(AnnotationStyle(color: .charcoal, size: .medium, mosaicMode: .pixelate))
         let bgBrightness = editor.backgroundColor?.usingColorSpace(.sRGB)?.brightnessComponent ?? 0
         XCTAssertGreaterThan(bgBrightness, 0.8)
+    }
+
+    func testLocalizationInEnglishAndSimplifiedChinese() throws {
+        CCXL10n.withLanguageForTesting(.zhHans) {
+            let (store, _) = makeStore()
+            let manager = PinManager(clipboardStore: store)
+            defer { manager.closeAllPins() }
+
+            var copiedMessages: [String] = []
+            manager.onCopied = { copiedMessages.append($0) }
+
+            let img = makePinTestImage(width: 240, height: 140) { _, _ in (120, 180, 240, 255) }
+            let entry = store.recordSnip(image: img, scale: 2, screenRect: .zero)!
+            XCTAssertEqual(manager.pinTileStatus(), .ready(count: 1, primaryLabel: "图片"))
+
+            XCTAssertTrue(manager.pin(content: .image(img, scale: 2), at: CGRect(x: 120, y: 120, width: 120, height: 70), contentIdentity: entry.pinIdentity))
+            let imagePanel = manager.panels[0]
+            XCTAssertEqual(imagePanel.title, "CCX 贴图")
+            XCTAssertEqual(imagePanel.contentView?.accessibilityLabel(), "贴图图片")
+
+            imagePanel.setClickThrough(true)
+            XCTAssertEqual(imagePanel.lastHUDTextForTesting, "鼠标穿透")
+            XCTAssertEqual(imagePanel.contentView?.accessibilityLabel(), "贴图图片，鼠标穿透")
+            XCTAssertFalse(manager.pin(content: .image(img, scale: 2), at: nil, contentIdentity: entry.pinIdentity))
+            XCTAssertEqual(imagePanel.lastHUDTextForTesting, "已贴图 · 鼠标穿透")
+
+            imagePanel.setClickThrough(false)
+            XCTAssertEqual(imagePanel.lastHUDTextForTesting, "已解除穿透")
+            imagePanel.toggleFlipHorizontal()
+            XCTAssertEqual(imagePanel.lastHUDTextForTesting, "水平翻转")
+            imagePanel.toggleFlipVertical()
+            XCTAssertEqual(imagePanel.lastHUDTextForTesting, "垂直翻转")
+            imagePanel.setOpacity(0.8)
+            XCTAssertEqual(imagePanel.lastHUDTextForTesting, "不透明度 80%")
+            imagePanel.resetAllTransforms()
+            XCTAssertEqual(imagePanel.lastHUDTextForTesting, "已重置")
+
+            imagePanel.setClickThrough(true)
+            let img2 = makePinTestImage(width: 160, height: 100) { _, _ in (200, 150, 100, 255) }
+            XCTAssertTrue(manager.pin(content: .image(img2, scale: 2), at: CGRect(x: 260, y: 120, width: 80, height: 50)))
+            let imagePanel2 = manager.panels[1]
+            let imageTitles = imagePanel2.makeContextMenu().items.map(\.title)
+            XCTAssertTrue(imageTitles.contains("拷贝"))
+            XCTAssertTrue(imageTitles.contains("识别文字 (OCR)"))
+            XCTAssertTrue(imageTitles.contains("保存 PNG"))
+            XCTAssertTrue(imageTitles.contains("快速保存 PNG"))
+            XCTAssertTrue(imageTitles.contains("创建副本"))
+            XCTAssertTrue(imageTitles.contains("标注"))
+            XCTAssertTrue(imageTitles.contains("实际大小 (100%)"))
+            XCTAssertTrue(imageTitles.contains("顺时针旋转 90°"))
+            XCTAssertTrue(imageTitles.contains("逆时针旋转 90°"))
+            XCTAssertTrue(imageTitles.contains("水平翻转"))
+            XCTAssertTrue(imageTitles.contains("垂直翻转"))
+            XCTAssertTrue(imageTitles.contains("重置全部变换"))
+            XCTAssertTrue(imageTitles.contains("不透明度"))
+            XCTAssertTrue(imageTitles.contains("鼠标穿透"))
+            XCTAssertTrue(imageTitles.contains("缩略图模式"))
+            XCTAssertTrue(imageTitles.contains("显示边框"))
+            XCTAssertTrue(imageTitles.contains("显示阴影"))
+            XCTAssertTrue(imageTitles.contains("关闭贴图"))
+            XCTAssertTrue(imageTitles.contains("解除全部穿透 (1)"))
+            XCTAssertTrue(imageTitles.contains("隐藏全部贴图"))
+            XCTAssertTrue(imageTitles.contains("关闭全部贴图"))
+
+            imagePanel2.copyPin(nil)
+            XCTAssertEqual(copiedMessages.last, "已拷贝到剪贴板")
+
+            store.copyText("#FF8000")
+            XCTAssertTrue(manager.pinFromClipboard())
+            let colorPanel = manager.panels.last!
+            let colorTitles = colorPanel.makeContextMenu().items.map(\.title)
+            XCTAssertTrue(colorTitles.contains("拷贝 HEX"))
+            XCTAssertTrue(colorTitles.contains("拷贝 RGB"))
+            XCTAssertTrue(colorTitles.contains("拷贝 HSL"))
+            colorPanel.copyHexColor(nil)
+            XCTAssertEqual(copiedMessages.last, "已拷贝 #FF8000")
+
+            store.copyText("测试文本")
+            XCTAssertEqual(manager.pinTileStatus(), .ready(count: 1, primaryLabel: "文本"))
+        }
     }
 }

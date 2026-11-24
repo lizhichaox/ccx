@@ -74,6 +74,7 @@ final class PixelMagnifierView: NSView {
     var displayedPositionText: String { positionLabel.stringValue }
     var displayedSizeText: String { sizeLabel.stringValue }
     var displayedColorText: String { colorLabel.stringValue }
+    var displayedHintText: String { hintLabel.stringValue }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -166,7 +167,7 @@ final class PixelMagnifierView: NSView {
         sizeLabel.frame = CGRect(x: 6, y: infoTop - 2 * lineHeight, width: side - 12, height: 15)
         colorLabel.frame = CGRect(x: 23, y: infoTop - 3 * lineHeight + 1, width: side - 29, height: 15)
         hintLabel.frame = CGRect(x: 6, y: max(3, infoTop - 4 * lineHeight + 3), width: side - 12, height: 13)
-        hintLabel.stringValue = "C copy · ⇧ format"
+        hintLabel.stringValue = CCXL10n.text("C copy · ⇧ format", zh: "C 拷贝 · ⇧ 格式")
 
         addSubview(positionLabel)
         addSubview(sizeLabel)

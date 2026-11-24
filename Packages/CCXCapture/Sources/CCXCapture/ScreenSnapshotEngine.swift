@@ -1,4 +1,5 @@
 import AppKit
+import CCXCore
 import CoreGraphics
 import OSLog
 import ScreenCaptureKit
@@ -13,9 +14,9 @@ public enum ScreenSnapshotError: Error, LocalizedError, Sendable {
     public var errorDescription: String? {
         switch self {
         case .noDisplays:
-            return "No active display was found."
+            return CCXL10n.text("No active display was found.", zh: "未找到可用显示器。")
         case .captureFailed:
-            return "Could not capture the screen. Please try again."
+            return CCXL10n.text("Could not capture the screen. Please try again.", zh: "无法截取屏幕，请重试。")
         }
     }
 }
@@ -43,7 +44,7 @@ public enum ScreenSnapshotEngine {
         return nsError.domain == SCStreamErrorDomain && nsError.code == SCStreamError.userDeclined.rawValue
     }
 
-    /// Maps ScreenCaptureKit and snapshot errors into concise, user-friendly English text.
+    /// Maps ScreenCaptureKit and snapshot errors into concise, localized user-facing text.
     public static func userFacingErrorMessage(for error: Error) -> String {
         if let snapshotError = error as? ScreenSnapshotError, let description = snapshotError.errorDescription {
             return description
@@ -52,20 +53,23 @@ public enum ScreenSnapshotEngine {
         if nsError.domain == SCStreamErrorDomain {
             switch SCStreamError.Code(rawValue: nsError.code) {
             case .userDeclined:
-                return "Screen Recording permission is required."
+                return CCXL10n.text("Screen Recording permission is required.", zh: "需要屏幕录制权限。")
             case .systemStoppedStream, .userStopped:
-                return "Screen capture was stopped by the system."
+                return CCXL10n.text("Screen capture was stopped by the system.", zh: "屏幕捕获已被系统停止。")
             case .noDisplayList, .noCaptureSource, .noWindowList:
-                return "No active display was found."
+                return CCXL10n.text("No active display was found.", zh: "未找到可用显示器。")
             case .missingEntitlements:
-                return "Screen capture permission is unavailable."
+                return CCXL10n.text("Screen capture permission is unavailable.", zh: "屏幕捕获权限不可用。")
             default:
-                return "Could not capture the screen. Please try again."
+                return CCXL10n.text("Could not capture the screen. Please try again.", zh: "无法截取屏幕，请重试。")
             }
         }
         let localized = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
-        if localized.isEmpty || localized.contains("The operation couldn’t be completed.") || localized.contains("The operation couldn't be completed.") {
-            return "Could not capture the screen. Please try again."
+        if localized.isEmpty
+            || localized.contains("The operation couldn’t be completed.")
+            || localized.contains("The operation couldn't be completed.")
+            || localized.contains("未能完成该操作") {
+            return CCXL10n.text("Could not capture the screen. Please try again.", zh: "无法截取屏幕，请重试。")
         }
         return localized
     }

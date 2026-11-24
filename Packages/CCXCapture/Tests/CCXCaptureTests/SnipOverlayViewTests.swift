@@ -1144,22 +1144,25 @@ struct SnipOverlayViewTests {
         #expect(view.handleScrollThickness(deltaY: 0, isPrecise: true, isDirectionInverted: false, phase: .ended))
 
         // Mosaic tool adjusts block/blur strength and formats HUD accordingly.
-        view.keyDown(with: try makeKeyEvent(characters: "6", modifiers: [], keyCode: 22))
-        view.applyStrokeSize(.small, recordUndo: false, showHUD: false)
-        view.mouseDown(with: try makeMouseEvent(type: .leftMouseDown, at: CGPoint(x: 300, y: 180)))
-        view.mouseDragged(with: try makeMouseEvent(type: .leftMouseDragged, at: CGPoint(x: 420, y: 280)))
-        view.mouseUp(with: try makeMouseEvent(type: .leftMouseUp, at: CGPoint(x: 420, y: 280)))
+        let blurSize: StrokeSize = try CCXL10n.withLanguageForTesting(.en) {
+            view.keyDown(with: try makeKeyEvent(characters: "6", modifiers: [], keyCode: 22))
+            view.applyStrokeSize(.small, recordUndo: false, showHUD: false)
+            view.mouseDown(with: try makeMouseEvent(type: .leftMouseDown, at: CGPoint(x: 300, y: 180)))
+            view.mouseDragged(with: try makeMouseEvent(type: .leftMouseDragged, at: CGPoint(x: 420, y: 280)))
+            view.mouseUp(with: try makeMouseEvent(type: .leftMouseUp, at: CGPoint(x: 420, y: 280)))
 
-        #expect(view.handleScrollThickness(deltaY: 5, isPrecise: false, isDirectionInverted: false, timestamp: 100))
-        let mosaicSize = try #require(view.annotations.selectedItem?.style.size)
-        #expect(mosaicSize.mosaicBlockSize > StrokeSize.small.mosaicBlockSize)
-        #expect(view.sizeHUDText == "Mosaic \(Int(mosaicSize.mosaicBlockSize.rounded()))")
+            #expect(view.handleScrollThickness(deltaY: 5, isPrecise: false, isDirectionInverted: false, timestamp: 100))
+            let mosaicSize = try #require(view.annotations.selectedItem?.style.size)
+            #expect(mosaicSize.mosaicBlockSize > StrokeSize.small.mosaicBlockSize)
+            #expect(view.sizeHUDText == "Mosaic \(Int(mosaicSize.mosaicBlockSize.rounded()))")
 
-        view.applyStyle(AnnotationStyle(color: .red, size: mosaicSize, mosaicMode: .blur))
-        #expect(view.handleScrollThickness(deltaY: 5, isPrecise: false, isDirectionInverted: false, timestamp: 101))
-        let blurSize = try #require(view.annotations.selectedItem?.style.size)
-        #expect(blurSize.blurRadius >= mosaicSize.blurRadius)
-        #expect(view.sizeHUDText == "Blur \(Int(blurSize.blurRadius.rounded()))")
+            view.applyStyle(AnnotationStyle(color: .red, size: mosaicSize, mosaicMode: .blur))
+            #expect(view.handleScrollThickness(deltaY: 5, isPrecise: false, isDirectionInverted: false, timestamp: 101))
+            let size = try #require(view.annotations.selectedItem?.style.size)
+            #expect(size.blurRadius >= mosaicSize.blurRadius)
+            #expect(view.sizeHUDText == "Blur \(Int(size.blurRadius.rounded()))")
+            return size
+        }
 
         // Real NSEvent.scrollWheel path (when CGEvent conversion succeeds) routes through `scrollWheel(with:)`.
         if let cgScroll = CGEvent(
@@ -1213,58 +1216,82 @@ struct SnipOverlayViewTests {
 
     @Test func scrollCaptureHUDPanelFitsAllControlsWithoutOverflow() throws {
         let visibleFrame = CGRect(x: 0, y: 0, width: 1440, height: 900)
-        let hud = ScrollCaptureHUDPanel(
-            captureRect: CGRect(x: 220, y: 260, width: 520, height: 500),
-            visibleFrame: visibleFrame
-        )
+        let hintFont = NSFont.monospacedSystemFont(ofSize: 8.5, weight: .regular)
 
-        func assertControlsFit() {
-            let contentBounds = hud.hudContentBounds
-            let frames = hud.hudControlFrames
-            #expect(contentBounds.height == 44)
-            #expect(frames.count == 9)
-            #expect(visibleFrame.contains(hud.frame))
-            for frame in frames {
-                #expect(frame.width > 0)
-                #expect(frame.height > 0)
-                #expect(contentBounds.contains(frame))
-            }
-            for i in 0 ..< frames.count {
-                for j in (i + 1) ..< frames.count {
-                    #expect(!frames[i].intersects(frames[j]))
+        for language in CCXLanguage.allCases {
+            CCXL10n.withLanguageForTesting(language) {
+                let hud = ScrollCaptureHUDPanel(
+                    captureRect: CGRect(x: 220, y: 260, width: 520, height: 500),
+                    visibleFrame: visibleFrame
+                )
+
+                @MainActor
+                func assertControlsFit() {
+                    let contentBounds = hud.hudContentBounds
+                    let frames = hud.hudControlFrames
+                    #expect(contentBounds.height == 44)
+                    #expect(frames.count == 9)
+                    #expect(visibleFrame.contains(hud.frame))
+                    for frame in frames {
+                        #expect(frame.width > 0)
+                        #expect(frame.height > 0)
+                        #expect(contentBounds.contains(frame))
+                    }
+                    for i in 0 ..< frames.count {
+                        for j in (i + 1) ..< frames.count {
+                            #expect(!frames[i].intersects(frames[j]))
+                        }
+                    }
                 }
+
+                assertControlsFit()
+
+                hud.updateMetrics(
+                    width: 1440,
+                    height: 12850,
+                    status: CCXL10n.text("Auto-scrolling", zh: "滚动中…"),
+                    accent: .autoScroll,
+                    isAutoScrolling: true
+                )
+                assertControlsFit()
+
+                hud.updateMetrics(
+                    width: 2880,
+                    height: 24500,
+                    status: CCXL10n.text("Needs Accessibility", zh: "需要辅助功能"),
+                    accent: .warning,
+                    isAutoScrolling: false
+                )
+                assertControlsFit()
+
+                hud.updateAutoScroll(
+                    isRunning: false,
+                    status: CCXL10n.text("Reached bottom", zh: "已到底部"),
+                    accent: .warning
+                )
+                assertControlsFit()
+
+                hud.updateAutoScroll(
+                    isRunning: false,
+                    status: CCXL10n.text("Max height", zh: "已达最大高度"),
+                    accent: .warning
+                )
+                assertControlsFit()
+
+                let bottomHUD = ScrollCaptureHUDPanel(
+                    captureRect: CGRect(x: 200, y: 8, width: 500, height: 500),
+                    visibleFrame: visibleFrame
+                )
+                #expect(visibleFrame.contains(bottomHUD.frame))
+                #expect(bottomHUD.hudControlFrames.allSatisfy { bottomHUD.hudContentBounds.contains($0) })
+
+                let magnifier = PixelMagnifierView()
+                let expectedHint = language == .zhHans ? "C 拷贝 · ⇧ 格式" : "C copy · ⇧ format"
+                #expect(magnifier.displayedHintText == expectedHint)
+                let hintWidth = (magnifier.displayedHintText as NSString).size(withAttributes: [.font: hintFont]).width
+                #expect(hintWidth <= 142)
             }
         }
-
-        assertControlsFit()
-
-        hud.updateMetrics(
-            width: 1440,
-            height: 12850,
-            status: "Auto-scrolling",
-            accent: .autoScroll,
-            isAutoScrolling: true
-        )
-        assertControlsFit()
-
-        hud.updateMetrics(
-            width: 2880,
-            height: 24500,
-            status: "Needs Accessibility",
-            accent: .warning,
-            isAutoScrolling: false
-        )
-        assertControlsFit()
-
-        hud.updateAutoScroll(isRunning: false, status: "Reached bottom", accent: .warning)
-        assertControlsFit()
-
-        let bottomHUD = ScrollCaptureHUDPanel(
-            captureRect: CGRect(x: 200, y: 8, width: 500, height: 500),
-            visibleFrame: visibleFrame
-        )
-        #expect(visibleFrame.contains(bottomHUD.frame))
-        #expect(bottomHUD.hudControlFrames.allSatisfy { bottomHUD.hudContentBounds.contains($0) })
     }
 
     @Test func autoScrollDriverAvoidsHUDAndPostsDiscreteScrollUntilBottomOrTakeover() async throws {

@@ -92,7 +92,11 @@ public final class PinManager {
             } else {
                 existing.orderFrontRegardless()
             }
-            existing.flashHUD(existing.state.isClickThrough ? "Pinned · Click-Through" : "Pinned")
+            existing.flashHUD(
+                existing.state.isClickThrough
+                    ? CCXL10n.text("Pinned · Click-Through", zh: "已贴图 · 鼠标穿透")
+                    : CCXL10n.text("Pinned", zh: "已贴图")
+            )
             onPinsChanged?()
             return false
         }
@@ -237,7 +241,7 @@ public final class PinManager {
         let pbBadge = clipboardStore.peekPinBadge()
         if pbBadge == .empty {
             if unpinnedHistoryCount > 0 {
-                return .ready(count: unpinnedHistoryCount, primaryLabel: "Image")
+                return .ready(count: unpinnedHistoryCount, primaryLabel: CCXL10n.text("Image", zh: "图片"))
             }
             return uniqueHistory.isEmpty ? .empty : .allPinned
         }
@@ -250,12 +254,12 @@ public final class PinManager {
             if clipUnpinned && (clipboardStore.hasClipboardChangedSinceLatestSnip || unpinnedHistoryCount == 0) {
                 return .ready(count: totalUnpinned, primaryLabel: pbBadge.displayText)
             }
-            return .ready(count: totalUnpinned, primaryLabel: "Image")
+            return .ready(count: totalUnpinned, primaryLabel: CCXL10n.text("Image", zh: "图片"))
         }
 
         let label = (unpinnedHistoryCount == 0 || clipboardStore.hasClipboardChangedSinceLatestSnip)
             ? pbBadge.displayText
-            : "Image"
+            : CCXL10n.text("Image", zh: "图片")
         return .ready(count: unpinnedHistoryCount + 1, primaryLabel: label)
     }
 
@@ -344,14 +348,14 @@ public final class PinManager {
         switch panel.content {
         case let .text(text):
             clipboardStore.copyText(text)
-            onCopied?("Copied to Clipboard")
+            onCopied?(CCXL10n.text("Copied to Clipboard", zh: "已拷贝到剪贴板"))
         case let .color(color):
             clipboardStore.copyText(color.hexString)
-            onCopied?("Copied \(color.hexString)")
+            onCopied?(CCXL10n.text("Copied \(color.hexString)", zh: "已拷贝 \(color.hexString)"))
         case .image:
             if let image = panel.exportImage() {
                 clipboardStore.copyImage(image, scale: panel.exportScale)
-                onCopied?("Copied to Clipboard")
+                onCopied?(CCXL10n.text("Copied to Clipboard", zh: "已拷贝到剪贴板"))
             }
         }
     }
@@ -368,7 +372,7 @@ public final class PinManager {
 
     private func duplicate(_ panel: PinPanel) {
         guard panels.count < Self.maxActivePins else {
-            panel.flashHUD("Pin Limit Reached")
+            panel.flashHUD(CCXL10n.text("Pin Limit Reached", zh: "贴图数量已达上限"))
             return
         }
         if panel.isToolbarVisible {
@@ -407,12 +411,12 @@ public final class PinManager {
         guard case let .color(sample) = panel.content else { return }
         let formatted = sample.formatted(as: format)
         clipboardStore.copyText(formatted)
-        onCopied?("Copied \(formatted)")
+        onCopied?(CCXL10n.text("Copied \(formatted)", zh: "已拷贝 \(formatted)"))
     }
 
     private func recognizeText(_ panel: PinPanel) {
         guard case .image = panel.content, let image = panel.exportImage() else { return }
-        panel.flashHUD("OCR…")
+        panel.flashHUD(CCXL10n.text("OCR…", zh: "识别中…"))
         onRequestRecognizeText?(image)
     }
 

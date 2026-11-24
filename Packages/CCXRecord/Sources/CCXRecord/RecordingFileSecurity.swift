@@ -1,3 +1,4 @@
+import CCXCore
 import Darwin
 import Foundation
 
@@ -20,7 +21,9 @@ enum RecordingFileSecurity {
     /// Ensures `url` exists as a user-owned, non-symlink directory with `0700` permissions.
     static func ensureSecureStagingDirectory(at url: URL) throws {
         guard url.isFileURL else {
-            throw RecordingError.writerInitializationFailed("Invalid staging directory URL.")
+            throw RecordingError.writerInitializationFailed(
+                CCXL10n.text("Invalid staging directory URL.", zh: "暂存目录路径无效。")
+            )
         }
         let fm = FileManager.default
         let path = lstatPath(for: url)
@@ -28,21 +31,29 @@ enum RecordingFileSecurity {
         if lstat(path, &st) == 0 {
             let fileType = st.st_mode & S_IFMT
             guard fileType == S_IFDIR else {
-                throw RecordingError.writerInitializationFailed("Recording staging path is not a directory.")
+                throw RecordingError.writerInitializationFailed(
+                    CCXL10n.text("Recording staging path is not a directory.", zh: "录屏暂存路径不是目录。")
+                )
             }
             guard st.st_uid == getuid() else {
-                throw RecordingError.writerInitializationFailed("Recording staging directory is not owned by the current user.")
+                throw RecordingError.writerInitializationFailed(
+                    CCXL10n.text("Recording staging directory is not owned by the current user.", zh: "录屏暂存目录不属于当前用户。")
+                )
             }
             if (st.st_mode & 0o777) != 0o700 {
                 guard chmod(path, 0o700) == 0 else {
-                    throw RecordingError.writerInitializationFailed("Could not secure recording staging directory permissions.")
+                    throw RecordingError.writerInitializationFailed(
+                        CCXL10n.text("Could not secure recording staging directory permissions.", zh: "无法设置录屏暂存目录权限。")
+                    )
                 }
             }
             return
         }
 
         guard errno == ENOENT else {
-            throw RecordingError.writerInitializationFailed("Could not access the temporary recordings folder.")
+            throw RecordingError.writerInitializationFailed(
+                CCXL10n.text("Could not access the temporary recordings folder.", zh: "无法访问临时录屏文件夹。")
+            )
         }
 
         do {
@@ -52,14 +63,21 @@ enum RecordingFileSecurity {
                 attributes: [.posixPermissions: 0o700]
             )
         } catch {
-            throw RecordingError.writerInitializationFailed("Could not create recording staging directory: \(error.localizedDescription)")
+            throw RecordingError.writerInitializationFailed(
+                CCXL10n.text(
+                    "Could not create recording staging directory: \(error.localizedDescription)",
+                    zh: "无法创建录屏暂存目录：\(error.localizedDescription)"
+                )
+            )
         }
 
         guard lstat(path, &st) == 0,
               (st.st_mode & S_IFMT) == S_IFDIR,
               st.st_uid == getuid()
         else {
-            throw RecordingError.writerInitializationFailed("Created recording staging directory failed security verification.")
+            throw RecordingError.writerInitializationFailed(
+                CCXL10n.text("Created recording staging directory failed security verification.", zh: "录屏暂存目录安全校验失败。")
+            )
         }
         _ = chmod(path, 0o700)
     }
@@ -68,10 +86,14 @@ enum RecordingFileSecurity {
     /// directories, traversal segments, or foreign-owned files, and safely removing an existing regular file.
     static func validateOutputURLForWriting(_ url: URL) throws {
         guard url.isFileURL, !url.path.isEmpty else {
-            throw RecordingError.writerInitializationFailed("Invalid recording output URL.")
+            throw RecordingError.writerInitializationFailed(
+                CCXL10n.text("Invalid recording output URL.", zh: "录屏输出路径无效。")
+            )
         }
         guard !url.pathComponents.contains("..") else {
-            throw RecordingError.writerInitializationFailed("Output path must not contain traversal segments.")
+            throw RecordingError.writerInitializationFailed(
+                CCXL10n.text("Output path must not contain traversal segments.", zh: "输出路径不能包含上级目录跳转。")
+            )
         }
 
         let path = lstatPath(for: url)
@@ -79,21 +101,34 @@ enum RecordingFileSecurity {
         if lstat(path, &st) == 0 {
             let fileType = st.st_mode & S_IFMT
             if fileType == S_IFLNK {
-                throw RecordingError.writerInitializationFailed("Refusing to write recording to a symbolic link.")
+                throw RecordingError.writerInitializationFailed(
+                    CCXL10n.text("Refusing to write recording to a symbolic link.", zh: "无法将录屏写入符号链接。")
+                )
             }
             guard fileType == S_IFREG else {
-                throw RecordingError.writerInitializationFailed("Recording output path is not a regular file.")
+                throw RecordingError.writerInitializationFailed(
+                    CCXL10n.text("Recording output path is not a regular file.", zh: "录屏输出路径不是常规文件。")
+                )
             }
             guard st.st_uid == getuid() else {
-                throw RecordingError.writerInitializationFailed("Recording output file is not owned by the current user.")
+                throw RecordingError.writerInitializationFailed(
+                    CCXL10n.text("Recording output file is not owned by the current user.", zh: "录屏输出文件不属于当前用户。")
+                )
             }
             do {
                 try FileManager.default.removeItem(at: url)
             } catch {
-                throw RecordingError.writerInitializationFailed("Could not replace existing output file: \(error.localizedDescription)")
+                throw RecordingError.writerInitializationFailed(
+                    CCXL10n.text(
+                        "Could not replace existing output file: \(error.localizedDescription)",
+                        zh: "无法覆盖现有输出文件：\(error.localizedDescription)"
+                    )
+                )
             }
         } else if errno != ENOENT {
-            throw RecordingError.writerInitializationFailed("Could not access the recording output location.")
+            throw RecordingError.writerInitializationFailed(
+                CCXL10n.text("Could not access the recording output location.", zh: "无法访问录屏输出位置。")
+            )
         }
     }
 
