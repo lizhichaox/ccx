@@ -9,12 +9,14 @@ let package = Package(
     ],
     dependencies: [
         .package(path: "../CCXCore"),
+        .package(path: "../CCXAnnotate"),
     ],
     targets: [
         .target(
             name: "CCXPin",
             dependencies: [
                 .product(name: "CCXCore", package: "CCXCore"),
+                .product(name: "CCXAnnotate", package: "CCXAnnotate"),
             ]
         ),
         .testTarget(

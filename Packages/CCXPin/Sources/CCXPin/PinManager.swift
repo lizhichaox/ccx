@@ -1,14 +1,35 @@
 import AppKit
+import CCXAnnotate
 import CCXCore
+
+/// Outcome when triggering the smart Pin action (newest unpinned item first, no duplicates).
+public enum PinNextOutcome: Equatable, Sendable {
+    case pinned
+    case allAlreadyPinned
+    case nothingAvailable
+}
+
+/// Zero-decode status summary for the menu bar Pin quick-action tile.
+public enum PinTileStatus: Equatable, Sendable {
+    case ready(count: Int, primaryLabel: String)
+    case allPinned
+    case empty
+}
 
 /// Owns every floating pin: creation, visibility, click-through, copy/save routing.
 @MainActor
 public final class PinManager {
+    public static let maxActivePins = 64
+
     public private(set) var panels: [PinPanel] = []
     public private(set) var arePinsHidden = false
+    public private(set) var lastAnnotationStyle = AnnotationStyle()
 
     public var pinCount: Int { panels.count }
-    public var hasClickThroughPins: Bool { panels.contains { $0.state.isClickThrough } }
+    public var clickThroughPinCount: Int {
+        panels.reduce(0) { $0 + ($1.state.isClickThrough ? 1 : 0) }
+    }
+    public var hasClickThroughPins: Bool { clickThroughPinCount > 0 }
 
     /// Called whenever pins are added, removed, hidden/shown, or change state.
     public var onPinsChanged: (() -> Void)?
@@ -23,24 +44,87 @@ public final class PinManager {
     public var onRequestRecognizeText: ((CGImage) -> Void)?
 
     private let clipboardStore: ClipboardStore
+    private var isBatchUpdatingState = false
+    private let screenObserver: ScreenParametersObserver
 
     public init(clipboardStore: ClipboardStore) {
         self.clipboardStore = clipboardStore
+        let observer = ScreenParametersObserver()
+        self.screenObserver = observer
+        observer.onScreensChanged = { [weak self] in
+            self?.rescueOffScreenPanels()
+        }
     }
 
-    /// Pins `content`. With `screenRect` (AppKit global coordinates, points) the pin is
-    /// placed exactly over that area so a fresh snip pins seamlessly; with `nil` it is
-    /// centered on the screen containing the mouse, shrunk to fit if needed.
-    public func pin(content: PinContent, at screenRect: CGRect?) {
-        let baseSize = PinLayout.baseSize(for: content)
+    public func existingPanel(matching identity: PinContentIdentity) -> PinPanel? {
+        panels.first { $0.contentIdentity.matches(identity) }
+    }
+
+    public func isPinned(_ identity: PinContentIdentity) -> Bool {
+        existingPanel(matching: identity) != nil
+    }
+
+    /// Closes any open annotation toolbars across active pins (committing edits by default).
+    public func closeAllToolbars(commit: Bool = true) {
+        for panel in panels where panel.isToolbarVisible {
+            panel.closeToolbar(commit: commit)
+        }
+    }
+
+    /// Pins `content` if not already on screen. Returns `false` and focuses the existing pin
+    /// when a matching pin is already active, or when `content` is invalid / pin limit reached.
+    ///
+    /// With `screenRect` (AppKit global coordinates, points) the pin is placed directly over
+    /// that area; with `nil` it is centered near the cursor and cascaded to avoid stacking.
+    @discardableResult
+    public func pin(
+        content: PinContent,
+        at screenRect: CGRect?,
+        contentIdentity: PinContentIdentity? = nil
+    ) -> Bool {
+        guard let sanitizedContent = Self.sanitize(content) else { return false }
+
+        let resolvedIdentity = contentIdentity ?? sanitizedContent.defaultIdentity
+        if let existing = existingPanel(matching: resolvedIdentity) {
+            if arePinsHidden {
+                arePinsHidden = false
+                panels.forEach { $0.orderFrontRegardless() }
+            } else {
+                existing.orderFrontRegardless()
+            }
+            existing.flashHUD(existing.state.isClickThrough ? "Pinned · Click-Through" : "Pinned")
+            onPinsChanged?()
+            return false
+        }
+
+        guard panels.count < Self.maxActivePins else { return false }
+
+        let validScreenRect = screenRect.flatMap { PinLayout.isFiniteRect($0) ? $0 : nil }
+        let baseSize = PinLayout.baseSize(for: sanitizedContent)
+        let visibleFrame = validScreenRect.map { Self.visibleFrame(containing: $0) }
+            ?? Self.visibleFrameUnderMouse()
         let placement = PinLayout.initialPlacement(
             baseSize: baseSize,
-            screenRect: screenRect,
-            visibleFrame: Self.visibleFrameUnderMouse()
+            screenRect: validScreenRect,
+            visibleFrame: visibleFrame
         )
-        let panel = PinPanel(content: content, frame: placement.frame, state: PinState(zoom: placement.zoom))
+        var targetFrame = placement.frame
+        if validScreenRect == nil && !panels.isEmpty {
+            targetFrame = Self.cascadedFrame(
+                startingFrom: targetFrame,
+                existingFrames: panels.map(\.frame),
+                visibleFrame: visibleFrame
+            )
+        }
+        let panel = PinPanel(
+            content: sanitizedContent,
+            frame: targetFrame,
+            state: PinState(zoom: placement.zoom),
+            contentIdentity: resolvedIdentity
+        )
         attachHandlers(to: panel)
         presentNewPanel(panel)
+        return true
     }
 
     private func attachHandlers(to panel: PinPanel) {
@@ -55,7 +139,22 @@ public final class PinManager {
         panel.onRecognizeText = { [weak self] panel in self?.recognizeText(panel) }
         panel.onHideAll = { [weak self] in self?.toggleVisibilityOfAllPins() }
         panel.onCloseAll = { [weak self] in self?.closeAllPins() }
-        panel.onStateChanged = { [weak self] _ in self?.onPinsChanged?() }
+        panel.onUnlockAllClickThrough = { [weak self] in self?.disableClickThroughForAllPins() }
+        panel.clickThroughCountProvider = { [weak self] in self?.clickThroughPinCount ?? 0 }
+        panel.onStateChanged = { [weak self] _ in
+            guard let self, !self.isBatchUpdatingState else { return }
+            self.onPinsChanged?()
+        }
+        panel.onToolbarWillOpen = { [weak self] openingPanel in
+            guard let self else { return }
+            for other in self.panels where other !== openingPanel && other.isToolbarVisible {
+                other.closeToolbar(commit: true)
+            }
+            openingPanel.currentAnnotationStyle = self.lastAnnotationStyle
+        }
+        panel.onAnnotationStyleChanged = { [weak self] style in
+            self?.lastAnnotationStyle = style
+        }
     }
 
     private func presentNewPanel(_ panel: PinPanel) {
@@ -70,17 +169,100 @@ public final class PinManager {
         onPinsChanged?()
     }
 
-    /// Pins the current pasteboard content (image, HEX color, or text). Returns `false`
-    /// when the pasteboard holds nothing pinnable.
+    /// Pins the next unpinned item in newest-to-oldest order across recent snips and the
+    /// clipboard without creating duplicate pins for the same image/content.
+    public func pinNextAvailable() -> PinNextOutcome {
+        let historyCandidates: [(content: PinContent, identity: PinContentIdentity)] = clipboardStore.history.map { entry in
+            (.image(entry.image, scale: entry.scale), entry.pinIdentity)
+        }
+
+        // Fast path: when history takes priority over clipboard, avoid decoding large clipboard
+        // payloads if an unpinned history entry is already available.
+        if !clipboardStore.hasClipboardChangedSinceLatestSnip {
+            for candidate in historyCandidates where !isPinned(candidate.identity) {
+                if pin(content: candidate.content, at: nil, contentIdentity: candidate.identity) {
+                    return .pinned
+                }
+            }
+        }
+
+        var clipboardCandidate: (content: PinContent, identity: PinContentIdentity)?
+        if let resolved = clipboardStore.readPinPayloadWithIdentity() {
+            let content: PinContent = switch resolved.payload {
+            case let .image(image, scale): .image(image, scale: scale)
+            case let .color(color): .color(color)
+            case let .text(text): .text(text)
+            }
+            clipboardCandidate = (content, resolved.identity)
+        }
+
+        let matchesHistory = clipboardCandidate.map { clip in
+            clipboardStore.history.contains { $0.pinIdentity.matches(clip.identity) }
+        } ?? false
+
+        var candidates: [(content: PinContent, identity: PinContentIdentity)] = []
+        if let clipboardCandidate, !matchesHistory {
+            if clipboardStore.hasClipboardChangedSinceLatestSnip {
+                candidates.append(clipboardCandidate)
+                candidates.append(contentsOf: historyCandidates)
+            } else {
+                candidates.append(contentsOf: historyCandidates)
+                candidates.append(clipboardCandidate)
+            }
+        } else {
+            candidates = historyCandidates
+        }
+
+        guard !candidates.isEmpty else { return .nothingAvailable }
+
+        for candidate in candidates where !isPinned(candidate.identity) {
+            if pin(content: candidate.content, at: nil, contentIdentity: candidate.identity) {
+                return .pinned
+            }
+        }
+        return .allAlreadyPinned
+    }
+
+    /// Zero-decode status summary for the menu bar Pin quick-action tile.
+    public func pinTileStatus() -> PinTileStatus {
+        var uniqueHistory: [PinContentIdentity] = []
+        for entry in clipboardStore.history {
+            let identity = entry.pinIdentity
+            if !uniqueHistory.contains(where: { $0.matches(identity) }) {
+                uniqueHistory.append(identity)
+            }
+        }
+        let unpinnedHistoryCount = uniqueHistory.filter { !isPinned($0) }.count
+
+        let pbBadge = clipboardStore.peekPinBadge()
+        if pbBadge == .empty {
+            if unpinnedHistoryCount > 0 {
+                return .ready(count: unpinnedHistoryCount, primaryLabel: "Image")
+            }
+            return uniqueHistory.isEmpty ? .empty : .allPinned
+        }
+
+        if let knownIdentity = clipboardStore.cachedClipboardIdentityIfKnown() {
+            let matchesHistory = uniqueHistory.contains { $0.matches(knownIdentity) }
+            let clipUnpinned = !matchesHistory && !isPinned(knownIdentity)
+            let totalUnpinned = unpinnedHistoryCount + (clipUnpinned ? 1 : 0)
+            guard totalUnpinned > 0 else { return .allPinned }
+            if clipUnpinned && (clipboardStore.hasClipboardChangedSinceLatestSnip || unpinnedHistoryCount == 0) {
+                return .ready(count: totalUnpinned, primaryLabel: pbBadge.displayText)
+            }
+            return .ready(count: totalUnpinned, primaryLabel: "Image")
+        }
+
+        let label = (unpinnedHistoryCount == 0 || clipboardStore.hasClipboardChangedSinceLatestSnip)
+            ? pbBadge.displayText
+            : "Image"
+        return .ready(count: unpinnedHistoryCount + 1, primaryLabel: label)
+    }
+
+    /// Pins the next unpinned item (or clipboard content). Returns `false` when nothing remains to pin.
     @discardableResult
     public func pinFromClipboard() -> Bool {
-        guard let payload = clipboardStore.readPinPayload() else { return false }
-        switch payload {
-        case let .image(image, scale): pin(content: .image(image, scale: scale), at: nil)
-        case let .color(color): pin(content: .color(color), at: nil)
-        case let .text(text): pin(content: .text(text), at: nil)
-        }
-        return true
+        pinNextAvailable() == .pinned
     }
 
     public func toggleVisibilityOfAllPins() {
@@ -91,15 +273,24 @@ public final class PinManager {
         }
         arePinsHidden.toggle()
         for panel in panels {
-            if arePinsHidden { panel.orderOut(nil) } else { panel.orderFrontRegardless() }
+            if arePinsHidden {
+                if panel.isToolbarVisible { panel.closeToolbar(commit: true) }
+                panel.orderOut(nil)
+            } else {
+                panel.orderFrontRegardless()
+            }
         }
         onPinsChanged?()
     }
 
     public func disableClickThroughForAllPins() {
-        for panel in panels where panel.state.isClickThrough {
+        let targets = panels.filter { $0.state.isClickThrough }
+        guard !targets.isEmpty else { return }
+        isBatchUpdatingState = true
+        for panel in targets {
             panel.setClickThrough(false)
         }
+        isBatchUpdatingState = false
         onPinsChanged?()
     }
 
@@ -114,7 +305,34 @@ public final class PinManager {
         onPinsChanged?()
     }
 
+    /// Clamps any pins stranded off-screen (e.g. after disconnecting an external monitor) back
+    /// onto active screens and repositions any open annotation toolbars.
+    internal func rescueOffScreenPanels(visibleScreens: [CGRect]? = nil) {
+        let screens = visibleScreens ?? NSScreen.screens.map(\.visibleFrame)
+        guard !screens.isEmpty else { return }
+        for panel in panels {
+            let clamped = PinLayout.clampedOriginToScreens(panel.frame, screens: screens)
+            if clamped.origin != panel.frame.origin {
+                panel.setFrameOrigin(clamped.origin)
+            }
+            panel.repositionAnnotationToolbarIfVisible()
+        }
+    }
+
     // MARK: - Private
+
+    private static func sanitize(_ content: PinContent) -> PinContent? {
+        switch content {
+        case let .image(image, scale):
+            guard let safeImage = PinLayout.sanitizedImage(image) else { return nil }
+            return .image(safeImage, scale: PinLayout.sanitizedScale(scale))
+        case let .text(string):
+            guard !string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+            return .text(string)
+        case .color:
+            return content
+        }
+    }
 
     private func panelDidClose(_ panel: PinPanel) {
         panels.removeAll { $0 === panel }
@@ -149,6 +367,13 @@ public final class PinManager {
     }
 
     private func duplicate(_ panel: PinPanel) {
+        guard panels.count < Self.maxActivePins else {
+            panel.flashHUD("Pin Limit Reached")
+            return
+        }
+        if panel.isToolbarVisible {
+            panel.closeToolbar(commit: true)
+        }
         var clonedState = panel.state
         clonedState.isClickThrough = false
 
@@ -168,7 +393,12 @@ public final class PinManager {
             candidate.origin.y = min(max(candidate.minY, visible.minY), maxY)
         }
 
-        let copy = PinPanel(content: panel.content, frame: candidate, state: clonedState)
+        let copy = PinPanel(
+            content: panel.content,
+            frame: candidate,
+            state: clonedState,
+            contentIdentity: panel.contentIdentity
+        )
         attachHandlers(to: copy)
         presentNewPanel(copy)
     }
@@ -182,17 +412,74 @@ public final class PinManager {
 
     private func recognizeText(_ panel: PinPanel) {
         guard case .image = panel.content, let image = panel.exportImage() else { return }
+        panel.flashHUD("OCR…")
         onRequestRecognizeText?(image)
     }
 
+    private static func cascadedFrame(
+        startingFrom initial: CGRect,
+        existingFrames: [CGRect],
+        visibleFrame: CGRect
+    ) -> CGRect {
+        var candidate = initial
+        for _ in 0..<12 {
+            let overlapsOrigin = existingFrames.contains {
+                abs($0.origin.x - candidate.origin.x) < 8 &&
+                abs($0.origin.y - candidate.origin.y) < 8
+            }
+            if !overlapsOrigin {
+                return candidate
+            }
+            var next = candidate.offsetBy(dx: 24, dy: -24)
+            if visibleFrame.width > 0 && visibleFrame.height > 0 {
+                let minX = visibleFrame.minX
+                let maxX = max(minX, visibleFrame.maxX - next.width)
+                let minY = visibleFrame.minY
+                let maxY = max(minY, visibleFrame.maxY - next.height)
+                if next.maxX > visibleFrame.maxX {
+                    next.origin.x = min(minX + 24, maxX)
+                } else {
+                    next.origin.x = max(next.origin.x, minX)
+                }
+                if next.minY < visibleFrame.minY {
+                    next.origin.y = max(maxY - 24, minY)
+                } else {
+                    next.origin.y = min(next.origin.y, maxY)
+                }
+            }
+            candidate = next
+        }
+        return candidate
+    }
+
     private static func visibleFrame(containing rect: CGRect) -> CGRect {
-        let screen = NSScreen.screens.first { $0.frame.intersects(rect) }
-        return screen?.visibleFrame ?? visibleFrameUnderMouse()
+        let screens = NSScreen.screens.map { ($0.frame, $0.visibleFrame) }
+        return PinLayout.bestScreenFrame(for: rect, in: screens) ?? visibleFrameUnderMouse()
     }
 
     private static func visibleFrameUnderMouse() -> CGRect {
         let mouse = NSEvent.mouseLocation
         let screen = NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) } ?? NSScreen.main
         return screen?.visibleFrame ?? CGRect(x: 0, y: 0, width: 1440, height: 900)
+    }
+}
+
+/// Selector-based observer for screen configuration changes (automatically unregisters on dealloc).
+@MainActor
+private final class ScreenParametersObserver: NSObject {
+    var onScreensChanged: (() -> Void)?
+
+    override init() {
+        super.init()
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleScreenParametersDidChange),
+            name: NSApplication.didChangeScreenParametersNotification,
+            object: nil
+        )
+    }
+
+    @objc private func handleScreenParametersDidChange() {
+        onScreensChanged?()
     }
 }

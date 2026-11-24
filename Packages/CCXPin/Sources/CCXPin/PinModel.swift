@@ -8,6 +8,14 @@ public enum PinContent: Sendable {
     case image(CGImage, scale: CGFloat)
     case text(String)
     case color(CCXColorSample)
+
+    public var defaultIdentity: PinContentIdentity {
+        switch self {
+        case let .image(image, _): .image(ImageFingerprint(image: image))
+        case let .text(string): .text(string)
+        case let .color(sample): .color(sample)
+        }
+    }
 }
 
 /// Mutable presentation state of a pin. All setters clamp to valid ranges.
@@ -59,16 +67,24 @@ public struct PinState: Equatable, Sendable {
 
     public mutating func setZoom(_ value: CGFloat) { zoom = value }
 
-    /// Multiplies the zoom by `factor` (e.g. `1.1` per scroll notch).
-    public mutating func multiplyZoom(by factor: CGFloat) { zoom *= factor }
+    /// Multiplies the zoom by `factor` (e.g. `1.1` per scroll notch). Ignores non-finite or non-positive factors.
+    public mutating func multiplyZoom(by factor: CGFloat) {
+        guard factor.isFinite, factor > 0 else { return }
+        zoom *= factor
+    }
 
     public mutating func resetZoom() { zoom = 1.0 }
 
     public mutating func setOpacity(_ value: CGFloat) { opacity = value }
 
-    public mutating func adjustOpacity(by delta: CGFloat) { opacity += delta }
+    public mutating func adjustOpacity(by delta: CGFloat) {
+        guard delta.isFinite else { return }
+        opacity += delta
+    }
 
-    public mutating func rotate(byDegrees degrees: Int) { rotationDegrees += degrees }
+    public mutating func rotate(byDegrees degrees: Int) {
+        rotationDegrees = Self.normalize(rotationDegrees + (degrees % 360))
+    }
 
     public mutating func rotateClockwise() { rotate(byDegrees: 90) }
 

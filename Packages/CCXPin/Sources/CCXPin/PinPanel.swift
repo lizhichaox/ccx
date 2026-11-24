@@ -1,16 +1,19 @@
 import AppKit
+import CCXAnnotate
 import CCXCore
 
 /// Always-on-top, non-activating floating window showing one pinned image, text, or color.
 ///
 /// Interactions: drag to move, scroll to zoom (0.1x-10x, around the cursor),
-/// Ctrl+scroll to change opacity, double-click to toggle a 72x72 thumbnail,
-/// Esc to close, Cmd+C to copy, Cmd+S to save, right-click for the context menu.
-public final class PinPanel: NSPanel {
-    public let content: PinContent
+/// Ctrl+scroll to change opacity, double-click an image pin to toggle its annotation toolbar
+/// (or restore from a 72x72 thumbnail), Esc to close, Cmd+C to copy, Cmd+S to save,
+/// right-click for the context menu.
+public final class PinPanel: NSPanel, NSWindowDelegate {
+    public private(set) var content: PinContent
+    public private(set) var contentIdentity: PinContentIdentity
     public private(set) var state: PinState
     /// Unrotated, unzoomed content size in points.
-    public let baseSize: CGSize
+    public private(set) var baseSize: CGSize
 
     var onClose: ((PinPanel) -> Void)?
     var onCopy: ((PinPanel) -> Void)?
@@ -21,20 +24,68 @@ public final class PinPanel: NSPanel {
     var onRecognizeText: ((PinPanel) -> Void)?
     var onHideAll: (() -> Void)?
     var onCloseAll: (() -> Void)?
+    var onUnlockAllClickThrough: (() -> Void)?
+    var clickThroughCountProvider: (() -> Int)?
     var onStateChanged: ((PinPanel) -> Void)?
+    var onToolbarWillOpen: ((PinPanel) -> Void)?
+    var onAnnotationStyleChanged: ((AnnotationStyle) -> Void)?
+
+    public var isToolbarVisible: Bool { annotationController?.isToolbarVisible ?? false }
+    public var canShowAnnotationToolbar: Bool {
+        if case .image = content { return true }
+        return false
+    }
+    public var currentAnnotationStyle: AnnotationStyle {
+        get { annotationController?.currentStyle ?? pendingAnnotationStyle }
+        set {
+            pendingAnnotationStyle = newValue
+            annotationController?.currentStyle = newValue
+        }
+    }
+
+    internal var toolbarPanelForTesting: NSPanel? { annotationController?.toolbarPanelForTesting }
+    internal var toolbarViewForTesting: AnnotationActionToolbar? { annotationController?.toolbarViewForTesting }
+    internal var annotationDocumentForTesting: AnnotationDocument? { annotationController?.document }
+    internal var inlineEditorForTesting: NSTextField? { annotationController?.inlineEditorForTesting }
+    internal var annotationBakeCountForTesting: Int { annotationController?.bakeCountForTesting ?? 0 }
+    internal var hasAnnotationControllerForTesting: Bool { annotationController != nil }
 
     private let pinView: PinContentView
+    private var annotationController: PinAnnotationController?
+    private var pendingAnnotationStyle = AnnotationStyle()
+    private let originalHistoryEntryID: UUID?
+    private var isApplyingFrameProgrammatically = false
     private var didClose = false
 
     /// - Parameters:
     ///   - frame: Initial window frame in AppKit global coordinates.
-    public init(content: PinContent, frame: CGRect, state: PinState = PinState()) {
+    public init(
+        content: PinContent,
+        frame: CGRect,
+        state: PinState = PinState(),
+        contentIdentity: PinContentIdentity? = nil
+    ) {
+        let resolvedIdentity = contentIdentity ?? content.defaultIdentity
         self.content = content
+        self.contentIdentity = resolvedIdentity
+        if case let .image(_, historyID) = resolvedIdentity {
+            self.originalHistoryEntryID = historyID
+        } else {
+            self.originalHistoryEntryID = nil
+        }
         self.state = state
         self.baseSize = PinLayout.baseSize(for: content)
-        self.pinView = PinContentView(frame: CGRect(origin: .zero, size: frame.size))
+        let safeFrame = PinLayout.isFiniteRect(frame)
+            ? CGRect(
+                x: frame.origin.x,
+                y: frame.origin.y,
+                width: max(1, frame.width),
+                height: max(1, frame.height)
+            )
+            : CGRect(origin: .zero, size: PinLayout.frameSize(baseSize: self.baseSize, state: state))
+        self.pinView = PinContentView(frame: CGRect(origin: .zero, size: safeFrame.size))
         super.init(
-            contentRect: frame,
+            contentRect: safeFrame,
             styleMask: [.nonactivatingPanel, .borderless, .fullSizeContentView],
             backing: .buffered,
             defer: false
@@ -42,7 +93,7 @@ public final class PinPanel: NSPanel {
         isFloatingPanel = true
         hidesOnDeactivate = false
         level = .floating
-        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
         isMovableByWindowBackground = true
         becomesKeyOnlyIfNeeded = false
         worksWhenModal = true
@@ -51,6 +102,7 @@ public final class PinPanel: NSPanel {
         backgroundColor = .clear
         animationBehavior = .none
         title = "CCX Pin"
+        delegate = self
 
         pinView.panel = self
         pinView.autoresizingMask = [.width, .height]
@@ -58,8 +110,12 @@ public final class PinPanel: NSPanel {
         applyState(from: nil, resizeKeeping: nil)
     }
 
-    override public var canBecomeKey: Bool { true }
+    override public var canBecomeKey: Bool { !state.isClickThrough }
     override public var canBecomeMain: Bool { false }
+
+    override public func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect {
+        frameRect
+    }
 
     // MARK: - State
 
@@ -82,11 +138,21 @@ public final class PinPanel: NSPanel {
         alphaValue = state.opacity
         hasShadow = state.showsShadow
         ignoresMouseEvents = state.isClickThrough
+        if state.isClickThrough && isKeyWindow {
+            resignKey()
+        }
 
         if let anchor {
             let size = PinLayout.frameSize(baseSize: baseSize, state: state)
             if size != frame.size {
-                setFrame(PinLayout.resizedFrame(frame, to: size, keeping: anchor), display: true)
+                var target = PinLayout.resizedFrame(frame, to: size, keeping: anchor)
+                if previous != nil {
+                    target = PinLayout.clampedOriginToScreens(target, screens: NSScreen.screens.map(\.visibleFrame))
+                }
+                isApplyingFrameProgrammatically = true
+                setFrame(target, display: false)
+                isApplyingFrameProgrammatically = false
+                annotationController?.handleParentFrameDidChange(for: self)
             }
         }
 
@@ -99,7 +165,13 @@ public final class PinPanel: NSPanel {
             || previous?.isFlippedVertically != state.isFlippedVertically
             || previous?.zoom != state.zoom
         if needsContentRedraw {
-            pinView.needsDisplay = true
+            pinView.syncVisualState()
+            if pinView.usesDirectDrawing {
+                pinView.needsDisplay = true
+            }
+            if activeAnnotationController != nil {
+                pinView.invalidateAnnotations()
+            }
         }
 
         let needsShadowInvalidation = previous == nil
@@ -113,10 +185,18 @@ public final class PinPanel: NSPanel {
         if let previous {
             if state.isThumbnail {
                 pinView.hideHUD()
+            } else if previous.isClickThrough != state.isClickThrough {
+                pinView.showHUD(state.isClickThrough ? "Click-Through" : "Interactive")
             } else if abs(previous.zoom - state.zoom) > 0.0001 {
                 pinView.showHUD("\(Int((state.zoom * 100).rounded()))%")
             } else if abs(previous.opacity - state.opacity) > 0.0001 {
                 pinView.showHUD("Opacity \(Int((state.opacity * 100).rounded()))%")
+            } else if previous.rotationDegrees != state.rotationDegrees {
+                pinView.showHUD("\(state.rotationDegrees)°")
+            } else if previous.isFlippedHorizontally != state.isFlippedHorizontally {
+                pinView.showHUD(state.isFlippedHorizontally ? "Flipped H" : "Unflipped H")
+            } else if previous.isFlippedVertically != state.isFlippedVertically {
+                pinView.showHUD(state.isFlippedVertically ? "Flipped V" : "Unflipped V")
             }
         }
 
@@ -125,8 +205,117 @@ public final class PinPanel: NSPanel {
         }
     }
 
+    public func windowDidMove(_ notification: Notification) {
+        guard !isApplyingFrameProgrammatically else { return }
+        annotationController?.handleParentWindowDidMove(for: self)
+    }
+
+    public func windowDidResignKey(_ notification: Notification) {
+        annotationController?.handleParentWindowDidResignKey(for: self)
+    }
+
+    public func windowWillClose(_ notification: Notification) {
+        finalizeCloseCleanup()
+    }
+
+    internal func repositionAnnotationToolbarIfVisible() {
+        annotationController?.handleParentFrameDidChange(for: self)
+    }
+
     var frameCenter: CGPoint { CGPoint(x: frame.midX, y: frame.midY) }
     var frameTopLeft: CGPoint { CGPoint(x: frame.minX, y: frame.maxY) }
+
+    /// Shows the two-tier Liquid Glass annotation toolbar attached to an `.image` pin.
+    public func showAnnotationToolbar() {
+        guard case let .image(image, scale) = content,
+              !state.isThumbnail,
+              !state.isClickThrough,
+              !isToolbarVisible
+        else { return }
+
+        onToolbarWillOpen?(self)
+
+        var workingBaseImage = image
+        let hasVisualTransform = state.rotationDegrees != 0 || state.isFlippedHorizontally || state.isFlippedVertically
+        if hasVisualTransform {
+            guard let flattened = PinLayout.transformedImage(
+                image,
+                clockwiseDegrees: state.rotationDegrees,
+                flipHorizontal: state.isFlippedHorizontally,
+                flipVertical: state.isFlippedVertically
+            ) else {
+                flashHUD("Cannot Annotate")
+                return
+            }
+            workingBaseImage = flattened
+            content = .image(flattened, scale: scale)
+            baseSize = PinLayout.baseSize(for: content)
+            contentIdentity = .image(ImageFingerprint(image: flattened), historyEntryID: originalHistoryEntryID)
+            state.rotationDegrees = 0
+            state.isFlippedHorizontally = false
+            state.isFlippedVertically = false
+            invalidateShadow()
+            annotationController?.replaceBaseImage(flattened)
+        }
+
+        let controller: PinAnnotationController
+        if let existing = annotationController {
+            controller = existing
+        } else {
+            let created = PinAnnotationController(baseImage: workingBaseImage, initialStyle: pendingAnnotationStyle)
+            annotationController = created
+            controller = created
+        }
+
+        controller.onStyleUpdated = { [weak self] style in
+            guard let self else { return }
+            self.pendingAnnotationStyle = style
+            self.onAnnotationStyleChanged?(style)
+        }
+        controller.onNeedRedraw = { [weak self] in
+            self?.pinView.invalidateAnnotations()
+        }
+        controller.onShowHUD = { [weak self] text in
+            self?.flashHUD(text)
+        }
+        controller.onToolbarAction = { [weak self] action in
+            guard let self else { return }
+            switch action {
+            case .ocr: self.recognizeTextFromMenu(nil)
+            case .copy: self.copyPin(nil)
+            case .save: self.savePin(nil)
+            case .done: self.closeToolbar(commit: true)
+            case .cancel: self.closeToolbar(commit: false)
+            case .undo, .redo, .scroll, .record, .pin: break
+            }
+        }
+
+        acceptsMouseMovedEvents = true
+        controller.openToolbar(on: self, in: pinView, initialStyle: pendingAnnotationStyle)
+        makeKey()
+        makeFirstResponder(pinView)
+        pinView.updateTrackingAreas()
+        pinView.syncVisualState()
+        pinView.invalidateAnnotations()
+    }
+
+    /// Closes the annotation toolbar, either baking committed annotations or rolling back session edits.
+    public func closeToolbar(commit: Bool) {
+        guard isToolbarVisible, let controller = annotationController else { return }
+        if commit {
+            if let baked = controller.closeToolbar(on: self, commit: true) {
+                content = .image(baked, scale: exportScale)
+                contentIdentity = .image(ImageFingerprint(image: baked), historyEntryID: originalHistoryEntryID)
+            }
+        } else {
+            _ = controller.closeToolbar(on: self, commit: false)
+        }
+        acceptsMouseMovedEvents = false
+        makeFirstResponder(pinView)
+        pinView.updateTrackingAreas()
+        pinView.syncVisualState()
+        pinView.invalidateAnnotations()
+    }
 
     public func setZoom(_ zoom: CGFloat, around anchor: CGPoint? = nil) {
         mutateState(anchor: anchor ?? frameCenter) { $0.setZoom(zoom) }
@@ -137,18 +326,22 @@ public final class PinPanel: NSPanel {
     }
 
     public func rotateClockwise() {
+        if isToolbarVisible { closeToolbar(commit: true) }
         mutateState(anchor: frameCenter) { $0.rotateClockwise() }
     }
 
     public func rotateCounterClockwise() {
+        if isToolbarVisible { closeToolbar(commit: true) }
         mutateState(anchor: frameCenter) { $0.rotateCounterClockwise() }
     }
 
     public func toggleFlipHorizontal() {
+        if isToolbarVisible { closeToolbar(commit: true) }
         mutateState(anchor: frameCenter) { $0.toggleFlipHorizontal() }
     }
 
     public func toggleFlipVertical() {
+        if isToolbarVisible { closeToolbar(commit: true) }
         mutateState(anchor: frameCenter) { $0.toggleFlipVertical() }
     }
 
@@ -161,41 +354,70 @@ public final class PinPanel: NSPanel {
     }
 
     public func setClickThrough(_ enabled: Bool) {
+        if enabled && isToolbarVisible { closeToolbar(commit: true) }
         mutateState { $0.isClickThrough = enabled }
     }
 
     /// Collapses to / restores from the 72x72 thumbnail, keeping the top-left corner fixed.
     public func toggleThumbnail() {
+        if isToolbarVisible { closeToolbar(commit: true) }
         mutateState(anchor: frameTopLeft) { $0.toggleThumbnail() }
     }
 
     /// Resets zoom, opacity, rotation, flip, and thumbnail mode back to defaults.
     public func resetAllTransforms() {
+        if isToolbarVisible { closeToolbar(commit: true) }
         mutateState(anchor: frameCenter) { $0.resetAll() }
         pinView.showHUD("Reset")
     }
 
+    /// Displays a transient centered HUD pill over the pin (no-op in compact thumbnail mode).
+    public func flashHUD(_ text: String) {
+        guard !state.isThumbnail else { return }
+        pinView.showHUD(text)
+    }
+
+    internal var lastHUDTextForTesting: String? { pinView.lastHUDText }
+
     // MARK: - Events
 
     override public func magnify(with event: NSEvent) {
-        guard !state.isThumbnail, event.magnification != 0 else { return }
-        let factor = max(0.2, 1 + event.magnification)
-        mutateState(anchor: NSEvent.mouseLocation) { $0.multiplyZoom(by: factor) }
+        guard !state.isThumbnail, event.magnification.isFinite, event.magnification != 0 else { return }
+        let factor = min(max(1 + event.magnification, 0.2), 5.0)
+        let anchor = PinLayout.clampedPoint(NSEvent.mouseLocation, to: frame)
+        mutateState(anchor: anchor) { $0.multiplyZoom(by: factor) }
     }
 
     override public func scrollWheel(with event: NSEvent) {
+        if let controller = annotationController,
+           controller.isToolbarVisible,
+           !event.modifierFlags.contains(.control),
+           controller.handleScrollThickness(event, on: self) {
+            return
+        }
+        guard event.momentumPhase.isEmpty else { return }
         let delta = event.scrollingDeltaY
-        guard delta != 0 else { return }
+        let deltaX = event.scrollingDeltaX
+        guard delta.isFinite, deltaX.isFinite, abs(delta) >= abs(deltaX), delta != 0 else { return }
+        let clampedDelta = min(max(delta, -120), 120)
         if event.modifierFlags.contains(.control) {
-            let step = event.hasPreciseScrollingDeltas ? delta * 0.005 : (delta > 0 ? 0.05 : -0.05)
+            let step = event.hasPreciseScrollingDeltas ? clampedDelta * 0.005 : (clampedDelta > 0 ? 0.05 : -0.05)
             mutateState { $0.adjustOpacity(by: step) }
         } else if !state.isThumbnail {
-            let factor = event.hasPreciseScrollingDeltas ? exp(delta * 0.01) : (delta > 0 ? 1.1 : 1 / 1.1)
-            mutateState(anchor: NSEvent.mouseLocation) { $0.multiplyZoom(by: factor) }
+            let factor = event.hasPreciseScrollingDeltas ? exp(clampedDelta * 0.01) : (clampedDelta > 0 ? 1.1 : 1 / 1.1)
+            let anchor = PinLayout.clampedPoint(NSEvent.mouseLocation, to: frame)
+            mutateState(anchor: anchor) { $0.multiplyZoom(by: factor) }
         }
     }
 
     override public func keyDown(with event: NSEvent) {
+        if let controller = annotationController, controller.isToolbarVisible {
+            if controller.handleKeyDown(event, on: self) {
+                return
+            }
+            super.keyDown(with: event)
+            return
+        }
         if event.keyCode == 53 { // Escape
             close()
             return
@@ -246,13 +468,20 @@ public final class PinPanel: NSPanel {
     }
 
     private func nudgeFrame(dx: CGFloat, dy: CGFloat) {
-        var origin = frame.origin
-        origin.x += dx
-        origin.y += dy
-        setFrameOrigin(origin)
+        let candidate = frame.offsetBy(dx: dx, dy: dy)
+        let clamped = PinLayout.clampedOriginToScreens(candidate, screens: NSScreen.screens.map(\.visibleFrame))
+        setFrameOrigin(clamped.origin)
     }
 
     override public func cancelOperation(_ sender: Any?) {
+        if let controller = annotationController, controller.isToolbarVisible {
+            if controller.isEditingText {
+                _ = controller.handleRightMouseDown(on: self)
+                return
+            }
+            closeToolbar(commit: false)
+            return
+        }
         close()
     }
 
@@ -260,8 +489,59 @@ public final class PinPanel: NSPanel {
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
             .subtracting([.capsLock, .numericPad, .function])
         let key = event.charactersIgnoringModifiers?.lowercased()
+
+        if let controller = annotationController, controller.isToolbarVisible, controller.isEditingText {
+            // Accessory app has no main Edit menu, so forward standard editing shortcuts explicitly.
+            if flags == .command, let key {
+                switch key {
+                case "a":
+                    NSApp.sendAction(#selector(NSResponder.selectAll(_:)), to: nil, from: self)
+                    return true
+                case "c":
+                    NSApp.sendAction(#selector(NSText.copy(_:)), to: nil, from: self)
+                    return true
+                case "v":
+                    NSApp.sendAction(#selector(NSText.paste(_:)), to: nil, from: self)
+                    return true
+                case "x":
+                    NSApp.sendAction(#selector(NSText.cut(_:)), to: nil, from: self)
+                    return true
+                case "z":
+                    NSApp.sendAction(Selector(("undo:")), to: nil, from: self)
+                    return true
+                default:
+                    break
+                }
+            }
+            if flags == [.command, .shift], key == "z" {
+                NSApp.sendAction(Selector(("redo:")), to: nil, from: self)
+                return true
+            }
+            return super.performKeyEquivalent(with: event)
+        }
+
+        if let controller = annotationController, controller.isToolbarVisible {
+            if flags == .command, key == "z" {
+                controller.performUndo(on: self)
+                return true
+            }
+            if flags == [.command, .shift], key == "z" {
+                controller.performRedo(on: self)
+                return true
+            }
+            if flags == .command, key == "d" {
+                if controller.duplicateSelectedAnnotation(on: self) {
+                    return true
+                }
+                return super.performKeyEquivalent(with: event)
+            }
+        }
         if flags == [.command, .shift], key == "s" {
             quickSavePin(nil)
+            return true
+        }
+        if flags == [.command, .shift], key == "0" || key == ")" {
+            resetAllTransforms()
             return true
         }
         if flags == .command, let key {
@@ -270,6 +550,15 @@ public final class PinPanel: NSPanel {
             case "d": duplicatePin(nil); return true
             case "s": savePin(nil); return true
             case "w": close(); return true
+            case "0":
+                if !state.isThumbnail { setZoom(1) }
+                return true
+            case "=", "+":
+                if !state.isThumbnail { mutateState(anchor: frameCenter) { $0.multiplyZoom(by: 1.1) } }
+                return true
+            case "-":
+                if !state.isThumbnail { mutateState(anchor: frameCenter) { $0.multiplyZoom(by: 1 / 1.1) } }
+                return true
             default: break
             }
         }
@@ -277,10 +566,43 @@ public final class PinPanel: NSPanel {
     }
 
     override public func close() {
+        let closeHandler = prepareCloseTeardown()
         super.close()
-        guard !didClose else { return }
+        closeHandler?(self)
+    }
+
+    private func finalizeCloseCleanup() {
+        let closeHandler = prepareCloseTeardown()
+        closeHandler?(self)
+    }
+
+    private func prepareCloseTeardown() -> ((PinPanel) -> Void)? {
+        guard !didClose else { return nil }
         didClose = true
-        onClose?(self)
+        if let controller = annotationController {
+            controller.teardownForClose(on: self)
+            annotationController = nil
+        }
+        acceptsMouseMovedEvents = false
+        pinView.hideHUD()
+        pinView.clearTrackingAreas()
+
+        let closeHandler = onClose
+        onClose = nil
+        onCopy = nil
+        onSave = nil
+        onQuickSave = nil
+        onDuplicate = nil
+        onCopyFormattedColor = nil
+        onRecognizeText = nil
+        onHideAll = nil
+        onCloseAll = nil
+        onUnlockAllClickThrough = nil
+        clickThroughCountProvider = nil
+        onStateChanged = nil
+        onToolbarWillOpen = nil
+        onAnnotationStyleChanged = nil
+        return closeHandler
     }
 
     // MARK: - Context menu
@@ -304,15 +626,43 @@ public final class PinPanel: NSPanel {
         quickSave.keyEquivalentModifierMask = [.command, .shift]
         menu.addItem(quickSave)
         menu.addItem(menuItem("Duplicate", #selector(duplicatePin(_:)), key: "d"))
+        if canShowAnnotationToolbar && !state.isThumbnail {
+            menu.addItem(menuItem(
+                isToolbarVisible ? "Done Annotating" : "Annotate",
+                #selector(toggleAnnotationToolbarFromMenu(_:))
+            ))
+        }
         menu.addItem(.separator())
-        menu.addItem(menuItem("Reset Zoom (100%)", #selector(resetZoom(_:))))
-        menu.addItem(menuItem("Rotate 90°", #selector(rotate90(_:))))
-        let flipH = menuItem("Flip Horizontal", #selector(flipHorizontalFromMenu(_:)))
+
+        let resetZoomItem = menuItem("Reset Zoom (100%)", #selector(resetZoom(_:)), key: "0")
+        resetZoomItem.isEnabled = !state.isThumbnail
+        menu.addItem(resetZoomItem)
+
+        let rotateCW = menuItem("Rotate 90°", #selector(rotate90(_:)), key: "r")
+        rotateCW.keyEquivalentModifierMask = []
+        rotateCW.isEnabled = !state.isThumbnail
+        menu.addItem(rotateCW)
+
+        let rotateCCW = menuItem("Rotate 90° CCW", #selector(rotate270(_:)), key: "r")
+        rotateCCW.keyEquivalentModifierMask = [.shift]
+        rotateCCW.isEnabled = !state.isThumbnail
+        menu.addItem(rotateCCW)
+
+        let flipH = menuItem("Flip Horizontal", #selector(flipHorizontalFromMenu(_:)), key: "h")
+        flipH.keyEquivalentModifierMask = []
         flipH.state = state.isFlippedHorizontally ? .on : .off
+        flipH.isEnabled = !state.isThumbnail
         menu.addItem(flipH)
-        let flipV = menuItem("Flip Vertical", #selector(flipVerticalFromMenu(_:)))
+
+        let flipV = menuItem("Flip Vertical", #selector(flipVerticalFromMenu(_:)), key: "v")
+        flipV.keyEquivalentModifierMask = []
         flipV.state = state.isFlippedVertically ? .on : .off
+        flipV.isEnabled = !state.isThumbnail
         menu.addItem(flipV)
+
+        let resetAll = menuItem("Reset All Transforms", #selector(resetAllFromMenu(_:)), key: "0")
+        resetAll.keyEquivalentModifierMask = [.command, .shift]
+        menu.addItem(resetAll)
 
         let opacityItem = NSMenuItem(title: "Opacity", action: nil, keyEquivalent: "")
         let opacityMenu = NSMenu(title: "Opacity")
@@ -339,6 +689,13 @@ public final class PinPanel: NSPanel {
         menu.addItem(showShadow)
         menu.addItem(.separator())
         menu.addItem(menuItem("Close Pin", #selector(closePin(_:)), key: "w"))
+        let clickThroughCount = clickThroughCountProvider?() ?? 0
+        if clickThroughCount > 0 {
+            menu.addItem(menuItem(
+                "Unlock Click-Through Pins (\(clickThroughCount))",
+                #selector(unlockAllClickThroughPins(_:))
+            ))
+        }
         menu.addItem(menuItem("Hide All Pins", #selector(hideAllPins(_:))))
         menu.addItem(menuItem("Close All Pins", #selector(closeAllPins(_:))))
         return menu
@@ -359,47 +716,148 @@ public final class PinPanel: NSPanel {
     @objc func savePin(_ sender: Any?) { onSave?(self) }
     @objc func quickSavePin(_ sender: Any?) { onQuickSave?(self) }
     @objc func duplicatePin(_ sender: Any?) { onDuplicate?(self) }
+    @objc func toggleAnnotationToolbarFromMenu(_ sender: Any?) {
+        if isToolbarVisible {
+            closeToolbar(commit: true)
+        } else {
+            showAnnotationToolbar()
+        }
+    }
     @objc func resetZoom(_ sender: Any?) { setZoom(1) }
     @objc func rotate90(_ sender: Any?) { rotateClockwise() }
+    @objc func rotate270(_ sender: Any?) { rotateCounterClockwise() }
     @objc func flipHorizontalFromMenu(_ sender: Any?) { toggleFlipHorizontal() }
     @objc func flipVerticalFromMenu(_ sender: Any?) { toggleFlipVertical() }
+    @objc func resetAllFromMenu(_ sender: Any?) { resetAllTransforms() }
     @objc func setOpacityFromMenu(_ sender: NSMenuItem) { setOpacity(CGFloat(sender.tag) / 100) }
     @objc func toggleClickThroughFromMenu(_ sender: Any?) { setClickThrough(!state.isClickThrough) }
     @objc func toggleThumbnailFromMenu(_ sender: Any?) { toggleThumbnail() }
     @objc func toggleBorderFromMenu(_ sender: Any?) { setShowsBorder(!state.showsBorder) }
     @objc func toggleShadowFromMenu(_ sender: Any?) { setShowsShadow(!state.showsShadow) }
     @objc func closePin(_ sender: Any?) { close() }
+    @objc func unlockAllClickThroughPins(_ sender: Any?) { onUnlockAllClickThrough?() }
     @objc func hideAllPins(_ sender: Any?) { onHideAll?() }
     @objc func closeAllPins(_ sender: Any?) { onCloseAll?() }
 
     /// Image used for copy/save/OCR: the original pixels (transformed) or a rendered card.
     public func exportImage() -> CGImage? {
-        PinRenderer.exportImage(
+        if let controller = annotationController, controller.isToolbarVisible {
+            return controller.bakedImage(baseSize: baseSize)
+        }
+        return PinRenderer.exportImage(
             for: content,
             rotationDegrees: state.rotationDegrees,
             flipHorizontal: state.isFlippedHorizontally,
-            flipVertical: state.isFlippedVertically
+            flipVertical: state.isFlippedVertically,
+            appearance: effectiveAppearance
         )
     }
 
     /// Pixels per point of `exportImage()`.
     public var exportScale: CGFloat {
-        if case let .image(_, scale) = content { return scale > 0 ? scale : 1 }
+        if case let .image(_, scale) = content { return PinLayout.sanitizedScale(scale) }
         return 2
+    }
+
+    fileprivate var activeAnnotationController: PinAnnotationController? {
+        guard let controller = annotationController, controller.isToolbarVisible else { return nil }
+        return controller
     }
 }
 
-/// Content view that draws the pin, transient zoom/opacity HUD, and routes mouse interactions.
-final class PinContentView: NSView {
+/// Transparent overlay drawing only live annotations on top of the GPU-composited base image.
+private final class PinAnnotationOverlayView: NSView {
     weak var panel: PinPanel?
-
-    private let hudView = PinHUDView()
-    private var hudHideTask: Task<Void, Never>?
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.clear.cgColor
+        layer?.zPosition = 20
+        layerContentsRedrawPolicy = .onSetNeedsDisplay
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    override var isFlipped: Bool { false }
+    override var isOpaque: Bool { false }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let panel,
+              let controller = panel.activeAnnotationController,
+              let context = NSGraphicsContext.current?.cgContext
+        else { return }
+        let base = panel.baseSize
+        guard base.width.isFinite, base.height.isFinite, base.width > 0, base.height > 0,
+              bounds.width.isFinite, bounds.height.isFinite, bounds.width > 0, bounds.height > 0
+        else { return }
+
+        let sx = bounds.width / base.width
+        let sy = bounds.height / base.height
+        let dirtyCanvas = CGRect(
+            x: dirtyRect.minX / sx,
+            y: dirtyRect.minY / sy,
+            width: dirtyRect.width / sx,
+            height: dirtyRect.height / sy
+        )
+        context.saveGState()
+        context.scaleBy(x: sx, y: sy)
+        controller.drawLiveAnnotations(in: context, dirtyRect: dirtyCanvas, baseSize: base)
+        context.restoreGState()
+    }
+}
+
+/// Content view that renders images via GPU `CALayer`, live annotations via an overlay subview,
+/// cards via cached CoreGraphics drawing, transient HUD, and routes mouse interactions.
+final class PinContentView: NSView {
+    weak var panel: PinPanel?
+
+    private let imageContainerLayer = CALayer()
+    private let imageLayer = CALayer()
+    private let borderLayer = CALayer()
+    private let annotationOverlayView = PinAnnotationOverlayView(frame: .zero)
+    private let hudView = PinHUDView()
+
+    private var hudHideTask: Task<Void, Never>?
+    private var hudGeneration: UInt64 = 0
+    private var hoverTrackingArea: NSTrackingArea?
+    private var cachedTextKey: String?
+    private var cachedAttributedText: NSAttributedString?
+    private(set) var lastHUDText: String?
+
+    var usesDirectDrawing: Bool {
+        guard let panel else { return false }
+        if case .image = panel.content { return false }
+        return true
+    }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layerContentsRedrawPolicy = .onSetNeedsDisplay
+
+        imageContainerLayer.masksToBounds = true
+        imageContainerLayer.zPosition = 0
+        imageContainerLayer.addSublayer(imageLayer)
+        layer?.addSublayer(imageContainerLayer)
+
+        annotationOverlayView.autoresizingMask = [.width, .height]
+        annotationOverlayView.isHidden = true
+        addSubview(annotationOverlayView)
+
+        borderLayer.backgroundColor = NSColor.clear.cgColor
+        borderLayer.zPosition = 30
+        layer?.addSublayer(borderLayer)
+
         hudView.isHidden = true
+        hudView.layer?.zPosition = 50
+        hudView.setAccessibilityElement(false)
         addSubview(hudView)
+
+        setAccessibilityElement(true)
+        setAccessibilityHelp("Drag to move, scroll to zoom, double-click to annotate, right-click for options")
     }
 
     @available(*, unavailable)
@@ -410,32 +868,185 @@ final class PinContentView: NSView {
     override var mouseDownCanMoveWindow: Bool { false }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        if newWindow == nil {
+            hideHUD()
+            clearTrackingAreas()
+        }
+        super.viewWillMove(toWindow: newWindow)
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        cachedTextKey = nil
+        cachedAttributedText = nil
+        syncVisualState()
+        if usesDirectDrawing {
+            needsDisplay = true
+        }
+    }
+
     override func layout() {
         super.layout()
+        annotationOverlayView.frame = bounds
+        syncVisualState()
         if !hudView.isHidden {
             positionHUD()
         }
     }
 
+    func invalidateAnnotations() {
+        guard let panel else { return }
+        annotationOverlayView.panel = panel
+        let showOverlay = panel.activeAnnotationController != nil
+        annotationOverlayView.isHidden = !showOverlay
+        if showOverlay {
+            annotationOverlayView.frame = bounds
+            annotationOverlayView.needsDisplay = true
+        }
+    }
+
+    func syncVisualState() {
+        guard let panel else { return }
+        let state = panel.state
+        let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+
+        imageContainerLayer.frame = bounds
+        imageContainerLayer.cornerRadius = state.isThumbnail ? PinLayout.thumbnailCornerRadius : 0
+        imageContainerLayer.masksToBounds = true
+
+        let displayImage: CGImage? = if let controller = panel.activeAnnotationController {
+            controller.baseImage
+        } else if case let .image(image, _) = panel.content {
+            image
+        } else {
+            nil
+        }
+
+        if let cgImage = displayImage {
+            imageContainerLayer.isHidden = false
+            imageLayer.contents = cgImage
+            imageLayer.contentsScale = scale
+            imageLayer.position = CGPoint(x: bounds.midX, y: bounds.midY)
+
+            let rad = -CGFloat(state.rotationDegrees) * .pi / 180
+            let sx: CGFloat = state.isFlippedHorizontally ? -1 : 1
+            let sy: CGFloat = state.isFlippedVertically ? -1 : 1
+            let affine = CGAffineTransform(rotationAngle: rad)
+                .concatenating(CGAffineTransform(scaleX: sx, y: sy))
+            imageLayer.transform = CATransform3DMakeAffineTransform(affine)
+
+            if state.isThumbnail {
+                let base = state.isQuarterTurned
+                    ? CGSize(width: panel.baseSize.height, height: panel.baseSize.width)
+                    : panel.baseSize
+                if base.width > 0, base.height > 0 {
+                    let fill = max(bounds.width / base.width, bounds.height / base.height)
+                    imageLayer.bounds = CGRect(
+                        origin: .zero,
+                        size: CGSize(width: panel.baseSize.width * fill, height: panel.baseSize.height * fill)
+                    )
+                } else {
+                    imageLayer.bounds = bounds
+                }
+                imageLayer.magnificationFilter = .linear
+                imageLayer.minificationFilter = .trilinear
+            } else {
+                let unrotated = state.isQuarterTurned
+                    ? CGSize(width: bounds.height, height: bounds.width)
+                    : bounds.size
+                imageLayer.bounds = CGRect(origin: .zero, size: unrotated)
+                imageLayer.magnificationFilter = abs(state.zoom - 1) < 0.001 ? .nearest : .linear
+                imageLayer.minificationFilter = abs(state.zoom - 1) < 0.001 ? .nearest : .trilinear
+            }
+        } else {
+            imageContainerLayer.isHidden = true
+            imageLayer.contents = nil
+        }
+
+        borderLayer.frame = bounds
+        borderLayer.cornerRadius = state.isThumbnail ? PinLayout.thumbnailCornerRadius : 0
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            if state.isClickThrough {
+                borderLayer.borderWidth = 3
+                borderLayer.borderColor = NSColor.systemCyan.withAlphaComponent(0.9).cgColor
+            } else if panel.activeAnnotationController != nil {
+                borderLayer.borderWidth = 1.5
+                borderLayer.borderColor = NSColor.systemBlue.withAlphaComponent(0.92).cgColor
+            } else if state.showsBorder {
+                borderLayer.borderWidth = 1
+                borderLayer.borderColor = NSColor(white: 0.5, alpha: 0.55).cgColor
+            } else {
+                borderLayer.borderWidth = 0
+                borderLayer.borderColor = nil
+            }
+        }
+
+        annotationOverlayView.panel = panel
+        annotationOverlayView.isHidden = (panel.activeAnnotationController == nil)
+
+        CATransaction.commit()
+        updateAccessibility(for: panel)
+    }
+
+    private func updateAccessibility(for panel: PinPanel) {
+        let baseLabel: String
+        switch panel.content {
+        case .image:
+            setAccessibilityRole(.image)
+            baseLabel = "Pinned image"
+        case let .text(text):
+            setAccessibilityRole(.staticText)
+            let preview = String(text.trimmingCharacters(in: .whitespacesAndNewlines).prefix(48))
+            baseLabel = preview.isEmpty ? "Pinned text" : "Pinned text: \(preview)"
+        case let .color(sample):
+            setAccessibilityRole(.colorWell)
+            baseLabel = "Pinned color \(sample.hexString)"
+        }
+        var qualifiers: [String] = []
+        if panel.state.isClickThrough { qualifiers.append("click-through") }
+        if panel.state.isThumbnail { qualifiers.append("thumbnail") }
+        if panel.activeAnnotationController != nil { qualifiers.append("annotating") }
+        let fullLabel = qualifiers.isEmpty ? baseLabel : "\(baseLabel), \(qualifiers.joined(separator: ", "))"
+        if accessibilityLabel() != fullLabel {
+            setAccessibilityLabel(fullLabel)
+        }
+    }
+
     func showHUD(_ text: String) {
+        hudGeneration &+= 1
+        let expectedGeneration = hudGeneration
         hudHideTask?.cancel()
+        hudHideTask = nil
+        hudView.layer?.removeAllAnimations()
         hudView.setText(text)
         guard bounds.width >= 56 && bounds.height >= 28 else {
             hudView.isHidden = true
             return
         }
+        lastHUDText = text
         positionHUD()
         hudView.alphaValue = 1
         hudView.isHidden = false
         hudHideTask = Task { @MainActor [weak self] in
             try? await Task.sleep(for: .milliseconds(750))
-            guard !Task.isCancelled, let self else { return }
+            guard !Task.isCancelled, let self, self.hudGeneration == expectedGeneration else { return }
+            if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+                self.hudView.isHidden = true
+                return
+            }
             NSAnimationContext.runAnimationGroup { context in
                 context.duration = 0.2
                 self.hudView.animator().alphaValue = 0
             } completionHandler: { [weak self] in
                 Task { @MainActor [weak self] in
-                    guard let self, self.hudView.alphaValue <= 0.01 else { return }
+                    guard let self,
+                          self.hudGeneration == expectedGeneration,
+                          self.hudView.alphaValue <= 0.01
+                    else { return }
                     self.hudView.isHidden = true
                 }
             }
@@ -443,8 +1054,11 @@ final class PinContentView: NSView {
     }
 
     func hideHUD() {
+        hudGeneration &+= 1
         hudHideTask?.cancel()
         hudHideTask = nil
+        lastHUDText = nil
+        hudView.layer?.removeAllAnimations()
         hudView.isHidden = true
     }
 
@@ -458,20 +1072,96 @@ final class PinContentView: NSView {
         )
     }
 
+    func clearTrackingAreas() {
+        if let hoverTrackingArea {
+            removeTrackingArea(hoverTrackingArea)
+            self.hoverTrackingArea = nil
+        }
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        clearTrackingAreas()
+        guard panel?.activeAnnotationController != nil else { return }
+        let area = NSTrackingArea(
+            rect: .zero,
+            options: [.mouseMoved, .mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        hoverTrackingArea = area
+    }
+
     override func mouseDown(with event: NSEvent) {
-        panel?.makeKey()
+        guard let panel else { return }
+        panel.makeKey()
+        if let controller = panel.activeAnnotationController {
+            let point = convert(event.locationInWindow, from: nil)
+            switch controller.handleMouseDown(at: point, clickCount: event.clickCount, in: self, panel: panel) {
+            case .handled:
+                return
+            case .doubleClickedEmptyToCommit:
+                panel.closeToolbar(commit: true)
+                return
+            case .passThroughDragPin:
+                window?.performDrag(with: event)
+                return
+            }
+        }
         if event.clickCount == 2 {
-            panel?.toggleThumbnail()
+            if panel.state.isThumbnail {
+                panel.toggleThumbnail()
+            } else if panel.canShowAnnotationToolbar {
+                panel.showAnnotationToolbar()
+            } else {
+                panel.toggleThumbnail()
+            }
             return
         }
         window?.performDrag(with: event)
     }
 
-    override func keyDown(with event: NSEvent) {
-        if event.keyCode == 53 {
-            panel?.close()
+    override func mouseDragged(with event: NSEvent) {
+        guard let panel, let controller = panel.activeAnnotationController else {
+            super.mouseDragged(with: event)
             return
         }
+        let point = convert(event.locationInWindow, from: nil)
+        controller.handleMouseDragged(at: point, constrain: event.modifierFlags.contains(.shift), in: self, panel: panel)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        guard let panel, let controller = panel.activeAnnotationController else {
+            super.mouseUp(with: event)
+            return
+        }
+        let point = convert(event.locationInWindow, from: nil)
+        controller.handleMouseUp(at: point, in: self, panel: panel)
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        guard let panel, let controller = panel.activeAnnotationController else {
+            super.mouseMoved(with: event)
+            return
+        }
+        let point = convert(event.locationInWindow, from: nil)
+        controller.handleMouseMoved(at: point, in: self, baseSize: panel.baseSize)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        panel?.activeAnnotationController?.handleMouseExited()
+        super.mouseExited(with: event)
+    }
+
+    override func rightMouseDown(with event: NSEvent) {
+        if let panel, let controller = panel.activeAnnotationController, controller.handleRightMouseDown(on: panel) {
+            return
+        }
+        super.rightMouseDown(with: event)
+    }
+
+    override func keyDown(with event: NSEvent) {
         super.keyDown(with: event)
     }
 
@@ -480,49 +1170,39 @@ final class PinContentView: NSView {
     }
 
     override func draw(_ dirtyRect: NSRect) {
-        guard let panel, let context = NSGraphicsContext.current?.cgContext else { return }
+        guard let panel, usesDirectDrawing, let context = NSGraphicsContext.current?.cgContext else { return }
         let state = panel.state
         context.clear(bounds)
 
-        let outline: NSBezierPath
         if state.isThumbnail {
-            outline = NSBezierPath(
+            let outline = NSBezierPath(
                 roundedRect: bounds,
                 xRadius: PinLayout.thumbnailCornerRadius,
                 yRadius: PinLayout.thumbnailCornerRadius
             )
             drawThumbnail(panel: panel, clip: outline, context: context)
         } else {
-            outline = NSBezierPath(rect: bounds)
             drawFull(panel: panel, context: context)
         }
+    }
 
-        if state.isClickThrough {
-            let inset: CGFloat = 1.5
-            let ring = state.isThumbnail
-                ? NSBezierPath(roundedRect: bounds.insetBy(dx: inset, dy: inset),
-                               xRadius: PinLayout.thumbnailCornerRadius - inset,
-                               yRadius: PinLayout.thumbnailCornerRadius - inset)
-                : NSBezierPath(rect: bounds.insetBy(dx: inset, dy: inset))
-            ring.lineWidth = 3
-            NSColor.systemCyan.withAlphaComponent(0.9).setStroke()
-            ring.stroke()
-        } else if state.showsBorder {
-            let border = state.isThumbnail
-                ? NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5),
-                               xRadius: PinLayout.thumbnailCornerRadius - 0.5,
-                               yRadius: PinLayout.thumbnailCornerRadius - 0.5)
-                : NSBezierPath(rect: bounds.insetBy(dx: 0.5, dy: 0.5))
-            border.lineWidth = 1
-            NSColor(white: 0.5, alpha: 0.55).setStroke()
-            border.stroke()
+    private func attributedText(for text: String) -> NSAttributedString {
+        if let cached = cachedAttributedText, cachedTextKey == text {
+            return cached
         }
-        _ = outline
+        let built = NSAttributedString(
+            string: PinLayout.displayText(for: text),
+            attributes: PinLayout.textAttributes()
+        )
+        cachedTextKey = text
+        cachedAttributedText = built
+        return built
     }
 
     private func drawFull(panel: PinPanel, context: CGContext) {
         let state = panel.state
         let base = panel.baseSize
+        guard base.width.isFinite, base.height.isFinite, base.width > 0, base.height > 0 else { return }
         context.saveGState()
         context.translateBy(x: bounds.midX, y: bounds.midY)
         if state.isFlippedHorizontally || state.isFlippedVertically {
@@ -537,7 +1217,12 @@ final class PinContentView: NSView {
             : bounds.size
         context.scaleBy(x: unrotated.width / base.width, y: unrotated.height / base.height)
         let rect = CGRect(x: -base.width / 2, y: -base.height / 2, width: base.width, height: base.height)
-        PinRenderer.draw(panel.content, in: rect, zoom: state.zoom, context: context)
+        let cachedText: NSAttributedString? = if case let .text(string) = panel.content {
+            attributedText(for: string)
+        } else {
+            nil
+        }
+        PinRenderer.draw(panel.content, in: rect, zoom: state.zoom, context: context, cachedAttributedText: cachedText)
         context.restoreGState()
     }
 
@@ -548,6 +1233,10 @@ final class PinContentView: NSView {
         let base = state.isQuarterTurned
             ? CGSize(width: panel.baseSize.height, height: panel.baseSize.width)
             : panel.baseSize
+        guard base.width.isFinite, base.height.isFinite, base.width > 0, base.height > 0 else {
+            context.restoreGState()
+            return
+        }
         // Aspect-fill the thumbnail square.
         let fill = max(bounds.width / base.width, bounds.height / base.height)
         context.translateBy(x: bounds.midX, y: bounds.midY)
@@ -570,7 +1259,12 @@ final class PinContentView: NSView {
             color.nsColor.setFill()
             bounds.fill()
         } else {
-            PinRenderer.draw(panel.content, in: rect, zoom: fill, context: context)
+            let cachedText: NSAttributedString? = if case let .text(string) = panel.content {
+                attributedText(for: string)
+            } else {
+                nil
+            }
+            PinRenderer.draw(panel.content, in: rect, zoom: fill, context: context, cachedAttributedText: cachedText)
         }
         context.restoreGState()
     }
