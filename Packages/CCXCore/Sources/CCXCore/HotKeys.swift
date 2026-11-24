@@ -9,7 +9,8 @@ public enum CCXHotKeyAction: String, CaseIterable, Sendable, Codable {
     /// Human-readable title for settings and menus.
     public var displayName: String {
         switch self {
-        case .snip: "Snip"
+        case .snip:
+            CCXL10n.text("Snip", zh: "截屏")
         }
     }
 
@@ -137,21 +138,36 @@ public enum HotKeyConflict: Equatable, Sendable, LocalizedError {
     public var errorDescription: String? {
         switch self {
         case .modifierOnly:
-            "Add a key with ⌘, ⌃, or ⌥."
+            CCXL10n.text("Add a key with ⌘, ⌃, or ⌥.", zh: "请搭配 ⌘、⌃ 或 ⌥ 与其他按键")
         case .missingModifier:
-            "Use ⌘, ⌃, ⌥, or F1–F20."
+            CCXL10n.text("Use ⌘, ⌃, ⌥, or F1–F20.", zh: "需包含 ⌘、⌃、⌥ 或 F1–F20")
         case .escapeNotAllowed:
-            "Esc cannot be a shortcut."
+            CCXL10n.text("Esc cannot be a shortcut.", zh: "Esc 不能作为全局快捷键")
         case .systemShortcut(let combo):
-            "\(combo.displayString) conflicts with macOS."
+            CCXL10n.text(
+                "\(combo.displayString) conflicts with macOS.",
+                zh: "\(combo.displayString) 与系统快捷键冲突"
+            )
         case .reservedAppShortcut(let combo, let label):
-            "\(combo.displayString) is reserved for \(label)."
+            CCXL10n.text(
+                "\(combo.displayString) is reserved for \(label).",
+                zh: "\(combo.displayString) 为系统「\(label)」保留"
+            )
         case .internalConflict(let combo, let action):
-            "\(combo.displayString) is already used by \(action.displayName)."
+            CCXL10n.text(
+                "\(combo.displayString) is already used by \(action.displayName).",
+                zh: "\(combo.displayString) 已被「\(action.displayName)」占用"
+            )
         case .inUseByAnotherApp(let combo):
-            "\(combo.displayString) is in use by another app."
+            CCXL10n.text(
+                "\(combo.displayString) is in use by another app.",
+                zh: "\(combo.displayString) 已被其他应用占用"
+            )
         case .registrationFailed(let combo, let status):
-            "Couldn't register \(combo.displayString) (\(status))."
+            CCXL10n.text(
+                "Couldn't register \(combo.displayString) (\(status)).",
+                zh: "无法注册 \(combo.displayString)（错误 \(status)）"
+            )
         }
     }
 }
@@ -164,35 +180,74 @@ public enum HotKeyRegistrationResult: Equatable, Sendable {
 
 /// Validates shortcut structure and checks reserved app and active macOS symbolic shortcuts.
 public enum HotKeyConflictDetector {
-    /// Essential system & standard application shortcuts that must not be hijacked globally.
-    public static let reservedAppShortcuts: [HotKeyCombo: String] = [
-        HotKeyCombo(keyCode: UInt32(kVK_ANSI_C), carbonModifiers: UInt32(cmdKey)): "Copy",
-        HotKeyCombo(keyCode: UInt32(kVK_ANSI_V), carbonModifiers: UInt32(cmdKey)): "Paste",
-        HotKeyCombo(keyCode: UInt32(kVK_ANSI_X), carbonModifiers: UInt32(cmdKey)): "Cut",
-        HotKeyCombo(keyCode: UInt32(kVK_ANSI_Z), carbonModifiers: UInt32(cmdKey)): "Undo",
-        HotKeyCombo(keyCode: UInt32(kVK_ANSI_Z), carbonModifiers: UInt32(cmdKey | shiftKey)): "Redo",
-        HotKeyCombo(keyCode: UInt32(kVK_ANSI_A), carbonModifiers: UInt32(cmdKey)): "Select All",
-        HotKeyCombo(keyCode: UInt32(kVK_ANSI_S), carbonModifiers: UInt32(cmdKey)): "Save",
-        HotKeyCombo(keyCode: UInt32(kVK_ANSI_Q), carbonModifiers: UInt32(cmdKey)): "Quit",
-        HotKeyCombo(keyCode: UInt32(kVK_ANSI_Q), carbonModifiers: UInt32(cmdKey | shiftKey)): "Log Out",
-        HotKeyCombo(keyCode: UInt32(kVK_ANSI_W), carbonModifiers: UInt32(cmdKey)): "Close Window",
-        HotKeyCombo(keyCode: UInt32(kVK_ANSI_H), carbonModifiers: UInt32(cmdKey)): "Hide",
-        HotKeyCombo(keyCode: UInt32(kVK_ANSI_H), carbonModifiers: UInt32(cmdKey | optionKey)): "Hide Others",
-        HotKeyCombo(keyCode: UInt32(kVK_ANSI_M), carbonModifiers: UInt32(cmdKey)): "Minimize",
-        HotKeyCombo(keyCode: UInt32(kVK_ANSI_N), carbonModifiers: UInt32(cmdKey)): "New",
-        HotKeyCombo(keyCode: UInt32(kVK_ANSI_O), carbonModifiers: UInt32(cmdKey)): "Open",
-        HotKeyCombo(keyCode: UInt32(kVK_ANSI_P), carbonModifiers: UInt32(cmdKey)): "Print",
-        HotKeyCombo(keyCode: UInt32(kVK_ANSI_F), carbonModifiers: UInt32(cmdKey)): "Find",
-        HotKeyCombo(keyCode: UInt32(kVK_ANSI_T), carbonModifiers: UInt32(cmdKey)): "New Tab",
-        HotKeyCombo(keyCode: UInt32(kVK_ANSI_R), carbonModifiers: UInt32(cmdKey)): "Reload",
-        HotKeyCombo(keyCode: UInt32(kVK_ANSI_Comma), carbonModifiers: UInt32(cmdKey)): "Settings",
-        HotKeyCombo(keyCode: UInt32(kVK_ANSI_Period), carbonModifiers: UInt32(cmdKey)): "Cancel",
-        HotKeyCombo(keyCode: UInt32(kVK_Tab), carbonModifiers: UInt32(cmdKey)): "App Switcher",
-        HotKeyCombo(keyCode: UInt32(kVK_Tab), carbonModifiers: UInt32(cmdKey | shiftKey)): "App Switcher",
-        HotKeyCombo(keyCode: UInt32(kVK_Space), carbonModifiers: UInt32(cmdKey)): "Spotlight",
-        HotKeyCombo(keyCode: UInt32(kVK_Escape), carbonModifiers: UInt32(cmdKey | optionKey)): "Force Quit",
-        HotKeyCombo(keyCode: UInt32(kVK_ANSI_Q), carbonModifiers: UInt32(controlKey | cmdKey)): "Lock Screen",
+    private struct LocalizedShortcutLabel: Sendable {
+        let english: String
+        let simplifiedChinese: String
+
+        var localized: String {
+            CCXL10n.text(english, zh: simplifiedChinese)
+        }
+    }
+
+    private static let reservedAppShortcutLabels: [HotKeyCombo: LocalizedShortcutLabel] = [
+        HotKeyCombo(keyCode: UInt32(kVK_ANSI_C), carbonModifiers: UInt32(cmdKey)):
+            LocalizedShortcutLabel(english: "Copy", simplifiedChinese: "拷贝"),
+        HotKeyCombo(keyCode: UInt32(kVK_ANSI_V), carbonModifiers: UInt32(cmdKey)):
+            LocalizedShortcutLabel(english: "Paste", simplifiedChinese: "粘贴"),
+        HotKeyCombo(keyCode: UInt32(kVK_ANSI_X), carbonModifiers: UInt32(cmdKey)):
+            LocalizedShortcutLabel(english: "Cut", simplifiedChinese: "剪切"),
+        HotKeyCombo(keyCode: UInt32(kVK_ANSI_Z), carbonModifiers: UInt32(cmdKey)):
+            LocalizedShortcutLabel(english: "Undo", simplifiedChinese: "撤销"),
+        HotKeyCombo(keyCode: UInt32(kVK_ANSI_Z), carbonModifiers: UInt32(cmdKey | shiftKey)):
+            LocalizedShortcutLabel(english: "Redo", simplifiedChinese: "重做"),
+        HotKeyCombo(keyCode: UInt32(kVK_ANSI_A), carbonModifiers: UInt32(cmdKey)):
+            LocalizedShortcutLabel(english: "Select All", simplifiedChinese: "全选"),
+        HotKeyCombo(keyCode: UInt32(kVK_ANSI_S), carbonModifiers: UInt32(cmdKey)):
+            LocalizedShortcutLabel(english: "Save", simplifiedChinese: "保存"),
+        HotKeyCombo(keyCode: UInt32(kVK_ANSI_Q), carbonModifiers: UInt32(cmdKey)):
+            LocalizedShortcutLabel(english: "Quit", simplifiedChinese: "退出"),
+        HotKeyCombo(keyCode: UInt32(kVK_ANSI_Q), carbonModifiers: UInt32(cmdKey | shiftKey)):
+            LocalizedShortcutLabel(english: "Log Out", simplifiedChinese: "退出登录"),
+        HotKeyCombo(keyCode: UInt32(kVK_ANSI_W), carbonModifiers: UInt32(cmdKey)):
+            LocalizedShortcutLabel(english: "Close Window", simplifiedChinese: "关闭窗口"),
+        HotKeyCombo(keyCode: UInt32(kVK_ANSI_H), carbonModifiers: UInt32(cmdKey)):
+            LocalizedShortcutLabel(english: "Hide", simplifiedChinese: "隐藏"),
+        HotKeyCombo(keyCode: UInt32(kVK_ANSI_H), carbonModifiers: UInt32(cmdKey | optionKey)):
+            LocalizedShortcutLabel(english: "Hide Others", simplifiedChinese: "隐藏其他"),
+        HotKeyCombo(keyCode: UInt32(kVK_ANSI_M), carbonModifiers: UInt32(cmdKey)):
+            LocalizedShortcutLabel(english: "Minimize", simplifiedChinese: "最小化"),
+        HotKeyCombo(keyCode: UInt32(kVK_ANSI_N), carbonModifiers: UInt32(cmdKey)):
+            LocalizedShortcutLabel(english: "New", simplifiedChinese: "新建"),
+        HotKeyCombo(keyCode: UInt32(kVK_ANSI_O), carbonModifiers: UInt32(cmdKey)):
+            LocalizedShortcutLabel(english: "Open", simplifiedChinese: "打开"),
+        HotKeyCombo(keyCode: UInt32(kVK_ANSI_P), carbonModifiers: UInt32(cmdKey)):
+            LocalizedShortcutLabel(english: "Print", simplifiedChinese: "打印"),
+        HotKeyCombo(keyCode: UInt32(kVK_ANSI_F), carbonModifiers: UInt32(cmdKey)):
+            LocalizedShortcutLabel(english: "Find", simplifiedChinese: "查找"),
+        HotKeyCombo(keyCode: UInt32(kVK_ANSI_T), carbonModifiers: UInt32(cmdKey)):
+            LocalizedShortcutLabel(english: "New Tab", simplifiedChinese: "新建标签页"),
+        HotKeyCombo(keyCode: UInt32(kVK_ANSI_R), carbonModifiers: UInt32(cmdKey)):
+            LocalizedShortcutLabel(english: "Reload", simplifiedChinese: "刷新"),
+        HotKeyCombo(keyCode: UInt32(kVK_ANSI_Comma), carbonModifiers: UInt32(cmdKey)):
+            LocalizedShortcutLabel(english: "Settings", simplifiedChinese: "设置"),
+        HotKeyCombo(keyCode: UInt32(kVK_ANSI_Period), carbonModifiers: UInt32(cmdKey)):
+            LocalizedShortcutLabel(english: "Cancel", simplifiedChinese: "取消"),
+        HotKeyCombo(keyCode: UInt32(kVK_Tab), carbonModifiers: UInt32(cmdKey)):
+            LocalizedShortcutLabel(english: "App Switcher", simplifiedChinese: "切换应用"),
+        HotKeyCombo(keyCode: UInt32(kVK_Tab), carbonModifiers: UInt32(cmdKey | shiftKey)):
+            LocalizedShortcutLabel(english: "App Switcher", simplifiedChinese: "切换应用"),
+        HotKeyCombo(keyCode: UInt32(kVK_Space), carbonModifiers: UInt32(cmdKey)):
+            LocalizedShortcutLabel(english: "Spotlight", simplifiedChinese: "聚焦搜索"),
+        HotKeyCombo(keyCode: UInt32(kVK_Escape), carbonModifiers: UInt32(cmdKey | optionKey)):
+            LocalizedShortcutLabel(english: "Force Quit", simplifiedChinese: "强制退出"),
+        HotKeyCombo(keyCode: UInt32(kVK_ANSI_Q), carbonModifiers: UInt32(controlKey | cmdKey)):
+            LocalizedShortcutLabel(english: "Lock Screen", simplifiedChinese: "锁定屏幕"),
     ]
+
+    /// Essential system & standard application shortcuts that must not be hijacked globally.
+    public static var reservedAppShortcuts: [HotKeyCombo: String] {
+        reservedAppShortcutLabels.mapValues(\.localized)
+    }
 
     /// Queries Carbon `CopySymbolicHotKeys` for all currently enabled macOS system shortcuts.
     public static func activeSystemSymbolicHotKeys() -> Set<HotKeyCombo> {
@@ -249,7 +304,7 @@ public enum HotKeyConflictDetector {
         if let structureConflict = validateStructure(normalized) {
             return structureConflict
         }
-        if let label = reservedAppShortcuts[normalized] {
+        if let label = reservedAppShortcutLabels[normalized]?.localized {
             return .reservedAppShortcut(normalized, label: label)
         }
         let activeSystem = symbolicHotKeysProvider()

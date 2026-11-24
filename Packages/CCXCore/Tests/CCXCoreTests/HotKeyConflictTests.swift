@@ -49,35 +49,70 @@ final class HotKeyConflictTests: XCTestCase {
 
     func testConflictLocalizedDescriptions() {
         let combo = HotKeyCombo(keyCode: UInt32(kVK_ANSI_4), carbonModifiers: UInt32(cmdKey | shiftKey))
-        XCTAssertEqual(HotKeyConflict.modifierOnly.localizedDescription, "Add a key with ⌘, ⌃, or ⌥.")
-        XCTAssertEqual(
-            HotKeyConflict.missingModifier.localizedDescription,
-            "Use ⌘, ⌃, ⌥, or F1–F20."
-        )
-        XCTAssertEqual(
-            HotKeyConflict.escapeNotAllowed.localizedDescription,
-            "Esc cannot be a shortcut."
-        )
-        XCTAssertEqual(
-            HotKeyConflict.systemShortcut(combo).localizedDescription,
-            "⇧⌘4 conflicts with macOS."
-        )
-        XCTAssertEqual(
-            HotKeyConflict.reservedAppShortcut(combo, label: "Copy").localizedDescription,
-            "⇧⌘4 is reserved for Copy."
-        )
-        XCTAssertEqual(
-            HotKeyConflict.internalConflict(combo, action: .snip).localizedDescription,
-            "⇧⌘4 is already used by Snip."
-        )
-        XCTAssertEqual(
-            HotKeyConflict.inUseByAnotherApp(combo).localizedDescription,
-            "⇧⌘4 is in use by another app."
-        )
-        XCTAssertEqual(
-            HotKeyConflict.registrationFailed(combo, -50).localizedDescription,
-            "Couldn't register ⇧⌘4 (-50)."
-        )
+
+        CCXL10n.withLanguageForTesting(.en) {
+            XCTAssertEqual(HotKeyConflict.modifierOnly.localizedDescription, "Add a key with ⌘, ⌃, or ⌥.")
+            XCTAssertEqual(
+                HotKeyConflict.missingModifier.localizedDescription,
+                "Use ⌘, ⌃, ⌥, or F1–F20."
+            )
+            XCTAssertEqual(
+                HotKeyConflict.escapeNotAllowed.localizedDescription,
+                "Esc cannot be a shortcut."
+            )
+            XCTAssertEqual(
+                HotKeyConflict.systemShortcut(combo).localizedDescription,
+                "⇧⌘4 conflicts with macOS."
+            )
+            XCTAssertEqual(
+                HotKeyConflict.reservedAppShortcut(combo, label: "Copy").localizedDescription,
+                "⇧⌘4 is reserved for Copy."
+            )
+            XCTAssertEqual(
+                HotKeyConflict.internalConflict(combo, action: .snip).localizedDescription,
+                "⇧⌘4 is already used by Snip."
+            )
+            XCTAssertEqual(
+                HotKeyConflict.inUseByAnotherApp(combo).localizedDescription,
+                "⇧⌘4 is in use by another app."
+            )
+            XCTAssertEqual(
+                HotKeyConflict.registrationFailed(combo, -50).localizedDescription,
+                "Couldn't register ⇧⌘4 (-50)."
+            )
+        }
+
+        CCXL10n.withLanguageForTesting(.zhHans) {
+            XCTAssertEqual(HotKeyConflict.modifierOnly.localizedDescription, "请搭配 ⌘、⌃ 或 ⌥ 与其他按键")
+            XCTAssertEqual(
+                HotKeyConflict.missingModifier.localizedDescription,
+                "需包含 ⌘、⌃、⌥ 或 F1–F20"
+            )
+            XCTAssertEqual(
+                HotKeyConflict.escapeNotAllowed.localizedDescription,
+                "Esc 不能作为全局快捷键"
+            )
+            XCTAssertEqual(
+                HotKeyConflict.systemShortcut(combo).localizedDescription,
+                "⇧⌘4 与系统快捷键冲突"
+            )
+            XCTAssertEqual(
+                HotKeyConflict.reservedAppShortcut(combo, label: "拷贝").localizedDescription,
+                "⇧⌘4 为系统「拷贝」保留"
+            )
+            XCTAssertEqual(
+                HotKeyConflict.internalConflict(combo, action: .snip).localizedDescription,
+                "⇧⌘4 已被「截屏」占用"
+            )
+            XCTAssertEqual(
+                HotKeyConflict.inUseByAnotherApp(combo).localizedDescription,
+                "⇧⌘4 已被其他应用占用"
+            )
+            XCTAssertEqual(
+                HotKeyConflict.registrationFailed(combo, -50).localizedDescription,
+                "无法注册 ⇧⌘4（错误 -50）"
+            )
+        }
     }
 
     @MainActor
@@ -90,42 +125,48 @@ final class HotKeyConflictTests: XCTestCase {
         )
         XCTAssertEqual(worstCombo.displayString, "⌃⌥⇧⌘Space")
 
-        var conflicts: [HotKeyConflict] = [
-            .modifierOnly,
-            .missingModifier,
-            .escapeNotAllowed,
-            .systemShortcut(worstCombo),
-            .reservedAppShortcut(worstCombo, label: "App Switcher"),
-            .inUseByAnotherApp(worstCombo),
-            .registrationFailed(worstCombo, OSStatus(eventHotKeyExistsErr)),
-        ]
-        for action in CCXHotKeyAction.allCases {
-            conflicts.append(.internalConflict(worstCombo, action: action))
-        }
-        for label in Set(HotKeyConflictDetector.reservedAppShortcuts.values) {
-            conflicts.append(.reservedAppShortcut(worstCombo, label: label))
-        }
+        for language in CCXLanguage.allCases {
+            CCXL10n.withLanguageForTesting(language) {
+                var conflicts: [HotKeyConflict] = [
+                    .modifierOnly,
+                    .missingModifier,
+                    .escapeNotAllowed,
+                    .systemShortcut(worstCombo),
+                    .inUseByAnotherApp(worstCombo),
+                    .registrationFailed(worstCombo, OSStatus(eventHotKeyExistsErr)),
+                ]
+                for action in CCXHotKeyAction.allCases {
+                    conflicts.append(.internalConflict(worstCombo, action: action))
+                }
+                for label in Set(HotKeyConflictDetector.reservedAppShortcuts.values) {
+                    conflicts.append(.reservedAppShortcut(worstCombo, label: label))
+                }
 
-        for conflict in conflicts {
-            let text = conflict.localizedDescription
-            XCTAssertFalse(text.isEmpty, "Conflict description must not be empty: \(conflict)")
-            XCTAssertFalse(text.contains("\n"), "Conflict description must be single-line: \(text)")
-            let width = ceil(NSAttributedString(string: text, attributes: [.font: font]).size().width)
-            XCTAssertLessThanOrEqual(
-                width,
-                maxSettingsSublineWidth,
-                "Conflict prompt '\(text)' measured \(width)pt, exceeding \(maxSettingsSublineWidth)pt Settings sub-line budget"
-            )
-        }
+                for conflict in conflicts {
+                    let text = conflict.localizedDescription
+                    XCTAssertFalse(text.isEmpty, "[\(language.rawValue)] Conflict description must not be empty: \(conflict)")
+                    XCTAssertFalse(text.contains("\n"), "[\(language.rawValue)] Conflict description must be single-line: \(text)")
+                    let width = ceil(NSAttributedString(string: text, attributes: [.font: font]).size().width)
+                    XCTAssertLessThanOrEqual(
+                        width,
+                        maxSettingsSublineWidth,
+                        "[\(language.rawValue)] Conflict prompt '\(text)' measured \(width)pt, exceeding \(maxSettingsSublineWidth)pt Settings sub-line budget"
+                    )
+                }
 
-        // Also verify Settings' unregistered sub-line fits cleanly beside the mini Retry button (283pt total).
-        let unregisteredPrompt = "\(worstCombo.displayString) in use by another app."
-        let unregisteredWidth = ceil(NSAttributedString(string: unregisteredPrompt, attributes: [.font: font]).size().width)
-        XCTAssertLessThanOrEqual(
-            unregisteredWidth,
-            220.0,
-            "Unregistered shortcut sub-line '\(unregisteredPrompt)' measured \(unregisteredWidth)pt, risking collision with Retry button"
-        )
+                // Also verify Settings' unregistered sub-line fits cleanly beside the mini Retry button (283pt total).
+                let unregisteredPrompt = CCXL10n.text(
+                    "\(worstCombo.displayString) in use by another app.",
+                    zh: "\(worstCombo.displayString) 已被其他应用占用"
+                )
+                let unregisteredWidth = ceil(NSAttributedString(string: unregisteredPrompt, attributes: [.font: font]).size().width)
+                XCTAssertLessThanOrEqual(
+                    unregisteredWidth,
+                    220.0,
+                    "[\(language.rawValue)] Unregistered shortcut sub-line '\(unregisteredPrompt)' measured \(unregisteredWidth)pt, risking collision with Retry button"
+                )
+            }
+        }
     }
 
     func testValidateStructure() {
@@ -178,30 +219,69 @@ final class HotKeyConflictTests: XCTestCase {
         let lockScreen = HotKeyCombo(keyCode: UInt32(kVK_ANSI_Q), carbonModifiers: UInt32(controlKey | cmdKey))
         let spotlight = HotKeyCombo(keyCode: UInt32(kVK_Space), carbonModifiers: UInt32(cmdKey))
 
-        XCTAssertEqual(
-            HotKeyConflictDetector.checkPreRegistrationConflict(cmdC, symbolicHotKeysProvider: { [] }),
-            .reservedAppShortcut(cmdC, label: "Copy")
-        )
-        XCTAssertEqual(
-            HotKeyConflictDetector.checkPreRegistrationConflict(cmdQ, symbolicHotKeysProvider: { [] }),
-            .reservedAppShortcut(cmdQ, label: "Quit")
-        )
-        XCTAssertEqual(
-            HotKeyConflictDetector.checkPreRegistrationConflict(cmdW, symbolicHotKeysProvider: { [] }),
-            .reservedAppShortcut(cmdW, label: "Close Window")
-        )
-        XCTAssertEqual(
-            HotKeyConflictDetector.checkPreRegistrationConflict(forceQuit, symbolicHotKeysProvider: { [] }),
-            .reservedAppShortcut(forceQuit, label: "Force Quit")
-        )
-        XCTAssertEqual(
-            HotKeyConflictDetector.checkPreRegistrationConflict(lockScreen, symbolicHotKeysProvider: { [] }),
-            .reservedAppShortcut(lockScreen, label: "Lock Screen")
-        )
-        XCTAssertEqual(
-            HotKeyConflictDetector.checkPreRegistrationConflict(spotlight, symbolicHotKeysProvider: { [] }),
-            .reservedAppShortcut(spotlight, label: "Spotlight")
-        )
+        CCXL10n.withLanguageForTesting(.en) {
+            XCTAssertEqual(
+                HotKeyConflictDetector.checkPreRegistrationConflict(cmdC, symbolicHotKeysProvider: { [] }),
+                .reservedAppShortcut(cmdC, label: "Copy")
+            )
+            XCTAssertEqual(
+                HotKeyConflictDetector.checkPreRegistrationConflict(cmdQ, symbolicHotKeysProvider: { [] }),
+                .reservedAppShortcut(cmdQ, label: "Quit")
+            )
+            XCTAssertEqual(
+                HotKeyConflictDetector.checkPreRegistrationConflict(cmdW, symbolicHotKeysProvider: { [] }),
+                .reservedAppShortcut(cmdW, label: "Close Window")
+            )
+            XCTAssertEqual(
+                HotKeyConflictDetector.checkPreRegistrationConflict(forceQuit, symbolicHotKeysProvider: { [] }),
+                .reservedAppShortcut(forceQuit, label: "Force Quit")
+            )
+            XCTAssertEqual(
+                HotKeyConflictDetector.checkPreRegistrationConflict(lockScreen, symbolicHotKeysProvider: { [] }),
+                .reservedAppShortcut(lockScreen, label: "Lock Screen")
+            )
+            XCTAssertEqual(
+                HotKeyConflictDetector.checkPreRegistrationConflict(spotlight, symbolicHotKeysProvider: { [] }),
+                .reservedAppShortcut(spotlight, label: "Spotlight")
+            )
+        }
+
+        CCXL10n.withLanguageForTesting(.zhHans) {
+            XCTAssertEqual(
+                HotKeyConflictDetector.checkPreRegistrationConflict(cmdC, symbolicHotKeysProvider: { [] }),
+                .reservedAppShortcut(cmdC, label: "拷贝")
+            )
+            XCTAssertEqual(
+                HotKeyConflictDetector.checkPreRegistrationConflict(cmdQ, symbolicHotKeysProvider: { [] }),
+                .reservedAppShortcut(cmdQ, label: "退出")
+            )
+            XCTAssertEqual(
+                HotKeyConflictDetector.checkPreRegistrationConflict(cmdW, symbolicHotKeysProvider: { [] }),
+                .reservedAppShortcut(cmdW, label: "关闭窗口")
+            )
+            XCTAssertEqual(
+                HotKeyConflictDetector.checkPreRegistrationConflict(forceQuit, symbolicHotKeysProvider: { [] }),
+                .reservedAppShortcut(forceQuit, label: "强制退出")
+            )
+            XCTAssertEqual(
+                HotKeyConflictDetector.checkPreRegistrationConflict(lockScreen, symbolicHotKeysProvider: { [] }),
+                .reservedAppShortcut(lockScreen, label: "锁定屏幕")
+            )
+            XCTAssertEqual(
+                HotKeyConflictDetector.checkPreRegistrationConflict(spotlight, symbolicHotKeysProvider: { [] }),
+                .reservedAppShortcut(spotlight, label: "聚焦搜索")
+            )
+        }
+
+        // Verify every reserved shortcut label is localized in both English and Simplified Chinese.
+        let englishMap = CCXL10n.withLanguageForTesting(.en) { HotKeyConflictDetector.reservedAppShortcuts }
+        let chineseMap = CCXL10n.withLanguageForTesting(.zhHans) { HotKeyConflictDetector.reservedAppShortcuts }
+        XCTAssertEqual(Set(englishMap.keys), Set(chineseMap.keys))
+        for (combo, englishLabel) in englishMap {
+            let chineseLabel = chineseMap[combo]
+            XCTAssertNotNil(chineseLabel)
+            XCTAssertNotEqual(englishLabel, chineseLabel, "Expected localized label for \(combo.displayString)")
+        }
 
         // Active system symbolic hotkey (e.g. Shift+Cmd+4) is flagged when enabled, allowed when omitted.
         let shiftCmd4 = HotKeyCombo(keyCode: UInt32(kVK_ANSI_4), carbonModifiers: UInt32(shiftKey | cmdKey))
@@ -248,10 +328,12 @@ final class HotKeyConflictTests: XCTestCase {
 
         // Pre-registration conflict must NOT disturb the active registration.
         let cmdC = HotKeyCombo(keyCode: UInt32(kVK_ANSI_C), carbonModifiers: UInt32(cmdKey))
-        XCTAssertEqual(
-            manager1.registerChecked(.snip, combo: cmdC, symbolicHotKeysProvider: { [] }),
-            .conflict(.reservedAppShortcut(cmdC, label: "Copy"))
-        )
+        CCXL10n.withLanguageForTesting(.en) {
+            XCTAssertEqual(
+                manager1.registerChecked(.snip, combo: cmdC, symbolicHotKeysProvider: { [] }),
+                .conflict(.reservedAppShortcut(cmdC, label: "Copy"))
+            )
+        }
         XCTAssertTrue(manager1.isRegistered(.snip))
         XCTAssertEqual(manager1.currentCombo(for: .snip), comboA)
 

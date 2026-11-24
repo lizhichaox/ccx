@@ -7,13 +7,22 @@ let package = Package(
     products: [
         .library(name: "CCXAnnotate", targets: ["CCXAnnotate"]),
     ],
+    dependencies: [
+        .package(path: "../CCXCore"),
+    ],
     targets: [
         .target(
-            name: "CCXAnnotate"
+            name: "CCXAnnotate",
+            dependencies: [
+                .product(name: "CCXCore", package: "CCXCore"),
+            ]
         ),
         .testTarget(
             name: "CCXAnnotateTests",
-            dependencies: ["CCXAnnotate"]
+            dependencies: [
+                "CCXAnnotate",
+                .product(name: "CCXCore", package: "CCXCore"),
+            ]
         ),
     ]
 )

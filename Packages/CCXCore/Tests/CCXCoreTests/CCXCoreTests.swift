@@ -512,7 +512,12 @@ final class ClipboardStoreTests: XCTestCase {
         let pb = InMemoryClipboardPasteboard()
         let store = ClipboardStore(pasteboard: pb)
         XCTAssertEqual(store.peekPinBadge(), .empty)
-        XCTAssertEqual(store.peekPinBadge().displayText, "Empty")
+        CCXL10n.withLanguageForTesting(.en) {
+            XCTAssertEqual(store.peekPinBadge().displayText, "Empty")
+        }
+        CCXL10n.withLanguageForTesting(.zhHans) {
+            XCTAssertEqual(store.peekPinBadge().displayText, "空")
+        }
 
         store.copyText("#112233")
         XCTAssertEqual(store.peekPinBadge(), .color(CCXColorSample(red: 0x11, green: 0x22, blue: 0x33)))
@@ -520,10 +525,22 @@ final class ClipboardStoreTests: XCTestCase {
 
         store.copyText("note")
         XCTAssertEqual(store.peekPinBadge(), .text)
+        CCXL10n.withLanguageForTesting(.en) {
+            XCTAssertEqual(store.peekPinBadge().displayText, "Text")
+        }
+        CCXL10n.withLanguageForTesting(.zhHans) {
+            XCTAssertEqual(store.peekPinBadge().displayText, "文本")
+        }
 
         // Undecodable placeholder bytes still classify as .image without triggering ImageIO decode.
         pb.writeData([(.png, Data([0x01, 0x02, 0x03]))])
         XCTAssertEqual(store.peekPinBadge(), .image)
+        CCXL10n.withLanguageForTesting(.en) {
+            XCTAssertEqual(store.peekPinBadge().displayText, "Image")
+        }
+        CCXL10n.withLanguageForTesting(.zhHans) {
+            XCTAssertEqual(store.peekPinBadge().displayText, "图片")
+        }
     }
 
     func testClearHistoryAndClipboardClearsHistoryImageTextFileURLAndBadge() throws {
@@ -852,8 +869,12 @@ final class ClipboardStoreTests: XCTestCase {
         store.clearClipboard()
         XCTAssertFalse(store.hasPasteboardContent)
 
-        XCTAssertFalse((ClipboardStoreError.encodingFailed.errorDescription ?? "").isEmpty)
-        XCTAssertFalse((ClipboardStoreError.writeFailed.errorDescription ?? "").isEmpty)
+        for language in CCXLanguage.allCases {
+            CCXL10n.withLanguageForTesting(language) {
+                XCTAssertFalse((ClipboardStoreError.encodingFailed.errorDescription ?? "").isEmpty)
+                XCTAssertFalse((ClipboardStoreError.writeFailed.errorDescription ?? "").isEmpty)
+            }
+        }
     }
 
     func testLazyTIFFDataProviderInvalidationPreventsSettingData() {

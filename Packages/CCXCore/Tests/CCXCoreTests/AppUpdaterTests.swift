@@ -822,61 +822,71 @@ final class AppUpdaterTests: XCTestCase {
             .cancelled,
         ]
 
-        var messages: [String] = try errors.map { error in
-            try XCTUnwrap(error.errorDescription, "Missing errorDescription for \(error)")
-        }
-
-        // Collect all AppUpdateInstaller.installEligibility failure reasons.
         let dir = try makeTempDirectory()
         let realApp = dir.appendingPathComponent("CCX.app", isDirectory: true)
         try FileManager.default.createDirectory(at: realApp, withIntermediateDirectories: true)
         let symlinkApp = dir.appendingPathComponent("LinkedCCX.app")
         try FileManager.default.createSymbolicLink(at: symlinkApp, withDestinationURL: realApp)
 
-        let eligibilityChecks: [AppInstallEligibility] = [
-            AppUpdateInstaller.installEligibility(for: dir.appendingPathComponent("NotAnApp")),
-            AppUpdateInstaller.installEligibility(for: URL(fileURLWithPath: "/private/var/folders/xx/AppTranslocation/1234/d/CCX.app")),
-            AppUpdateInstaller.installEligibility(for: URL(fileURLWithPath: "/Volumes/CCX/CCX.app")),
-            AppUpdateInstaller.installEligibility(for: symlinkApp),
-            AppUpdateInstaller.installEligibility(for: realApp) { path in path == realApp.path },
-        ]
-        for eligibility in eligibilityChecks {
-            guard case .manualRequired(let reason) = eligibility else {
-                return XCTFail("Expected .manualRequired, got \(eligibility)")
+        func collectAllMessages() throws -> [String] {
+            var messages: [String] = try errors.map { error in
+                try XCTUnwrap(error.errorDescription, "Missing errorDescription for \(error)")
             }
-            messages.append(reason)
+
+            let eligibilityChecks: [AppInstallEligibility] = [
+                AppUpdateInstaller.installEligibility(for: dir.appendingPathComponent("NotAnApp")),
+                AppUpdateInstaller.installEligibility(for: URL(fileURLWithPath: "/private/var/folders/xx/AppTranslocation/1234/d/CCX.app")),
+                AppUpdateInstaller.installEligibility(for: URL(fileURLWithPath: "/Volumes/CCX/CCX.app")),
+                AppUpdateInstaller.installEligibility(for: symlinkApp),
+                AppUpdateInstaller.installEligibility(for: realApp) { path in path == realApp.path },
+            ]
+            for eligibility in eligibilityChecks {
+                guard case .manualRequired(let reason) = eligibility else {
+                    XCTFail("Expected .manualRequired, got \(eligibility)")
+                    return []
+                }
+                messages.append(reason)
+            }
+
+            messages.append(contentsOf: AppUpdateInstaller.Messages.allAuxiliaryMessages)
+            return messages
         }
 
-        // Include installer/delegate/fallback failure prompts.
-        messages.append(contentsOf: [
-            "Couldn't prepare update folder.",
-            "Couldn't validate app bundle.",
-            "Couldn't write update to folder.",
-            "Couldn't verify staged bundle.",
-            "Couldn't verify update bundle.",
-            "Couldn't start updater helper.",
-            "Couldn't create temp download file.",
-            "Couldn't write downloaded update.",
-            "Update failed. Try again or GitHub.",
-        ])
+        var messagesByLanguage: [CCXLanguage: [String]] = [:]
 
-        for message in messages {
-            XCTAssertFalse(message.isEmpty, "Update error prompt must not be empty")
-            XCTAssertFalse(message.contains("\n"), "Update error prompt must be single-line: \(message)")
+        for language in CCXLanguage.allCases {
+            let messages = try CCXL10n.withLanguageForTesting(language) {
+                try collectAllMessages()
+            }
+            XCTAssertFalse(messages.isEmpty, "[\(language.rawValue)] Expected update messages to verify")
+            messagesByLanguage[language] = messages
 
-            let popoverWidth = ceil(NSAttributedString(string: message, attributes: [.font: popoverFont]).size().width)
-            XCTAssertLessThanOrEqual(
-                popoverWidth,
-                maxPopoverWidth,
-                "Update prompt '\(message)' measured \(popoverWidth)pt at 10pt, exceeding Popover \(maxPopoverWidth)pt budget"
-            )
+            for message in messages {
+                XCTAssertFalse(message.isEmpty, "[\(language.rawValue)] Update error prompt must not be empty")
+                XCTAssertFalse(message.contains("\n"), "[\(language.rawValue)] Update error prompt must be single-line: \(message)")
 
-            let settingsWidth = ceil(NSAttributedString(string: message, attributes: [.font: settingsFont]).size().width)
-            XCTAssertLessThanOrEqual(
-                settingsWidth,
-                maxSettingsWidth,
-                "Update prompt '\(message)' measured \(settingsWidth)pt at 10.5pt, exceeding Settings \(maxSettingsWidth)pt budget"
-            )
+                let popoverWidth = ceil(NSAttributedString(string: message, attributes: [.font: popoverFont]).size().width)
+                XCTAssertLessThanOrEqual(
+                    popoverWidth,
+                    maxPopoverWidth,
+                    "[\(language.rawValue)] Update prompt '\(message)' measured \(popoverWidth)pt at 10pt, exceeding Popover \(maxPopoverWidth)pt budget"
+                )
+
+                let settingsWidth = ceil(NSAttributedString(string: message, attributes: [.font: settingsFont]).size().width)
+                XCTAssertLessThanOrEqual(
+                    settingsWidth,
+                    maxSettingsWidth,
+                    "[\(language.rawValue)] Update prompt '\(message)' measured \(settingsWidth)pt at 10.5pt, exceeding Settings \(maxSettingsWidth)pt budget"
+                )
+            }
+        }
+
+        // Verify every update prompt is actually localized between English and Simplified Chinese.
+        let enMessages = try XCTUnwrap(messagesByLanguage[.en])
+        let zhMessages = try XCTUnwrap(messagesByLanguage[.zhHans])
+        XCTAssertEqual(enMessages.count, zhMessages.count)
+        for (en, zh) in zip(enMessages, zhMessages) {
+            XCTAssertNotEqual(en, zh, "Expected Simplified Chinese localization distinct from English for '\(en)'")
         }
     }
 }

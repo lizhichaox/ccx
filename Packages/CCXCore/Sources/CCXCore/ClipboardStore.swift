@@ -21,10 +21,10 @@ public enum ClipboardPinBadge: Equatable, Sendable {
 
     public var displayText: String {
         switch self {
-        case .image: "Image"
+        case .image: CCXL10n.text("Image", zh: "图片")
         case let .color(sample): sample.hexString
-        case .text: "Text"
-        case .empty: "Empty"
+        case .text: CCXL10n.text("Text", zh: "文本")
+        case .empty: CCXL10n.text("Empty", zh: "空")
         }
     }
 }
@@ -103,9 +103,9 @@ public enum ClipboardStoreError: Error, Equatable, LocalizedError {
     public var errorDescription: String? {
         switch self {
         case .encodingFailed:
-            "Could not encode the image as PNG."
+            CCXL10n.text("Could not encode the image as PNG.", zh: "无法将图片编码为 PNG。")
         case .writeFailed:
-            "Could not write the PNG file to disk."
+            CCXL10n.text("Could not write the PNG file to disk.", zh: "无法将 PNG 文件写入磁盘。")
         }
     }
 }
