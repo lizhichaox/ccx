@@ -32,7 +32,7 @@ final class MenuBarPanelModel: ObservableObject {
     }
 
     func syncRecentSnipsOnly(clipboardStore: ClipboardStore) {
-        let nextRecent = Array(clipboardStore.history.prefix(4))
+        let nextRecent = clipboardStore.history
         if recentSnips.map(\.id) != nextRecent.map(\.id) {
             recentSnips = nextRecent
         }
@@ -345,6 +345,42 @@ private struct QuickActionTile: View {
 
 // MARK: - Recent Snips
 
+private struct ScrollEdgeState: Equatable, Sendable {
+    let canScrollLeft: Bool
+    let canScrollRight: Bool
+    let contentOffsetX: CGFloat
+    let visibleWidth: CGFloat
+    let contentWidth: CGFloat
+
+    static let edgeEpsilon: CGFloat = 1.5
+    static let initialOverflow = ScrollEdgeState(
+        canScrollLeft: false,
+        canScrollRight: true,
+        contentOffsetX: 0,
+        visibleWidth: 288,
+        contentWidth: 0
+    )
+
+    static func from(_ geometry: ScrollGeometry) -> ScrollEdgeState {
+        let visibleWidth = geometry.visibleRect.width
+        let contentWidth = geometry.contentSize.width
+        guard visibleWidth > 0, contentWidth > 0 else {
+            return .initialOverflow
+        }
+        let maxOffset = max(0, contentWidth - visibleWidth)
+        let rawOffset = geometry.contentOffset.x + geometry.contentInsets.leading
+        let clampedOffset = min(max(rawOffset, 0), maxOffset)
+        let roundedOffset = (clampedOffset * 2).rounded() / 2
+        return ScrollEdgeState(
+            canScrollLeft: clampedOffset > edgeEpsilon,
+            canScrollRight: maxOffset - clampedOffset > edgeEpsilon,
+            contentOffsetX: roundedOffset,
+            visibleWidth: visibleWidth,
+            contentWidth: contentWidth
+        )
+    }
+}
+
 private struct RecentSnipsSection: View {
     let entries: [SnipHistoryEntry]
     let pinnedHistoryIDs: Set<UUID>
@@ -356,10 +392,21 @@ private struct RecentSnipsSection: View {
             Divider().opacity(0.45)
 
             ZStack {
-                Text("RECENT SNIPS")
-                    .font(.system(size: 9.5, weight: .semibold))
-                    .foregroundStyle(.secondary)
-                    .tracking(0.6)
+                HStack(spacing: 5) {
+                    Text("RECENT SNIPS")
+                        .font(.system(size: 9.5, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .tracking(0.6)
+
+                    Text("\(entries.count)")
+                        .font(.system(size: 9.5, weight: .semibold).monospacedDigit())
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1.5)
+                        .background(Color.primary.opacity(0.08), in: Capsule())
+                }
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("Recent snips, \(entries.count)")
 
                 HStack {
                     Spacer()
@@ -368,15 +415,180 @@ private struct RecentSnipsSection: View {
             }
             .frame(maxWidth: .infinity)
 
-            HStack(spacing: 6) {
+            if entries.count <= 4 {
+                HStack(spacing: 6) {
+                    ForEach(entries) { entry in
+                        RecentSnipThumbnail(entry: entry, isPinned: pinnedHistoryIDs.contains(entry.id)) {
+                            onPinHistory(entry)
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .center)
+                .frame(height: 42)
+            } else {
+                ScrollableRecentSnipsStrip(
+                    entries: entries,
+                    pinnedHistoryIDs: pinnedHistoryIDs,
+                    onPinHistory: onPinHistory
+                )
+            }
+        }
+    }
+}
+
+private struct ScrollableRecentSnipsStrip: View {
+    private static let thumbnailWidth: CGFloat = 60.5
+    private static let thumbnailSpacing: CGFloat = 6
+    private static let horizontalInset: CGFloat = 2
+    private static let stripHeight: CGFloat = 42
+    private static let fallbackVisibleWidth: CGFloat = 288
+    private static let leadingFadeWidth: CGFloat = 14
+    private static let trailingFadeWidth: CGFloat = 18
+    private static let stepThumbnails: CGFloat = 3
+
+    let entries: [SnipHistoryEntry]
+    let pinnedHistoryIDs: Set<UUID>
+    let onPinHistory: (SnipHistoryEntry) -> Void
+
+    @State private var scrollPosition = ScrollPosition(x: 0)
+    @State private var scrollEdgeState = ScrollEdgeState.initialOverflow
+    @State private var isStripHovering = false
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: Self.thumbnailSpacing) {
                 ForEach(entries) { entry in
                     RecentSnipThumbnail(entry: entry, isPinned: pinnedHistoryIDs.contains(entry.id)) {
                         onPinHistory(entry)
                     }
                 }
             }
-            .frame(maxWidth: .infinity, alignment: .center)
+            .padding(.horizontal, Self.horizontalInset)
+            .frame(height: Self.stripHeight)
         }
+        .defaultScrollAnchor(.leading)
+        .scrollPosition($scrollPosition)
+        .onScrollGeometryChange(for: ScrollEdgeState.self) { geometry in
+            ScrollEdgeState.from(geometry)
+        } action: { _, nextState in
+            scrollEdgeState = nextState
+        }
+        .frame(height: Self.stripHeight)
+        .mask {
+            GeometryReader { proxy in
+                let width = max(proxy.size.width, 1)
+                let leftStop = min(Self.leadingFadeWidth / width, 0.25)
+                let rightStop = max(1 - Self.trailingFadeWidth / width, 0.75)
+                LinearGradient(
+                    stops: [
+                        .init(color: .black.opacity(scrollEdgeState.canScrollLeft ? 0 : 1), location: 0),
+                        .init(color: .black, location: leftStop),
+                        .init(color: .black, location: rightStop),
+                        .init(color: .black.opacity(scrollEdgeState.canScrollRight ? 0 : 1), location: 1),
+                    ],
+                    startPoint: .leading,
+                    endPoint: .trailing
+                )
+                .animation(.easeInOut(duration: 0.16), value: scrollEdgeState.canScrollLeft)
+                .animation(.easeInOut(duration: 0.16), value: scrollEdgeState.canScrollRight)
+            }
+        }
+        .overlay(alignment: .leading) {
+            Group {
+                if isStripHovering && scrollEdgeState.canScrollLeft {
+                    ScrollStepButton(
+                        symbol: "chevron.left",
+                        label: "Scroll newer snips",
+                        action: { stepScroll(direction: -1) }
+                    )
+                    .padding(.leading, 2)
+                    .transition(.opacity)
+                }
+            }
+            .animation(.easeInOut(duration: 0.15), value: isStripHovering && scrollEdgeState.canScrollLeft)
+        }
+        .overlay(alignment: .trailing) {
+            Group {
+                if isStripHovering && scrollEdgeState.canScrollRight {
+                    ScrollStepButton(
+                        symbol: "chevron.right",
+                        label: "Scroll older snips",
+                        action: { stepScroll(direction: 1) }
+                    )
+                    .padding(.trailing, 2)
+                    .transition(.opacity)
+                }
+            }
+            .animation(.easeInOut(duration: 0.15), value: isStripHovering && scrollEdgeState.canScrollRight)
+        }
+        .onAppear {
+            scrollPosition.scrollTo(x: 0)
+        }
+        .onHover { isStripHovering = $0 }
+        .onChange(of: entries.first?.id) { _, _ in
+            scrollPosition.scrollTo(x: 0)
+        }
+    }
+
+    private func stepScroll(direction: CGFloat) {
+        let visibleWidth = scrollEdgeState.visibleWidth > 0
+            ? scrollEdgeState.visibleWidth
+            : Self.fallbackVisibleWidth
+        let estimatedContentWidth = CGFloat(entries.count) * Self.thumbnailWidth
+            + CGFloat(max(0, entries.count - 1)) * Self.thumbnailSpacing
+            + Self.horizontalInset * 2
+        let contentWidth = scrollEdgeState.contentWidth > 0
+            ? scrollEdgeState.contentWidth
+            : estimatedContentWidth
+        let maxOffset = max(0, contentWidth - visibleWidth)
+        guard maxOffset > 0 else { return }
+
+        let stepWidth = Self.stepThumbnails * (Self.thumbnailWidth + Self.thumbnailSpacing)
+        var targetX = scrollEdgeState.contentOffsetX + direction * stepWidth
+        if direction > 0, maxOffset - targetX < 20 {
+            targetX = maxOffset
+        } else if direction < 0, targetX < 20 {
+            targetX = 0
+        }
+        let clampedTargetX = min(max(targetX, 0), maxOffset)
+        withAnimation(.snappy(duration: 0.24)) {
+            scrollPosition.scrollTo(x: clampedTargetX)
+        }
+    }
+}
+
+private struct ScrollStepButton: View {
+    let symbol: String
+    let label: String
+    let action: () -> Void
+
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 9.5, weight: .bold))
+                .foregroundStyle(isHovering ? Color.primary : Color.primary.opacity(0.8))
+                .frame(width: 20, height: 20)
+                .background(.regularMaterial, in: Circle())
+                .overlay(
+                    Circle()
+                        .fill(Color.primary.opacity(isHovering ? 0.12 : 0.03))
+                )
+                .overlay(
+                    Circle()
+                        .strokeBorder(
+                            Color.primary.opacity(isHovering ? 0.28 : 0.16),
+                            lineWidth: 0.75
+                        )
+                )
+                .shadow(color: .black.opacity(0.18), radius: 2, y: 1)
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .help(label)
+        .accessibilityLabel(label)
+        .onHover { isHovering = $0 }
     }
 }
 
