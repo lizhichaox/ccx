@@ -5,6 +5,7 @@
 - **100% Native macOS**: Built with Swift 6, AppKit, SwiftUI, ScreenCaptureKit, Metal/CoreImage, AVFoundation/VideoToolbox, and Apple Vision — zero Electron, zero third-party runtime dependencies.
 - **Local Captures & OCR · Zero Telemetry**: All screenshots, OCR text recognition, and recordings stay on your Mac. No accounts, no cloud uploads, no analytics or telemetry; optional in-app update checks connect only to GitHub Releases and can be disabled anytime in Settings.
 - **Universal Binary**: Supports macOS 15.0 Sequoia and later on both Apple Silicon (`arm64`) and Intel (`x86_64`) Macs.
+- **Automatic English & Simplified Chinese**: Follows macOS **System Settings → Language & Region** automatically (`en` and `zh-Hans`), falling back to English for other languages.
 
 ---
 
@@ -32,7 +33,7 @@
 
 ## Installation
 
-1. Download the latest `CCX-0.6.0-macOS-universal.dmg` (or `.zip`).
+1. Download the latest `CCX-0.7.0-macOS-universal.dmg` (or `.zip`).
 2. Open the disk image and drag **CCX.app** into **Applications**.
 3. Launch **CCX** from `/Applications` or Spotlight.
 
@@ -153,7 +154,7 @@ done
 ### Public Release Packaging (Universal Binary + Hardened Runtime)
 ```bash
 # Bump version in project.yml when preparing a release:
-./scripts/bump-version.sh 0.6.0
+./scripts/bump-version.sh 0.7.0
 
 # Build signed Universal Binary (arm64 + x86_64), verify dylibs/codesign/entitlements,
 # and emit dist/CCX-<version>-macOS-universal.{dmg,zip} + dist/SHA256SUMS.txt:

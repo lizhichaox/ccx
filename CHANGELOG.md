@@ -2,6 +2,14 @@
 
 All notable changes to **CCX (Control · Command · X)** are documented in this file.
 
+## [0.7.0] - 2026-11-24
+
+### Added
+- **Automatic Simplified Chinese & English Localization (`zh-Hans` / `en`)**: Added native bilingual localization across the entire app — Settings, Menu Bar Popover, Setup Guide, floating pins, Smart Snip & Scroll Capture overlays, Screen Recording HUDs, toasts, dialogs, error notices, and macOS permission prompt `InfoPlist.strings` (`en.lproj` & `zh-Hans.lproj`). Language resolves automatically from macOS **System Settings → Language & Region** via `CCXL10n`, falling back to English for unmatched languages.
+
+### Improved
+- **Single-Line Prompt & Microcopy Hardening**: Tightened all prompts, hints, conflict messages, error notices, badges, and buttons across both English and Simplified Chinese so every line renders crisply on a single line without wrapping, clipping, or ellipsis truncation inside the compact Settings (`368pt`), Menu Bar Popover (`316pt`), Setup Guide (`464 × 344`), and floating HUD layouts.
+
 ## [0.6.0] - 2026-11-24
 
 ### Added
