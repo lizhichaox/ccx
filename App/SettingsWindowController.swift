@@ -455,7 +455,8 @@ private struct SettingsView: View {
         ZStack(alignment: .top) {
             LinearGradient(
                 colors: [
-                    Color.accentColor.opacity(0.10),
+                    CCXBadgePalette.blue.topColor.opacity(0.14),
+                    CCXBadgePalette.indigo.topColor.opacity(0.05),
                     Color.clear,
                 ],
                 startPoint: .top,
@@ -513,7 +514,7 @@ private struct SettingsView: View {
                         Divider().padding(.leading, 42)
                         PermissionSettingRow(
                             symbol: "accessibility",
-                            tint: .indigo,
+                            palette: .indigo,
                             title: CCXL10n.text("Accessibility", zh: "辅助功能"),
                             granted: permissions.status.accessibility,
                             openAction: permissions.openAccessibilitySettings
@@ -521,7 +522,7 @@ private struct SettingsView: View {
                         Divider().padding(.leading, 42)
                         PermissionSettingRow(
                             symbol: "mic.fill",
-                            tint: .pink,
+                            palette: .pink,
                             title: CCXL10n.text("Microphone", zh: "麦克风"),
                             granted: permissions.status.microphone,
                             openAction: permissions.openMicrophoneSettings
@@ -534,9 +535,15 @@ private struct SettingsView: View {
                     Button {
                         onOpenGuide()
                     } label: {
-                        Label(CCXL10n.text("Setup Guide", zh: "使用指南"), systemImage: "book.closed")
-                            .font(.system(size: 11.5, weight: .medium))
-                            .frame(maxWidth: .infinity)
+                        HStack(spacing: 5) {
+                            Image(systemName: "book.closed.fill")
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundStyle(CCXBadgePalette.blue.accentColor)
+                            Text(CCXL10n.text("Setup Guide", zh: "使用指南"))
+                                .font(.system(size: 11.5, weight: .medium))
+                                .lineLimit(1)
+                        }
+                        .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
@@ -544,9 +551,19 @@ private struct SettingsView: View {
                     Button {
                         onClearHistory()
                     } label: {
-                        Label(CCXL10n.text("Clear Snip History", zh: "清空记录"), systemImage: "trash")
-                            .font(.system(size: 11.5, weight: .medium))
-                            .frame(maxWidth: .infinity)
+                        HStack(spacing: 5) {
+                            Image(systemName: "trash.fill")
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundStyle(
+                                    hotKeyState.hasClearableHistory
+                                        ? CCXBadgePalette.red.accentColor
+                                        : Color.secondary
+                                )
+                            Text(CCXL10n.text("Clear Snip History", zh: "清空记录"))
+                                .font(.system(size: 11.5, weight: .medium))
+                                .lineLimit(1)
+                        }
+                        .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
@@ -647,17 +664,19 @@ private struct SettingsIdentityHeader: View {
 
 private struct SettingsRow<Trailing: View>: View {
     let symbol: String
-    let tint: Color
+    let palette: CCXBadgePalette
     let title: String
     @ViewBuilder let trailing: () -> Trailing
 
     var body: some View {
         HStack(spacing: 9) {
-            Image(systemName: symbol)
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(tint)
-                .frame(width: 24, height: 24)
-                .background(tint.opacity(0.14), in: RoundedRectangle(cornerRadius: 6.5, style: .continuous))
+            CCXIconBadge(
+                symbol: symbol,
+                palette: palette,
+                size: 24,
+                cornerRadius: 6.5,
+                symbolSize: 12
+            )
 
             Text(title)
                 .font(.system(size: 12.5, weight: .medium))
@@ -690,7 +709,7 @@ private struct SnipShortcutRow: View {
     @State private var isHoveringReset = false
     @State private var isHoveringCancel = false
 
-    private var iconTint: Color {
+    private var iconPalette: CCXBadgePalette {
         if feedback != nil || (!isRecording && !isRegistered) {
             return .orange
         }
@@ -713,7 +732,7 @@ private struct SnipShortcutRow: View {
         VStack(alignment: .leading, spacing: 5) {
             SettingsRow(
                 symbol: "viewfinder",
-                tint: iconTint,
+                palette: iconPalette,
                 title: CCXL10n.text("Snip Shortcut", zh: "截屏快捷键")
             ) {
                 if isRecording {
@@ -868,7 +887,7 @@ private struct LaunchAtLoginRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            SettingsRow(symbol: "power", tint: .teal, title: CCXL10n.text("Launch at Login", zh: "开机自启")) {
+            SettingsRow(symbol: "power", palette: .teal, title: CCXL10n.text("Launch at Login", zh: "开机自启")) {
                 HStack(spacing: 6) {
                     if serviceStatus == .requiresApproval {
                         Button(CCXL10n.text("Approve", zh: "批准")) {
@@ -949,11 +968,13 @@ private struct RecordingsFolderRow: View {
 
     var body: some View {
         HStack(spacing: 9) {
-            Image(systemName: "folder.fill")
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(.orange)
-                .frame(width: 24, height: 24)
-                .background(Color.orange.opacity(0.14), in: RoundedRectangle(cornerRadius: 6.5, style: .continuous))
+            CCXIconBadge(
+                symbol: "folder.fill",
+                palette: .orange,
+                size: 24,
+                cornerRadius: 6.5,
+                symbolSize: 12
+            )
 
             VStack(alignment: .leading, spacing: 1.5) {
                 Text(CCXL10n.text("Recordings", zh: "录屏目录"))
@@ -988,7 +1009,7 @@ private struct RecordingsFolderRow: View {
 private struct UpdatesSettingRow: View {
     @ObservedObject var updateManager: AppUpdateManager
 
-    private var iconTint: Color {
+    private var iconPalette: CCXBadgePalette {
         switch updateManager.state {
         case .available, .readyToInstall:
             return .green
@@ -1032,9 +1053,9 @@ private struct UpdatesSettingRow: View {
     private var subtitleColor: Color {
         switch updateManager.state {
         case .available, .readyToInstall:
-            return .green
+            return CCXBadgePalette.green.accentColor
         case .failed:
-            return .red
+            return CCXBadgePalette.red.accentColor
         case .idle, .checking, .upToDate, .downloading, .verifying, .installing:
             return .secondary
         }
@@ -1043,11 +1064,13 @@ private struct UpdatesSettingRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
             HStack(spacing: 9) {
-                Image(systemName: "arrow.down.circle.fill")
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(iconTint)
-                    .frame(width: 24, height: 24)
-                    .background(iconTint.opacity(0.14), in: RoundedRectangle(cornerRadius: 6.5, style: .continuous))
+                CCXIconBadge(
+                    symbol: "arrow.down.circle.fill",
+                    palette: iconPalette,
+                    size: 24,
+                    cornerRadius: 6.5,
+                    symbolSize: 12
+                )
 
                 VStack(alignment: .leading, spacing: 1.5) {
                     Text(CCXL10n.text("Updates", zh: "更新"))
@@ -1249,7 +1272,7 @@ private struct ScreenRecordingSettingRow: View {
         VStack(alignment: .leading, spacing: 5) {
             SettingsRow(
                 symbol: "rectangle.dashed.badge.record",
-                tint: granted ? .green : .orange,
+                palette: granted ? .green : .orange,
                 title: CCXL10n.text("Screen Recording", zh: "屏幕录制")
             ) {
                 HStack(spacing: 6) {
@@ -1298,13 +1321,13 @@ private struct ScreenRecordingSettingRow: View {
 
 private struct PermissionSettingRow: View {
     let symbol: String
-    let tint: Color
+    let palette: CCXBadgePalette
     let title: String
     let granted: Bool
     let openAction: () -> Void
 
     var body: some View {
-        SettingsRow(symbol: symbol, tint: granted ? .green : tint, title: title) {
+        SettingsRow(symbol: symbol, palette: granted ? .green : palette, title: title) {
             HStack(spacing: 6) {
                 PermissionBadge(granted: granted)
                 Button(CCXL10n.text("Open", zh: "打开"), action: openAction)

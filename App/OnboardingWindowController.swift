@@ -447,8 +447,8 @@ private struct OnboardingView: View {
         ZStack(alignment: .top) {
             LinearGradient(
                 colors: [
-                    Color.accentColor.opacity(0.12),
-                    Color.indigo.opacity(0.04),
+                    CCXBadgePalette.blue.topColor.opacity(0.14),
+                    CCXBadgePalette.indigo.topColor.opacity(0.06),
                     Color.clear,
                 ],
                 startPoint: .top,
@@ -522,19 +522,19 @@ private struct WelcomeStepView: View {
             HStack(alignment: .center, spacing: 8) {
                 FeatureBentoCard(
                     symbol: "viewfinder",
-                    tint: .blue,
+                    palette: .blue,
                     title: CCXL10n.text("Smart Snip", zh: "智能截屏"),
                     detail: CCXL10n.text("Detect, draw & OCR", zh: "识别、标注与 OCR")
                 )
                 FeatureBentoCard(
                     symbol: "pin.fill",
-                    tint: .indigo,
+                    palette: .indigo,
                     title: CCXL10n.text("Floating Pins", zh: "悬浮贴图"),
                     detail: CCXL10n.text("Always on top", zh: "始终置顶显示")
                 )
                 FeatureBentoCard(
                     symbol: "record.circle.fill",
-                    tint: .red,
+                    palette: .red,
                     title: CCXL10n.text("Screen Record", zh: "屏幕录制"),
                     detail: CCXL10n.text("MP4, MOV & GIF", zh: "MP4、MOV 与 GIF")
                 )
@@ -548,17 +548,19 @@ private struct WelcomeStepView: View {
 
 private struct FeatureBentoCard: View {
     let symbol: String
-    let tint: Color
+    let palette: CCXBadgePalette
     let title: String
     let detail: String
 
     var body: some View {
         VStack(alignment: .center, spacing: 5) {
-            Image(systemName: symbol)
-                .font(.system(size: 14, weight: .semibold))
-                .foregroundStyle(tint)
-                .frame(width: 28, height: 28)
-                .background(tint.opacity(0.14), in: RoundedRectangle(cornerRadius: 7.5, style: .continuous))
+            CCXIconBadge(
+                symbol: symbol,
+                palette: palette,
+                size: 28,
+                cornerRadius: 8,
+                symbolSize: 14
+            )
 
             Text(title)
                 .font(.system(size: 12.5, weight: .semibold))
@@ -574,7 +576,11 @@ private struct FeatureBentoCard: View {
         .padding(.horizontal, 10)
         .padding(.vertical, 12)
         .frame(maxWidth: .infinity, alignment: .center)
-        .ccxCardSurface(cornerRadius: 12)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(palette.accentColor.opacity(0.055))
+        )
+        .ccxCardSurface(cornerRadius: 12, borderColor: palette.accentColor.opacity(0.20))
     }
 }
 
@@ -594,7 +600,7 @@ private struct PermissionsStepView: View {
             VStack(spacing: 0) {
                 PermissionRow(
                     symbol: "rectangle.dashed.badge.record",
-                    tint: .blue,
+                    palette: .blue,
                     title: CCXL10n.text("Screen Recording", zh: "屏幕录制"),
                     detail: CCXL10n.text("Capture displays & pixels", zh: "用于截屏、取色与录屏"),
                     granted: model.status.screenRecording,
@@ -609,7 +615,7 @@ private struct PermissionsStepView: View {
 
                 PermissionRow(
                     symbol: "accessibility",
-                    tint: .indigo,
+                    palette: .indigo,
                     title: CCXL10n.text("Accessibility", zh: "辅助功能"),
                     detail: CCXL10n.text("Detect UI elements", zh: "自动识别窗口与界面元素"),
                     granted: model.status.accessibility,
@@ -637,7 +643,7 @@ private struct PermissionsStepView: View {
 
 private struct PermissionRow: View {
     let symbol: String
-    let tint: Color
+    let palette: CCXBadgePalette
     let title: String
     let detail: String
     let granted: Bool
@@ -647,14 +653,13 @@ private struct PermissionRow: View {
 
     var body: some View {
         HStack(spacing: 10) {
-            Image(systemName: symbol)
-                .font(.system(size: 14, weight: .semibold))
-                .foregroundStyle(granted ? .green : tint)
-                .frame(width: 28, height: 28)
-                .background(
-                    (granted ? Color.green : tint).opacity(0.14),
-                    in: RoundedRectangle(cornerRadius: 7.5, style: .continuous)
-                )
+            CCXIconBadge(
+                symbol: symbol,
+                palette: granted ? .green : palette,
+                size: 28,
+                cornerRadius: 7.5,
+                symbolSize: 14
+            )
 
             VStack(alignment: .leading, spacing: 1.5) {
                 Text(title)
@@ -693,10 +698,14 @@ private struct PermissionGrantedPill: View {
     var body: some View {
         Label(CCXL10n.text("Granted", zh: "已授权"), systemImage: "checkmark.circle.fill")
             .font(.system(size: 11, weight: .semibold))
-            .foregroundStyle(.green)
+            .foregroundStyle(CCXBadgePalette.green.accentColor)
             .padding(.horizontal, 8)
             .padding(.vertical, 3.5)
-            .background(Color.green.opacity(0.14), in: Capsule())
+            .background(CCXBadgePalette.green.accentColor.opacity(0.14), in: Capsule())
+            .overlay(
+                Capsule()
+                    .strokeBorder(CCXBadgePalette.green.accentColor.opacity(0.24), lineWidth: 0.75)
+            )
             .fixedSize()
     }
 }
@@ -739,7 +748,11 @@ private struct ScreenRecordingHintStrip: View {
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 7)
-        .background(Color.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+        .background(CCXBadgePalette.orange.accentColor.opacity(0.10), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .strokeBorder(CCXBadgePalette.orange.accentColor.opacity(0.24), lineWidth: 0.75)
+        )
     }
 }
 
@@ -755,7 +768,7 @@ private struct ReadyStepView: View {
             HStack(spacing: 6) {
                 Image(systemName: "checkmark.seal.fill")
                     .font(.system(size: 16, weight: .semibold))
-                    .foregroundStyle(.green)
+                    .foregroundStyle(CCXBadgePalette.green.accentColor)
 
                 Text(CCXL10n.text("All Set", zh: "准备就绪"))
                     .font(.system(size: 16, weight: .bold))
@@ -764,21 +777,21 @@ private struct ReadyStepView: View {
             VStack(spacing: 0) {
                 GuideActionRow(
                     symbol: "viewfinder",
-                    tint: .blue,
+                    palette: .blue,
                     title: CCXL10n.text("Smart Snip", zh: "智能截屏"),
                     trailing: { KeycapComboView(combo: flow.snipCombo) }
                 )
                 Divider().padding(.leading, 40)
                 GuideActionRow(
                     symbol: "pin.fill",
-                    tint: .indigo,
+                    palette: .indigo,
                     title: CCXL10n.text("Paste as Pin", zh: "粘贴为贴图"),
                     trailing: { InteractionPillView(text: CCXL10n.text("Menu Bar · Pin", zh: "菜单栏 · 贴图")) }
                 )
                 Divider().padding(.leading, 40)
                 GuideActionRow(
                     symbol: "text.viewfinder",
-                    tint: .cyan,
+                    palette: .teal,
                     title: CCXL10n.text("Annotate, OCR & Record", zh: "标注、OCR 与录屏"),
                     trailing: { InteractionPillView(text: "1–8 · T · R") }
                 )
@@ -793,17 +806,19 @@ private struct ReadyStepView: View {
 
 private struct GuideActionRow<Trailing: View>: View {
     let symbol: String
-    let tint: Color
+    let palette: CCXBadgePalette
     let title: String
     @ViewBuilder let trailing: () -> Trailing
 
     var body: some View {
         HStack(spacing: 10) {
-            Image(systemName: symbol)
-                .font(.system(size: 12.5, weight: .semibold))
-                .foregroundStyle(tint)
-                .frame(width: 24, height: 24)
-                .background(tint.opacity(0.14), in: RoundedRectangle(cornerRadius: 6.5, style: .continuous))
+            CCXIconBadge(
+                symbol: symbol,
+                palette: palette,
+                size: 24,
+                cornerRadius: 6.5,
+                symbolSize: 12.5
+            )
 
             Text(title)
                 .font(.system(size: 12.5, weight: .medium))
@@ -946,7 +961,7 @@ private struct OnboardingFooterBar: View {
                         }
                     } label: {
                         Capsule()
-                            .fill(flow.step == step ? Color.accentColor : Color.primary.opacity(0.2))
+                            .fill(flow.step == step ? CCXBadgePalette.blue.accentColor : Color.primary.opacity(0.2))
                             .frame(width: flow.step == step ? 20 : 7, height: 7)
                     }
                     .buttonStyle(.plain)
@@ -961,20 +976,20 @@ private struct OnboardingFooterBar: View {
 
 private extension View {
     @ViewBuilder
-    func ccxCardSurface(cornerRadius: CGFloat = 14) -> some View {
+    func ccxCardSurface(cornerRadius: CGFloat = 14, borderColor: Color = Color.primary.opacity(0.08)) -> some View {
         if #available(macOS 26.0, *) {
             self
                 .glassEffect(.regular, in: .rect(cornerRadius: cornerRadius))
                 .overlay(
                     RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                        .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
+                        .strokeBorder(borderColor, lineWidth: 1)
                 )
         } else {
             self
                 .background(.regularMaterial, in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
                 .overlay(
                     RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                        .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
+                        .strokeBorder(borderColor, lineWidth: 1)
                 )
         }
     }
@@ -993,6 +1008,105 @@ struct CCXBrandIcon: View {
     }
 }
 
+/// Luminous Apple-calibrated accent pairs shared across Popover, Settings, and Setup Guide.
+enum CCXBadgePalette: Sendable {
+    case blue
+    case indigo
+    case red
+    case orange
+    case green
+    case teal
+    case pink
+
+    var topColor: Color {
+        switch self {
+        case .blue: Color(red: 0.22, green: 0.66, blue: 1.00)
+        case .indigo: Color(red: 0.56, green: 0.44, blue: 1.00)
+        case .red: Color(red: 1.00, green: 0.38, blue: 0.34)
+        case .orange: Color(red: 1.00, green: 0.66, blue: 0.18)
+        case .green: Color(red: 0.24, green: 0.84, blue: 0.46)
+        case .teal: Color(red: 0.18, green: 0.82, blue: 0.86)
+        case .pink: Color(red: 1.00, green: 0.36, blue: 0.60)
+        }
+    }
+
+    var bottomColor: Color {
+        switch self {
+        case .blue: Color(red: 0.04, green: 0.45, blue: 0.98)
+        case .indigo: Color(red: 0.36, green: 0.28, blue: 0.92)
+        case .red: Color(red: 0.92, green: 0.16, blue: 0.24)
+        case .orange: Color(red: 0.96, green: 0.44, blue: 0.06)
+        case .green: Color(red: 0.10, green: 0.68, blue: 0.32)
+        case .teal: Color(red: 0.04, green: 0.62, blue: 0.78)
+        case .pink: Color(red: 0.90, green: 0.16, blue: 0.44)
+        }
+    }
+
+    var accentColor: Color {
+        switch self {
+        case .blue: Color(red: 0.06, green: 0.47, blue: 0.98)
+        case .indigo: Color(red: 0.40, green: 0.31, blue: 0.94)
+        case .red: Color(red: 0.94, green: 0.20, blue: 0.26)
+        case .orange: Color(red: 0.96, green: 0.48, blue: 0.08)
+        case .green: Color(red: 0.12, green: 0.70, blue: 0.34)
+        case .teal: Color(red: 0.06, green: 0.65, blue: 0.80)
+        case .pink: Color(red: 0.92, green: 0.20, blue: 0.48)
+        }
+    }
+
+    func labelColor(for colorScheme: ColorScheme) -> Color {
+        switch colorScheme {
+        case .dark:
+            switch self {
+            case .blue: Color(red: 0.38, green: 0.74, blue: 1.00)
+            case .indigo: Color(red: 0.66, green: 0.56, blue: 1.00)
+            case .red: Color(red: 1.00, green: 0.44, blue: 0.42)
+            case .orange: Color(red: 1.00, green: 0.70, blue: 0.26)
+            case .green: Color(red: 0.30, green: 0.86, blue: 0.50)
+            case .teal: Color(red: 0.26, green: 0.84, blue: 0.90)
+            case .pink: Color(red: 1.00, green: 0.44, blue: 0.68)
+            }
+        default:
+            accentColor
+        }
+    }
+}
+
+/// Crisp Apple System Settings–style saturated gradient rounded-square icon tile.
+struct CCXIconBadge: View {
+    let symbol: String
+    let palette: CCXBadgePalette
+    var size: CGFloat = 24
+    var cornerRadius: CGFloat = 6.5
+    var symbolSize: CGFloat = 12
+    var isHighlighted = false
+
+    var body: some View {
+        Image(systemName: symbol)
+            .font(.system(size: symbolSize, weight: .semibold))
+            .foregroundStyle(.white)
+            .shadow(color: .black.opacity(0.14), radius: 0.75, y: 0.5)
+            .frame(width: size, height: size)
+            .background(
+                LinearGradient(
+                    colors: [palette.topColor, palette.bottomColor],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                ),
+                in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    .strokeBorder(.white.opacity(isHighlighted ? 0.38 : 0.24), lineWidth: 0.75)
+            )
+            .shadow(
+                color: palette.accentColor.opacity(isHighlighted ? 0.42 : 0.26),
+                radius: isHighlighted ? 4.5 : 2.5,
+                y: 1.5
+            )
+    }
+}
+
 /// Green check / orange warning label for a permission state (shared with Settings).
 struct PermissionBadge: View {
     let granted: Bool
@@ -1004,7 +1118,7 @@ struct PermissionBadge: View {
         )
         .labelStyle(.titleAndIcon)
         .font(.caption.weight(.medium))
-        .foregroundStyle(granted ? Color.green : Color.orange)
+        .foregroundStyle(granted ? CCXBadgePalette.green.accentColor : CCXBadgePalette.orange.accentColor)
         .fixedSize()
     }
 }

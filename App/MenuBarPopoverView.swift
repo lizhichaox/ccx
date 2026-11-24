@@ -143,9 +143,9 @@ struct MenuBarPopoverView: View {
                         badge: model.isSnipHotKeyRegistered
                             ? model.snipShortcut
                             : CCXL10n.text("Conflict", zh: "冲突"),
-                        isBadgeDimmed: !model.isSnipHotKeyRegistered,
+                        isBadgeDimmed: false,
                         symbol: "viewfinder",
-                        tint: model.isSnipHotKeyRegistered ? .blue : .orange,
+                        palette: model.isSnipHotKeyRegistered ? .blue : .orange,
                         tooltip: model.isSnipHotKeyRegistered
                             ? CCXL10n.text("Capture screen (\(model.snipShortcut))", zh: "截屏 (\(model.snipShortcut))")
                             : CCXL10n.text(
@@ -159,10 +159,10 @@ struct MenuBarPopoverView: View {
                         badge: model.pinBadge,
                         isBadgeDimmed: model.isPinBadgeDimmed,
                         symbol: "pin.fill",
-                        tint: .indigo,
+                        palette: .indigo,
                         accessorySymbol: "xmark.circle.fill",
                         accessoryTooltip: CCXL10n.text("Clear clipboard", zh: "清空剪贴板"),
-                        isAccessoryDestructive: true,
+                        accessoryPalette: .red,
                         onAccessory: model.hasClipboardContent ? actions.onClearClipboard : nil,
                         action: actions.onPastePin
                     )
@@ -170,11 +170,11 @@ struct MenuBarPopoverView: View {
                         title: CCXL10n.text("Record", zh: "录屏"),
                         badge: CCXL10n.text("Video · GIF", zh: "视频 · GIF"),
                         symbol: "record.circle.fill",
-                        tint: .red,
+                        palette: .red,
                         tooltip: CCXL10n.text("Record screen (MP4, MOV, or GIF)", zh: "录屏 (MP4、MOV 或 GIF)"),
                         accessorySymbol: "folder.fill",
                         accessoryTooltip: CCXL10n.text("Open Recordings Folder", zh: "打开录屏目录"),
-                        isAccessoryDestructive: false,
+                        accessoryPalette: .orange,
                         onAccessory: actions.onOpenRecordingsFolder,
                         action: actions.onRecord
                     )
@@ -233,7 +233,7 @@ private struct ActiveRecordingBanner: View {
     let onDiscard: () -> Void
 
     var body: some View {
-        let tint: Color = status.isPaused ? .orange : .red
+        let tint: Color = status.isPaused ? CCXBadgePalette.orange.accentColor : CCXBadgePalette.red.accentColor
         VStack(spacing: 8) {
             HStack(spacing: 8) {
                 Circle()
@@ -255,14 +255,14 @@ private struct ActiveRecordingBanner: View {
                 PinControlPill(
                     title: status.isPaused ? CCXL10n.text("Resume", zh: "继续") : CCXL10n.text("Pause", zh: "暂停"),
                     symbol: status.isPaused ? "play.fill" : "pause.fill",
-                    tint: status.isPaused ? .cyan : .secondary,
+                    tint: status.isPaused ? CCXBadgePalette.teal.accentColor : CCXBadgePalette.orange.accentColor,
                     isActive: status.isPaused,
                     action: onTogglePause
                 )
                 PinControlPill(
                     title: CCXL10n.text("Stop", zh: "停止"),
                     symbol: "stop.fill",
-                    tint: .red,
+                    tint: CCXBadgePalette.red.accentColor,
                     isActive: true,
                     action: onStop
                 )
@@ -285,7 +285,7 @@ private struct ActiveRecordingBanner: View {
         )
         .overlay(
             RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .strokeBorder(tint.opacity(0.28), lineWidth: 1)
+                .strokeBorder(tint.opacity(0.30), lineWidth: 1)
         )
     }
 }
@@ -297,28 +297,29 @@ private struct QuickActionTile: View {
     let badge: String
     var isBadgeDimmed = false
     let symbol: String
-    let tint: Color
+    let palette: CCXBadgePalette
     var tooltip: String? = nil
     var accessorySymbol: String? = nil
     var accessoryTooltip: String = ""
-    var isAccessoryDestructive = false
+    var accessoryPalette: CCXBadgePalette = .orange
     var onAccessory: (() -> Void)? = nil
     let action: () -> Void
 
+    @Environment(\.colorScheme) private var colorScheme
     @State private var isHovering = false
     @State private var isAccessoryHovering = false
 
     var body: some View {
         Button(action: action) {
             VStack(spacing: 6) {
-                Image(systemName: symbol)
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundStyle(tint)
-                    .frame(width: 28, height: 28)
-                    .background(
-                        tint.opacity(isHovering ? 0.24 : 0.15),
-                        in: RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    )
+                CCXIconBadge(
+                    symbol: symbol,
+                    palette: palette,
+                    size: 28,
+                    cornerRadius: 8,
+                    symbolSize: 14,
+                    isHighlighted: isHovering
+                )
 
                 VStack(spacing: 2) {
                     Text(title)
@@ -327,8 +328,8 @@ private struct QuickActionTile: View {
                         .lineLimit(1)
 
                     Text(badge)
-                        .font(.system(size: 10, weight: .medium).monospacedDigit())
-                        .foregroundStyle(isBadgeDimmed ? .tertiary : .secondary)
+                        .font(.system(size: 10, weight: .semibold).monospacedDigit())
+                        .foregroundStyle(isBadgeDimmed ? Color.secondary.opacity(0.75) : palette.labelColor(for: colorScheme))
                         .lineLimit(1)
                 }
             }
@@ -337,12 +338,12 @@ private struct QuickActionTile: View {
             .frame(maxWidth: .infinity, alignment: .center)
             .background(
                 RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .fill(isHovering ? Color.primary.opacity(0.09) : Color.primary.opacity(0.05))
+                    .fill(palette.accentColor.opacity(isHovering ? 0.14 : 0.065))
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 12, style: .continuous)
                     .strokeBorder(
-                        isHovering ? tint.opacity(0.35) : Color.primary.opacity(0.08),
+                        palette.accentColor.opacity(isHovering ? 0.50 : 0.20),
                         lineWidth: 1
                     )
             )
@@ -353,19 +354,44 @@ private struct QuickActionTile: View {
             if let onAccessory, let accessorySymbol, isHovering {
                 Button(action: onAccessory) {
                     Image(systemName: accessorySymbol)
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(
-                            isAccessoryHovering
-                                ? (isAccessoryDestructive ? Color.red : Color.accentColor)
-                                : Color.secondary
-                        )
+                        .font(.system(size: 10.5, weight: .semibold))
+                        .foregroundStyle(isAccessoryHovering ? Color.white : accessoryPalette.labelColor(for: colorScheme))
                         .frame(width: 20, height: 20)
-                        .contentShape(Rectangle())
+                        .background {
+                            if isAccessoryHovering {
+                                Circle()
+                                    .fill(
+                                        LinearGradient(
+                                            colors: [accessoryPalette.topColor, accessoryPalette.bottomColor],
+                                            startPoint: .topLeading,
+                                            endPoint: .bottomTrailing
+                                        )
+                                    )
+                                    .shadow(
+                                        color: accessoryPalette.accentColor.opacity(0.35),
+                                        radius: 2.5,
+                                        y: 1
+                                    )
+                            } else {
+                                Circle()
+                                    .fill(accessoryPalette.accentColor.opacity(0.16))
+                            }
+                        }
+                        .overlay(
+                            Circle()
+                                .strokeBorder(
+                                    isAccessoryHovering
+                                        ? Color.white.opacity(0.28)
+                                        : accessoryPalette.accentColor.opacity(0.36),
+                                    lineWidth: 0.75
+                                )
+                        )
+                        .contentShape(Circle())
                 }
                 .buttonStyle(.plain)
                 .help(accessoryTooltip)
                 .accessibilityLabel(accessoryTooltip)
-                .padding(2)
+                .padding(4)
                 .onHover { isAccessoryHovering = $0 }
             }
         }
@@ -427,6 +453,8 @@ private struct RecentSnipsSection: View {
     let onPinHistory: (SnipHistoryEntry) -> Void
     let onClearHistory: () -> Void
 
+    @Environment(\.colorScheme) private var colorScheme
+
     var body: some View {
         VStack(alignment: .center, spacing: 6) {
             Divider().opacity(0.45)
@@ -435,15 +463,19 @@ private struct RecentSnipsSection: View {
                 HStack(spacing: 5) {
                     Text(CCXL10n.text("RECENT SNIPS", zh: "最近截屏"))
                         .font(.system(size: 9.5, weight: .semibold))
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(Color.primary.opacity(0.74))
                         .tracking(0.6)
 
                     Text("\(entries.count)")
-                        .font(.system(size: 9.5, weight: .semibold).monospacedDigit())
-                        .foregroundStyle(.secondary)
+                        .font(.system(size: 9.5, weight: .bold).monospacedDigit())
+                        .foregroundStyle(CCXBadgePalette.blue.labelColor(for: colorScheme))
                         .padding(.horizontal, 5)
                         .padding(.vertical, 1.5)
-                        .background(Color.primary.opacity(0.08), in: Capsule())
+                        .background(CCXBadgePalette.blue.accentColor.opacity(0.14), in: Capsule())
+                        .overlay(
+                            Capsule()
+                                .strokeBorder(CCXBadgePalette.blue.accentColor.opacity(0.24), lineWidth: 0.75)
+                        )
                 }
                 .accessibilityElement(children: .combine)
                 .accessibilityLabel(CCXL10n.text(
@@ -638,18 +670,31 @@ private struct ScrollStepButton: View {
 private struct RecentClearButton: View {
     let action: () -> Void
 
+    @Environment(\.colorScheme) private var colorScheme
     @State private var isHovering = false
 
     var body: some View {
         Button(action: action) {
             Text(CCXL10n.text("Clear", zh: "清空"))
-                .font(.system(size: 10, weight: .medium))
-                .foregroundStyle(isHovering ? Color.red : Color.secondary)
-                .padding(.horizontal, 6)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(isHovering ? Color.white : CCXBadgePalette.red.labelColor(for: colorScheme))
+                .padding(.horizontal, 7)
                 .padding(.vertical, 2)
                 .background(
-                    RoundedRectangle(cornerRadius: 5, style: .continuous)
-                        .fill(isHovering ? Color.red.opacity(0.11) : Color.clear)
+                    Capsule()
+                        .fill(isHovering ? CCXBadgePalette.red.accentColor : CCXBadgePalette.red.accentColor.opacity(0.09))
+                )
+                .overlay(
+                    Capsule()
+                        .strokeBorder(
+                            isHovering ? Color.clear : CCXBadgePalette.red.accentColor.opacity(0.22),
+                            lineWidth: 0.75
+                        )
+                )
+                .shadow(
+                    color: isHovering ? CCXBadgePalette.red.accentColor.opacity(0.28) : .clear,
+                    radius: 2,
+                    y: 1
                 )
         }
         .buttonStyle(.plain)
@@ -679,7 +724,7 @@ private struct RecentSnipThumbnail: View {
                 .overlay(alignment: .topTrailing) {
                     if isPinned {
                         Circle()
-                            .fill(Color.indigo)
+                            .fill(CCXBadgePalette.indigo.accentColor)
                             .frame(width: 7, height: 7)
                             .overlay(Circle().strokeBorder(.white, lineWidth: 1))
                             .padding(3)
@@ -689,7 +734,9 @@ private struct RecentSnipThumbnail: View {
                 .overlay(
                     RoundedRectangle(cornerRadius: 6, style: .continuous)
                         .strokeBorder(
-                            isHovering ? Color.accentColor : Color.primary.opacity(0.14),
+                            isPinned
+                                ? CCXBadgePalette.indigo.accentColor.opacity(0.80)
+                                : (isHovering ? CCXBadgePalette.blue.accentColor.opacity(0.88) : Color.primary.opacity(0.15)),
                             lineWidth: isHovering ? 1.5 : 1
                         )
                         .allowsHitTesting(false)
@@ -721,6 +768,8 @@ private struct FloatingPinsSection: View {
     let onUnlockClickThrough: () -> Void
     let onCloseAllPins: () -> Void
 
+    @Environment(\.colorScheme) private var colorScheme
+
     var body: some View {
         VStack(alignment: .center, spacing: 6) {
             Divider().opacity(0.45)
@@ -728,15 +777,19 @@ private struct FloatingPinsSection: View {
             HStack(spacing: 6) {
                 Text(CCXL10n.text("FLOATING PINS", zh: "悬浮贴图"))
                     .font(.system(size: 9.5, weight: .semibold))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(Color.primary.opacity(0.74))
                     .tracking(0.6)
 
                 Text(CCXL10n.text("\(pinCount) active", zh: "\(pinCount) 个显示"))
-                    .font(.system(size: 9.5, weight: .semibold).monospacedDigit())
-                    .foregroundStyle(Color.accentColor)
+                    .font(.system(size: 9.5, weight: .bold).monospacedDigit())
+                    .foregroundStyle(CCXBadgePalette.indigo.labelColor(for: colorScheme))
                     .padding(.horizontal, 6)
                     .padding(.vertical, 2)
-                    .background(Color.accentColor.opacity(0.14), in: Capsule())
+                    .background(CCXBadgePalette.indigo.accentColor.opacity(0.14), in: Capsule())
+                    .overlay(
+                        Capsule()
+                            .strokeBorder(CCXBadgePalette.indigo.accentColor.opacity(0.24), lineWidth: 0.75)
+                    )
             }
             .frame(maxWidth: .infinity, alignment: .center)
 
@@ -745,7 +798,7 @@ private struct FloatingPinsSection: View {
                     PinControlPill(
                         title: arePinsHidden ? CCXL10n.text("Show All", zh: "显示全部") : CCXL10n.text("Hide All", zh: "隐藏全部"),
                         symbol: arePinsHidden ? "eye" : "eye.slash",
-                        tint: arePinsHidden ? .accentColor : .secondary,
+                        tint: CCXBadgePalette.indigo.labelColor(for: colorScheme),
                         isActive: arePinsHidden,
                         action: onToggleAllPins
                     )
@@ -753,7 +806,7 @@ private struct FloatingPinsSection: View {
                     PinControlPill(
                         title: CCXL10n.text("Close All", zh: "关闭全部"),
                         symbol: "xmark.circle",
-                        tint: .secondary,
+                        tint: CCXBadgePalette.red.labelColor(for: colorScheme),
                         isDestructive: true,
                         action: onCloseAllPins
                     )
@@ -763,7 +816,7 @@ private struct FloatingPinsSection: View {
                     PinControlPill(
                         title: CCXL10n.text("Unlock Click-Through", zh: "解除穿透"),
                         symbol: "cursorarrow.click",
-                        tint: .cyan,
+                        tint: CCXBadgePalette.teal.labelColor(for: colorScheme),
                         isActive: true,
                         action: onUnlockClickThrough
                     )
@@ -781,6 +834,7 @@ private struct PinControlPill: View {
     var isDestructive = false
     let action: () -> Void
 
+    @Environment(\.colorScheme) private var colorScheme
     @State private var isHovering = false
 
     var body: some View {
@@ -788,11 +842,12 @@ private struct PinControlPill: View {
             HStack(spacing: 5) {
                 Image(systemName: symbol)
                     .font(.system(size: 11.5, weight: .semibold))
+                    .foregroundStyle(iconColor)
                 Text(title)
                     .font(.system(size: 11.5, weight: .medium))
+                    .foregroundStyle(labelColor)
                     .lineLimit(1)
             }
-            .foregroundStyle(foregroundColor)
             .frame(maxWidth: .infinity)
             .frame(height: 30)
             .background(
@@ -808,22 +863,30 @@ private struct PinControlPill: View {
         .onHover { isHovering = $0 }
     }
 
-    private var foregroundColor: Color {
-        if isHovering && isDestructive { return .red }
+    private var iconColor: Color {
+        if isDestructive {
+            let red = CCXBadgePalette.red.labelColor(for: colorScheme)
+            return isHovering ? red : red.opacity(0.86)
+        }
+        return tint
+    }
+
+    private var labelColor: Color {
+        if isHovering && isDestructive { return CCXBadgePalette.red.labelColor(for: colorScheme) }
         if isActive { return tint }
         return .primary
     }
 
     private var backgroundColor: Color {
-        if isHovering && isDestructive { return Color.red.opacity(0.11) }
+        if isHovering && isDestructive { return CCXBadgePalette.red.accentColor.opacity(0.12) }
         if isActive { return tint.opacity(isHovering ? 0.22 : 0.14) }
-        return isHovering ? Color.primary.opacity(0.09) : Color.primary.opacity(0.05)
+        return isHovering ? tint.opacity(0.10) : Color.primary.opacity(0.05)
     }
 
     private var borderColor: Color {
-        if isHovering && isDestructive { return Color.red.opacity(0.32) }
-        if isActive { return tint.opacity(0.35) }
-        return Color.primary.opacity(0.08)
+        if isHovering && isDestructive { return CCXBadgePalette.red.accentColor.opacity(0.36) }
+        if isActive { return tint.opacity(0.38) }
+        return isHovering ? tint.opacity(0.28) : Color.primary.opacity(0.10)
     }
 }
 
@@ -835,13 +898,13 @@ private struct UpdateAvailableBanner: View {
     private var tint: Color {
         switch updateManager.state {
         case .available, .readyToInstall:
-            return .green
+            return CCXBadgePalette.green.accentColor
         case .failed:
-            return .orange
+            return CCXBadgePalette.orange.accentColor
         case .downloading, .verifying, .installing:
-            return .accentColor
+            return CCXBadgePalette.blue.accentColor
         case .idle, .checking, .upToDate:
-            return .green
+            return CCXBadgePalette.green.accentColor
         }
     }
 
@@ -854,7 +917,7 @@ private struct UpdateAvailableBanner: View {
                 HStack(spacing: 8) {
                     Image(systemName: "arrow.down.circle.fill")
                         .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(.green)
+                        .foregroundStyle(CCXBadgePalette.green.accentColor)
 
                     Text(CCXL10n.text(
                         "Update v\(release.version.description)",
@@ -874,7 +937,7 @@ private struct UpdateAvailableBanner: View {
                             .foregroundStyle(.white)
                             .padding(.horizontal, 9)
                             .padding(.vertical, 3.5)
-                            .background(Color.green, in: Capsule())
+                            .background(CCXBadgePalette.green.accentColor, in: Capsule())
                     }
                     .buttonStyle(.plain)
                     .fixedSize()
@@ -898,7 +961,7 @@ private struct UpdateAvailableBanner: View {
                 HStack(spacing: 8) {
                     Image(systemName: "arrow.down.circle.fill")
                         .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(Color.accentColor)
+                        .foregroundStyle(CCXBadgePalette.blue.accentColor)
 
                     Text(CCXL10n.text("Downloading \(pct)%", zh: "下载中 \(pct)%"))
                         .font(.system(size: 11, weight: .medium).monospacedDigit())
@@ -939,7 +1002,7 @@ private struct UpdateAvailableBanner: View {
                 HStack(spacing: 8) {
                     Image(systemName: "arrow.down.circle.fill")
                         .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(.green)
+                        .foregroundStyle(CCXBadgePalette.green.accentColor)
 
                     Text(CCXL10n.text(
                         "v\(release.version.description) Ready",
@@ -959,7 +1022,7 @@ private struct UpdateAvailableBanner: View {
                             .foregroundStyle(.white)
                             .padding(.horizontal, 9)
                             .padding(.vertical, 3.5)
-                            .background(Color.green, in: Capsule())
+                            .background(CCXBadgePalette.green.accentColor, in: Capsule())
                     }
                     .buttonStyle(.plain)
                     .fixedSize()
@@ -993,7 +1056,7 @@ private struct UpdateAvailableBanner: View {
                     HStack(spacing: 6) {
                         Image(systemName: "exclamationmark.triangle.fill")
                             .font(.system(size: 12, weight: .semibold))
-                            .foregroundStyle(.orange)
+                            .foregroundStyle(CCXBadgePalette.orange.accentColor)
 
                         Text(CCXL10n.text("Update Failed", zh: "更新失败"))
                             .font(.system(size: 11.5, weight: .semibold))
@@ -1010,7 +1073,7 @@ private struct UpdateAvailableBanner: View {
                                 .foregroundStyle(.white)
                                 .padding(.horizontal, 8)
                                 .padding(.vertical, 3)
-                                .background(Color.orange, in: Capsule())
+                                .background(CCXBadgePalette.orange.accentColor, in: Capsule())
                         }
                         .buttonStyle(.plain)
                         .fixedSize()
@@ -1020,7 +1083,7 @@ private struct UpdateAvailableBanner: View {
                         } label: {
                             Text("GitHub")
                                 .font(.system(size: 10.5, weight: .medium))
-                                .foregroundStyle(Color.accentColor)
+                                .foregroundStyle(CCXBadgePalette.blue.accentColor)
                         }
                         .buttonStyle(.plain)
                         .pointerStyle(.link)
@@ -1059,7 +1122,7 @@ private struct UpdateAvailableBanner: View {
         )
         .overlay(
             RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .strokeBorder(tint.opacity(0.26), lineWidth: 1)
+                .strokeBorder(tint.opacity(0.28), lineWidth: 1)
         )
     }
 }
@@ -1074,6 +1137,8 @@ private struct UtilityFooterSection: View {
     let onOpenSettings: () -> Void
     let onQuit: () -> Void
 
+    @Environment(\.colorScheme) private var colorScheme
+
     var body: some View {
         VStack(spacing: 8) {
             Divider().opacity(0.45)
@@ -1082,8 +1147,10 @@ private struct UtilityFooterSection: View {
             HStack(spacing: 6) {
                 UtilityDockButton(
                     title: allGranted ? CCXL10n.text("Ready", zh: "就绪") : CCXL10n.text("Guide", zh: "指南"),
-                    symbol: allGranted ? "checkmark.shield" : "exclamationmark.triangle.fill",
-                    symbolTint: allGranted ? .green : .orange,
+                    symbol: allGranted ? "checkmark.shield.fill" : "exclamationmark.triangle.fill",
+                    symbolTint: allGranted
+                        ? CCXBadgePalette.green.labelColor(for: colorScheme)
+                        : CCXBadgePalette.orange.labelColor(for: colorScheme),
                     needsAttention: !allGranted,
                     tooltip: allGranted
                         ? CCXL10n.text("All permissions granted — click to open Guide", zh: "权限已就绪，点击打开使用指南")
@@ -1093,7 +1160,8 @@ private struct UtilityFooterSection: View {
 
                 UtilityDockButton(
                     title: CCXL10n.text("Settings", zh: "设置"),
-                    symbol: "gearshape",
+                    symbol: "gearshape.fill",
+                    symbolTint: CCXBadgePalette.blue.labelColor(for: colorScheme),
                     showBadgeDot: hasUpdateBadge,
                     tooltip: hasUpdateBadge
                         ? (isUpdateReady
@@ -1106,6 +1174,7 @@ private struct UtilityFooterSection: View {
                 UtilityDockButton(
                     title: CCXL10n.text("Quit", zh: "退出"),
                     symbol: "power",
+                    symbolTint: CCXBadgePalette.red.labelColor(for: colorScheme).opacity(0.90),
                     isDestructive: true,
                     tooltip: CCXL10n.text("Quit CCX (⌘Q)", zh: "退出 CCX (⌘Q)"),
                     action: onQuit
@@ -1125,6 +1194,7 @@ private struct UtilityDockButton: View {
     let tooltip: String
     let action: () -> Void
 
+    @Environment(\.colorScheme) private var colorScheme
     @State private var isHovering = false
 
     var body: some View {
@@ -1136,7 +1206,7 @@ private struct UtilityDockButton: View {
                     .overlay(alignment: .topTrailing) {
                         if showBadgeDot {
                             Circle()
-                                .fill(Color.green)
+                                .fill(CCXBadgePalette.green.labelColor(for: colorScheme))
                                 .frame(width: 6, height: 6)
                                 .offset(x: 4, y: -2)
                         }
@@ -1164,27 +1234,27 @@ private struct UtilityDockButton: View {
     }
 
     private var resolvedSymbolColor: Color {
-        if isDestructive && isHovering { return .red }
+        if isDestructive && isHovering { return CCXBadgePalette.red.labelColor(for: colorScheme) }
         if let symbolTint { return symbolTint }
         return isHovering ? .primary : .secondary
     }
 
     private var resolvedLabelColor: Color {
-        if isDestructive && isHovering { return .red }
-        if needsAttention { return .orange }
-        return isHovering ? .primary : .secondary
+        if isDestructive && isHovering { return CCXBadgePalette.red.labelColor(for: colorScheme) }
+        if needsAttention { return CCXBadgePalette.orange.labelColor(for: colorScheme) }
+        return isHovering ? .primary : Color.primary.opacity(0.76)
     }
 
     private var hoverBackground: Color {
-        if isDestructive && isHovering { return Color.red.opacity(0.11) }
-        if needsAttention { return Color.orange.opacity(isHovering ? 0.18 : 0.10) }
-        return isHovering ? Color.primary.opacity(0.08) : .clear
+        if isDestructive && isHovering { return CCXBadgePalette.red.accentColor.opacity(0.12) }
+        if needsAttention { return CCXBadgePalette.orange.accentColor.opacity(isHovering ? 0.18 : 0.10) }
+        return (symbolTint ?? Color.primary).opacity(isHovering ? 0.12 : 0)
     }
 
     private var hoverBorder: Color {
-        if isDestructive && isHovering { return Color.red.opacity(0.28) }
-        if needsAttention { return Color.orange.opacity(isHovering ? 0.36 : 0.22) }
-        return isHovering ? Color.primary.opacity(0.10) : .clear
+        if isDestructive && isHovering { return CCXBadgePalette.red.accentColor.opacity(0.32) }
+        if needsAttention { return CCXBadgePalette.orange.accentColor.opacity(isHovering ? 0.40 : 0.24) }
+        return (symbolTint ?? Color.primary).opacity(isHovering ? 0.30 : 0)
     }
 }
 
@@ -1193,19 +1263,38 @@ private struct UtilityDockButton: View {
 private extension View {
     @ViewBuilder
     func ccxPopoverSurface(cornerRadius: CGFloat) -> some View {
+        let topWash = LinearGradient(
+            colors: [
+                CCXBadgePalette.blue.topColor.opacity(0.085),
+                CCXBadgePalette.indigo.topColor.opacity(0.035),
+                .clear,
+            ],
+            startPoint: .top,
+            endPoint: .center
+        )
         if #available(macOS 26.0, *) {
             self
+                .background(
+                    topWash,
+                    in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                )
                 .glassEffect(.regular, in: .rect(cornerRadius: cornerRadius))
                 .overlay(
                     RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
                         .strokeBorder(Color.primary.opacity(0.12), lineWidth: 1)
+                        .allowsHitTesting(false)
                 )
         } else {
             self
+                .background(
+                    topWash,
+                    in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                )
                 .background(.regularMaterial, in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
                 .overlay(
                     RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
                         .strokeBorder(Color.primary.opacity(0.12), lineWidth: 1)
+                        .allowsHitTesting(false)
                 )
         }
     }
