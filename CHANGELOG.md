@@ -2,6 +2,12 @@
 
 All notable changes to **CCX (Control · Command · X)** are documented in this file.
 
+## [0.4.4] - 2026-11-24
+
+### Added
+- **Dedicated Recordings Folder**: Screen recordings (`MP4`, `MOV`, and `GIF`) now save by default to `~/Movies/CCX`, kept cleanly independent from the PNG screenshot save directory and customizable anytime in **Settings → Recordings** (`Choose…` / `Open`).
+- **Quick-Open from Menu Bar Popover**: Added a hover-revealed folder accessory button and right-click context menu item (`Open Recordings Folder`) directly on the **Record** tile in the menu bar popover to jump straight to your recordings in Finder.
+
 ## [0.4.3] - 2026-11-24
 
 ### Fixed

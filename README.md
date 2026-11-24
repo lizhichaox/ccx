@@ -25,13 +25,14 @@
 ### 3. Record (Screen Recording — MP4, MOV & GIF)
 - **Hardware-Accelerated Video & GIF**: Record any region or full display to `MP4` (H.264), `MOV` (HEVC), or memory-bounded `GIF` with adjustable recording border and live menu bar timer.
 - **Dual Audio & Pause/Resume**: Optional system audio and microphone narration with real-time mixing, true pause/resume timeline offsetting, graceful microphone fallback, and stream-interruption salvage.
+- **Dedicated Recordings Folder**: Saves recordings by default to `~/Movies/CCX` (configurable in **Settings** and independent from PNG save locations), with quick-open access from the menu bar popover's **Record** tile and Settings.
 - **Non-Destructive Output**: Atomic Copy, Save, Quick Save, and Reveal in Finder actions that preserve your recording if a destination write fails.
 
 ---
 
 ## Installation
 
-1. Download the latest `CCX-0.4.3-macOS-universal.dmg` (or `.zip`).
+1. Download the latest `CCX-0.4.4-macOS-universal.dmg` (or `.zip`).
 2. Open the disk image and drag **CCX.app** into **Applications**.
 3. Launch **CCX** from `/Applications` or Spotlight.
 
@@ -146,7 +147,7 @@ done
 ### Public Release Packaging (Universal Binary + Hardened Runtime)
 ```bash
 # Bump version in project.yml when preparing a release:
-./scripts/bump-version.sh 0.4.3
+./scripts/bump-version.sh 0.4.4
 
 # Build signed Universal Binary (arm64 + x86_64), verify dylibs/codesign/entitlements,
 # and emit dist/CCX-<version>-macOS-universal.{dmg,zip} + dist/SHA256SUMS.txt:
