@@ -49,6 +49,8 @@ public final class PinPanel: NSPanel, NSWindowDelegate {
     internal var inlineEditorForTesting: NSTextField? { annotationController?.inlineEditorForTesting }
     internal var annotationBakeCountForTesting: Int { annotationController?.bakeCountForTesting ?? 0 }
     internal var hasAnnotationControllerForTesting: Bool { annotationController != nil }
+    internal var activeAnnotationToolForTesting: AnnotationTool? { annotationController?.activeTool }
+    internal var hoverToolbarButtonForTesting: NSButton? { pinView.hoverToolbarButton }
 
     private let pinView: PinContentView
     private var annotationController: PinAnnotationController?
@@ -156,6 +158,15 @@ public final class PinPanel: NSPanel, NSWindowDelegate {
             }
         }
 
+        if state.isThumbnail || state.isClickThrough {
+            pinView.cancelPendingDragAndClicks()
+        }
+        if previous == nil
+            || previous?.isThumbnail != state.isThumbnail
+            || previous?.isClickThrough != state.isClickThrough {
+            pinView.updateTrackingAreas()
+        }
+
         let needsContentRedraw = previous == nil
             || previous?.isThumbnail != state.isThumbnail
             || previous?.showsBorder != state.showsBorder
@@ -224,6 +235,7 @@ public final class PinPanel: NSPanel, NSWindowDelegate {
     }
 
     public func windowDidResignKey(_ notification: Notification) {
+        pinView.cancelPendingDragAndClicks()
         annotationController?.handleParentWindowDidResignKey(for: self)
     }
 
@@ -239,13 +251,14 @@ public final class PinPanel: NSPanel, NSWindowDelegate {
     var frameTopLeft: CGPoint { CGPoint(x: frame.minX, y: frame.maxY) }
 
     /// Shows the two-tier Liquid Glass annotation toolbar attached to an `.image` pin.
-    public func showAnnotationToolbar() {
+    public func showAnnotationToolbar(initialTool: AnnotationTool = .select) {
         guard case let .image(image, scale) = content,
               !state.isThumbnail,
               !state.isClickThrough,
               !isToolbarVisible
         else { return }
 
+        pinView.cancelPendingDragAndClicks()
         onToolbarWillOpen?(self)
 
         var workingBaseImage = image
@@ -304,7 +317,7 @@ public final class PinPanel: NSPanel, NSWindowDelegate {
         }
 
         acceptsMouseMovedEvents = true
-        controller.openToolbar(on: self, in: pinView, initialStyle: pendingAnnotationStyle)
+        controller.openToolbar(on: self, in: pinView, initialStyle: pendingAnnotationStyle, initialTool: initialTool)
         makeKey()
         makeFirstResponder(pinView)
         pinView.updateTrackingAreas()
@@ -315,6 +328,7 @@ public final class PinPanel: NSPanel, NSWindowDelegate {
     /// Closes the annotation toolbar, either baking committed annotations or rolling back session edits.
     public func closeToolbar(commit: Bool) {
         guard isToolbarVisible, let controller = annotationController else { return }
+        pinView.cancelPendingDragAndClicks()
         if commit {
             if let baked = controller.closeToolbar(on: self, commit: true) {
                 content = .image(baked, scale: exportScale)
@@ -450,6 +464,20 @@ public final class PinPanel: NSPanel, NSWindowDelegate {
 
         let char = event.charactersIgnoringModifiers?.lowercased() ?? ""
         if !flags.contains(.command) && !flags.contains(.control) && !flags.contains(.option) {
+            if !flags.contains(.shift), canShowAnnotationToolbar, !state.isThumbnail {
+                if char == "e" || char == " " || event.keyCode == 49 {
+                    showAnnotationToolbar()
+                    return
+                }
+                if char == "t" {
+                    recognizeTextFromMenu(nil)
+                    return
+                }
+                if let tool = AnnotationTool.forNumberKey(char) {
+                    showAnnotationToolbar(initialTool: tool)
+                    return
+                }
+            }
             switch char {
             case "r":
                 if flags.contains(.shift) { rotateCounterClockwise() } else { rotateClockwise() }
@@ -598,6 +626,7 @@ public final class PinPanel: NSPanel, NSWindowDelegate {
         }
         acceptsMouseMovedEvents = false
         pinView.hideHUD()
+        pinView.resetInteractionState()
         pinView.clearTrackingAreas()
 
         let closeHandler = onClose
@@ -623,6 +652,22 @@ public final class PinPanel: NSPanel, NSWindowDelegate {
     func makeContextMenu() -> NSMenu {
         let menu = NSMenu(title: CCXL10n.text("Pin", zh: "贴图"))
         menu.autoenablesItems = false
+        if canShowAnnotationToolbar {
+            let toolbarItem = menuItem(
+                isToolbarVisible
+                    ? CCXL10n.text("Hide Toolbar", zh: "收起工具栏")
+                    : CCXL10n.text("Show Toolbar", zh: "显示工具栏"),
+                #selector(toggleAnnotationToolbarFromMenu(_:)),
+                key: "e"
+            )
+            toolbarItem.keyEquivalentModifierMask = []
+            toolbarItem.image = NSImage(
+                systemSymbolName: isToolbarVisible ? "checkmark.circle" : "pencil.tip.crop.circle",
+                accessibilityDescription: nil
+            )
+            menu.addItem(toolbarItem)
+            menu.addItem(.separator())
+        }
         menu.addItem(menuItem(CCXL10n.text("Copy", zh: "拷贝"), #selector(copyPin(_:)), key: "c"))
         switch content {
         case .image:
@@ -639,14 +684,6 @@ public final class PinPanel: NSPanel, NSWindowDelegate {
         quickSave.keyEquivalentModifierMask = [.command, .shift]
         menu.addItem(quickSave)
         menu.addItem(menuItem(CCXL10n.text("Duplicate", zh: "创建副本"), #selector(duplicatePin(_:)), key: "d"))
-        if canShowAnnotationToolbar && !state.isThumbnail {
-            menu.addItem(menuItem(
-                isToolbarVisible
-                    ? CCXL10n.text("Done Annotating", zh: "完成标注")
-                    : CCXL10n.text("Annotate", zh: "标注"),
-                #selector(toggleAnnotationToolbarFromMenu(_:))
-            ))
-        }
         menu.addItem(.separator())
 
         let resetZoomItem = menuItem(CCXL10n.text("Reset Zoom (100%)", zh: "实际大小 (100%)"), #selector(resetZoom(_:)), key: "0")
@@ -736,6 +773,9 @@ public final class PinPanel: NSPanel, NSWindowDelegate {
         if isToolbarVisible {
             closeToolbar(commit: true)
         } else {
+            if state.isThumbnail {
+                toggleThumbnail()
+            }
             showAnnotationToolbar()
         }
     }
@@ -828,17 +868,40 @@ private final class PinAnnotationOverlayView: NSView {
 /// Content view that renders images via GPU `CALayer`, live annotations via an overlay subview,
 /// cards via cached CoreGraphics drawing, transient HUD, and routes mouse interactions.
 final class PinContentView: NSView {
+    private struct PendingWindowDrag {
+        let startScreenPoint: CGPoint
+        let initialOrigin: CGPoint
+        var didStartMoving: Bool
+    }
+
+    private struct PrimaryClickRecord {
+        let timestamp: TimeInterval
+        let screenPoint: CGPoint
+    }
+
     weak var panel: PinPanel?
+    var mouseLocationProvider: () -> CGPoint = { NSEvent.mouseLocation }
+    var hoverToolbarButton: NSButton { hoverToolbarControl }
 
     private let imageContainerLayer = CALayer()
     private let imageLayer = CALayer()
     private let borderLayer = CALayer()
     private let annotationOverlayView = PinAnnotationOverlayView(frame: .zero)
+    private let hoverToolbarControl = PinHoverToolbarButton(frame: CGRect(
+        x: 0,
+        y: 0,
+        width: PinHoverToolbarButton.diameter,
+        height: PinHoverToolbarButton.diameter
+    ))
     private let hudView = PinHUDView()
 
     private var hudHideTask: Task<Void, Never>?
     private var hudGeneration: UInt64 = 0
     private var hoverTrackingArea: NSTrackingArea?
+    private var isPointerInside = false
+    private var pendingWindowDrag: PendingWindowDrag?
+    private var lastPrimaryClick: PrimaryClickRecord?
+    private var lastDoubleClickActionTimestamp: TimeInterval = 0
     private var cachedTextKey: String?
     private var cachedAttributedText: NSAttributedString?
     private(set) var lastHUDText: String?
@@ -867,6 +930,11 @@ final class PinContentView: NSView {
         borderLayer.zPosition = 30
         layer?.addSublayer(borderLayer)
 
+        hoverToolbarControl.isHidden = true
+        hoverToolbarControl.target = self
+        hoverToolbarControl.action = #selector(handleHoverToolbarButtonClick(_:))
+        addSubview(hoverToolbarControl)
+
         hudView.isHidden = true
         hudView.layer?.zPosition = 50
         hudView.setAccessibilityElement(false)
@@ -892,6 +960,7 @@ final class PinContentView: NSView {
     override func viewWillMove(toWindow newWindow: NSWindow?) {
         if newWindow == nil {
             hideHUD()
+            resetInteractionState()
             clearTrackingAreas()
         }
         super.viewWillMove(toWindow: newWindow)
@@ -911,6 +980,8 @@ final class PinContentView: NSView {
         super.layout()
         annotationOverlayView.frame = bounds
         syncVisualState()
+        positionHoverToolbarButton()
+        updateHoverToolbarButtonVisibility()
         if !hudView.isHidden {
             positionHUD()
         }
@@ -1010,6 +1081,9 @@ final class PinContentView: NSView {
         annotationOverlayView.isHidden = (panel.activeAnnotationController == nil)
 
         CATransaction.commit()
+        hoverToolbarControl.updateLocalization()
+        positionHoverToolbarButton()
+        updateHoverToolbarButtonVisibility()
         updateAccessibility(for: panel)
     }
 
@@ -1096,6 +1170,57 @@ final class PinContentView: NSView {
         )
     }
 
+    func cancelPendingDragAndClicks() {
+        pendingWindowDrag = nil
+        lastPrimaryClick = nil
+        updateHoverToolbarButtonVisibility()
+    }
+
+    func resetInteractionState() {
+        pendingWindowDrag = nil
+        lastPrimaryClick = nil
+        lastDoubleClickActionTimestamp = 0
+        isPointerInside = false
+        hoverToolbarControl.isHidden = true
+    }
+
+    private var canShowHoverToolbarButton: Bool {
+        guard let panel,
+              panel.canShowAnnotationToolbar,
+              !panel.state.isThumbnail,
+              !panel.state.isClickThrough,
+              !panel.isToolbarVisible,
+              pendingWindowDrag?.didStartMoving != true,
+              bounds.width >= 84,
+              bounds.height >= 52
+        else { return false }
+        return true
+    }
+
+    private func positionHoverToolbarButton() {
+        let size = PinHoverToolbarButton.diameter
+        let inset = PinHoverToolbarButton.edgeInset
+        hoverToolbarControl.frame = CGRect(
+            x: (bounds.maxX - inset - size).rounded(),
+            y: inset,
+            width: size,
+            height: size
+        )
+    }
+
+    private func updateHoverToolbarButtonVisibility() {
+        let shouldShow = isPointerInside && canShowHoverToolbarButton
+        hoverToolbarControl.isHidden = !shouldShow
+        if shouldShow {
+            positionHoverToolbarButton()
+        }
+    }
+
+    @objc private func handleHoverToolbarButtonClick(_ sender: Any?) {
+        cancelPendingDragAndClicks()
+        panel?.showAnnotationToolbar()
+    }
+
     func clearTrackingAreas() {
         if let hoverTrackingArea {
             removeTrackingArea(hoverTrackingArea)
@@ -1106,34 +1231,112 @@ final class PinContentView: NSView {
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
         clearTrackingAreas()
-        guard panel?.activeAnnotationController != nil else { return }
+        guard let panel,
+              panel.canShowAnnotationToolbar,
+              !panel.state.isThumbnail,
+              !panel.state.isClickThrough
+        else {
+            isPointerInside = false
+            updateHoverToolbarButtonVisibility()
+            return
+        }
+        var options: NSTrackingArea.Options = [.mouseEnteredAndExited, .activeAlways, .inVisibleRect]
+        if panel.activeAnnotationController != nil {
+            options.insert(.mouseMoved)
+        }
         let area = NSTrackingArea(
             rect: .zero,
-            options: [.mouseMoved, .mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            options: options,
             owner: self,
             userInfo: nil
         )
         addTrackingArea(area)
         hoverTrackingArea = area
+        updateHoverToolbarButtonVisibility()
+    }
+
+    private func isDoubleClickEvent(_ event: NSEvent, atScreenPoint screenPoint: CGPoint) -> Bool {
+        if event.clickCount >= 2 {
+            // Prevent an accidental 3rd rapid click right after a double-click action from bouncing back.
+            if event.clickCount == 3,
+               event.timestamp > 0,
+               lastDoubleClickActionTimestamp > 0 {
+                let sinceAction = event.timestamp - lastDoubleClickActionTimestamp
+                if sinceAction > 0 && sinceAction <= NSEvent.doubleClickInterval {
+                    return false
+                }
+            }
+            return true
+        }
+        guard event.timestamp > 0,
+              let last = lastPrimaryClick,
+              last.timestamp > 0
+        else { return false }
+        let delta = event.timestamp - last.timestamp
+        guard delta > 0 && delta <= NSEvent.doubleClickInterval else { return false }
+        let distance = hypot(screenPoint.x - last.screenPoint.x, screenPoint.y - last.screenPoint.y)
+        return distance <= 6
+    }
+
+    private func consumeDoubleClick(timestamp: TimeInterval) {
+        lastPrimaryClick = nil
+        pendingWindowDrag = nil
+        lastDoubleClickActionTimestamp = timestamp > 0 ? timestamp : 0
+    }
+
+    private func recordPrimaryClick(atScreenPoint screenPoint: CGPoint, timestamp: TimeInterval) {
+        if timestamp > 0 {
+            lastPrimaryClick = PrimaryClickRecord(timestamp: timestamp, screenPoint: screenPoint)
+        } else {
+            lastPrimaryClick = nil
+        }
+    }
+
+    private func beginPendingWindowDrag(for panel: PinPanel) {
+        pendingWindowDrag = PendingWindowDrag(
+            startScreenPoint: mouseLocationProvider(),
+            initialOrigin: panel.frame.origin,
+            didStartMoving: false
+        )
     }
 
     override func mouseDown(with event: NSEvent) {
         guard let panel else { return }
+        pendingWindowDrag = nil
         panel.makeKey()
+
+        let screenPoint = panel.convertPoint(toScreen: event.locationInWindow)
+        let isDoubleClick = isDoubleClickEvent(event, atScreenPoint: screenPoint)
+
         if let controller = panel.activeAnnotationController {
+            let effectiveClickCount = isDoubleClick ? max(event.clickCount, 2) : 1
             let point = convert(event.locationInWindow, from: nil)
-            switch controller.handleMouseDown(at: point, clickCount: event.clickCount, in: self, panel: panel) {
+            switch controller.handleMouseDown(at: point, clickCount: effectiveClickCount, in: self, panel: panel) {
             case .handled:
+                if isDoubleClick {
+                    consumeDoubleClick(timestamp: event.timestamp)
+                } else {
+                    lastPrimaryClick = nil
+                }
                 return
             case .doubleClickedEmptyToCommit:
+                consumeDoubleClick(timestamp: event.timestamp)
                 panel.closeToolbar(commit: true)
                 return
             case .passThroughDragPin:
-                window?.performDrag(with: event)
+                if isDoubleClick {
+                    consumeDoubleClick(timestamp: event.timestamp)
+                    panel.closeToolbar(commit: true)
+                    return
+                }
+                recordPrimaryClick(atScreenPoint: screenPoint, timestamp: event.timestamp)
+                beginPendingWindowDrag(for: panel)
                 return
             }
         }
-        if event.clickCount == 2 {
+
+        if isDoubleClick {
+            consumeDoubleClick(timestamp: event.timestamp)
             if panel.state.isThumbnail {
                 panel.toggleThumbnail()
             } else if panel.canShowAnnotationToolbar {
@@ -1143,11 +1346,32 @@ final class PinContentView: NSView {
             }
             return
         }
-        window?.performDrag(with: event)
+
+        recordPrimaryClick(atScreenPoint: screenPoint, timestamp: event.timestamp)
+        beginPendingWindowDrag(for: panel)
     }
 
     override func mouseDragged(with event: NSEvent) {
-        guard let panel, let controller = panel.activeAnnotationController else {
+        guard let panel else {
+            super.mouseDragged(with: event)
+            return
+        }
+        if var drag = pendingWindowDrag {
+            let screenNow = mouseLocationProvider()
+            let dx = screenNow.x - drag.startScreenPoint.x
+            let dy = screenNow.y - drag.startScreenPoint.y
+            guard dx.isFinite, dy.isFinite else { return }
+            if !drag.didStartMoving {
+                guard hypot(dx, dy) >= 3.0 else { return }
+                drag.didStartMoving = true
+                lastPrimaryClick = nil
+                pendingWindowDrag = drag
+                updateHoverToolbarButtonVisibility()
+            }
+            panel.setFrameOrigin(CGPoint(x: drag.initialOrigin.x + dx, y: drag.initialOrigin.y + dy))
+            return
+        }
+        guard let controller = panel.activeAnnotationController else {
             super.mouseDragged(with: event)
             return
         }
@@ -1156,7 +1380,29 @@ final class PinContentView: NSView {
     }
 
     override func mouseUp(with event: NSEvent) {
-        guard let panel, let controller = panel.activeAnnotationController else {
+        guard let panel else {
+            super.mouseUp(with: event)
+            return
+        }
+        if let drag = pendingWindowDrag {
+            pendingWindowDrag = nil
+            if drag.didStartMoving {
+                let screens = NSScreen.screens.map(\.visibleFrame)
+                if !screens.isEmpty {
+                    let clamped = PinLayout.clampedOriginToScreens(panel.frame, screens: screens)
+                    if clamped.origin != panel.frame.origin {
+                        panel.setFrameOrigin(clamped.origin)
+                    }
+                }
+                if isPointerInside {
+                    let point = convert(event.locationInWindow, from: nil)
+                    isPointerInside = bounds.contains(point)
+                }
+                updateHoverToolbarButtonVisibility()
+            }
+            return
+        }
+        guard let controller = panel.activeAnnotationController else {
             super.mouseUp(with: event)
             return
         }
@@ -1173,12 +1419,21 @@ final class PinContentView: NSView {
         controller.handleMouseMoved(at: point, in: self, baseSize: panel.baseSize)
     }
 
+    override func mouseEntered(with event: NSEvent) {
+        isPointerInside = true
+        updateHoverToolbarButtonVisibility()
+        super.mouseEntered(with: event)
+    }
+
     override func mouseExited(with event: NSEvent) {
+        isPointerInside = false
+        updateHoverToolbarButtonVisibility()
         panel?.activeAnnotationController?.handleMouseExited()
         super.mouseExited(with: event)
     }
 
     override func rightMouseDown(with event: NSEvent) {
+        cancelPendingDragAndClicks()
         if let panel, let controller = panel.activeAnnotationController, controller.handleRightMouseDown(on: panel) {
             return
         }
@@ -1291,6 +1546,116 @@ final class PinContentView: NSView {
             PinRenderer.draw(panel.content, in: rect, zoom: fill, context: context, cachedAttributedText: cachedText)
         }
         context.restoreGState()
+    }
+}
+
+private final class PinHoverToolbarButton: NSButton {
+    static let diameter: CGFloat = 26
+    static let edgeInset: CGFloat = 8
+
+    private var hoverArea: NSTrackingArea?
+    private var isHovered = false {
+        didSet {
+            guard oldValue != isHovered else { return }
+            updateChrome()
+        }
+    }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        setButtonType(.momentaryChange)
+        isBordered = false
+        title = ""
+        imagePosition = .imageOnly
+        bezelStyle = .regularSquare
+        focusRingType = .none
+        (cell as? NSButtonCell)?.imageScaling = .scaleProportionallyDown
+
+        wantsLayer = true
+        layer?.cornerRadius = Self.diameter / 2
+        layer?.masksToBounds = false
+        layer?.borderWidth = 0.75
+        layer?.shadowColor = NSColor.black.cgColor
+        layer?.shadowOpacity = 0.30
+        layer?.shadowRadius = 4
+        layer?.shadowOffset = CGSize(width: 0, height: -1)
+        layer?.zPosition = 45
+
+        let symbolConfig = NSImage.SymbolConfiguration(pointSize: 13, weight: .semibold)
+        let symbol = NSImage(systemSymbolName: "pencil.tip.crop.circle", accessibilityDescription: nil)?
+            .withSymbolConfiguration(symbolConfig)
+        symbol?.isTemplate = true
+        image = symbol
+        contentTintColor = NSColor.white.withAlphaComponent(0.95)
+
+        updateLocalization()
+        updateChrome()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    override var mouseDownCanMoveWindow: Bool { false }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override var isHidden: Bool {
+        didSet {
+            if isHidden {
+                isHovered = false
+            }
+        }
+    }
+
+    func updateLocalization() {
+        toolTip = CCXL10n.text("Show Toolbar (E / Double-click)", zh: "显示工具栏 (E / 双击)")
+        setAccessibilityLabel(CCXL10n.text("Show Toolbar", zh: "显示工具栏"))
+    }
+
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        if newWindow == nil, let hoverArea {
+            removeTrackingArea(hoverArea)
+            self.hoverArea = nil
+            isHovered = false
+        }
+        super.viewWillMove(toWindow: newWindow)
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let hoverArea {
+            removeTrackingArea(hoverArea)
+            self.hoverArea = nil
+        }
+        let area = NSTrackingArea(
+            rect: .zero,
+            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        hoverArea = area
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        isHovered = true
+        super.mouseEntered(with: event)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        isHovered = false
+        super.mouseExited(with: event)
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        updateChrome()
+    }
+
+    private func updateChrome() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            layer?.backgroundColor = NSColor(white: 0.11, alpha: isHovered ? 0.88 : 0.72).cgColor
+            layer?.borderColor = NSColor.white.withAlphaComponent(isHovered ? 0.42 : 0.26).cgColor
+        }
     }
 }
 

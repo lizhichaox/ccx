@@ -113,16 +113,24 @@ final class PinAnnotationController: NSObject, NSTextFieldDelegate {
         activeDrag = .none
     }
 
-    func openToolbar(on panel: PinPanel, in contentView: NSView, initialStyle: AnnotationStyle) {
+    func openToolbar(
+        on panel: PinPanel,
+        in contentView: NSView,
+        initialStyle: AnnotationStyle,
+        initialTool: AnnotationTool = .select
+    ) {
         hostPanel = panel
         hostContentView = contentView
         currentStyle = initialStyle
-        activeTool = .select
+        activeTool = initialTool
         activeDrag = .none
         customToolbarOffsetFromTopLeft = nil
         resetScrollUndoCoalescing()
         resetSliderUndoCoalescing()
         sessionEntrySnapshot = (items: document.items, selectedID: document.selectedID)
+        if initialTool.isDrawingTool {
+            document.selectedID = nil
+        }
         isToolbarVisible = true
 
         let toolbar = AnnotationActionToolbar(preset: .pin)
@@ -157,7 +165,7 @@ final class PinAnnotationController: NSObject, NSTextFieldDelegate {
             for: panel.frame,
             in: visible,
             topInset: 0,
-            showsStyleBar: false,
+            showsStyleBar: shouldShowStyleBar,
             preset: .pin
         )
         let floating = PinToolbarPanel(frame: initialFrame, toolbar: toolbar)
@@ -737,6 +745,10 @@ final class PinAnnotationController: NSObject, NSTextFieldDelegate {
         }
 
         if flags.isEmpty {
+            if chars == "e" {
+                onToolbarAction?(.done)
+                return true
+            }
             if chars == "v" {
                 setActiveTool(.select, on: panel)
                 return true

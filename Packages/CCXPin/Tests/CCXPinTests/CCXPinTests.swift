@@ -642,8 +642,10 @@ final class PinPanelAndManagerTests: XCTestCase {
         XCTAssertTrue(manager.pin(content: .image(imgA, scale: 2), at: CGRect(x: 120, y: 120, width: 120, height: 70), contentIdentity: identityA))
         let panelA = try XCTUnwrap(manager.panels.first)
 
-        let closedMenuTitles = panelA.makeContextMenu().items.map(\.title)
-        XCTAssertTrue(closedMenuTitles.contains("Annotate"))
+        let closedMenu = panelA.makeContextMenu()
+        let closedMenuTitles = closedMenu.items.map(\.title)
+        XCTAssertEqual(closedMenuTitles.first, "Show Toolbar")
+        XCTAssertTrue(closedMenu.items[1].isSeparatorItem)
         XCTAssertTrue(closedMenuTitles.contains("Toggle Thumbnail"))
 
         // Double-clicking an image pin opens its floating annotation toolbar instead of collapsing to thumbnail.
@@ -662,7 +664,7 @@ final class PinPanelAndManagerTests: XCTestCase {
         XCTAssertTrue(panelA.isToolbarVisible)
         XCTAssertFalse(panelA.state.isThumbnail)
         XCTAssertNotNil(panelA.toolbarPanelForTesting)
-        XCTAssertTrue(panelA.makeContextMenu().items.map(\.title).contains("Done Annotating"))
+        XCTAssertEqual(panelA.makeContextMenu().items.first?.title, "Hide Toolbar")
 
         // Select rectangle tool (`1`), draw a bright red rectangle across the center, and test undo/redo.
         let key1 = try XCTUnwrap(NSEvent.keyEvent(
@@ -1506,13 +1508,15 @@ final class PinPanelAndManagerTests: XCTestCase {
             let img2 = makePinTestImage(width: 160, height: 100) { _, _ in (200, 150, 100, 255) }
             XCTAssertTrue(manager.pin(content: .image(img2, scale: 2), at: CGRect(x: 260, y: 120, width: 80, height: 50)))
             let imagePanel2 = manager.panels[1]
-            let imageTitles = imagePanel2.makeContextMenu().items.map(\.title)
+            let imageMenu = imagePanel2.makeContextMenu()
+            let imageTitles = imageMenu.items.map(\.title)
+            XCTAssertEqual(imageTitles.first, "显示工具栏")
+            XCTAssertTrue(imageMenu.items[1].isSeparatorItem)
             XCTAssertTrue(imageTitles.contains("拷贝"))
             XCTAssertTrue(imageTitles.contains("识别文字 (OCR)"))
             XCTAssertTrue(imageTitles.contains("保存 PNG"))
             XCTAssertTrue(imageTitles.contains("快速保存 PNG"))
             XCTAssertTrue(imageTitles.contains("创建副本"))
-            XCTAssertTrue(imageTitles.contains("标注"))
             XCTAssertTrue(imageTitles.contains("实际大小 (100%)"))
             XCTAssertTrue(imageTitles.contains("顺时针旋转 90°"))
             XCTAssertTrue(imageTitles.contains("逆时针旋转 90°"))
@@ -1528,6 +1532,10 @@ final class PinPanelAndManagerTests: XCTestCase {
             XCTAssertTrue(imageTitles.contains("解除全部穿透 (1)"))
             XCTAssertTrue(imageTitles.contains("隐藏全部贴图"))
             XCTAssertTrue(imageTitles.contains("关闭全部贴图"))
+
+            imagePanel2.showAnnotationToolbar()
+            XCTAssertEqual(imagePanel2.makeContextMenu().items.first?.title, "收起工具栏")
+            imagePanel2.closeToolbar(commit: false)
 
             imagePanel2.copyPin(nil)
             XCTAssertEqual(copiedMessages.last, "已拷贝到剪贴板")
@@ -1545,5 +1553,392 @@ final class PinPanelAndManagerTests: XCTestCase {
             store.copyText("测试文本")
             XCTAssertEqual(manager.pinTileStatus(), .ready(count: 1, primaryLabel: "文本"))
         }
+    }
+
+    func testContextMenuToolbarTriggerAtIndexZeroWithShortcutLocalizationAndThumbnailSupport() throws {
+        let (store, _) = makeStore()
+        let manager = PinManager(clipboardStore: store)
+        defer { manager.closeAllPins() }
+
+        let img = makePinTestImage(width: 240, height: 140) { _, _ in (210, 220, 230, 255) }
+        XCTAssertTrue(manager.pin(content: .image(img, scale: 2), at: CGRect(x: 120, y: 120, width: 120, height: 70)))
+        let panel = try XCTUnwrap(manager.panels.first)
+
+        // Index 0 is "Show Toolbar" with shortcut "e" (empty modifiers) and SF symbol icon, followed by separator.
+        let closedMenu = panel.makeContextMenu()
+        let firstItem = try XCTUnwrap(closedMenu.items.first)
+        XCTAssertEqual(firstItem.title, "Show Toolbar")
+        XCTAssertEqual(firstItem.keyEquivalent, "e")
+        XCTAssertEqual(firstItem.keyEquivalentModifierMask, [])
+        XCTAssertNotNil(firstItem.image)
+        XCTAssertTrue(closedMenu.items[1].isSeparatorItem)
+        XCTAssertFalse(closedMenu.items.map(\.title).contains("Annotate"))
+        XCTAssertFalse(closedMenu.items.map(\.title).contains("Done Annotating"))
+
+        // Invoking from menu opens toolbar and flips index 0 to "Hide Toolbar".
+        panel.toggleAnnotationToolbarFromMenu(nil)
+        XCTAssertTrue(panel.isToolbarVisible)
+        let openMenu = panel.makeContextMenu()
+        let openFirst = try XCTUnwrap(openMenu.items.first)
+        XCTAssertEqual(openFirst.title, "Hide Toolbar")
+        XCTAssertEqual(openFirst.keyEquivalent, "e")
+        XCTAssertEqual(openFirst.keyEquivalentModifierMask, [])
+        XCTAssertNotNil(openFirst.image)
+        XCTAssertTrue(openMenu.items[1].isSeparatorItem)
+
+        // Invoking again from menu commits and closes toolbar.
+        panel.toggleAnnotationToolbarFromMenu(nil)
+        XCTAssertFalse(panel.isToolbarVisible)
+
+        // Simplified Chinese localization at index 0 for closed and open states.
+        CCXL10n.withLanguageForTesting(.zhHans) {
+            let zhClosed = panel.makeContextMenu()
+            XCTAssertEqual(zhClosed.items.first?.title, "显示工具栏")
+            XCTAssertTrue(zhClosed.items[1].isSeparatorItem)
+
+            panel.showAnnotationToolbar()
+            let zhOpen = panel.makeContextMenu()
+            XCTAssertEqual(zhOpen.items.first?.title, "收起工具栏")
+            XCTAssertTrue(zhOpen.items[1].isSeparatorItem)
+            panel.closeToolbar(commit: false)
+        }
+
+        // Thumbnail mode keeps "Show Toolbar" at index 0; menu toggle restores full size and opens toolbar,
+        // while direct programmatic showAnnotationToolbar() stays safely guarded.
+        panel.toggleThumbnail()
+        XCTAssertTrue(panel.state.isThumbnail)
+        panel.showAnnotationToolbar()
+        XCTAssertFalse(panel.isToolbarVisible)
+        XCTAssertTrue(panel.state.isThumbnail)
+
+        let thumbMenu = panel.makeContextMenu()
+        XCTAssertEqual(thumbMenu.items.first?.title, "Show Toolbar")
+        XCTAssertEqual(thumbMenu.items.first?.isEnabled, true)
+        panel.toggleAnnotationToolbarFromMenu(nil)
+        XCTAssertFalse(panel.state.isThumbnail)
+        XCTAssertTrue(panel.isToolbarVisible)
+        panel.closeToolbar(commit: false)
+
+        // Text and color pins must NOT include the toolbar item or leading separator.
+        XCTAssertTrue(manager.pin(content: .text("Note"), at: CGRect(x: 300, y: 120, width: 120, height: 60)))
+        let textPanel = try XCTUnwrap(manager.panels.last)
+        XCTAssertEqual(textPanel.makeContextMenu().items.first?.title, "Copy")
+
+        XCTAssertTrue(manager.pin(content: .color(CCXColorSample(red: 12, green: 34, blue: 56)), at: CGRect(x: 450, y: 120, width: 120, height: 60)))
+        let colorPanel = try XCTUnwrap(manager.panels.last)
+        XCTAssertEqual(colorPanel.makeContextMenu().items.first?.title, "Copy")
+    }
+
+    func testDeferredDragAndResilientDoubleClickDetection() throws {
+        let (store, _) = makeStore()
+        let manager = PinManager(clipboardStore: store)
+        defer { manager.closeAllPins() }
+
+        let img = makePinTestImage(width: 240, height: 140) { _, _ in (225, 225, 225, 255) }
+        let initialFrame = CGRect(x: 160, y: 160, width: 120, height: 70)
+        XCTAssertTrue(manager.pin(content: .image(img, scale: 2), at: initialFrame))
+        let panel = try XCTUnwrap(manager.panels.first)
+        let contentView = try XCTUnwrap(panel.contentView as? PinContentView)
+
+        var simulatedMouse = CGPoint(x: 220, y: 195)
+        contentView.mouseLocationProvider = { simulatedMouse }
+
+        // Single-click + mouseUp without dragging does NOT move the panel or open toolbar.
+        let click1 = try XCTUnwrap(NSEvent.mouseEvent(
+            with: .leftMouseDown, location: CGPoint(x: 60, y: 35), modifierFlags: [], timestamp: 10.0,
+            windowNumber: 0, context: nil, eventNumber: 1, clickCount: 1, pressure: 1
+        ))
+        let up1 = try XCTUnwrap(NSEvent.mouseEvent(
+            with: .leftMouseUp, location: CGPoint(x: 60, y: 35), modifierFlags: [], timestamp: 10.04,
+            windowNumber: 0, context: nil, eventNumber: 2, clickCount: 1, pressure: 0
+        ))
+        contentView.mouseDown(with: click1)
+        // Tiny sub-3pt jitter before mouseUp must NOT move the panel or cancel double-click detection.
+        simulatedMouse = CGPoint(x: 221.5, y: 196.0)
+        let tinyJitterDrag = try XCTUnwrap(NSEvent.mouseEvent(
+            with: .leftMouseDragged, location: CGPoint(x: 61.5, y: 36), modifierFlags: [], timestamp: 10.02,
+            windowNumber: 0, context: nil, eventNumber: 3, clickCount: 1, pressure: 1
+        ))
+        contentView.mouseDragged(with: tinyJitterDrag)
+        contentView.mouseUp(with: up1)
+        XCTAssertEqual(panel.frame.origin, initialFrame.origin)
+        XCTAssertFalse(panel.isToolbarVisible)
+
+        // Rapid second click with clickCount == 1 and 2.2pt jitter triggers double-click fallback & opens toolbar.
+        let click2 = try XCTUnwrap(NSEvent.mouseEvent(
+            with: .leftMouseDown, location: CGPoint(x: 62, y: 36), modifierFlags: [], timestamp: 10.16,
+            windowNumber: 0, context: nil, eventNumber: 4, clickCount: 1, pressure: 1
+        ))
+        contentView.mouseDown(with: click2)
+        XCTAssertTrue(panel.isToolbarVisible)
+
+        // A 3rd rapid click immediately afterward must NOT bounce back and close the toolbar.
+        let click3 = try XCTUnwrap(NSEvent.mouseEvent(
+            with: .leftMouseDown, location: CGPoint(x: 62, y: 36), modifierFlags: [], timestamp: 10.28,
+            windowNumber: 0, context: nil, eventNumber: 5, clickCount: 1, pressure: 1
+        ))
+        contentView.mouseDown(with: click3)
+        XCTAssertTrue(panel.isToolbarVisible)
+
+        // A genuine subsequent double-click on empty canvas while open in .select commits & closes toolbar.
+        let closeClick1 = try XCTUnwrap(NSEvent.mouseEvent(
+            with: .leftMouseDown, location: CGPoint(x: 50, y: 30), modifierFlags: [], timestamp: 12.0,
+            windowNumber: 0, context: nil, eventNumber: 6, clickCount: 1, pressure: 1
+        ))
+        let closeUp1 = try XCTUnwrap(NSEvent.mouseEvent(
+            with: .leftMouseUp, location: CGPoint(x: 50, y: 30), modifierFlags: [], timestamp: 12.03,
+            windowNumber: 0, context: nil, eventNumber: 7, clickCount: 1, pressure: 0
+        ))
+        let closeClick2 = try XCTUnwrap(NSEvent.mouseEvent(
+            with: .leftMouseDown, location: CGPoint(x: 52, y: 31), modifierFlags: [], timestamp: 12.15,
+            windowNumber: 0, context: nil, eventNumber: 8, clickCount: 1, pressure: 1
+        ))
+        contentView.mouseDown(with: closeClick1)
+        contentView.mouseUp(with: closeUp1)
+        XCTAssertTrue(panel.isToolbarVisible)
+        contentView.mouseDown(with: closeClick2)
+        XCTAssertFalse(panel.isToolbarVisible)
+
+        // Synthetic zero-timestamp clicks must NEVER false-trigger double-click.
+        let synthetic1 = try XCTUnwrap(NSEvent.mouseEvent(
+            with: .leftMouseDown, location: CGPoint(x: 60, y: 35), modifierFlags: [], timestamp: 0,
+            windowNumber: 0, context: nil, eventNumber: 9, clickCount: 1, pressure: 1
+        ))
+        let synthetic2 = try XCTUnwrap(NSEvent.mouseEvent(
+            with: .leftMouseDown, location: CGPoint(x: 60, y: 35), modifierFlags: [], timestamp: 0,
+            windowNumber: 0, context: nil, eventNumber: 10, clickCount: 1, pressure: 1
+        ))
+        contentView.mouseDown(with: synthetic1)
+        contentView.mouseDown(with: synthetic2)
+        XCTAssertFalse(panel.isToolbarVisible)
+
+        // Two rapid real-timestamp clicks > 6pt apart must NOT trigger double-click.
+        let farClick1 = try XCTUnwrap(NSEvent.mouseEvent(
+            with: .leftMouseDown, location: CGPoint(x: 20, y: 20), modifierFlags: [], timestamp: 20.0,
+            windowNumber: 0, context: nil, eventNumber: 11, clickCount: 1, pressure: 1
+        ))
+        let farClick2 = try XCTUnwrap(NSEvent.mouseEvent(
+            with: .leftMouseDown, location: CGPoint(x: 90, y: 50), modifierFlags: [], timestamp: 20.12,
+            windowNumber: 0, context: nil, eventNumber: 12, clickCount: 1, pressure: 1
+        ))
+        contentView.mouseDown(with: farClick1)
+        contentView.mouseDown(with: farClick2)
+        XCTAssertFalse(panel.isToolbarVisible)
+
+        // Dragging >= 3pt moves the panel cleanly and cancels double-click fallback.
+        simulatedMouse = CGPoint(x: 200, y: 200)
+        let dragDown = try XCTUnwrap(NSEvent.mouseEvent(
+            with: .leftMouseDown, location: CGPoint(x: 40, y: 40), modifierFlags: [], timestamp: 30.0,
+            windowNumber: 0, context: nil, eventNumber: 13, clickCount: 1, pressure: 1
+        ))
+        contentView.mouseDown(with: dragDown)
+        simulatedMouse = CGPoint(x: 225, y: 215)
+        let dragMove = try XCTUnwrap(NSEvent.mouseEvent(
+            with: .leftMouseDragged, location: CGPoint(x: 40, y: 40), modifierFlags: [], timestamp: 30.04,
+            windowNumber: 0, context: nil, eventNumber: 14, clickCount: 1, pressure: 1
+        ))
+        contentView.mouseDragged(with: dragMove)
+        let dragUp = try XCTUnwrap(NSEvent.mouseEvent(
+            with: .leftMouseUp, location: CGPoint(x: 40, y: 40), modifierFlags: [], timestamp: 30.08,
+            windowNumber: 0, context: nil, eventNumber: 15, clickCount: 1, pressure: 0
+        ))
+        contentView.mouseUp(with: dragUp)
+        XCTAssertEqual(panel.frame.origin.x, initialFrame.origin.x + 25, accuracy: 0.5)
+        XCTAssertEqual(panel.frame.origin.y, initialFrame.origin.y + 15, accuracy: 0.5)
+
+        // Explicit clickCount == 2 opens the toolbar reliably.
+        let explicitDoubleClick = try XCTUnwrap(NSEvent.mouseEvent(
+            with: .leftMouseDown, location: CGPoint(x: 60, y: 35), modifierFlags: [], timestamp: 35.0,
+            windowNumber: 0, context: nil, eventNumber: 16, clickCount: 2, pressure: 1
+        ))
+        contentView.mouseDown(with: explicitDoubleClick)
+        XCTAssertTrue(panel.isToolbarVisible)
+    }
+
+    func testHoverToolbarButtonVisibilityAndClickAction() throws {
+        let (store, _) = makeStore()
+        let manager = PinManager(clipboardStore: store)
+        defer { manager.closeAllPins() }
+
+        let img = makePinTestImage(width: 240, height: 140) { _, _ in (230, 230, 230, 255) }
+        XCTAssertTrue(manager.pin(content: .image(img, scale: 2), at: CGRect(x: 120, y: 120, width: 120, height: 70)))
+        let panel = try XCTUnwrap(manager.panels.first)
+        let contentView = try XCTUnwrap(panel.contentView)
+        let button = try XCTUnwrap(panel.hoverToolbarButtonForTesting)
+
+        let enterEvent = try XCTUnwrap(NSEvent.enterExitEvent(
+            with: .mouseEntered, location: CGPoint(x: 60, y: 35), modifierFlags: [], timestamp: 0,
+            windowNumber: 0, context: nil, eventNumber: 1, trackingNumber: 1, userData: nil
+        ))
+        let exitEvent = try XCTUnwrap(NSEvent.enterExitEvent(
+            with: .mouseExited, location: CGPoint(x: -5, y: -5), modifierFlags: [], timestamp: 0,
+            windowNumber: 0, context: nil, eventNumber: 2, trackingNumber: 1, userData: nil
+        ))
+
+        // Starts hidden so non-hovered rendering stays pure; acceptsFirstMouse for non-activating click.
+        XCTAssertTrue(button.isHidden)
+        XCTAssertTrue(button.acceptsFirstMouse(for: nil))
+        XCTAssertEqual(button.frame.size, CGSize(width: 26, height: 26))
+        XCTAssertEqual(button.frame.maxX, contentView.bounds.maxX - 8, accuracy: 0.5)
+        XCTAssertEqual(button.frame.minY, 8, accuracy: 0.5)
+
+        // Hover reveals button; exit hides it.
+        contentView.mouseEntered(with: enterEvent)
+        XCTAssertFalse(button.isHidden)
+        contentView.mouseExited(with: exitEvent)
+        XCTAssertTrue(button.isHidden)
+
+        // Clicking the hover button opens the toolbar and hides the button.
+        contentView.mouseEntered(with: enterEvent)
+        XCTAssertFalse(button.isHidden)
+        button.performClick(nil)
+        XCTAssertTrue(panel.isToolbarVisible)
+        XCTAssertTrue(button.isHidden)
+        panel.closeToolbar(commit: false)
+
+        // Collapsing to thumbnail hides hover button.
+        contentView.mouseEntered(with: enterEvent)
+        XCTAssertFalse(button.isHidden)
+        panel.toggleThumbnail()
+        XCTAssertTrue(button.isHidden)
+        contentView.mouseEntered(with: enterEvent)
+        XCTAssertTrue(button.isHidden)
+        panel.toggleThumbnail()
+
+        // Entering click-through hides hover button.
+        contentView.mouseEntered(with: enterEvent)
+        XCTAssertFalse(button.isHidden)
+        panel.setClickThrough(true)
+        XCTAssertTrue(button.isHidden)
+        contentView.mouseEntered(with: enterEvent)
+        XCTAssertTrue(button.isHidden)
+        panel.setClickThrough(false)
+
+        // Resizing below 84x52 hides hover button.
+        contentView.mouseEntered(with: enterEvent)
+        XCTAssertFalse(button.isHidden)
+        panel.setZoom(0.5) // 60x35 < 84x52
+        XCTAssertTrue(button.isHidden)
+
+        // Tiny image pin (< 84x52) keeps hover button hidden even on mouseEntered.
+        let tinyImg = makePinTestImage(width: 70, height: 44) { _, _ in (180, 180, 180, 255) }
+        XCTAssertTrue(manager.pin(content: .image(tinyImg, scale: 1), at: CGRect(x: 300, y: 120, width: 70, height: 44)))
+        let tinyPanel = try XCTUnwrap(manager.panels.last)
+        let tinyButton = try XCTUnwrap(tinyPanel.hoverToolbarButtonForTesting)
+        tinyPanel.contentView?.mouseEntered(with: enterEvent)
+        XCTAssertTrue(tinyButton.isHidden)
+
+        // Text pin keeps hover button hidden even on mouseEntered.
+        XCTAssertTrue(manager.pin(content: .text("No toolbar"), at: CGRect(x: 420, y: 120, width: 140, height: 60)))
+        let textPanel = try XCTUnwrap(manager.panels.last)
+        let textButton = try XCTUnwrap(textPanel.hoverToolbarButtonForTesting)
+        textPanel.contentView?.mouseEntered(with: enterEvent)
+        XCTAssertTrue(textButton.isHidden)
+    }
+
+    func testKeyboardDirectAccessOnFocusedImagePin() throws {
+        let (store, _) = makeStore()
+        let manager = PinManager(clipboardStore: store)
+        defer { manager.closeAllPins() }
+
+        var ocrCount = 0
+        manager.onRequestRecognizeText = { _ in ocrCount += 1 }
+
+        let img = makePinTestImage(width: 240, height: 140) { _, _ in (240, 240, 240, 255) }
+        XCTAssertTrue(manager.pin(content: .image(img, scale: 2), at: CGRect(x: 120, y: 120, width: 120, height: 70)))
+        let panel = try XCTUnwrap(manager.panels.first)
+
+        let eKey = try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: 0,
+            context: nil, characters: "e", charactersIgnoringModifiers: "e", isARepeat: false, keyCode: 14
+        ))
+        let spaceKey = try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: 0,
+            context: nil, characters: " ", charactersIgnoringModifiers: " ", isARepeat: false, keyCode: 49
+        ))
+        let tKey = try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: 0,
+            context: nil, characters: "t", charactersIgnoringModifiers: "t", isARepeat: false, keyCode: 17
+        ))
+        let key1 = try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: 0,
+            context: nil, characters: "1", charactersIgnoringModifiers: "1", isARepeat: false, keyCode: 18
+        ))
+        let shiftE = try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: [.shift], timestamp: 0, windowNumber: 0,
+            context: nil, characters: "E", charactersIgnoringModifiers: "E", isARepeat: false, keyCode: 14
+        ))
+
+        // Pressing 'e' opens toolbar, pressing 'e' again commits & closes it.
+        panel.keyDown(with: eKey)
+        XCTAssertTrue(panel.isToolbarVisible)
+        XCTAssertEqual(panel.activeAnnotationToolForTesting, .select)
+        panel.keyDown(with: eKey)
+        XCTAssertFalse(panel.isToolbarVisible)
+
+        // Pressing Space opens toolbar.
+        panel.keyDown(with: spaceKey)
+        XCTAssertTrue(panel.isToolbarVisible)
+        XCTAssertEqual(panel.activeAnnotationToolForTesting, .select)
+        panel.closeToolbar(commit: false)
+
+        // Pressing 't' triggers OCR directly without opening toolbar.
+        panel.keyDown(with: tKey)
+        XCTAssertEqual(ocrCount, 1)
+        XCTAssertFalse(panel.isToolbarVisible)
+
+        // Pressing '1' opens toolbar with .rectangle immediately active and ready to draw.
+        panel.keyDown(with: key1)
+        XCTAssertTrue(panel.isToolbarVisible)
+        XCTAssertEqual(panel.activeAnnotationToolForTesting, .rectangle)
+        let down = try XCTUnwrap(NSEvent.mouseEvent(
+            with: .leftMouseDown, location: CGPoint(x: 20, y: 15), modifierFlags: [], timestamp: 0,
+            windowNumber: 0, context: nil, eventNumber: 1, clickCount: 1, pressure: 1
+        ))
+        let drag = try XCTUnwrap(NSEvent.mouseEvent(
+            with: .leftMouseDragged, location: CGPoint(x: 90, y: 50), modifierFlags: [], timestamp: 0,
+            windowNumber: 0, context: nil, eventNumber: 2, clickCount: 1, pressure: 1
+        ))
+        let up = try XCTUnwrap(NSEvent.mouseEvent(
+            with: .leftMouseUp, location: CGPoint(x: 90, y: 50), modifierFlags: [], timestamp: 0,
+            windowNumber: 0, context: nil, eventNumber: 3, clickCount: 1, pressure: 1
+        ))
+        panel.contentView?.mouseDown(with: down)
+        panel.contentView?.mouseDragged(with: drag)
+        panel.contentView?.mouseUp(with: up)
+        XCTAssertEqual(panel.annotationDocumentForTesting?.items.count, 1)
+        panel.closeToolbar(commit: false)
+
+        // Shift+E is ignored when toolbar is closed.
+        panel.keyDown(with: shiftE)
+        XCTAssertFalse(panel.isToolbarVisible)
+
+        // Thumbnail image pin ignores 'e', Space, '1', and 't'.
+        panel.toggleThumbnail()
+        panel.keyDown(with: eKey)
+        panel.keyDown(with: spaceKey)
+        panel.keyDown(with: key1)
+        panel.keyDown(with: tKey)
+        XCTAssertFalse(panel.isToolbarVisible)
+        XCTAssertEqual(ocrCount, 1)
+
+        // Text and color pins ignore 'e', Space, '1', and 't'.
+        XCTAssertTrue(manager.pin(content: .text("Hello"), at: CGRect(x: 300, y: 120, width: 120, height: 60)))
+        let textPanel = try XCTUnwrap(manager.panels.last)
+        textPanel.keyDown(with: eKey)
+        textPanel.keyDown(with: spaceKey)
+        textPanel.keyDown(with: key1)
+        textPanel.keyDown(with: tKey)
+        XCTAssertFalse(textPanel.isToolbarVisible)
+        XCTAssertEqual(ocrCount, 1)
+
+        XCTAssertTrue(manager.pin(content: .color(CCXColorSample(red: 255, green: 0, blue: 0)), at: CGRect(x: 450, y: 120, width: 120, height: 60)))
+        let colorPanel = try XCTUnwrap(manager.panels.last)
+        colorPanel.keyDown(with: eKey)
+        colorPanel.keyDown(with: spaceKey)
+        colorPanel.keyDown(with: key1)
+        colorPanel.keyDown(with: tKey)
+        XCTAssertFalse(colorPanel.isToolbarVisible)
+        XCTAssertEqual(ocrCount, 1)
     }
 }
