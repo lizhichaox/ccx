@@ -21,6 +21,7 @@ final class OnboardingFlowState: ObservableObject {
     @Published var step: OnboardingStep = .welcome
     @Published var requestedScreenRecording = false
     @Published var swipeOffset: CGFloat = 0
+    @Published var snipCombo: HotKeyCombo = .defaultSnip
 
     func goNext() {
         guard let next = OnboardingStep(rawValue: step.rawValue + 1) else { return }
@@ -61,12 +62,20 @@ final class OnboardingWindowController: NSObject, NSWindowDelegate {
     private var lastDiscreteSwipeTime: TimeInterval = 0
 
     init(
+        snipCombo: HotKeyCombo = .defaultSnip,
         onComplete: @escaping () -> Void,
         onTrySnip: @escaping () -> Void
     ) {
         self.onComplete = onComplete
         self.onTrySnip = onTrySnip
         super.init()
+        self.flow.snipCombo = snipCombo
+    }
+
+    func updateSnipCombo(_ combo: HotKeyCombo) {
+        if flow.snipCombo != combo {
+            flow.snipCombo = combo
+        }
     }
 
     deinit {
@@ -447,7 +456,7 @@ private struct OnboardingView: View {
                             .padding(.bottom, 12)
                             .frame(width: pageWidth, height: proxy.size.height)
 
-                        ReadyStepView()
+                        ReadyStepView(flow: flow)
                             .padding(.horizontal, 20)
                             .padding(.top, 28)
                             .padding(.bottom, 12)
@@ -712,6 +721,8 @@ private struct ScreenRecordingHintStrip: View {
 // MARK: - Step 3: Shortcuts & Gestures
 
 private struct ReadyStepView: View {
+    @ObservedObject var flow: OnboardingFlowState
+
     var body: some View {
         VStack(spacing: 12) {
             Spacer(minLength: 0)
@@ -730,7 +741,7 @@ private struct ReadyStepView: View {
                     symbol: "viewfinder",
                     tint: .blue,
                     title: "Smart Snip",
-                    trailing: { KeycapComboView(combo: .defaultSnip) }
+                    trailing: { KeycapComboView(combo: flow.snipCombo) }
                 )
                 Divider().padding(.leading, 40)
                 GuideActionRow(
@@ -806,24 +817,9 @@ private struct InteractionPillView: View {
 struct KeycapComboView: View {
     let combo: HotKeyCombo
 
-    private var tokens: [String] {
-        var result: [String] = []
-        let display = combo.displayString
-        let modifiers: Set<Character> = ["⌃", "⌥", "⇧", "⌘"]
-        var index = display.startIndex
-        while index < display.endIndex, modifiers.contains(display[index]) {
-            result.append(String(display[index]))
-            index = display.index(after: index)
-        }
-        if index < display.endIndex {
-            result.append(String(display[index...]))
-        }
-        return result
-    }
-
     var body: some View {
         HStack(spacing: 4) {
-            ForEach(Array(tokens.enumerated()), id: \.offset) { _, token in
+            ForEach(Array(combo.tokens.enumerated()), id: \.offset) { _, token in
                 Text(token)
                     .font(.system(size: 12, weight: .semibold, design: .rounded))
                     .foregroundStyle(.primary)

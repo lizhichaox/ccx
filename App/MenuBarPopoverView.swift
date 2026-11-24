@@ -14,7 +14,7 @@ final class MenuBarPanelModel: ObservableObject {
     @Published private(set) var recentSnips: [SnipHistoryEntry] = []
     @Published private(set) var recordingStatus: RecordingMenuBarStatus?
 
-    let snipShortcut = HotKeyCombo.defaultSnip.displayString
+    @Published private(set) var snipShortcut = HotKeyCombo.defaultSnip.displayString
     @Published private(set) var isSnipHotKeyRegistered = true
     @Published private(set) var pinBadge = "Empty"
     @Published private(set) var isPinBadgeDimmed = true
@@ -42,6 +42,7 @@ final class MenuBarPanelModel: ObservableObject {
         pinManager: PinManager,
         clipboardStore: ClipboardStore,
         recordingStatus: RecordingMenuBarStatus? = nil,
+        snipShortcut: String = HotKeyCombo.defaultSnip.displayString,
         isSnipHotKeyRegistered: Bool = true
     ) {
         let nextPinCount = pinManager.pinCount
@@ -55,6 +56,10 @@ final class MenuBarPanelModel: ObservableObject {
 
         let nextPermissions = PermissionManager.currentStatus()
         if permissions != nextPermissions { permissions = nextPermissions }
+
+        if self.snipShortcut != snipShortcut {
+            self.snipShortcut = snipShortcut
+        }
 
         if self.isSnipHotKeyRegistered != isSnipHotKeyRegistered {
             self.isSnipHotKeyRegistered = isSnipHotKeyRegistered

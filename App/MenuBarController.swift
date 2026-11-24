@@ -101,6 +101,7 @@ final class MenuBarController: NSObject, NSWindowDelegate {
     private var isShowingRecordingButton = false
     private var lastRecordingPaused: Bool?
     private var brandButtonImage: NSImage?
+    private var snipHotKeyCombo: HotKeyCombo = .defaultSnip
     private var isSnipHotKeyRegistered = true
     private var isTrackingContextMenu = false
     private var pendingLayoutPass = false
@@ -215,11 +216,14 @@ final class MenuBarController: NSObject, NSWindowDelegate {
         }
     }
 
-    func updateHotKeyRegistered(_ registered: Bool) {
-        guard isSnipHotKeyRegistered != registered else { return }
-        isSnipHotKeyRegistered = registered
+    func updateSnipHotKey(combo: HotKeyCombo, isRegistered: Bool) {
+        guard snipHotKeyCombo != combo || isSnipHotKeyRegistered != isRegistered else { return }
+        snipHotKeyCombo = combo
+        isSnipHotKeyRegistered = isRegistered
         if panel?.isVisible == true {
             refresh()
+        } else {
+            syncModel()
         }
     }
 
@@ -518,6 +522,7 @@ final class MenuBarController: NSObject, NSWindowDelegate {
             pinManager: pinManager,
             clipboardStore: clipboardStore,
             recordingStatus: recordingStatus,
+            snipShortcut: snipHotKeyCombo.displayString,
             isSnipHotKeyRegistered: isSnipHotKeyRegistered
         )
         updateStatusTooltip()

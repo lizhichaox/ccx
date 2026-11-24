@@ -33,6 +33,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var menuBarController: MenuBarController?
     private var onboardingController: OnboardingWindowController?
     private var settingsController: SettingsWindowController?
+    private var currentSnipCombo: HotKeyCombo = HotKeyPreferences.loadCombo(for: .snip)
+    private var isRecordingShortcut = false
     private var hadClickThroughPins = false
     private var pendingLaunchTask: Task<Void, Never>?
     private var scheduledUpdateCheckTask: Task<Void, Never>?
@@ -83,8 +85,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hotKeyManager.onAction = { [weak self] action in
             self?.perform(action)
         }
-        hotKeyManager.registerDefaults()
-        let snipHotKeyRegistered = hotKeyManager.isRegistered(.snip)
+        let snipHotKeyRegistered = hotKeyManager.register(.snip, combo: currentSnipCombo)
 
         RecordingCoordinator.cleanupTemporaryRecordings()
         DispatchQueue.global(qos: .utility).async {
@@ -112,7 +113,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             updateManager: updateManager
         )
         menuBarController.delegate = self
-        menuBarController.updateHotKeyRegistered(snipHotKeyRegistered)
+        menuBarController.updateSnipHotKey(combo: currentSnipCombo, isRegistered: snipHotKeyRegistered)
         self.menuBarController = menuBarController
         clipboardStore.onHistoryChanged = { [weak self] in
             guard let self else { return }
@@ -139,7 +140,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         if !snipHotKeyRegistered {
             toast.show(
-                "Shortcut \(HotKeyCombo.defaultSnip.displayString) In Use by Another App",
+                "Shortcut \(currentSnipCombo.displayString) In Use by Another App",
                 symbolName: "exclamationmark.triangle"
             )
         }
@@ -232,28 +233,76 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func retrySnipHotKeySilentlyIfNeeded() {
-        guard !hotKeyManager.isRegistered(.snip) else { return }
-        let registered = hotKeyManager.register(.snip, combo: .defaultSnip)
-        syncHotKeyRegistrationState(registered)
+        guard !isRecordingShortcut, !hotKeyManager.isRegistered(.snip) else { return }
+        let registered = hotKeyManager.register(.snip, combo: currentSnipCombo)
+        syncHotKeyState(registered: registered)
     }
 
     private func retrySnipHotKeyRegistration() -> Bool {
-        let registered = hotKeyManager.register(.snip, combo: .defaultSnip)
-        syncHotKeyRegistrationState(registered)
+        let registered = hotKeyManager.register(.snip, combo: currentSnipCombo)
+        syncHotKeyState(registered: registered)
         if registered {
-            toast.show("Shortcut \(HotKeyCombo.defaultSnip.displayString) Restored", symbolName: "checkmark.circle.fill")
+            toast.show("Shortcut \(currentSnipCombo.displayString) Restored", symbolName: "checkmark.circle.fill")
         } else {
             toast.show(
-                "Shortcut \(HotKeyCombo.defaultSnip.displayString) Still In Use",
+                "Shortcut \(currentSnipCombo.displayString) Still In Use",
                 symbolName: "exclamationmark.triangle"
             )
         }
         return registered
     }
 
-    private func syncHotKeyRegistrationState(_ registered: Bool) {
-        menuBarController?.updateHotKeyRegistered(registered)
-        settingsController?.updateHotKeyRegistered(registered)
+    private func beginShortcutRecording() {
+        isRecordingShortcut = true
+        hotKeyManager.unregister(.snip)
+    }
+
+    private func endShortcutRecording() {
+        isRecordingShortcut = false
+        ensureCurrentSnipHotKeyRegistered()
+    }
+
+    private func ensureCurrentSnipHotKeyRegistered() {
+        let registered: Bool
+        if hotKeyManager.isRegistered(.snip),
+           hotKeyManager.currentCombo(for: .snip) == currentSnipCombo {
+            registered = true
+        } else {
+            registered = hotKeyManager.register(.snip, combo: currentSnipCombo)
+        }
+        syncHotKeyState(registered: registered)
+    }
+
+    private func changeSnipHotKey(to candidate: HotKeyCombo) -> HotKeyConflict? {
+        switch hotKeyManager.registerChecked(.snip, combo: candidate) {
+        case .registered(let combo):
+            currentSnipCombo = combo
+            HotKeyPreferences.saveCombo(combo, for: .snip)
+            syncHotKeyState(registered: true)
+            toast.show("Shortcut Updated to \(combo.displayString)", symbolName: "keyboard")
+            return nil
+        case .conflict(let conflict):
+            return conflict
+        }
+    }
+
+    private func resetSnipHotKey() -> HotKeyConflict? {
+        switch hotKeyManager.registerChecked(.snip, combo: .defaultSnip) {
+        case .registered(let combo):
+            currentSnipCombo = combo
+            HotKeyPreferences.saveCombo(combo, for: .snip)
+            syncHotKeyState(registered: true)
+            toast.show("Shortcut Reset to \(HotKeyCombo.defaultSnip.displayString)", symbolName: "arrow.counterclockwise")
+            return nil
+        case .conflict(let conflict):
+            return conflict
+        }
+    }
+
+    private func syncHotKeyState(registered: Bool) {
+        menuBarController?.updateSnipHotKey(combo: currentSnipCombo, isRegistered: registered)
+        settingsController?.updateSnipHotKey(combo: currentSnipCombo, isRegistered: registered)
+        onboardingController?.updateSnipCombo(currentSnipCombo)
     }
 
     private func scheduleDelayedLaunch(milliseconds: Int, action: @escaping @MainActor () -> Void) {
@@ -990,6 +1039,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         recordingCoordinator.cancelIfInReadyPhase()
         if onboardingController == nil {
             onboardingController = OnboardingWindowController(
+                snipCombo: currentSnipCombo,
                 onComplete: {
                     UserDefaults.standard.set(true, forKey: Self.hasCompletedOnboardingKey)
                 },
@@ -1000,6 +1050,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     }
                 }
             )
+        } else {
+            onboardingController?.updateSnipCombo(currentSnipCombo)
         }
         onboardingController?.show(startingAt: step, anchor: anchor)
     }
@@ -1011,9 +1063,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if settingsController == nil {
             settingsController = SettingsWindowController(
                 updateManager: updateManager,
+                snipCombo: currentSnipCombo,
                 isSnipHotKeyRegistered: hotKeyManager.isRegistered(.snip),
                 hasClearableHistory: hasClearable,
                 recordingsFolderPath: recordingsFolderPath,
+                onBeginShortcutRecording: { [weak self] in
+                    self?.beginShortcutRecording()
+                },
+                onEndShortcutRecording: { [weak self] in
+                    self?.endShortcutRecording()
+                },
+                onChangeSnipHotKey: { [weak self] candidate in
+                    self?.changeSnipHotKey(to: candidate)
+                },
+                onResetSnipHotKey: { [weak self] in
+                    self?.resetSnipHotKey()
+                },
                 onRetryHotKey: { [weak self] in
                     self?.retrySnipHotKeyRegistration() ?? false
                 },
@@ -1040,7 +1105,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             )
         } else {
-            settingsController?.updateHotKeyRegistered(hotKeyManager.isRegistered(.snip))
+            settingsController?.updateSnipHotKey(
+                combo: currentSnipCombo,
+                isRegistered: hotKeyManager.isRegistered(.snip)
+            )
             settingsController?.updateHasClearableHistory(hasClearable)
             settingsController?.updateRecordingsFolder(recordingsFolderPath)
         }
