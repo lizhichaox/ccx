@@ -1,3 +1,4 @@
+import AppKit
 import CryptoKit
 import Darwin
 import Foundation
@@ -791,5 +792,91 @@ final class AppUpdaterTests: XCTestCase {
         XCTAssertEqual(release?.version, AppSemanticVersion(major: 0, minor: 5, patch: 0))
         XCTAssertTrue(manager.shouldShowPopoverBanner)
         XCTAssertEqual(reportedErrors.value, [message])
+    }
+
+    // MARK: 8. Single-Line Pixel-Width Budget Regression Tests
+
+    @MainActor
+    func testAllUpdateErrorAndEligibilityMessagesFitSingleLine() throws {
+        let popoverFont = NSFont.systemFont(ofSize: 10.0)
+        let settingsFont = NSFont.systemFont(ofSize: 10.5)
+        let maxPopoverWidth: CGFloat = 264.0
+        let maxSettingsWidth: CGFloat = 278.0
+
+        let errors: [AppUpdateError] = [
+            .invalidResponse,
+            .untrustedURL,
+            .responseTooLarge,
+            .rateLimited,
+            .httpStatus(503),
+            .networkUnavailable,
+            .missingReleaseAssets,
+            .missingChecksumEntry,
+            .checksumMismatch,
+            .extractionFailed,
+            .invalidBundleMetadata,
+            .unsignedCurrentApp,
+            .signatureVerificationFailed(-67061),
+            .installLocationNotWritable(""),
+            .installFailed(""),
+            .cancelled,
+        ]
+
+        var messages: [String] = try errors.map { error in
+            try XCTUnwrap(error.errorDescription, "Missing errorDescription for \(error)")
+        }
+
+        // Collect all AppUpdateInstaller.installEligibility failure reasons.
+        let dir = try makeTempDirectory()
+        let realApp = dir.appendingPathComponent("CCX.app", isDirectory: true)
+        try FileManager.default.createDirectory(at: realApp, withIntermediateDirectories: true)
+        let symlinkApp = dir.appendingPathComponent("LinkedCCX.app")
+        try FileManager.default.createSymbolicLink(at: symlinkApp, withDestinationURL: realApp)
+
+        let eligibilityChecks: [AppInstallEligibility] = [
+            AppUpdateInstaller.installEligibility(for: dir.appendingPathComponent("NotAnApp")),
+            AppUpdateInstaller.installEligibility(for: URL(fileURLWithPath: "/private/var/folders/xx/AppTranslocation/1234/d/CCX.app")),
+            AppUpdateInstaller.installEligibility(for: URL(fileURLWithPath: "/Volumes/CCX/CCX.app")),
+            AppUpdateInstaller.installEligibility(for: symlinkApp),
+            AppUpdateInstaller.installEligibility(for: realApp) { path in path == realApp.path },
+        ]
+        for eligibility in eligibilityChecks {
+            guard case .manualRequired(let reason) = eligibility else {
+                return XCTFail("Expected .manualRequired, got \(eligibility)")
+            }
+            messages.append(reason)
+        }
+
+        // Include installer/delegate/fallback failure prompts.
+        messages.append(contentsOf: [
+            "Couldn't prepare update folder.",
+            "Couldn't validate app bundle.",
+            "Couldn't write update to folder.",
+            "Couldn't verify staged bundle.",
+            "Couldn't verify update bundle.",
+            "Couldn't start updater helper.",
+            "Couldn't create temp download file.",
+            "Couldn't write downloaded update.",
+            "Update failed. Try again or GitHub.",
+        ])
+
+        for message in messages {
+            XCTAssertFalse(message.isEmpty, "Update error prompt must not be empty")
+            XCTAssertFalse(message.contains("\n"), "Update error prompt must be single-line: \(message)")
+
+            let popoverWidth = ceil(NSAttributedString(string: message, attributes: [.font: popoverFont]).size().width)
+            XCTAssertLessThanOrEqual(
+                popoverWidth,
+                maxPopoverWidth,
+                "Update prompt '\(message)' measured \(popoverWidth)pt at 10pt, exceeding Popover \(maxPopoverWidth)pt budget"
+            )
+
+            let settingsWidth = ceil(NSAttributedString(string: message, attributes: [.font: settingsFont]).size().width)
+            XCTAssertLessThanOrEqual(
+                settingsWidth,
+                maxSettingsWidth,
+                "Update prompt '\(message)' measured \(settingsWidth)pt at 10.5pt, exceeding Settings \(maxSettingsWidth)pt budget"
+            )
+        }
     }
 }

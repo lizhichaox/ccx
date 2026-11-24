@@ -966,6 +966,7 @@ private struct UpdateAvailableBanner: View {
                     Text(message)
                         .font(.system(size: 10))
                         .foregroundStyle(.secondary)
+                        .lineLimit(1)
                         .fixedSize(horizontal: false, vertical: true)
                 }
 

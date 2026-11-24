@@ -49,34 +49,82 @@ final class HotKeyConflictTests: XCTestCase {
 
     func testConflictLocalizedDescriptions() {
         let combo = HotKeyCombo(keyCode: UInt32(kVK_ANSI_4), carbonModifiers: UInt32(cmdKey | shiftKey))
-        XCTAssertEqual(HotKeyConflict.modifierOnly.localizedDescription, "Press a key along with ⌘, ⌃, or ⌥.")
+        XCTAssertEqual(HotKeyConflict.modifierOnly.localizedDescription, "Add a key with ⌘, ⌃, or ⌥.")
         XCTAssertEqual(
             HotKeyConflict.missingModifier.localizedDescription,
-            "Include ⌘, ⌃, or ⌥ (or use a Function key F1–F20)."
+            "Use ⌘, ⌃, ⌥, or F1–F20."
         )
         XCTAssertEqual(
             HotKeyConflict.escapeNotAllowed.localizedDescription,
-            "Escape cannot be used as a global shortcut."
+            "Esc cannot be a shortcut."
         )
         XCTAssertEqual(
             HotKeyConflict.systemShortcut(combo).localizedDescription,
-            "⇧⌘4 is used by a macOS system shortcut. Disable it in System Settings or choose another."
+            "⇧⌘4 conflicts with macOS."
         )
         XCTAssertEqual(
             HotKeyConflict.reservedAppShortcut(combo, label: "Copy").localizedDescription,
-            "⇧⌘4 is reserved for Copy. Choose another shortcut."
+            "⇧⌘4 is reserved for Copy."
         )
         XCTAssertEqual(
             HotKeyConflict.internalConflict(combo, action: .snip).localizedDescription,
-            "⇧⌘4 is already assigned to Snip."
+            "⇧⌘4 is already used by Snip."
         )
         XCTAssertEqual(
             HotKeyConflict.inUseByAnotherApp(combo).localizedDescription,
-            "⇧⌘4 is already in use by another app."
+            "⇧⌘4 is in use by another app."
         )
         XCTAssertEqual(
             HotKeyConflict.registrationFailed(combo, -50).localizedDescription,
-            "Could not register ⇧⌘4 (error -50)."
+            "Couldn't register ⇧⌘4 (-50)."
+        )
+    }
+
+    @MainActor
+    func testAllConflictDescriptionsFitSingleLineInSettings() {
+        let font = NSFont.systemFont(ofSize: 10.5)
+        let maxSettingsSublineWidth: CGFloat = 278.0
+        let worstCombo = HotKeyCombo(
+            keyCode: UInt32(kVK_Space),
+            carbonModifiers: UInt32(controlKey | optionKey | shiftKey | cmdKey)
+        )
+        XCTAssertEqual(worstCombo.displayString, "⌃⌥⇧⌘Space")
+
+        var conflicts: [HotKeyConflict] = [
+            .modifierOnly,
+            .missingModifier,
+            .escapeNotAllowed,
+            .systemShortcut(worstCombo),
+            .reservedAppShortcut(worstCombo, label: "App Switcher"),
+            .inUseByAnotherApp(worstCombo),
+            .registrationFailed(worstCombo, OSStatus(eventHotKeyExistsErr)),
+        ]
+        for action in CCXHotKeyAction.allCases {
+            conflicts.append(.internalConflict(worstCombo, action: action))
+        }
+        for label in Set(HotKeyConflictDetector.reservedAppShortcuts.values) {
+            conflicts.append(.reservedAppShortcut(worstCombo, label: label))
+        }
+
+        for conflict in conflicts {
+            let text = conflict.localizedDescription
+            XCTAssertFalse(text.isEmpty, "Conflict description must not be empty: \(conflict)")
+            XCTAssertFalse(text.contains("\n"), "Conflict description must be single-line: \(text)")
+            let width = ceil(NSAttributedString(string: text, attributes: [.font: font]).size().width)
+            XCTAssertLessThanOrEqual(
+                width,
+                maxSettingsSublineWidth,
+                "Conflict prompt '\(text)' measured \(width)pt, exceeding \(maxSettingsSublineWidth)pt Settings sub-line budget"
+            )
+        }
+
+        // Also verify Settings' unregistered sub-line fits cleanly beside the mini Retry button (283pt total).
+        let unregisteredPrompt = "\(worstCombo.displayString) in use by another app."
+        let unregisteredWidth = ceil(NSAttributedString(string: unregisteredPrompt, attributes: [.font: font]).size().width)
+        XCTAssertLessThanOrEqual(
+            unregisteredWidth,
+            220.0,
+            "Unregistered shortcut sub-line '\(unregisteredPrompt)' measured \(unregisteredWidth)pt, risking collision with Retry button"
         )
     }
 

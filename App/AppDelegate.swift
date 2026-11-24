@@ -140,7 +140,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         if !snipHotKeyRegistered {
             toast.show(
-                "Shortcut \(currentSnipCombo.displayString) In Use by Another App",
+                "\(currentSnipCombo.displayString) In Use by Another App",
                 symbolName: "exclamationmark.triangle"
             )
         }
@@ -161,7 +161,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         if recordingCoordinator.phase == .finalizing {
-            toast.show("Finishing Recording — Try Quitting Again in a Moment", symbolName: "hourglass")
+            toast.show("Finishing Recording… Try Again Soon", symbolName: "hourglass")
             return .terminateCancel
         }
         if recordingCoordinator.isRecordingOrPaused {
@@ -242,10 +242,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let registered = hotKeyManager.register(.snip, combo: currentSnipCombo)
         syncHotKeyState(registered: registered)
         if registered {
-            toast.show("Shortcut \(currentSnipCombo.displayString) Restored", symbolName: "checkmark.circle.fill")
+            toast.show("\(currentSnipCombo.displayString) Restored", symbolName: "checkmark.circle.fill")
         } else {
             toast.show(
-                "Shortcut \(currentSnipCombo.displayString) Still In Use",
+                "\(currentSnipCombo.displayString) Still In Use",
                 symbolName: "exclamationmark.triangle"
             )
         }
@@ -279,7 +279,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             currentSnipCombo = combo
             HotKeyPreferences.saveCombo(combo, for: .snip)
             syncHotKeyState(registered: true)
-            toast.show("Shortcut Updated to \(combo.displayString)", symbolName: "keyboard")
+            toast.show("Shortcut Set to \(combo.displayString)", symbolName: "keyboard")
             return nil
         case .conflict(let conflict):
             return conflict
@@ -415,7 +415,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             toast.show("Copied \(text)", symbolName: "eyedropper")
         case .permissionDenied:
             menuBarController?.refresh()
-            toast.show("Screen Recording Permission Required", symbolName: "exclamationmark.triangle")
+            toast.show("Screen Recording Needed", symbolName: "exclamationmark.triangle")
             showOnboarding(startingAt: .permissions)
         case .failed(let message):
             toast.show("Capture Failed: \(Self.userFriendlyNotice(message))", symbolName: "exclamationmark.triangle")
@@ -468,7 +468,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if isPresentingSavePanel {
             NSApp.activate()
             activeSavePanel?.makeKeyAndOrderFront(nil)
-            toast.show("Finish Current Save Dialog First", symbolName: "exclamationmark.circle")
+            toast.show("Finish Save Dialog First", symbolName: "exclamationmark.circle")
             return
         }
 
@@ -598,7 +598,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard Self.isRealDirectory(atPath: directory.path),
               NSWorkspace.shared.open(directory)
         else {
-            toast.show("Could Not Open Recordings Folder", symbolName: "exclamationmark.triangle")
+            toast.show("Couldn't Open Recordings Folder", symbolName: "exclamationmark.triangle")
             return
         }
     }
@@ -607,7 +607,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if isPresentingSavePanel {
             NSApp.activate()
             activeSavePanel?.makeKeyAndOrderFront(nil)
-            toast.show("Finish Current Save Dialog First", symbolName: "exclamationmark.circle")
+            toast.show("Finish Save Dialog First", symbolName: "exclamationmark.circle")
             return
         }
 
@@ -729,7 +729,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             quickSaveRecording(result, revealInFinder: true)
         case .permissionDenied:
             menuBarController?.refresh()
-            toast.show("Screen Recording Permission Required", symbolName: "exclamationmark.triangle")
+            toast.show("Screen Recording Needed", symbolName: "exclamationmark.triangle")
             showOnboarding(startingAt: .permissions)
         case .failed(let message):
             toast.show("Recording Failed: \(Self.userFriendlyNotice(message))", symbolName: "exclamationmark.triangle")
@@ -766,7 +766,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             } catch {
                 await MainActor.run { [weak self] in
                     guard let self else { return }
-                    self.toast.show("Could Not Copy \(label) — Choose Save Location", symbolName: "exclamationmark.triangle")
+                    self.toast.show("Copy Failed — Choose Save Location", symbolName: "exclamationmark.triangle")
                     self.presentSavePanel(for: result)
                 }
             }
@@ -871,7 +871,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             } catch {
                 await MainActor.run { [weak self] in
                     guard let self else { return }
-                    self.toast.show("Quick Save Failed — Choose Save Location", symbolName: "exclamationmark.triangle")
+                    self.toast.show("Quick Save Failed — Choose Folder", symbolName: "exclamationmark.triangle")
                     self.presentSavePanel(for: result)
                 }
             }
@@ -1101,7 +1101,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 },
                 onClearHistory: { [weak self] in
                     self?.menuBarRequestedClearHistory()
-                    self?.toast.show("Cleared Snip History & Clipboard", symbolName: "trash")
+                    self?.toast.show("History & Clipboard Cleared", symbolName: "trash")
                 }
             )
         } else {

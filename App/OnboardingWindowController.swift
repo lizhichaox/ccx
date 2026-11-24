@@ -692,7 +692,7 @@ private struct ScreenRecordingHintStrip: View {
             Text("Enable CCX in Settings, then relaunch.")
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
-                .lineLimit(2)
+                .lineLimit(1)
                 .fixedSize(horizontal: false, vertical: true)
 
             Spacer(minLength: 6)

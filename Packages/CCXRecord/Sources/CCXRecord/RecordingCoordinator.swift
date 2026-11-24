@@ -270,11 +270,11 @@ public final class RecordingCoordinator {
                     }
                     if !granted {
                         runSettings.capturesMicrophone = false
-                        self.onNotice?("Microphone Denied — Recording Without Mic", "mic.slash")
+                        self.onNotice?("Mic Denied — Recording No Mic", "mic.slash")
                     }
                 case .denied, .restricted:
                     runSettings.capturesMicrophone = false
-                    self.onNotice?("Microphone Off in System Settings — Recording Without Mic", "mic.slash")
+                    self.onNotice?("Mic Off in Settings — No Mic Audio", "mic.slash")
                 @unknown default:
                     runSettings.capturesMicrophone = false
                 }
@@ -308,7 +308,7 @@ public final class RecordingCoordinator {
             }
             newEngine.onLimitReached = { [weak self] in
                 guard let self, self.isSessionActive, self.sessionGeneration == generation, self.isRecordingOrPaused else { return }
-                self.onNotice?("GIF Frame Limit Reached — Finalizing", "film")
+                self.onNotice?("GIF Frame Limit — Finalizing…", "film")
                 self.stopActiveRecording()
             }
             newEngine.onUnexpectedStop = { [weak self] error in
@@ -319,7 +319,7 @@ public final class RecordingCoordinator {
                     self.tearDown(outcome: .permissionDenied, deleteStagedFile: true)
                 } else if self.isRecordingOrPaused {
                     if !Self.isUserStoppedStreamError(error) {
-                        self.onNotice?("Recording Interrupted — Saving Captured Footage", "exclamationmark.triangle")
+                        self.onNotice?("Recording Interrupted — Saving…", "exclamationmark.triangle")
                     }
                     self.stopActiveRecording()
                 } else {

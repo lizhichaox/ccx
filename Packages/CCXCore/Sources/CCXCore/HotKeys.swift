@@ -137,21 +137,21 @@ public enum HotKeyConflict: Equatable, Sendable, LocalizedError {
     public var errorDescription: String? {
         switch self {
         case .modifierOnly:
-            "Press a key along with ⌘, ⌃, or ⌥."
+            "Add a key with ⌘, ⌃, or ⌥."
         case .missingModifier:
-            "Include ⌘, ⌃, or ⌥ (or use a Function key F1–F20)."
+            "Use ⌘, ⌃, ⌥, or F1–F20."
         case .escapeNotAllowed:
-            "Escape cannot be used as a global shortcut."
+            "Esc cannot be a shortcut."
         case .systemShortcut(let combo):
-            "\(combo.displayString) is used by a macOS system shortcut. Disable it in System Settings or choose another."
+            "\(combo.displayString) conflicts with macOS."
         case .reservedAppShortcut(let combo, let label):
-            "\(combo.displayString) is reserved for \(label). Choose another shortcut."
+            "\(combo.displayString) is reserved for \(label)."
         case .internalConflict(let combo, let action):
-            "\(combo.displayString) is already assigned to \(action.displayName)."
+            "\(combo.displayString) is already used by \(action.displayName)."
         case .inUseByAnotherApp(let combo):
-            "\(combo.displayString) is already in use by another app."
+            "\(combo.displayString) is in use by another app."
         case .registrationFailed(let combo, let status):
-            "Could not register \(combo.displayString) (error \(status))."
+            "Couldn't register \(combo.displayString) (\(status))."
         }
     }
 }

@@ -46,7 +46,7 @@ public final class ScreenRecordingEngine {
         // Fallback gracefully when microphone is enabled & authorized, but no audio input device exists.
         if effectiveSettings.effectiveMicrophone, AVCaptureDevice.default(for: .audio) == nil {
             effectiveSettings.capturesMicrophone = false
-            onNotice?("No Microphone Detected — Recording Without Mic", "mic.slash")
+            onNotice?("No Mic Found — Recording No Mic", "mic.slash")
         }
 
         try prepareOutputPipeline(for: effectiveSettings)
@@ -82,7 +82,7 @@ public final class ScreenRecordingEngine {
                 videoWriter?.cancelAndWait()
                 videoWriter = nil
                 effectiveSettings.capturesMicrophone = false
-                onNotice?("Microphone Unavailable — Recording Without Mic", "mic.slash")
+                onNotice?("Mic Unavailable — No Mic Audio", "mic.slash")
                 do {
                     try prepareOutputPipeline(for: effectiveSettings)
                     try await startStream(filter: filter, runSettings: effectiveSettings)

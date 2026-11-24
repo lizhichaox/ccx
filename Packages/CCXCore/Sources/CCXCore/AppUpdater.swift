@@ -135,35 +135,35 @@ public enum AppUpdateError: LocalizedError, Equatable, Sendable {
     public var errorDescription: String? {
         switch self {
         case .invalidResponse:
-            return "GitHub returned an unexpected update response."
+            return "Unexpected response from GitHub."
         case .untrustedURL:
-            return "Blocked an untrusted download address."
+            return "Blocked untrusted download URL."
         case .responseTooLarge:
-            return "The update download exceeded the allowed size limit."
+            return "Update exceeds size limit."
         case .rateLimited:
-            return "GitHub rate limit reached. Try again later."
+            return "GitHub rate limit. Try later."
         case .httpStatus(let code):
-            return "GitHub returned an error (HTTP \(code))."
+            return "GitHub error (HTTP \(code))."
         case .networkUnavailable:
-            return "Could not reach GitHub. Check your internet connection."
+            return "Can't reach GitHub. Check network."
         case .missingReleaseAssets:
-            return "This release is missing its macOS universal package or checksums."
+            return "Release assets or checksum missing."
         case .missingChecksumEntry:
-            return "Could not find a SHA-256 checksum for this release package."
+            return "SHA-256 checksum missing."
         case .checksumMismatch:
-            return "Downloaded update failed SHA-256 integrity verification."
+            return "SHA-256 check failed."
         case .extractionFailed:
-            return "Could not extract the downloaded CCX update archive."
+            return "Couldn't extract update archive."
         case .invalidBundleMetadata:
-            return "The downloaded app bundle is invalid or incomplete."
+            return "Downloaded app bundle is invalid."
         case .unsignedCurrentApp:
-            return "Automatic updates require a Developer ID-signed build of CCX."
+            return "Requires Developer ID build."
         case .signatureVerificationFailed:
-            return "The downloaded update failed Apple Developer ID code-signature verification."
+            return "Developer ID signature check failed."
         case .installLocationNotWritable(let reason):
-            return Self.sanitizeReason(reason, fallback: "CCX cannot update its current install location.")
+            return Self.sanitizeReason(reason, fallback: "Can't update this app folder.")
         case .installFailed(let reason):
-            return Self.sanitizeReason(reason, fallback: "Could not install the update.")
+            return Self.sanitizeReason(reason, fallback: "Couldn't install update.")
         case .cancelled:
             return "Update cancelled."
         }
@@ -799,23 +799,23 @@ public enum AppUpdateInstaller {
         let normalizedBundleURL = URL(fileURLWithPath: normalizedBundlePath, isDirectory: true)
 
         guard normalizedBundleURL.pathExtension == "app" else {
-            return .manualRequired(reason: "Move CCX.app to Applications to enable one-click updates.")
+            return .manualRequired(reason: "Move CCX.app to Applications first.")
         }
 
         if normalizedBundlePath.contains("/AppTranslocation/") || normalizedBundlePath.hasPrefix("/Volumes/") {
-            return .manualRequired(reason: "Move CCX.app to Applications to enable one-click updates.")
+            return .manualRequired(reason: "Move CCX.app to Applications first.")
         }
 
         var st = stat()
         guard Darwin.lstat(normalizedBundlePath, &st) == 0,
               (st.st_mode & S_IFMT) == S_IFDIR
         else {
-            return .manualRequired(reason: "Move CCX.app to Applications to enable one-click updates.")
+            return .manualRequired(reason: "Move CCX.app to Applications first.")
         }
 
         let parentPath = normalizedPath(normalizedBundleURL.deletingLastPathComponent().path)
         guard isWritable(parentPath), isWritable(normalizedBundlePath) else {
-            return .manualRequired(reason: "CCX does not have permission to update this folder. Move CCX.app to a writable Applications folder or update manually.")
+            return .manualRequired(reason: "App folder not writable. Use GitHub.")
         }
 
         return .canInstallInPlace(targetAppURL: normalizedBundleURL)
@@ -825,11 +825,11 @@ public enum AppUpdateInstaller {
     public static func createPrivateStagingDirectory() throws -> URL {
         let rootURL = updatesRootDirectoryURL()
         guard ensurePrivateDirectory(at: rootURL) else {
-            throw AppUpdateError.installFailed("Could not prepare a private update staging folder.")
+            throw AppUpdateError.installFailed("Couldn't prepare update folder.")
         }
         let stagingURL = rootURL.appendingPathComponent("update-\(UUID().uuidString)", isDirectory: true)
         guard ensurePrivateDirectory(at: stagingURL) else {
-            throw AppUpdateError.installFailed("Could not create a private update staging folder.")
+            throw AppUpdateError.installFailed("Couldn't prepare update folder.")
         }
         return stagingURL
     }
@@ -922,7 +922,7 @@ public enum AppUpdateInstaller {
               Darwin.lstat(normalizedTargetPath, &targetStat) == 0,
               (targetStat.st_mode & S_IFMT) == S_IFDIR
         else {
-            throw AppUpdateError.installFailed("Could not validate the target application bundle.")
+            throw AppUpdateError.installFailed("Couldn't validate app bundle.")
         }
 
         let parentDir = URL(fileURLWithPath: normalizedTargetPath, isDirectory: true).deletingLastPathComponent()
@@ -936,13 +936,13 @@ public enum AppUpdateInstaller {
                 try fm.copyItem(at: verifiedAppURL, to: stagedURL)
             } catch {
                 try? fm.removeItem(at: stagedURL)
-                throw AppUpdateError.installFailed("Could not write the update to \(parentDir.lastPathComponent).")
+                throw AppUpdateError.installFailed("Couldn't write update to folder.")
             }
         }
 
         guard isOwnedRealDirectory(at: stagedURL, uid: uid) else {
             try? fm.removeItem(at: stagedURL)
-            throw AppUpdateError.installFailed("Could not verify the staged update bundle.")
+            throw AppUpdateError.installFailed("Couldn't verify staged bundle.")
         }
 
         return stagedURL
@@ -968,7 +968,7 @@ public enum AppUpdateInstaller {
               Darwin.lstat(targetPath, &targetStat) == 0,
               (targetStat.st_mode & S_IFMT) == S_IFDIR
         else {
-            throw AppUpdateError.installFailed("Could not verify bundles before relaunching.")
+            throw AppUpdateError.installFailed("Couldn't verify update bundle.")
         }
 
         let parentDir = URL(fileURLWithPath: targetPath, isDirectory: true).deletingLastPathComponent()
@@ -1024,7 +1024,7 @@ public enum AppUpdateInstaller {
         do {
             try process.run()
         } catch {
-            throw AppUpdateError.installFailed("Could not start the update helper process.")
+            throw AppUpdateError.installFailed("Couldn't start updater helper.")
         }
     }
 
@@ -1357,7 +1357,7 @@ private final class StreamingUpdateSessionDelegate: NSObject, URLSessionDataDele
             if let destinationURL {
                 let fd = Darwin.open(destinationURL.path, O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW, 0o600)
                 guard fd >= 0 else {
-                    state.overrideError = .installFailed("Could not create the temporary download file.")
+                    state.overrideError = .installFailed("Couldn't create temp download file.")
                     return false
                 }
                 state.fileDescriptor = fd
@@ -1384,7 +1384,7 @@ private final class StreamingUpdateSessionDelegate: NSObject, URLSessionDataDele
 
             if destinationURL != nil {
                 guard state.fileDescriptor >= 0, writeAll(data, to: state.fileDescriptor) else {
-                    state.overrideError = .installFailed("Could not write the downloaded update to disk.")
+                    state.overrideError = .installFailed("Couldn't write downloaded update.")
                     return nil
                 }
             } else {
@@ -2007,8 +2007,8 @@ public final class AppUpdateManager: ObservableObject {
                 return AppUpdateError.cancelled.errorDescription ?? "Update cancelled."
             }
             return AppUpdateError.networkUnavailable.errorDescription
-                ?? "Could not reach GitHub. Check your internet connection."
+                ?? "Can't reach GitHub. Check network."
         }
-        return "Update failed. Please try again or download from GitHub."
+        return "Update failed. Try again or GitHub."
     }
 }

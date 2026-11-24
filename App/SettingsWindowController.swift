@@ -105,12 +105,14 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         }
         if hotKeyState.isSnipRegistered != isRegistered {
             hotKeyState.isSnipRegistered = isRegistered
+            scheduleWindowHeightSync()
         }
     }
 
     func updateHotKeyRegistered(_ registered: Bool) {
         if hotKeyState.isSnipRegistered != registered {
             hotKeyState.isSnipRegistered = registered
+            scheduleWindowHeightSync()
         }
     }
 
@@ -178,6 +180,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
                 self.updateHotKeyRegistered(registered)
                 if registered {
                     self.hotKeyState.shortcutFeedback = nil
+                    self.scheduleWindowHeightSync()
                 }
             },
             onOpenRecordingsFolder: { [weak self] in
@@ -228,30 +231,38 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         (window as? DismissibleWindow)?.suppressDismissKeyEquivalents = true
         onBeginShortcutRecording()
         installShortcutMonitor()
+        scheduleWindowHeightSync()
     }
 
     private func stopRecordingShortcut(clearFeedback: Bool = true) {
         let wasRecording = hotKeyState.isRecordingShortcut
+        let hadFeedback = hotKeyState.shortcutFeedback != nil
         removeShortcutMonitor()
         (window as? DismissibleWindow)?.suppressDismissKeyEquivalents = false
         hotKeyState.liveRecordingModifiers = []
         if clearFeedback {
             hotKeyState.shortcutFeedback = nil
         }
-        guard wasRecording else { return }
-        hotKeyState.isRecordingShortcut = false
-        onEndShortcutRecording()
+        if wasRecording {
+            hotKeyState.isRecordingShortcut = false
+            onEndShortcutRecording()
+        }
+        if wasRecording || (clearFeedback && hadFeedback) {
+            scheduleWindowHeightSync()
+        }
     }
 
     private func resetSnipShortcut() {
         stopRecordingShortcut()
         if let conflict = onResetSnipHotKey() {
             hotKeyState.shortcutFeedback = conflict.localizedDescription
+            scheduleWindowHeightSync()
             NSSound.beep()
         } else {
             hotKeyState.snipCombo = .defaultSnip
             hotKeyState.isSnipRegistered = true
             hotKeyState.shortcutFeedback = nil
+            scheduleWindowHeightSync()
         }
     }
 
@@ -328,6 +339,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
 
         if let conflict = onChangeSnipHotKey(candidate) {
             hotKeyState.shortcutFeedback = conflict.localizedDescription
+            scheduleWindowHeightSync()
             NSSound.beep()
             return true
         }
@@ -337,6 +349,12 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         hotKeyState.shortcutFeedback = nil
         stopRecordingShortcut()
         return true
+    }
+
+    private func scheduleWindowHeightSync() {
+        DispatchQueue.main.async { [weak self] in
+            self?.syncWindowHeightToFit(preserveTopEdge: true)
+        }
     }
 
     private func syncWindowHeightToFit(preserveTopEdge: Bool) {
@@ -539,6 +557,12 @@ private struct SettingsView: View {
                     onContentHeightChange()
                 }
             }
+            .onChange(of: hotKeyState.isRecordingShortcut) { _, _ in
+                onContentHeightChange()
+            }
+            .onChange(of: hotKeyState.shortcutFeedback) { _, _ in
+                onContentHeightChange()
+            }
         }
         .frame(width: 368)
         .fixedSize(horizontal: false, vertical: true)
@@ -625,6 +649,7 @@ private struct SettingsRow<Trailing: View>: View {
             Text(title)
                 .font(.system(size: 12.5, weight: .medium))
                 .lineLimit(1)
+                .layoutPriority(1)
 
             Spacer(minLength: 8)
 
@@ -666,10 +691,9 @@ private struct SnipShortcutRow: View {
         if liveModifiers.contains(.shift) { parts.append("⇧") }
         if liveModifiers.contains(.command) { parts.append("⌘") }
         if parts.isEmpty {
-            return "Press shortcut…"
+            return "Press Keys"
         }
-        parts.append("…")
-        return parts.joined(separator: " ")
+        return parts.joined(separator: " ") + " + Key"
     }
 
     var body: some View {
@@ -719,13 +743,6 @@ private struct SnipShortcutRow: View {
                     }
                 } else {
                     HStack(spacing: 5) {
-                        if !isRegistered {
-                            Button("Retry", action: onRetry)
-                                .buttonStyle(.bordered)
-                                .controlSize(.small)
-                                .fixedSize()
-                        }
-
                         if combo != .defaultSnip {
                             Button(action: onReset) {
                                 Image(systemName: "arrow.counterclockwise")
@@ -776,26 +793,36 @@ private struct SnipShortcutRow: View {
                 Text(feedback)
                     .font(.system(size: 10.5))
                     .foregroundStyle(.orange)
+                    .lineLimit(1)
                     .fixedSize(horizontal: false, vertical: true)
                     .padding(.leading, 43)
                     .padding(.trailing, 10)
                     .padding(.bottom, 7)
             } else if isRecording {
-                Text("Press your new shortcut, or Esc to cancel.")
+                Text("Press keys, or Esc to cancel.")
                     .font(.system(size: 10.5))
                     .foregroundStyle(.secondary)
+                    .lineLimit(1)
                     .fixedSize(horizontal: false, vertical: true)
                     .padding(.leading, 43)
                     .padding(.trailing, 10)
                     .padding(.bottom, 7)
             } else if !isRegistered {
-                Text("Shortcut \(combo.displayString) is currently in use by another app.")
-                    .font(.system(size: 10.5))
-                    .foregroundStyle(.orange)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .padding(.leading, 43)
-                    .padding(.trailing, 10)
-                    .padding(.bottom, 7)
+                HStack(spacing: 6) {
+                    Text("\(combo.displayString) in use by another app.")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.orange)
+                        .lineLimit(1)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 4)
+                    Button("Retry", action: onRetry)
+                        .buttonStyle(.bordered)
+                        .controlSize(.mini)
+                        .fixedSize()
+                }
+                .padding(.leading, 43)
+                .padding(.trailing, 10)
+                .padding(.bottom, 7)
             }
         }
     }
@@ -834,9 +861,10 @@ private struct LaunchAtLoginRow: View {
             }
 
             if serviceStatus == .requiresApproval {
-                Text("Approval required in System Settings → Login Items.")
+                Text("Approve in System Settings → Login Items.")
                     .font(.system(size: 10.5))
                     .foregroundStyle(.orange)
+                    .lineLimit(1)
                     .fixedSize(horizontal: false, vertical: true)
                     .padding(.leading, 43)
                     .padding(.trailing, 10)
@@ -845,6 +873,7 @@ private struct LaunchAtLoginRow: View {
                 Text(errorMessage)
                     .font(.system(size: 10.5))
                     .foregroundStyle(.red)
+                    .lineLimit(1)
                     .fixedSize(horizontal: false, vertical: true)
                     .padding(.leading, 43)
                     .padding(.trailing, 10)
@@ -877,7 +906,7 @@ private struct LaunchAtLoginRow: View {
             serviceStatus = SMAppService.mainApp.status
         } catch {
             serviceStatus = SMAppService.mainApp.status
-            errorMessage = "Could not update Launch at Login."
+            errorMessage = "Couldn't update Launch at Login."
         }
     }
 }
@@ -946,7 +975,7 @@ private struct UpdatesSettingRow: View {
         case .available(let release):
             return "v\(release.version.description) available"
         case .downloading(_, let progress):
-            return "Downloading \(Int((progress * 100).rounded()))%…"
+            return "Downloading \(Int((progress * 100).rounded()))%"
         case .verifying:
             return "Verifying…"
         case .installing:
@@ -999,9 +1028,11 @@ private struct UpdatesSettingRow: View {
                     Button {
                         NSWorkspace.shared.open(release.releaseURL)
                     } label: {
-                        Text("View Release Notes ↗")
+                        Text("Release Notes ↗")
                             .font(.system(size: 10.5, weight: .medium))
                             .foregroundStyle(Color.accentColor)
+                            .lineLimit(1)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                     .buttonStyle(.plain)
                     .pointerStyle(.link)
@@ -1016,6 +1047,7 @@ private struct UpdatesSettingRow: View {
                     Text(message)
                         .font(.system(size: 10.5))
                         .foregroundStyle(.red)
+                        .lineLimit(1)
                         .fixedSize(horizontal: false, vertical: true)
 
                     Button {
@@ -1024,6 +1056,8 @@ private struct UpdatesSettingRow: View {
                         Text("Open GitHub ↗")
                             .font(.system(size: 10.5, weight: .medium))
                             .foregroundStyle(Color.accentColor)
+                            .lineLimit(1)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                     .buttonStyle(.plain)
                     .pointerStyle(.link)
@@ -1145,6 +1179,7 @@ private struct ScreenRecordingSettingRow: View {
                     Text(showRelaunch ? "Relaunch CCX after enabling." : "Already enabled?")
                         .font(.system(size: 10.5))
                         .foregroundStyle(.secondary)
+                        .lineLimit(1)
                         .fixedSize(horizontal: false, vertical: true)
                     Spacer(minLength: 4)
                     Button(isChecking ? "Checking…" : "Verify", action: onVerify)

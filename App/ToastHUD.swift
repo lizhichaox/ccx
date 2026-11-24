@@ -75,7 +75,7 @@ final class ToastHUD {
         let horizontalPadding: CGFloat = 16
         let iconSize: CGFloat = 16
         let spacing: CGFloat = 8
-        let maxLabelWidth = max(120, min(420, visible.width - horizontalPadding * 2 - iconSize - spacing - 32))
+        let maxLabelWidth = max(120, min(560, visible.width - horizontalPadding * 2 - iconSize - spacing - 32))
         let labelWidth = min(ceil(label.frame.width), maxLabelWidth)
         let width = horizontalPadding * 2 + iconSize + spacing + labelWidth
 
