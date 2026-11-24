@@ -154,6 +154,9 @@ done
 
 # Optional: notarize and staple with an Apple notarytool keychain profile:
 ./scripts/package-release.sh --notarize "CCX-Notary"
+
+# Optional: notarize and staple using gitignored .env (APPLE_API_KEY_PATH, APPLE_API_KEY_ID, APPLE_API_ISSUER_ID):
+./scripts/package-release.sh --notarize-env
 ```
 
 ---

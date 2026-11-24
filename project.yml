@@ -77,6 +77,7 @@ targets:
           ONLY_ACTIVE_ARCH: YES
         Release:
           ENABLE_HARDENED_RUNTIME: YES
+          CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
           ARCHS: "$(ARCHS_STANDARD)"
           ONLY_ACTIVE_ARCH: NO
           OTHER_CODE_SIGN_FLAGS: "--timestamp"

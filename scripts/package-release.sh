@@ -11,6 +11,8 @@
 #                                    (default: auto-detect valid "Developer ID Application")
 #   --adhoc                          Ad-hoc sign ("-") for local packaging only (no Gatekeeper)
 #   --notarize <keychain-profile>    Submit to Apple notary service and staple .app/.dmg
+#   --notarize-env                   Notarize and staple using credentials from a local .env file
+#   --env-file <path>                Env file path for --notarize-env (default: <repo-root>/.env)
 #   --out-dir <dir>                  Output directory for release artifacts (default: dist)
 #   --no-dmg                         Skip DMG creation
 #   --no-zip                         Skip ZIP creation
@@ -29,6 +31,8 @@ ARCH_MODE="universal"
 SIGN_IDENTITY_OVERRIDE=""
 ADHOC=0
 NOTARIZE_PROFILE=""
+NOTARIZE_ENV=0
+ENV_FILE_OVERRIDE=""
 OUT_DIR="dist"
 BUILD_DMG=1
 BUILD_ZIP=1
@@ -56,11 +60,23 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --notarize)
-      if [[ $# -lt 2 ]]; then
+      if [[ $# -lt 2 || -z "$2" ]]; then
         echo "error: --notarize requires a notarytool keychain profile name" >&2
         exit 2
       fi
       NOTARIZE_PROFILE="$2"
+      shift 2
+      ;;
+    --notarize-env)
+      NOTARIZE_ENV=1
+      shift
+      ;;
+    --env-file)
+      if [[ $# -lt 2 || -z "$2" ]]; then
+        echo "error: --env-file requires a file path" >&2
+        exit 2
+      fi
+      ENV_FILE_OVERRIDE="$2"
       shift 2
       ;;
     --out-dir)
@@ -115,13 +131,224 @@ if [[ "$ADHOC" -eq 1 && -n "$NOTARIZE_PROFILE" ]]; then
   exit 2
 fi
 
+if [[ "$ADHOC" -eq 1 && "$NOTARIZE_ENV" -eq 1 ]]; then
+  echo "error: --notarize-env cannot be combined with --adhoc signing" >&2
+  exit 2
+fi
+
+if [[ "$NOTARIZE_ENV" -eq 1 && -n "$NOTARIZE_PROFILE" ]]; then
+  echo "error: --notarize-env cannot be combined with --notarize" >&2
+  exit 2
+fi
+
+if [[ -n "$ENV_FILE_OVERRIDE" && "$NOTARIZE_ENV" -eq 0 ]]; then
+  echo "error: --env-file requires --notarize-env" >&2
+  exit 2
+fi
+
 if [[ "$ADHOC" -eq 1 && -n "$SIGN_IDENTITY_OVERRIDE" ]]; then
   echo "error: --sign-identity cannot be combined with --adhoc" >&2
   exit 2
 fi
 
+ORIG_PWD="$PWD"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
+
+ENV_FILE=""
+ENV_NOTARY_KEYCHAIN_PROFILE=""
+ENV_APPLE_API_KEY_PATH=""
+ENV_APPLE_API_KEY_ID=""
+ENV_APPLE_API_ISSUER_ID=""
+ENV_APPLE_ID=""
+ENV_APPLE_APP_SPECIFIC_PASSWORD=""
+ENV_APPLE_TEAM_ID=""
+ENV_DEVELOPMENT_TEAM=""
+
+NOTARIZE_MODE=""
+NOTARIZE_MODE_LABEL=""
+NOTARY_KEYCHAIN_PROFILE_RESOLVED=""
+NOTARY_TEAM_ID_RESOLVED=""
+
+load_notarize_env() {
+  local env_file="$1"
+  local env_perms line key val
+
+  if [[ ! -f "$env_file" || -L "$env_file" ]]; then
+    if [[ -L "$env_file" ]]; then
+      echo "error: env file must not be a symlink: $env_file" >&2
+    elif [[ ! -e "$env_file" ]]; then
+      echo "error: env file not found: $env_file" >&2
+    else
+      echo "error: env file must be a regular file: $env_file" >&2
+    fi
+    exit 1
+  fi
+
+  if [[ ! -r "$env_file" ]]; then
+    echo "error: env file is not readable: $env_file" >&2
+    exit 1
+  fi
+
+  env_perms="$(stat -f '%Lp' "$env_file" 2>/dev/null || true)"
+  if [[ "$env_perms" != "600" && "$env_perms" != "400" ]]; then
+    echo "warning: $env_file should be chmod 600" >&2
+  fi
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    line="${line#"${line%%[![:space:]]*}"}"
+
+    if [[ -z "$line" || "$line" == \#* ]]; then
+      continue
+    fi
+
+    if [[ "$line" == export[[:space:]]* ]]; then
+      line="${line#export}"
+      line="${line#"${line%%[![:space:]]*}"}"
+    fi
+
+    if [[ "$line" != *=* ]]; then
+      continue
+    fi
+
+    key="${line%%=*}"
+    val="${line#*=}"
+
+    key="${key%"${key##*[![:space:]]}"}"
+    val="${val#"${val%%[![:space:]]*}"}"
+    val="${val%"${val##*[![:space:]]}"}"
+
+    if [[ ${#val} -ge 2 && "$val" == \"*\" ]]; then
+      val="${val#\"}"
+      val="${val%\"}"
+    elif [[ ${#val} -ge 2 && "$val" == \'*\' ]]; then
+      val="${val#\'}"
+      val="${val%\'}"
+    fi
+
+    case "$key" in
+      NOTARY_KEYCHAIN_PROFILE)
+        ENV_NOTARY_KEYCHAIN_PROFILE="$val"
+        ;;
+      APPLE_API_KEY_PATH)
+        if [[ "$val" == "~/"* ]]; then
+          val="${HOME%/}/${val#"~/"}"
+        fi
+        ENV_APPLE_API_KEY_PATH="$val"
+        ;;
+      APPLE_API_KEY_ID)
+        ENV_APPLE_API_KEY_ID="$val"
+        ;;
+      APPLE_API_ISSUER_ID)
+        ENV_APPLE_API_ISSUER_ID="$val"
+        ;;
+      APPLE_ID)
+        ENV_APPLE_ID="$val"
+        ;;
+      APPLE_APP_SPECIFIC_PASSWORD)
+        ENV_APPLE_APP_SPECIFIC_PASSWORD="$val"
+        ;;
+      APPLE_TEAM_ID)
+        ENV_APPLE_TEAM_ID="$val"
+        ;;
+      DEVELOPMENT_TEAM)
+        ENV_DEVELOPMENT_TEAM="$val"
+        ;;
+      *)
+        ;;
+    esac
+  done < "$env_file"
+
+  if [[ -z "$ENV_APPLE_TEAM_ID" && -n "$ENV_DEVELOPMENT_TEAM" ]]; then
+    ENV_APPLE_TEAM_ID="$ENV_DEVELOPMENT_TEAM"
+  fi
+}
+
+resolve_notarization_config() {
+  if [[ -n "$NOTARIZE_PROFILE" ]]; then
+    NOTARIZE_MODE="keychain-profile"
+    NOTARIZE_MODE_LABEL="keychain profile"
+    NOTARY_KEYCHAIN_PROFILE_RESOLVED="$NOTARIZE_PROFILE"
+    return 0
+  fi
+
+  if [[ "$NOTARIZE_ENV" -ne 1 ]]; then
+    return 0
+  fi
+
+  # Mode 1: App Store Connect API Key
+  if [[ -n "$ENV_APPLE_API_KEY_PATH" && -n "$ENV_APPLE_API_KEY_ID" && -n "$ENV_APPLE_API_ISSUER_ID" ]]; then
+    if [[ ! -f "$ENV_APPLE_API_KEY_PATH" || ! -r "$ENV_APPLE_API_KEY_PATH" ]]; then
+      echo "error: APPLE_API_KEY_PATH in $ENV_FILE does not exist, is not a regular file, or is not readable" >&2
+      exit 1
+    fi
+    NOTARIZE_MODE="api-key"
+    NOTARIZE_MODE_LABEL="App Store Connect API Key"
+    return 0
+  fi
+
+  # Mode 2: Keychain Profile
+  if [[ -n "$ENV_NOTARY_KEYCHAIN_PROFILE" ]]; then
+    NOTARIZE_MODE="keychain-profile"
+    NOTARIZE_MODE_LABEL="keychain profile"
+    NOTARY_KEYCHAIN_PROFILE_RESOLVED="$ENV_NOTARY_KEYCHAIN_PROFILE"
+    return 0
+  fi
+
+  # Mode 3: Apple ID + App-Specific Password (Team ID finalized after signing identity resolution)
+  if [[ -n "$ENV_APPLE_ID" && -n "$ENV_APPLE_APP_SPECIFIC_PASSWORD" ]]; then
+    NOTARIZE_MODE="apple-id"
+    NOTARIZE_MODE_LABEL="Apple ID + app-specific password"
+    return 0
+  fi
+
+  echo "error: incomplete or missing notarization credentials in $ENV_FILE." >&2
+  if [[ -n "$ENV_APPLE_API_KEY_PATH" || -n "$ENV_APPLE_API_KEY_ID" || -n "$ENV_APPLE_API_ISSUER_ID" ]]; then
+    local missing_api=""
+    if [[ -z "$ENV_APPLE_API_KEY_PATH" ]]; then
+      missing_api="${missing_api} APPLE_API_KEY_PATH"
+    fi
+    if [[ -z "$ENV_APPLE_API_KEY_ID" ]]; then
+      missing_api="${missing_api} APPLE_API_KEY_ID"
+    fi
+    if [[ -z "$ENV_APPLE_API_ISSUER_ID" ]]; then
+      missing_api="${missing_api} APPLE_API_ISSUER_ID"
+    fi
+    echo "       App Store Connect API Key mode is missing:${missing_api}" >&2
+  fi
+  if [[ -n "$ENV_APPLE_ID" || -n "$ENV_APPLE_APP_SPECIFIC_PASSWORD" ]]; then
+    local missing_apple=""
+    if [[ -z "$ENV_APPLE_ID" ]]; then
+      missing_apple="${missing_apple} APPLE_ID"
+    fi
+    if [[ -z "$ENV_APPLE_APP_SPECIFIC_PASSWORD" ]]; then
+      missing_apple="${missing_apple} APPLE_APP_SPECIFIC_PASSWORD"
+    fi
+    echo "       Apple ID mode is missing:${missing_apple}" >&2
+  fi
+  echo "       Provide one complete credential set in $ENV_FILE:" >&2
+  echo "         1. App Store Connect API Key: APPLE_API_KEY_PATH, APPLE_API_KEY_ID, APPLE_API_ISSUER_ID" >&2
+  echo "         2. Keychain Profile:          NOTARY_KEYCHAIN_PROFILE" >&2
+  echo "         3. Apple ID:                  APPLE_ID, APPLE_APP_SPECIFIC_PASSWORD (optional: APPLE_TEAM_ID)" >&2
+  exit 1
+}
+
+if [[ "$NOTARIZE_ENV" -eq 1 ]]; then
+  if [[ -n "$ENV_FILE_OVERRIDE" ]]; then
+    if [[ "$ENV_FILE_OVERRIDE" == "~/"* ]]; then
+      ENV_FILE="${HOME%/}/${ENV_FILE_OVERRIDE#"~/"}"
+    elif [[ "$ENV_FILE_OVERRIDE" != /* ]]; then
+      ENV_FILE="${ORIG_PWD}/${ENV_FILE_OVERRIDE}"
+    else
+      ENV_FILE="$ENV_FILE_OVERRIDE"
+    fi
+  else
+    ENV_FILE="${ROOT_DIR}/.env"
+  fi
+  load_notarize_env "$ENV_FILE"
+fi
+resolve_notarization_config
 
 export DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"
 
@@ -259,9 +486,107 @@ else
     "CODE_SIGN_IDENTITY=$SIGN_IDENTITY"
     "DEVELOPMENT_TEAM=$TEAM_ID"
     "ENABLE_HARDENED_RUNTIME=YES"
+    "CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO"
     "OTHER_CODE_SIGN_FLAGS=--timestamp"
   )
 fi
+
+if [[ "$NOTARIZE_MODE" == "apple-id" ]]; then
+  NOTARY_TEAM_ID_RESOLVED="${ENV_APPLE_TEAM_ID:-$TEAM_ID}"
+  if [[ -z "$NOTARY_TEAM_ID_RESOLVED" ]]; then
+    echo "error: Apple ID notarization requires APPLE_TEAM_ID in $ENV_FILE (or a resolved signing Team ID)" >&2
+    exit 1
+  fi
+fi
+
+if [[ -n "$NOTARIZE_MODE" ]]; then
+  echo "==> Notarization enabled (${NOTARIZE_MODE_LABEL})"
+fi
+
+parse_json_field() {
+  local json_input="$1"
+  local key="$2"
+  local val=""
+  if val="$(printf '%s' "$json_input" | plutil -extract "$key" raw -o - - 2>/dev/null)"; then
+    printf '%s' "$val"
+  fi
+}
+
+notarize_artifact() {
+  local artifact="$1"
+  local artifact_name submit_target notary_stage
+  local submit_json="" submit_rc=0
+  local submission_id="" submission_status="" submission_message=""
+  local NOTARY_ARGS=()
+
+  artifact_name="$(basename "$artifact")"
+  submit_target="$artifact"
+
+  case "$NOTARIZE_MODE" in
+    api-key)
+      NOTARY_ARGS=(
+        --key "$ENV_APPLE_API_KEY_PATH"
+        --key-id "$ENV_APPLE_API_KEY_ID"
+        --issuer "$ENV_APPLE_API_ISSUER_ID"
+      )
+      ;;
+    keychain-profile)
+      NOTARY_ARGS=(
+        --keychain-profile "$NOTARY_KEYCHAIN_PROFILE_RESOLVED"
+      )
+      ;;
+    apple-id)
+      NOTARY_ARGS=(
+        --apple-id "$ENV_APPLE_ID"
+        --team-id "$NOTARY_TEAM_ID_RESOLVED"
+        --password "$ENV_APPLE_APP_SPECIFIC_PASSWORD"
+      )
+      ;;
+    *)
+      echo "error: unsupported notarization mode '${NOTARIZE_MODE}'" >&2
+      exit 1
+      ;;
+  esac
+
+  echo "==> Submitting ${artifact_name} for notarization (${NOTARIZE_MODE_LABEL})"
+
+  if [[ -d "$artifact" ]]; then
+    notary_stage="$(mktemp -d "${TMPDIR:-/tmp}/ccx-notary.XXXXXX")"
+    CLEANUP_PATHS+=("$notary_stage")
+    submit_target="${notary_stage}/${artifact_name%.app}.zip"
+    ditto -c -k --keepParent "$artifact" "$submit_target"
+  fi
+
+  submit_json="$(xcrun notarytool submit "$submit_target" "${NOTARY_ARGS[@]}" --wait --output-format json)" || submit_rc=$?
+
+  if [[ -n "$submit_json" ]]; then
+    submission_id="$(parse_json_field "$submit_json" "id")"
+    submission_status="$(parse_json_field "$submit_json" "status")"
+    submission_message="$(parse_json_field "$submit_json" "message")"
+  fi
+
+  if [[ -n "$submission_id" || -n "$submission_status" ]]; then
+    echo "    [info] Notary submission ID: ${submission_id:-<unknown>}, status: ${submission_status:-<unknown>}"
+  fi
+
+  if [[ "$submit_rc" -ne 0 || "$submission_status" != "Accepted" ]]; then
+    echo "error: notarization failed for ${artifact_name} (status: ${submission_status:-unknown}, exit: ${submit_rc})" >&2
+    if [[ -n "$submission_message" ]]; then
+      echo "       message: ${submission_message}" >&2
+    elif [[ -z "$submission_status" && -n "$submit_json" ]]; then
+      printf '%s\n' "$submit_json" >&2
+    fi
+    if [[ -n "$submission_id" ]]; then
+      echo "==> Fetching Apple notary log for submission ${submission_id}" >&2
+      xcrun notarytool log "$submission_id" "${NOTARY_ARGS[@]}" >&2 || echo "warning: failed to fetch notary log for submission ${submission_id}" >&2
+    fi
+    exit 1
+  fi
+
+  xcrun stapler staple "$artifact"
+  xcrun stapler validate "$artifact"
+  echo "    [ok] ${artifact_name} notarized and stapled"
+}
 
 echo "==> Packaging CCX v${VERSION} (${BUILD_NUMBER}) for ${ARCH_MODE}"
 echo "==> Generating CCX.xcodeproj"
@@ -356,6 +681,13 @@ fi
 echo "    [ok] com.apple.security.device.audio-input entitlement present"
 
 if [[ "$ADHOC" -eq 0 ]]; then
+  if printf '%s\n' "$ENTITLEMENTS_OUT" | grep -Fq 'com.apple.security.get-task-allow'; then
+    echo "error: forbidden com.apple.security.get-task-allow entitlement present in $BUILT_APP (will be rejected by Apple notarization)" >&2
+    printf '%s\n' "$ENTITLEMENTS_OUT" >&2
+    exit 1
+  fi
+  echo "    [ok] No get-task-allow entitlement present"
+
   CODESIGN_INFO="$(codesign -dvv "$BUILT_APP" 2>&1)"
   if ! printf '%s\n' "$CODESIGN_INFO" | grep -Eq 'flags=.*runtime'; then
     echo "error: Hardened Runtime flag not present in code signature" >&2
@@ -381,19 +713,12 @@ ditto "$BUILT_APP" "$APP_STAGE_DIR/CCX.app"
 rm -rf "$DIST_APP"
 mv "$APP_STAGE_DIR/CCX.app" "$DIST_APP"
 
-if [[ -n "$NOTARIZE_PROFILE" ]]; then
-  echo "==> Submitting CCX.app for notarization (profile: $NOTARIZE_PROFILE)"
-  NOTARY_STAGE="$(mktemp -d "${TMPDIR:-/tmp}/ccx-notary.XXXXXX")"
-  CLEANUP_PATHS+=("$NOTARY_STAGE")
-  NOTARY_APP_ZIP="$NOTARY_STAGE/CCX.zip"
-  ditto -c -k --keepParent "$DIST_APP" "$NOTARY_APP_ZIP"
-  xcrun notarytool submit "$NOTARY_APP_ZIP" --keychain-profile "$NOTARIZE_PROFILE" --wait
-  xcrun stapler staple "$DIST_APP"
-  xcrun stapler validate "$DIST_APP"
-  echo "    [ok] CCX.app notarized and stapled"
+if [[ -n "$NOTARIZE_MODE" ]]; then
+  notarize_artifact "$DIST_APP"
 fi
 
 ARTIFACT_BASENAMES=()
+DMG_PATH=""
 
 if [[ "$BUILD_ZIP" -eq 1 ]]; then
   ZIP_NAME="CCX-${VERSION}-macOS-${ARCH_MODE}.zip"
@@ -427,12 +752,8 @@ if [[ "$BUILD_DMG" -eq 1 ]]; then
     codesign --force --sign "$SIGN_IDENTITY" --timestamp "$DMG_PATH"
   fi
 
-  if [[ -n "$NOTARIZE_PROFILE" ]]; then
-    echo "==> Submitting $DMG_NAME for notarization (profile: $NOTARIZE_PROFILE)"
-    xcrun notarytool submit "$DMG_PATH" --keychain-profile "$NOTARIZE_PROFILE" --wait
-    xcrun stapler staple "$DMG_PATH"
-    xcrun stapler validate "$DMG_PATH"
-    echo "    [ok] $DMG_NAME notarized and stapled"
+  if [[ -n "$NOTARIZE_MODE" ]]; then
+    notarize_artifact "$DMG_PATH"
   fi
   ARTIFACT_BASENAMES+=("$DMG_NAME")
 fi
@@ -447,6 +768,9 @@ fi
 
 echo "==> Gatekeeper assessment (spctl)"
 spctl -a -t exec -vv "$DIST_APP" 2>&1 || true
+if [[ -n "$NOTARIZE_MODE" && "$BUILD_DMG" -eq 1 && -f "$DMG_PATH" ]]; then
+  spctl -a -t open --context context:primary-signature -vv "$DMG_PATH" 2>&1 || true
+fi
 
 echo ""
 echo "==> Release artifacts ready in $OUT_DIR_ABS:"
@@ -456,12 +780,14 @@ if [[ -f "$OUT_DIR_ABS/SHA256SUMS.txt" ]]; then
   cat "$OUT_DIR_ABS/SHA256SUMS.txt"
 fi
 
-if [[ "$ADHOC" -eq 0 && -z "$NOTARIZE_PROFILE" ]]; then
+if [[ "$ADHOC" -eq 0 && -z "$NOTARIZE_MODE" ]]; then
   echo ""
   echo "Note: Bundle is Developer ID signed with Hardened Runtime, but NOT YET NOTARIZED."
   echo "To notarize and staple for zero-warning Gatekeeper installs on external Macs:"
-  echo "  1. Store notarytool credentials once:"
+  echo "  Option A (gitignored .env with App Store Connect API key, keychain profile, or Apple ID):"
+  echo "     chmod 600 .env"
+  echo "     ./scripts/package-release.sh --arch ${ARCH_MODE} --notarize-env"
+  echo "  Option B (notarytool keychain profile):"
   echo "     xcrun notarytool store-credentials \"CCX-Notary\" --apple-id \"<apple-id>\" --team-id \"$TEAM_ID\" --password \"<app-specific-password>\""
-  echo "  2. Re-run packaging with notarization:"
   echo "     ./scripts/package-release.sh --arch ${ARCH_MODE} --notarize \"CCX-Notary\""
 fi
