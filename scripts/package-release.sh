@@ -279,9 +279,18 @@ resolve_notarization_config() {
 
   # Mode 1: App Store Connect API Key
   if [[ -n "$ENV_APPLE_API_KEY_PATH" && -n "$ENV_APPLE_API_KEY_ID" && -n "$ENV_APPLE_API_ISSUER_ID" ]]; then
+    if [[ -L "$ENV_APPLE_API_KEY_PATH" ]]; then
+      echo "error: APPLE_API_KEY_PATH must not be a symlink: $ENV_APPLE_API_KEY_PATH" >&2
+      exit 1
+    fi
     if [[ ! -f "$ENV_APPLE_API_KEY_PATH" || ! -r "$ENV_APPLE_API_KEY_PATH" ]]; then
       echo "error: APPLE_API_KEY_PATH in $ENV_FILE does not exist, is not a regular file, or is not readable" >&2
       exit 1
+    fi
+    local key_perms
+    key_perms="$(stat -f '%Lp' "$ENV_APPLE_API_KEY_PATH" 2>/dev/null || true)"
+    if [[ "$key_perms" != "600" && "$key_perms" != "400" ]]; then
+      echo "warning: APPLE_API_KEY_PATH ($ENV_APPLE_API_KEY_PATH) should be chmod 600" >&2
     fi
     NOTARIZE_MODE="api-key"
     NOTARIZE_MODE_LABEL="App Store Connect API Key"
@@ -298,6 +307,7 @@ resolve_notarization_config() {
 
   # Mode 3: Apple ID + App-Specific Password (Team ID finalized after signing identity resolution)
   if [[ -n "$ENV_APPLE_ID" && -n "$ENV_APPLE_APP_SPECIFIC_PASSWORD" ]]; then
+    echo "warning: Apple ID notarization passes --password on the command line, which may be briefly visible to other local users via ps; prefer App Store Connect API Key (Mode 1) or a Keychain Profile (NOTARY_KEYCHAIN_PROFILE)." >&2
     NOTARIZE_MODE="apple-id"
     NOTARIZE_MODE_LABEL="Apple ID + app-specific password"
     return 0

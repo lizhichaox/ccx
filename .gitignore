@@ -36,6 +36,13 @@ CCX.xcodeproj/
 
 # Personal signing settings (public repository)
 Config/LocalSigning.xcconfig
+*.p8
+*.p12
+*.pem
+*.key
+*.cer
+*.mobileprovision
+.env.*
 
 # Swift Package Manager
 .build/

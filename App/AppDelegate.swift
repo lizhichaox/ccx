@@ -606,16 +606,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func preferredSaveDirectoryURL() -> URL {
-        let fm = FileManager.default
-        if let savedPath = UserDefaults.standard.string(forKey: Self.lastSaveDirectoryKey) {
-            var st = stat()
-            if Darwin.lstat(savedPath, &st) == 0,
-               (st.st_mode & S_IFMT) == S_IFDIR,
-               fm.isWritableFile(atPath: savedPath) {
-                return URL(fileURLWithPath: savedPath, isDirectory: true)
-            }
+        if let savedPath = UserDefaults.standard.string(forKey: Self.lastSaveDirectoryKey),
+           Self.isWritableRealDirectory(atPath: savedPath) {
+            return URL(fileURLWithPath: Self.normalizedDirectoryPath(savedPath), isDirectory: true)
         }
-        return fm.urls(for: .desktopDirectory, in: .userDomainMask).first
+        return FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Desktop", isDirectory: true)
     }
 
@@ -787,15 +782,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         "CCX-\(fileTimestampFormatter.string(from: date))"
     }
 
+    private nonisolated static func entryExistsOrSymlink(atPath path: String) -> Bool {
+        let normalized = normalizedDirectoryPath(path)
+        guard !normalized.isEmpty else { return false }
+        var st = stat()
+        return Darwin.lstat(normalized, &st) == 0 || FileManager.default.fileExists(atPath: normalized)
+    }
+
     private nonisolated static func nextUniqueURL(
         in directory: URL,
         stem: String,
         fileExtension: String
     ) -> URL? {
-        let fm = FileManager.default
         var candidate = directory.appendingPathComponent("\(stem).\(fileExtension)")
         var suffix = 2
-        while fm.fileExists(atPath: candidate.path) {
+        while entryExistsOrSymlink(atPath: candidate.path) {
             if suffix > maxQuickSaveSuffixAttempts {
                 return directory.appendingPathComponent("\(stem)-\(UUID().uuidString.prefix(8)).\(fileExtension)")
             }
@@ -997,11 +998,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private nonisolated static func destinationExistsRejectingSymlink(atPath path: String) throws -> Bool {
+        var destStat = stat()
+        if Darwin.lstat(path, &destStat) == 0 {
+            guard (destStat.st_mode & S_IFMT) != S_IFLNK else {
+                throw CocoaError(.fileWriteNoPermission)
+            }
+            return true
+        }
+        if errno == ENOENT {
+            return false
+        }
+        throw CocoaError(.fileWriteNoPermission)
+    }
+
     /// Moves `sourceURL` to `destinationURL` without ever deleting an existing file before replacement
     /// and without losing `sourceURL` if the copy/move fails (including across volumes).
     private nonisolated static func moveRecordingAtomically(from sourceURL: URL, to destinationURL: URL) throws {
+        let normalizedSourcePath = normalizedDirectoryPath(sourceURL.path)
+        let normalizedDestPath = normalizedDirectoryPath(destinationURL.path)
+        guard !normalizedSourcePath.isEmpty, !normalizedDestPath.isEmpty else {
+            throw CocoaError(.fileWriteNoPermission)
+        }
+
+        var sourceStat = stat()
+        if Darwin.lstat(normalizedSourcePath, &sourceStat) != 0 {
+            throw errno == ENOENT ? CocoaError(.fileNoSuchFile) : CocoaError(.fileWriteNoPermission)
+        }
+        guard (sourceStat.st_mode & S_IFMT) == S_IFREG else {
+            throw CocoaError(.fileWriteNoPermission)
+        }
+
         let fm = FileManager.default
-        let destinationExists = fm.fileExists(atPath: destinationURL.path)
+        let destinationExists = try destinationExistsRejectingSymlink(atPath: normalizedDestPath)
 
         if destinationExists {
             do {
@@ -1011,7 +1040,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 // Cross-volume replace falls back to staging a sibling temp file in the
                 // destination directory and swapping atomically on the destination volume.
             }
-        } else if Darwin.rename(sourceURL.path, destinationURL.path) == 0 {
+        } else if Darwin.rename(normalizedSourcePath, normalizedDestPath) == 0 {
             return
         }
 
@@ -1020,7 +1049,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .appendingPathComponent(".ccx-save-\(UUID().uuidString)")
         do {
             try fm.copyItem(at: sourceURL, to: siblingTemp)
-            if fm.fileExists(atPath: destinationURL.path) {
+            if try destinationExistsRejectingSymlink(atPath: normalizedDestPath) {
                 _ = try fm.replaceItemAt(destinationURL, withItemAt: siblingTemp)
             } else {
                 try fm.moveItem(at: siblingTemp, to: destinationURL)
@@ -1066,6 +1095,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             && st.st_uid == Darwin.getuid()
     }
 
+    private nonisolated static func unlinkOwnedPasteboardEntry(at url: URL) {
+        let path = normalizedDirectoryPath(url.path)
+        guard !path.isEmpty else { return }
+        var st = stat()
+        guard Darwin.lstat(path, &st) == 0,
+              st.st_uid == Darwin.getuid(),
+              (st.st_mode & S_IFMT) == S_IFREG || (st.st_mode & S_IFMT) == S_IFLNK
+        else { return }
+        _ = Darwin.unlink(path)
+    }
+
     private nonisolated static func prunePasteboardRecordings(keepingLatest maxKeep: Int) {
         let dir = pasteboardRecordingsDirectoryURL()
         guard isPrivateExistingDirectory(at: dir) else { return }
@@ -1082,7 +1122,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return lDate > rDate
         }
         for url in sorted.dropFirst(max(0, maxKeep)) {
-            _ = Darwin.unlink(url.path)
+            unlinkOwnedPasteboardEntry(at: url)
         }
     }
 
@@ -1096,7 +1136,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             options: []
         ) else { return }
         for url in urls {
-            _ = Darwin.unlink(url.path)
+            unlinkOwnedPasteboardEntry(at: url)
         }
     }
 
@@ -1112,7 +1152,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let cutoff = Date().addingTimeInterval(-maxAge)
         for url in urls {
             if let created = (try? url.resourceValues(forKeys: [.creationDateKey]))?.creationDate, created < cutoff {
-                _ = Darwin.unlink(url.path)
+                unlinkOwnedPasteboardEntry(at: url)
             }
         }
         prunePasteboardRecordings(keepingLatest: maxRetainedPasteboardRecordings)
