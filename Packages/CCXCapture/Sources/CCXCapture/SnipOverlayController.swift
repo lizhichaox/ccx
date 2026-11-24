@@ -17,6 +17,7 @@ final class SnipOverlayPanel: NSPanel {
 final class SnipOverlayController {
     private let snapshots: [DisplaySnapshot]
     private let detector: SmartElementDetector
+    private let selectionMode: SnipSelectionMode
     private let initialStyle: AnnotationStyle
     private let previousSelections: [CGDirectDisplayID: CGRect]
     private let onStyleUpdated: ((AnnotationStyle) -> Void)?
@@ -25,11 +26,13 @@ final class SnipOverlayController {
     private let onFinish: (SnipOutcome) -> Void
     private var panels: [SnipOverlayPanel] = []
     private var views: [SnipOverlayView] = []
+    private var screenParametersObserver: NSObjectProtocol?
     private var isFinished = false
 
     init(
         snapshots: [DisplaySnapshot],
         detector: SmartElementDetector,
+        selectionMode: SnipSelectionMode = .snip,
         initialStyle: AnnotationStyle = AnnotationStyle(),
         previousSelections: [CGDirectDisplayID: CGRect] = [:],
         onStyleUpdated: ((AnnotationStyle) -> Void)? = nil,
@@ -39,6 +42,7 @@ final class SnipOverlayController {
     ) {
         self.snapshots = snapshots
         self.detector = detector
+        self.selectionMode = selectionMode
         self.initialStyle = initialStyle
         self.previousSelections = previousSelections
         self.onStyleUpdated = onStyleUpdated
@@ -75,6 +79,7 @@ final class SnipOverlayController {
             let view = SnipOverlayView(
                 snapshot: snapshot,
                 topInset: topInset,
+                selectionMode: selectionMode,
                 initialStyle: initialStyle,
                 previousSelectionRect: previousSelections[snapshot.displayID]
             )
@@ -140,6 +145,22 @@ final class SnipOverlayController {
             key.makeFirstResponder(view)
             (view as? SnipOverlayView)?.invalidateCursor()
         }
+
+        screenParametersObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.handleScreenParametersChanged()
+            }
+        }
+    }
+
+    private func handleScreenParametersChanged() {
+        guard !isFinished else { return }
+        close()
+        onFinish(.cancelled)
     }
 
     /// Finds the display index containing `globalPoint`, preferring strict half-open containment
@@ -175,10 +196,14 @@ final class SnipOverlayController {
     /// Tears down all panels without reporting an outcome.
     func close() {
         isFinished = true
+        if let screenParametersObserver {
+            NotificationCenter.default.removeObserver(screenParametersObserver)
+            self.screenParametersObserver = nil
+        }
         detector.cancelPendingRequests()
         NSCursor.arrow.set()
-        for panel in panels { panel.orderOut(nil) }
         for view in views {
+            view.tearDown()
             view.onFinish = nil
             view.onBeginInteraction = nil
             view.onHoverActive = nil
@@ -189,6 +214,12 @@ final class SnipOverlayController {
             view.elementRectRequester = nil
             view.cancelElementRectRequests = nil
             view.onStyleUpdated = nil
+        }
+        for panel in panels {
+            panel.makeFirstResponder(nil)
+            panel.orderOut(nil)
+            panel.contentView = nil
+            panel.close()
         }
         panels.removeAll()
         views.removeAll()
@@ -211,13 +242,13 @@ final class SnipOverlayController {
         let outcome: SnipOutcome
         switch action {
         case let .pin(rect):
-            outcome = renderResult(for: rect).map(SnipOutcome.pin) ?? .cancelled
+            outcome = renderResult(for: rect).map(SnipOutcome.pin) ?? .failed("Could not render selected region")
         case let .copy(rect):
-            outcome = renderResult(for: rect).map(SnipOutcome.copy) ?? .cancelled
+            outcome = renderResult(for: rect).map(SnipOutcome.copy) ?? .failed("Could not render selected region")
         case let .save(rect):
-            outcome = renderResult(for: rect).map(SnipOutcome.save) ?? .cancelled
+            outcome = renderResult(for: rect).map(SnipOutcome.save) ?? .failed("Could not render selected region")
         case let .quickSave(rect):
-            outcome = renderResult(for: rect).map(SnipOutcome.quickSave) ?? .cancelled
+            outcome = renderResult(for: rect).map(SnipOutcome.quickSave) ?? .failed("Could not render selected region")
         case let .scroll(rect):
             let initialResult = Self.makeResult(localRect: rect, snapshot: view.snapshot)
             if initialResult != nil {
@@ -235,11 +266,28 @@ final class SnipOverlayController {
                 )
                 onRequestScrollCapture(request)
             } else {
-                onFinish(.cancelled)
+                onFinish(.failed("Could not render selected region"))
             }
             return
         case let .ocr(rect):
-            outcome = renderResult(for: rect).map(SnipOutcome.ocr) ?? .cancelled
+            outcome = renderResult(for: rect).map(SnipOutcome.ocr) ?? .failed("Could not render selected region")
+        case let .record(rect):
+            let standardized = rect.standardized
+            let localBounds = CGRect(origin: .zero, size: view.snapshot.screenFrame.size)
+            let clipped = standardized.intersection(localBounds)
+            let effectiveLocal = (!clipped.isNull && clipped.width >= 1 && clipped.height >= 1) ? clipped : standardized
+            let scale = view.snapshot.screenFrame.width > 0
+                ? CGFloat(view.snapshot.image.width) / view.snapshot.screenFrame.width
+                : view.snapshot.backingScaleFactor
+            let screenRect = effectiveLocal.offsetBy(dx: view.snapshot.screenFrame.minX, dy: view.snapshot.screenFrame.minY)
+            onSelectionCommitted?(view.snapshot.displayID, effectiveLocal)
+            outcome = .record(RecordRegionRequest(
+                displayID: view.snapshot.displayID,
+                displayFrame: view.snapshot.screenFrame,
+                localRect: effectiveLocal,
+                screenRect: screenRect,
+                scale: scale
+            ))
         case let .copyColor(sample, format):
             outcome = .copiedColor(sample, format)
         case .cancel:

@@ -62,7 +62,13 @@ public struct SelectionStateMachine: Sendable {
     private var didExceedClickThreshold = false
 
     public init(bounds: CGRect) {
-        self.bounds = bounds
+        if !bounds.isNull && !bounds.isInfinite &&
+            bounds.origin.x.isFinite && bounds.origin.y.isFinite &&
+            bounds.size.width.isFinite && bounds.size.height.isFinite {
+            self.bounds = bounds.standardized
+        } else {
+            self.bounds = .zero
+        }
         self.state = .hovering(detectedRect: nil)
     }
 
@@ -113,6 +119,7 @@ public struct SelectionStateMachine: Sendable {
     }
 
     public mutating func mouseDown(at rawPoint: CGPoint) {
+        guard rawPoint.x.isFinite, rawPoint.y.isFinite else { return }
         let point = Self.clampedPoint(rawPoint, in: bounds)
         switch state {
         case let .hovering(detected):
@@ -143,6 +150,7 @@ public struct SelectionStateMachine: Sendable {
         constrainSquare: Bool = false,
         moveOrigin: Bool = false
     ) {
+        guard rawPoint.x.isFinite, rawPoint.y.isFinite else { return }
         let point = Self.clampedPoint(rawPoint, in: bounds)
         switch state {
         case let .dragging(origin, current):
@@ -196,7 +204,7 @@ public struct SelectionStateMachine: Sendable {
     }
 
     public mutating func mouseUp(at rawPoint: CGPoint) {
-        let point = Self.clampedPoint(rawPoint, in: bounds)
+        let point = (rawPoint.x.isFinite && rawPoint.y.isFinite) ? Self.clampedPoint(rawPoint, in: bounds) : bounds.origin
         switch state {
         case let .dragging(origin, current):
             let isClick = !didExceedClickThreshold &&
@@ -226,7 +234,7 @@ public struct SelectionStateMachine: Sendable {
     /// Moves the selection by `dx`/`dy` points (arrow-key nudging). Returns `true` if handled.
     @discardableResult
     public mutating func nudge(dx: CGFloat, dy: CGFloat) -> Bool {
-        guard case let .selected(rect) = state else { return false }
+        guard dx.isFinite, dy.isFinite, case let .selected(rect) = state else { return false }
         state = .selected(rect: Self.clampedOffset(rect, dx: dx, dy: dy, in: bounds))
         return true
     }
@@ -235,13 +243,15 @@ public struct SelectionStateMachine: Sendable {
     /// clamped to `bounds` and minimum `1 × 1`. Returns `true` if handled.
     @discardableResult
     public mutating func resizeBy(dw: CGFloat, dh: CGFloat) -> Bool {
-        guard case let .selected(rect) = state else { return false }
-        let newWidth = min(max(rect.width + dw, 1), bounds.maxX - rect.minX)
-        let newHeight = min(max(rect.height + dh, 1), bounds.height)
+        guard dw.isFinite, dh.isFinite, case let .selected(rect) = state else { return false }
+        let maxW = max(1, bounds.maxX - rect.minX)
+        let maxH = max(1, bounds.height)
+        let newWidth = min(max(rect.width + dw, 1), maxW)
+        let newHeight = min(max(rect.height + dh, 1), maxH)
         let newY = max(bounds.minY, rect.maxY - newHeight)
         let resized = CGRect(
             x: rect.minX,
-            y: min(newY, bounds.maxY - newHeight),
+            y: min(newY, max(bounds.minY, bounds.maxY - newHeight)),
             width: newWidth,
             height: newHeight
         )
@@ -317,22 +327,32 @@ public struct SelectionStateMachine: Sendable {
     }
 
     static func clampedPoint(_ point: CGPoint, in bounds: CGRect) -> CGPoint {
-        CGPoint(x: min(max(point.x, bounds.minX), bounds.maxX), y: min(max(point.y, bounds.minY), bounds.maxY))
+        let px = point.x.isFinite ? point.x : bounds.minX
+        let py = point.y.isFinite ? point.y : bounds.minY
+        return CGPoint(x: min(max(px, bounds.minX), bounds.maxX), y: min(max(py, bounds.minY), bounds.maxY))
     }
 
     /// Intersects `rect` with `bounds`; returns `nil` when they do not overlap.
     static func clampedRect(_ rect: CGRect, in bounds: CGRect) -> CGRect? {
+        guard !rect.isNull, !rect.isInfinite,
+              rect.origin.x.isFinite, rect.origin.y.isFinite,
+              rect.size.width.isFinite, rect.size.height.isFinite
+        else { return nil }
         let clipped = rect.standardized.intersection(bounds)
         return clipped.isNull || clipped.isEmpty ? nil : clipped
     }
 
     /// Offsets `rect` by `dx`/`dy`, keeping it fully inside `bounds`.
     static func clampedOffset(_ rect: CGRect, dx: CGFloat, dy: CGFloat, in bounds: CGRect) -> CGRect {
-        var moved = rect.offsetBy(dx: dx, dy: dy)
+        let safeDx = dx.isFinite ? dx : 0
+        let safeDy = dy.isFinite ? dy : 0
+        var moved = rect.offsetBy(dx: safeDx, dy: safeDy)
         if moved.width > bounds.width { moved.size.width = bounds.width }
         if moved.height > bounds.height { moved.size.height = bounds.height }
-        moved.origin.x = min(max(moved.minX, bounds.minX), bounds.maxX - moved.width)
-        moved.origin.y = min(max(moved.minY, bounds.minY), bounds.maxY - moved.height)
+        let maxOriginX = max(bounds.minX, bounds.maxX - moved.width)
+        let maxOriginY = max(bounds.minY, bounds.maxY - moved.height)
+        moved.origin.x = min(max(moved.minX, bounds.minX), maxOriginX)
+        moved.origin.y = min(max(moved.minY, bounds.minY), maxOriginY)
         return moved
     }
 

@@ -1,6 +1,7 @@
 import AppKit
 import CoreGraphics
 import Foundation
+import os
 
 /// Interactive annotation modes available inside the snip canvas.
 public enum AnnotationTool: String, CaseIterable, Sendable {
@@ -77,6 +78,28 @@ public enum AnnotationTool: String, CaseIterable, Sendable {
         case "7": .text
         case "8": .counter
         default: nil
+        }
+    }
+
+    public func formattedSizeHUDLabel(for size: StrokeSize, mosaicMode: MosaicMode) -> String {
+        switch self {
+        case .select, .rectangle, .ellipse, .arrow, .pen:
+            return "\(size.formattedLineWidth) pt"
+        case .highlighter:
+            let halves = Int((size.highlighterWidth * 2).rounded())
+            let widthText = halves.isMultiple(of: 2) ? "\(halves / 2)" : "\(halves / 2).5"
+            return "\(widthText) pt"
+        case .text:
+            return "\(Int(size.fontSize.rounded())) pt"
+        case .counter:
+            return "\(Int(size.counterDiameter.rounded())) px"
+        case .mosaic:
+            switch mosaicMode {
+            case .pixelate:
+                return "Mosaic \(Int(size.mosaicBlockSize.rounded()))"
+            case .blur:
+                return "Blur \(Int(size.blurRadius.rounded()))"
+            }
         }
     }
 }
@@ -321,6 +344,7 @@ public struct AnnotationItem: Identifiable, Equatable, Sendable {
     }
 
     public func hitTestHandle(at point: CGPoint, radius: CGFloat = 7) -> AnnotationHandle? {
+        guard point.x.isFinite, point.y.isFinite, radius.isFinite, radius >= 0 else { return nil }
         let points = handlePoints
         for handle in Self.handleHitOrder {
             guard let center = points[handle] else { continue }
@@ -332,6 +356,7 @@ public struct AnnotationItem: Identifiable, Equatable, Sendable {
     }
 
     public func hitTest(point: CGPoint, tolerance: CGFloat = 8) -> Bool {
+        guard point.x.isFinite, point.y.isFinite, tolerance.isFinite, tolerance >= 0 else { return false }
         switch kind {
         case let .rectangle(raw):
             let rect = raw.standardized
@@ -385,6 +410,7 @@ public struct AnnotationItem: Identifiable, Equatable, Sendable {
     }
 
     public func translated(by delta: CGSize) -> AnnotationItem {
+        guard delta.width.isFinite, delta.height.isFinite else { return self }
         var copy = self
         switch kind {
         case let .rectangle(rect):
@@ -421,20 +447,28 @@ public struct AnnotationItem: Identifiable, Equatable, Sendable {
     }
 
     public func resized(handle: AnnotationHandle, to point: CGPoint, constrain: Bool, within bounds: CGRect?) -> AnnotationItem {
+        guard point.x.isFinite, point.y.isFinite else { return self }
+        let safeBounds = Self.sanitizedBounds(bounds)
         var copy = self
         switch kind {
         case let .rectangle(raw):
-            copy.kind = .rectangle(Self.resizedRect(raw, handle: handle, to: point, constrain: constrain, within: bounds))
+            copy.kind = .rectangle(Self.resizedRect(raw, handle: handle, to: point, constrain: constrain, within: safeBounds))
         case let .ellipse(raw):
-            copy.kind = .ellipse(Self.resizedRect(raw, handle: handle, to: point, constrain: constrain, within: bounds))
+            copy.kind = .ellipse(Self.resizedRect(raw, handle: handle, to: point, constrain: constrain, within: safeBounds))
         case let .mosaic(raw, mode):
-            copy.kind = .mosaic(Self.resizedRect(raw, handle: handle, to: point, constrain: constrain, within: bounds), mode)
+            copy.kind = .mosaic(Self.resizedRect(raw, handle: handle, to: point, constrain: constrain, within: safeBounds), mode)
         case let .arrow(start, end):
             switch handle {
             case .start:
-                copy.kind = .arrow(start: Self.constrainedEnd(from: end, to: point, snapAngle: constrain), end: end)
+                copy.kind = .arrow(
+                    start: Self.constrainedEnd(from: end, to: point, snapAngle: constrain, within: safeBounds),
+                    end: end
+                )
             case .end:
-                copy.kind = .arrow(start: start, end: Self.constrainedEnd(from: start, to: point, snapAngle: constrain))
+                copy.kind = .arrow(
+                    start: start,
+                    end: Self.constrainedEnd(from: start, to: point, snapAngle: constrain, within: safeBounds)
+                )
             default:
                 break
             }
@@ -456,32 +490,36 @@ public struct AnnotationItem: Identifiable, Equatable, Sendable {
         within bounds: CGRect? = nil,
         minimumSize: CGFloat = 4
     ) -> CGRect {
+        guard Self.isFiniteRect(rawRect) else { return .zero }
         let rect = rawRect.standardized
-        let minBoundX = bounds?.minX
-        let maxBoundX = bounds?.maxX
-        let minBoundY = bounds?.minY
-        let maxBoundY = bounds?.maxY
+        guard point.x.isFinite, point.y.isFinite else { return rect }
+        let safeMin = minimumSize.isFinite ? max(1, minimumSize) : 4
+        let safeBounds = Self.sanitizedBounds(bounds)
+        let minBoundX = safeBounds?.minX
+        let maxBoundX = safeBounds?.maxX
+        let minBoundY = safeBounds?.minY
+        let maxBoundY = safeBounds?.maxY
 
         switch handle {
         case .topLeft, .topRight, .bottomRight, .bottomLeft:
             guard let anchor = oppositeCorner(of: rect, for: handle) else { return rect }
             if constrain {
-                let targetX = bounds.map { min(max(point.x, $0.minX), $0.maxX) } ?? point.x
-                let targetY = bounds.map { min(max(point.y, $0.minY), $0.maxY) } ?? point.y
+                let targetX = safeBounds.map { min(max(point.x, $0.minX), $0.maxX) } ?? point.x
+                let targetY = safeBounds.map { min(max(point.y, $0.minY), $0.maxY) } ?? point.y
                 let dx = targetX - anchor.x
                 let dy = targetY - anchor.y
                 let signX: CGFloat = dx >= 0 ? 1 : -1
                 let signY: CGFloat = dy >= 0 ? 1 : -1
                 let rawSide = max(abs(dx), abs(dy))
                 let side: CGFloat
-                if let bounds {
-                    let availX = dx >= 0 ? max(0, bounds.maxX - anchor.x) : max(0, anchor.x - bounds.minX)
-                    let availY = dy >= 0 ? max(0, bounds.maxY - anchor.y) : max(0, anchor.y - bounds.minY)
+                if let safeBounds {
+                    let availX = dx >= 0 ? max(0, safeBounds.maxX - anchor.x) : max(0, anchor.x - safeBounds.minX)
+                    let availY = dy >= 0 ? max(0, safeBounds.maxY - anchor.y) : max(0, anchor.y - safeBounds.minY)
                     let maxSide = min(availX, availY)
-                    let effectiveMin = min(minimumSize, maxSide)
+                    let effectiveMin = min(safeMin, maxSide)
                     side = min(max(rawSide, effectiveMin), maxSide)
                 } else {
-                    side = max(rawSide, minimumSize)
+                    side = max(rawSide, safeMin)
                 }
                 let end = CGPoint(x: anchor.x + signX * side, y: anchor.y + signY * side)
                 return CGRect(
@@ -491,24 +529,24 @@ public struct AnnotationItem: Identifiable, Equatable, Sendable {
                     height: abs(end.y - anchor.y)
                 )
             }
-            let (x, width) = axisInterval(anchor: anchor.x, target: point.x, minimumSize: minimumSize, minBound: minBoundX, maxBound: maxBoundX)
-            let (y, height) = axisInterval(anchor: anchor.y, target: point.y, minimumSize: minimumSize, minBound: minBoundY, maxBound: maxBoundY)
+            let (x, width) = axisInterval(anchor: anchor.x, target: point.x, minimumSize: safeMin, minBound: minBoundX, maxBound: maxBoundX)
+            let (y, height) = axisInterval(anchor: anchor.y, target: point.y, minimumSize: safeMin, minBound: minBoundY, maxBound: maxBoundY)
             return CGRect(x: x, y: y, width: width, height: height)
 
         case .top:
-            let (y, height) = axisInterval(anchor: rect.minY, target: point.y, minimumSize: minimumSize, minBound: minBoundY, maxBound: maxBoundY)
+            let (y, height) = axisInterval(anchor: rect.minY, target: point.y, minimumSize: safeMin, minBound: minBoundY, maxBound: maxBoundY)
             return CGRect(x: rect.minX, y: y, width: rect.width, height: height)
 
         case .bottom:
-            let (y, height) = axisInterval(anchor: rect.maxY, target: point.y, minimumSize: minimumSize, minBound: minBoundY, maxBound: maxBoundY)
+            let (y, height) = axisInterval(anchor: rect.maxY, target: point.y, minimumSize: safeMin, minBound: minBoundY, maxBound: maxBoundY)
             return CGRect(x: rect.minX, y: y, width: rect.width, height: height)
 
         case .right:
-            let (x, width) = axisInterval(anchor: rect.minX, target: point.x, minimumSize: minimumSize, minBound: minBoundX, maxBound: maxBoundX)
+            let (x, width) = axisInterval(anchor: rect.minX, target: point.x, minimumSize: safeMin, minBound: minBoundX, maxBound: maxBoundX)
             return CGRect(x: x, y: rect.minY, width: width, height: rect.height)
 
         case .left:
-            let (x, width) = axisInterval(anchor: rect.maxX, target: point.x, minimumSize: minimumSize, minBound: minBoundX, maxBound: maxBoundX)
+            let (x, width) = axisInterval(anchor: rect.maxX, target: point.x, minimumSize: safeMin, minBound: minBoundX, maxBound: maxBoundX)
             return CGRect(x: x, y: rect.minY, width: width, height: rect.height)
 
         case .start, .end:
@@ -557,21 +595,49 @@ public struct AnnotationItem: Identifiable, Equatable, Sendable {
 
     /// Normalized rectangle spanned from `origin` to `current`, optionally constrained to a 1:1 square.
     public static func constrainedRect(from origin: CGPoint, to current: CGPoint, square: Bool) -> CGRect {
-        var target = current
+        constrainedRect(from: origin, to: current, square: square, within: nil)
+    }
+
+    /// Normalized rectangle spanned from `origin` to `current`, optionally constrained to a 1:1 square
+    /// and clamped to stay inside `bounds`.
+    public static func constrainedRect(
+        from origin: CGPoint,
+        to current: CGPoint,
+        square: Bool,
+        within bounds: CGRect?
+    ) -> CGRect {
+        guard origin.x.isFinite, origin.y.isFinite, current.x.isFinite, current.y.isFinite else {
+            return .zero
+        }
+        let safeBounds = Self.sanitizedBounds(bounds)
+        let clampedOrigin = safeBounds.map { Self.clampPoint(origin, to: $0) } ?? origin
+        let clampedCurrent = safeBounds.map { Self.clampPoint(current, to: $0) } ?? current
+
+        var target = clampedCurrent
         if square {
-            let dx = current.x - origin.x
-            let dy = current.y - origin.y
-            let side = max(abs(dx), abs(dy))
+            let dx = clampedCurrent.x - clampedOrigin.x
+            let dy = clampedCurrent.y - clampedOrigin.y
+            let signX: CGFloat = dx >= 0 ? 1 : -1
+            let signY: CGFloat = dy >= 0 ? 1 : -1
+            let rawSide = max(abs(dx), abs(dy))
+            let side: CGFloat
+            if let safeBounds {
+                let availX = dx >= 0 ? max(0, safeBounds.maxX - clampedOrigin.x) : max(0, clampedOrigin.x - safeBounds.minX)
+                let availY = dy >= 0 ? max(0, safeBounds.maxY - clampedOrigin.y) : max(0, clampedOrigin.y - safeBounds.minY)
+                side = min(rawSide, min(availX, availY))
+            } else {
+                side = rawSide
+            }
             target = CGPoint(
-                x: origin.x + (dx >= 0 ? side : -side),
-                y: origin.y + (dy >= 0 ? side : -side)
+                x: clampedOrigin.x + signX * side,
+                y: clampedOrigin.y + signY * side
             )
         }
         return CGRect(
-            x: min(origin.x, target.x),
-            y: min(origin.y, target.y),
-            width: abs(target.x - origin.x),
-            height: abs(target.y - origin.y)
+            x: min(clampedOrigin.x, target.x),
+            y: min(clampedOrigin.y, target.y),
+            width: abs(target.x - clampedOrigin.x),
+            height: abs(target.y - clampedOrigin.y)
         )
     }
 
@@ -582,45 +648,160 @@ public struct AnnotationItem: Identifiable, Equatable, Sendable {
         snapAngle: Bool,
         stepDegrees: CGFloat = 15
     ) -> CGPoint {
-        guard snapAngle else { return end }
-        let dx = end.x - start.x
-        let dy = end.y - start.y
+        constrainedEnd(from: start, to: end, snapAngle: snapAngle, stepDegrees: stepDegrees, within: nil)
+    }
+
+    /// Snaps `end` onto `stepDegrees` increments around `start` when `snapAngle` is enabled,
+    /// clipping the snapped ray so the returned point stays within `bounds`.
+    public static func constrainedEnd(
+        from start: CGPoint,
+        to end: CGPoint,
+        snapAngle: Bool,
+        stepDegrees: CGFloat = 15,
+        within bounds: CGRect?
+    ) -> CGPoint {
+        guard start.x.isFinite, start.y.isFinite else { return .zero }
+        guard end.x.isFinite, end.y.isFinite else { return start }
+        let safeBounds = Self.sanitizedBounds(bounds)
+        let clampedEnd = safeBounds.map { Self.clampPoint(end, to: $0) } ?? end
+        guard snapAngle, stepDegrees.isFinite, stepDegrees > 0 else { return clampedEnd }
+
+        let dx = clampedEnd.x - start.x
+        let dy = clampedEnd.y - start.y
         let length = hypot(dx, dy)
-        guard length > 0 else { return end }
+        guard length > 0 else { return clampedEnd }
         let stepRad = stepDegrees * .pi / 180
         let angle = (atan2(dy, dx) / stepRad).rounded() * stepRad
-        return CGPoint(x: start.x + cos(angle) * length, y: start.y + sin(angle) * length)
+        let dirX = cos(angle)
+        let dirY = sin(angle)
+
+        var clippedLength = length
+        if let safeBounds {
+            let clampedStart = Self.clampPoint(start, to: safeBounds)
+            if abs(dirX) > 1e-9 {
+                let boundX = dirX > 0 ? safeBounds.maxX : safeBounds.minX
+                let maxTX = (boundX - clampedStart.x) / dirX
+                clippedLength = min(clippedLength, max(0, maxTX))
+            }
+            if abs(dirY) > 1e-9 {
+                let boundY = dirY > 0 ? safeBounds.maxY : safeBounds.minY
+                let maxTY = (boundY - clampedStart.y) / dirY
+                clippedLength = min(clippedLength, max(0, maxTY))
+            }
+            let candidate = CGPoint(
+                x: clampedStart.x + dirX * clippedLength,
+                y: clampedStart.y + dirY * clippedLength
+            )
+            return Self.clampPoint(candidate, to: safeBounds)
+        }
+        return CGPoint(x: start.x + dirX * clippedLength, y: start.y + dirY * clippedLength)
     }
 
     /// Appends `point` to a polyline only when it moved at least `minDistance` points from the tail.
     public static func appendPoint(_ point: CGPoint, to points: [CGPoint], minDistance: CGFloat = 2.5) -> [CGPoint] {
+        guard point.x.isFinite, point.y.isFinite else { return points }
+        let safeDist = minDistance.isFinite ? max(0, minDistance) : 2.5
         guard let last = points.last else { return [point] }
-        guard hypot(point.x - last.x, point.y - last.y) >= minDistance else { return points }
+        guard hypot(point.x - last.x, point.y - last.y) >= safeDist else { return points }
         return points + [point]
     }
 
     /// Text attributes shared between the inline text editor and Canvas/CoreGraphics renderer.
     public static func textAttributes(color: AnnotationColor, fontSize: CGFloat) -> [NSAttributedString.Key: Any] {
+        let safeFontSize = fontSize.isFinite ? max(1, fontSize) : 14
         let paragraph = NSMutableParagraphStyle()
         paragraph.lineBreakMode = .byWordWrapping
         return [
-            .font: NSFont.systemFont(ofSize: fontSize, weight: .bold),
+            .font: NSFont.systemFont(ofSize: safeFontSize, weight: .bold),
             .foregroundColor: color.nsColor,
             .paragraphStyle: paragraph,
         ]
     }
 
+    private struct TextMeasureKey: Hashable, Sendable {
+        let content: String
+        let fontTenths: Int
+        let maxWidthPoints: Int
+    }
+
+    private struct TextMeasureCacheState: Sendable {
+        var sizes: [TextMeasureKey: CGSize] = [:]
+        var order: [TextMeasureKey] = []
+    }
+
+    private static let maxTextMeasureCacheEntries = 64
+    private static let textMeasureCache = OSAllocatedUnfairLock(initialState: TextMeasureCacheState())
+
     /// Computes AppKit bottom-left bounds for `content` anchored at top-left `origin`.
-    public static func textBoundingBox(origin: CGPoint, content: String, fontSize: CGFloat) -> CGRect {
-        let measured = content.isEmpty ? "Ag" : content
-        let attributed = NSAttributedString(string: measured, attributes: textAttributes(color: .white, fontSize: fontSize))
-        let measuredBounds = attributed.boundingRect(
-            with: CGSize(width: 640, height: CGFloat.greatestFiniteMagnitude),
-            options: [.usesLineFragmentOrigin, .usesFontLeading]
+    public static func textBoundingBox(
+        origin: CGPoint,
+        content: String,
+        fontSize: CGFloat,
+        maxWidth: CGFloat = 640
+    ) -> CGRect {
+        let safeOrigin = (origin.x.isFinite && origin.y.isFinite) ? origin : .zero
+        let safeFontSize = fontSize.isFinite ? max(1, min(fontSize, 256)) : 14
+        let safeMaxWidth = maxWidth.isFinite ? max(24, min(maxWidth, 4096)) : 640
+
+        let baseMeasured = content.isEmpty ? "Ag" : content
+        // `NSAttributedString.boundingRect` ignores a trailing newline; append a space so Shift+Enter
+        // immediately expands the box height to show the new empty line.
+        let measured = baseMeasured.hasSuffix("\n") ? (baseMeasured + " ") : baseMeasured
+        let key = TextMeasureKey(
+            content: measured,
+            fontTenths: Int((safeFontSize * 10).rounded()),
+            maxWidthPoints: Int(safeMaxWidth.rounded())
         )
-        let width = max(24, ceil(measuredBounds.width) + 6)
-        let height = max(ceil(fontSize * 1.35), ceil(measuredBounds.height) + 4)
-        return CGRect(x: origin.x, y: origin.y - height, width: width, height: height)
+
+        let size: CGSize
+        if let cached = textMeasureCache.withLock({ $0.sizes[key] }) {
+            size = cached
+        } else {
+            let attributed = NSAttributedString(
+                string: measured,
+                attributes: textAttributes(color: .white, fontSize: safeFontSize)
+            )
+            let measuredBounds = attributed.boundingRect(
+                with: CGSize(width: safeMaxWidth, height: CGFloat.greatestFiniteMagnitude),
+                options: [.usesLineFragmentOrigin, .usesFontLeading]
+            )
+            let width = max(24, ceil(measuredBounds.width) + 6)
+            let height = max(ceil(safeFontSize * 1.35), ceil(measuredBounds.height) + 4)
+            let computed = CGSize(width: width, height: height)
+            textMeasureCache.withLock { state in
+                if state.sizes[key] == nil {
+                    state.order.append(key)
+                }
+                state.sizes[key] = computed
+                while state.order.count > maxTextMeasureCacheEntries {
+                    let evicted = state.order.removeFirst()
+                    state.sizes.removeValue(forKey: evicted)
+                }
+            }
+            size = computed
+        }
+
+        return CGRect(x: safeOrigin.x, y: safeOrigin.y - size.height, width: size.width, height: size.height)
+    }
+
+    private static func isFiniteRect(_ rect: CGRect) -> Bool {
+        !rect.isNull && !rect.isInfinite &&
+            rect.origin.x.isFinite && rect.origin.y.isFinite &&
+            rect.size.width.isFinite && rect.size.height.isFinite
+    }
+
+    private static func sanitizedBounds(_ bounds: CGRect?) -> CGRect? {
+        guard let bounds, isFiniteRect(bounds) else { return nil }
+        let standardized = bounds.standardized
+        guard standardized.width >= 0, standardized.height >= 0 else { return nil }
+        return standardized
+    }
+
+    private static func clampPoint(_ point: CGPoint, to bounds: CGRect) -> CGPoint {
+        CGPoint(
+            x: min(max(point.x, bounds.minX), bounds.maxX),
+            y: min(max(point.y, bounds.minY), bounds.maxY)
+        )
     }
 
     private static func oppositeCorner(of rect: CGRect, for handle: AnnotationHandle) -> CGPoint? {

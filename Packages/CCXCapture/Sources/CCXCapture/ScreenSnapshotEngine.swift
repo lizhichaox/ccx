@@ -4,11 +4,20 @@ import OSLog
 import ScreenCaptureKit
 
 /// Errors thrown by `ScreenSnapshotEngine`.
-public enum ScreenSnapshotError: Error, Sendable {
+public enum ScreenSnapshotError: Error, LocalizedError, Sendable {
     /// No `SCDisplay` could be matched to an `NSScreen`.
     case noDisplays
     /// Every display capture failed (typically a missing Screen Recording grant).
     case captureFailed
+
+    public var errorDescription: String? {
+        switch self {
+        case .noDisplays:
+            return "No active display was found."
+        case .captureFailed:
+            return "Could not capture the screen. Please try again."
+        }
+    }
 }
 
 /// Freezes every connected display using ScreenCaptureKit only.
@@ -32,6 +41,33 @@ public enum ScreenSnapshotEngine {
     public static func isPermissionDeniedError(_ error: Error) -> Bool {
         let nsError = error as NSError
         return nsError.domain == SCStreamErrorDomain && nsError.code == SCStreamError.userDeclined.rawValue
+    }
+
+    /// Maps ScreenCaptureKit and snapshot errors into concise, user-friendly English text.
+    public static func userFacingErrorMessage(for error: Error) -> String {
+        if let snapshotError = error as? ScreenSnapshotError, let description = snapshotError.errorDescription {
+            return description
+        }
+        let nsError = error as NSError
+        if nsError.domain == SCStreamErrorDomain {
+            switch SCStreamError.Code(rawValue: nsError.code) {
+            case .userDeclined:
+                return "Screen Recording permission is required."
+            case .systemStoppedStream, .userStopped:
+                return "Screen capture was stopped by the system."
+            case .noDisplayList, .noCaptureSource, .noWindowList:
+                return "No active display was found."
+            case .missingEntitlements:
+                return "Screen capture permission is unavailable."
+            default:
+                return "Could not capture the screen. Please try again."
+            }
+        }
+        let localized = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+        if localized.isEmpty || localized.contains("The operation couldn’t be completed.") || localized.contains("The operation couldn't be completed.") {
+            return "Could not capture the screen. Please try again."
+        }
+        return localized
     }
 
     /// Captures every active display concurrently, including all visible windows except `excludingWindowIDs`.
@@ -119,8 +155,22 @@ public enum ScreenSnapshotEngine {
     }
 
     nonisolated private static func captureImage(filter: SCContentFilter, geometry: ScreenGeometry) async throws -> CGImage {
-        let pixelWidth = Int((geometry.frame.width * geometry.scale).rounded())
-        let pixelHeight = Int((geometry.frame.height * geometry.scale).rounded())
+        guard geometry.frame.width.isFinite,
+              geometry.frame.height.isFinite,
+              geometry.scale.isFinite,
+              geometry.frame.width > 0,
+              geometry.frame.height > 0,
+              geometry.scale > 0
+        else {
+            throw ScreenSnapshotError.captureFailed
+        }
+        let rawWidth = (geometry.frame.width * geometry.scale).rounded()
+        let rawHeight = (geometry.frame.height * geometry.scale).rounded()
+        guard rawWidth.isFinite, rawHeight.isFinite, rawWidth >= 1, rawHeight >= 1 else {
+            throw ScreenSnapshotError.captureFailed
+        }
+        let pixelWidth = min(max(1, Int(rawWidth)), 16_384)
+        let pixelHeight = min(max(1, Int(rawHeight)), 16_384)
 
         if #available(macOS 26.0, *) {
             do {

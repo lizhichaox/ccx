@@ -1,3 +1,4 @@
+import ApplicationServices
 import CoreGraphics
 import Foundation
 import os
@@ -1047,6 +1048,73 @@ struct SmartElementDetectorTests {
         try? await Task.sleep(for: .milliseconds(30))
 
         #expect(switchDeliveries.withLock { $0 } == [ptB])
+    }
+
+    @Test @MainActor func axElementReaderDetectsMultiCopyTimeoutsRejectsHugeCoordsAndPreservesPerPIDBackoff() async throws {
+        // 1. AXValue wrapping kAXErrorCannotComplete inside multi-copy array is detected as timedOut.
+        var cannotComplete = AXError.cannotComplete
+        let timeoutVal = try #require(AXValueCreate(.axError, &cannotComplete))
+        var unsupported = AXError.attributeUnsupported
+        let unsupportedVal = try #require(AXValueCreate(.axError, &unsupported))
+        #expect(AXElementReader.containsCannotCompleteError(in: ["AXGroup" as NSString, timeoutVal]))
+        #expect(!AXElementReader.containsCannotCompleteError(in: ["AXGroup" as NSString, unsupportedVal]))
+
+        // 2. Extreme / corrupt AX coordinates (> 1e6) are rejected cleanly.
+        #expect(AXElementReader.convertQuartzFrame(
+            position: CGPoint(x: 1e12, y: 10),
+            size: CGSize(width: 100, height: 50),
+            primaryScreenHeight: 982
+        ) == nil)
+        #expect(AXElementReader.convertQuartzFrame(
+            position: CGPoint(x: 10, y: 10),
+            size: CGSize(width: 2_000_000, height: 50),
+            primaryScreenHeight: 982
+        ) == nil)
+        #expect(AXElementReader.convertQuartzFrame(
+            position: CGPoint(x: 10, y: 50),
+            size: CGSize(width: 100, height: 40),
+            primaryScreenHeight: 982
+        ) != nil)
+
+        // 3. Per-PID timeout backoff persists across sibling windowIDs of the same hung PID and resets on success.
+        let hungPID: pid_t = 4242
+        let win1 = AXQueryWorker.WindowTarget(windowID: 101, pid: hungPID, containerFrame: CGRect(x: 0, y: 0, width: 600, height: 400))
+        let win2 = AXQueryWorker.WindowTarget(windowID: 102, pid: hungPID, containerFrame: CGRect(x: 600, y: 0, width: 600, height: 400))
+        let queryCount = OSAllocatedUnfairLock(initialState: 0)
+        let done1 = DispatchSemaphore(value: 0)
+        let done2 = DispatchSemaphore(value: 0)
+        let done3 = DispatchSemaphore(value: 0)
+
+        let worker = AXQueryWorker(excludedPID: 1, minimumInterval: 0) { _, _ in
+            let n = queryCount.withLock { c -> Int in
+                c += 1
+                return c
+            }
+            if n <= 2 {
+                return AXQueryWorker.QueryResult(rect: nil, isOverlay: false, timedOut: true)
+            }
+            return AXQueryWorker.QueryResult(rect: CGRect(x: 10, y: 10, width: 80, height: 30), isOverlay: false, timedOut: false)
+        }
+
+        worker.enqueue(AXQueryWorker.Request(point: CGPoint(x: 50, y: 50), primaryScreenHeight: 982, targetWindow: win1, overlayFallback: nil)) { _, _, _ in
+            done1.signal()
+        }
+        await waitOnBackground(done1)
+        #expect(worker.timeoutCountForTesting(pid: hungPID) == 1)
+
+        // Switch to sibling window of same PID -> timeout count must NOT reset to 0, advances to 2.
+        worker.enqueue(AXQueryWorker.Request(point: CGPoint(x: 650, y: 50), primaryScreenHeight: 982, targetWindow: win2, overlayFallback: nil)) { _, _, _ in
+            done2.signal()
+        }
+        await waitOnBackground(done2)
+        #expect(worker.timeoutCountForTesting(pid: hungPID) == 2)
+
+        // Successful query clears per-PID timeout backoff.
+        worker.enqueue(AXQueryWorker.Request(point: CGPoint(x: 660, y: 50), primaryScreenHeight: 982, targetWindow: win2, overlayFallback: nil)) { _, _, _ in
+            done3.signal()
+        }
+        await waitOnBackground(done3)
+        #expect(worker.timeoutCountForTesting(pid: hungPID) == 0)
     }
 }
 

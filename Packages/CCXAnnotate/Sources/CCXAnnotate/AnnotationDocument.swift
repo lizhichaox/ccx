@@ -35,7 +35,7 @@ public final class AnnotationDocument {
             if case let .counter(_, number) = item.kind { return number }
             return nil
         }.max() ?? 0
-        return highest + 1
+        return highest < Int.max ? highest + 1 : Int.max
     }
 
     /// Captures an undo checkpoint before a continuous edit (dragging or handle resizing).
@@ -53,9 +53,11 @@ public final class AnnotationDocument {
     }
 
     /// Updates an existing item in place, optionally pushing an undo snapshot first.
+    /// Avoids pushing a no-op undo snapshot when `updated` equals the existing item.
     @discardableResult
     public func replaceItem(_ updated: AnnotationItem, recordUndo: Bool) -> Bool {
         guard let index = items.firstIndex(where: { $0.id == updated.id }) else { return false }
+        guard items[index] != updated else { return true }
         if recordUndo { beginMutationSnapshot() }
         items[index] = updated
         return true
@@ -120,6 +122,17 @@ public final class AnnotationDocument {
         selectedID = nil
         undoStack.removeAll()
         redoStack.removeAll()
+    }
+
+    /// Replaces the committed annotation items without altering `undoStack`/`redoStack`
+    /// or resets undo history when rolling back a cancelled editing session.
+    public func replaceAll(items: [AnnotationItem], selectedID: UUID?) {
+        self.items = items
+        self.draft = nil
+        self.selectedID = selectedID
+        undoStack.removeAll()
+        redoStack.removeAll()
+        reconcileSelection()
     }
 
     private func pushUndoSnapshot(_ snapshot: Snapshot) {

@@ -23,18 +23,42 @@ public struct ScrollFrameBuffer: Sendable {
     let rowContrast: [Int32]
 
     private static let signatureSampleLimit = 64
+    public static let maxFrameDimension = 16_384
+    public static let maxFrameBytes = 256 * 1024 * 1024
 
-    /// Canonical bitmap info matching `kCVPixelFormatType_32BGRA` on Apple Silicon.
+    /// Canonical bitmap info matching `kCVPixelFormatType_32BGRA` on macOS (little-endian `arm64` and `x86_64`).
     nonisolated static var canonicalBitmapInfo: CGBitmapInfo {
         CGBitmapInfo(rawValue: CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.noneSkipFirst.rawValue)
+    }
+
+    private static func checkedFrameByteLayout(width: Int, height: Int) -> (bytesPerRow: Int, byteCount: Int)? {
+        guard width >= 4, height >= 8, width <= maxFrameDimension, height <= maxFrameDimension else { return nil }
+        let (bytesPerRow, rowOverflow) = width.multipliedReportingOverflow(by: 4)
+        guard !rowOverflow else { return nil }
+        let (byteCount, countOverflow) = bytesPerRow.multipliedReportingOverflow(by: height)
+        guard !countOverflow, byteCount > 0, byteCount <= maxFrameBytes else { return nil }
+        return (bytesPerRow, byteCount)
+    }
+
+    private static func resolvedOutputRGBColorSpace(for colorSpace: CGColorSpace?) -> CGColorSpace {
+        if let space = colorSpace, space.model == .rgb {
+            if space.supportsOutput && !CGColorSpaceUsesExtendedRange(space) && !CGColorSpaceUsesITUR_2100TF(space) {
+                return space
+            }
+            if let displayP3 = CGColorSpace(name: CGColorSpace.displayP3) {
+                return displayP3
+            }
+        }
+        return CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
     }
 
     /// Initializes a canonical buffer directly from a ScreenCaptureKit `kCVPixelFormatType_32BGRA`
     /// `CVPixelBuffer`, releasing the read-only pixel buffer lock before returning.
     public init?(pixelBuffer: CVPixelBuffer) {
+        guard !CVPixelBufferIsPlanar(pixelBuffer) else { return nil }
         let width = CVPixelBufferGetWidth(pixelBuffer)
         let height = CVPixelBufferGetHeight(pixelBuffer)
-        guard width >= 4, height >= 8 else { return nil }
+        guard let layout = Self.checkedFrameByteLayout(width: width, height: height) else { return nil }
         guard CVPixelBufferGetPixelFormatType(pixelBuffer) == kCVPixelFormatType_32BGRA else { return nil }
 
         let lockResult = CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
@@ -44,15 +68,22 @@ public struct ScrollFrameBuffer: Sendable {
         defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
 
         let srcBytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
-        let dstBytesPerRow = width * 4
+        let dstBytesPerRow = layout.bytesPerRow
         guard srcBytesPerRow >= dstBytesPerRow else { return nil }
 
-        var data = Data(count: dstBytesPerRow * height)
+        // Validate that reading all rows stays strictly inside the backing allocation.
+        let dataSize = CVPixelBufferGetDataSize(pixelBuffer)
+        let (leadingRowsBytes, leadingOverflow) = srcBytesPerRow.multipliedReportingOverflow(by: height - 1)
+        guard !leadingOverflow else { return nil }
+        let (requiredSrcBytes, totalOverflow) = leadingRowsBytes.addingReportingOverflow(dstBytesPerRow)
+        guard !totalOverflow, requiredSrcBytes <= dataSize else { return nil }
+
+        var data = Data(count: layout.byteCount)
         data.withUnsafeMutableBytes { dstRaw in
             guard let dstPtr = dstRaw.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
             let srcPtr = baseAddress.assumingMemoryBound(to: UInt8.self)
             if srcBytesPerRow == dstBytesPerRow {
-                dstPtr.update(from: srcPtr, count: dstBytesPerRow * height)
+                dstPtr.update(from: srcPtr, count: layout.byteCount)
             } else {
                 for y in 0..<height {
                     dstPtr.advanced(by: y * dstBytesPerRow)
@@ -62,9 +93,10 @@ public struct ScrollFrameBuffer: Sendable {
         }
 
         let attachedCS = CVBufferCopyAttachment(pixelBuffer, kCVImageBufferCGColorSpaceKey, nil)
-        let cgCS: CGColorSpace? = attachedCS.flatMap { raw in
+        let rawCGCS: CGColorSpace? = attachedCS.flatMap { raw in
             CFGetTypeID(raw) == CGColorSpace.typeID ? unsafeDowncast(raw, to: CGColorSpace.self) : nil
         }
+        let cgCS = rawCGCS.map { Self.resolvedOutputRGBColorSpace(for: $0) }
 
         self.init(
             width: width,
@@ -80,25 +112,42 @@ public struct ScrollFrameBuffer: Sendable {
     public init?(cgImage: CGImage) {
         let width = cgImage.width
         let height = cgImage.height
-        guard width >= 4, height >= 8 else { return nil }
+        guard let layout = Self.checkedFrameByteLayout(width: width, height: height) else { return nil }
 
-        let bytesPerRow = width * 4
-        var data = Data(count: bytesPerRow * height)
-        let sourceCS = cgImage.colorSpace.flatMap { $0.model == .rgb ? $0 : nil }
-            ?? CGColorSpace(name: CGColorSpace.sRGB)!
+        let bytesPerRow = layout.bytesPerRow
+        var data = Data(count: layout.byteCount)
+        let preferredCS = Self.resolvedOutputRGBColorSpace(for: cgImage.colorSpace)
+        let fallbackCS = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
 
+        var usedCS = preferredCS
         let rendered: Bool = data.withUnsafeMutableBytes { raw in
-            guard let ptr = raw.baseAddress,
-                  let context = CGContext(
-                      data: ptr,
-                      width: width,
-                      height: height,
-                      bitsPerComponent: 8,
-                      bytesPerRow: bytesPerRow,
-                      space: sourceCS,
-                      bitmapInfo: Self.canonicalBitmapInfo.rawValue
-                  )
-            else { return false }
+            guard let ptr = raw.baseAddress else { return false }
+            let context: CGContext?
+            if let primary = CGContext(
+                data: ptr,
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bytesPerRow: bytesPerRow,
+                space: preferredCS,
+                bitmapInfo: Self.canonicalBitmapInfo.rawValue
+            ) {
+                context = primary
+            } else if let secondary = CGContext(
+                data: ptr,
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bytesPerRow: bytesPerRow,
+                space: fallbackCS,
+                bitmapInfo: Self.canonicalBitmapInfo.rawValue
+            ) {
+                usedCS = fallbackCS
+                context = secondary
+            } else {
+                context = nil
+            }
+            guard let context else { return false }
             context.interpolationQuality = .none
             context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
             return true
@@ -110,8 +159,8 @@ public struct ScrollFrameBuffer: Sendable {
             height: height,
             bytesPerRow: bytesPerRow,
             bgraData: data,
-            colorSpaceName: sourceCS.name as String?,
-            iccProfileData: sourceCS.name == nil ? (sourceCS.copyICCData() as Data?) : nil
+            colorSpaceName: usedCS.name as String?,
+            iccProfileData: usedCS.name == nil ? (usedCS.copyICCData() as Data?) : nil
         )
     }
 
@@ -193,15 +242,15 @@ public struct ScrollFrameBuffer: Sendable {
         if let iccProfileData, let cs = CGColorSpace(iccData: iccProfileData as CFData) {
             return cs
         }
-        return CGColorSpace(name: CGColorSpace.sRGB)!
+        return CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
     }
 
     /// Creates a compact `CGImage` containing only rows `[yStart, yStart + sliceHeight)`.
     public func cropCGImage(yStart: Int, height sliceHeight: Int) -> CGImage? {
-        guard sliceHeight > 0, yStart >= 0, yStart + sliceHeight <= height else { return nil }
-        let byteStart = yStart * bytesPerRow
-        let byteEnd = (yStart + sliceHeight) * bytesPerRow
-        guard byteEnd <= bgraData.count else { return nil }
+        guard sliceHeight > 0, yStart >= 0, yStart <= height, sliceHeight <= height - yStart else { return nil }
+        let (byteStart, startOverflow) = yStart.multipliedReportingOverflow(by: bytesPerRow)
+        let (byteEnd, endOverflow) = (yStart + sliceHeight).multipliedReportingOverflow(by: bytesPerRow)
+        guard !startOverflow, !endOverflow, byteStart >= 0, byteEnd <= bgraData.count else { return nil }
         let sliceData = bgraData.subdata(in: byteStart..<byteEnd)
         guard let provider = CGDataProvider(data: sliceData as CFData) else { return nil }
         return CGImage(
@@ -257,7 +306,11 @@ public struct ScrollSidebarBounds: Equatable, Sendable {
 
 /// Incremental, sticky-bar-aware vertical scroll stitcher storing only newly revealed strip slices.
 public final class ScrollImageStitcher {
+    /// Default total pixel-area ceiling (~320 MB uncompressed RGBA) preventing OOM on 5K/6K displays.
+    public static let defaultMaxTotalPixels = 80_000_000
+
     public let maxTotalHeight: Int
+    public let maxTotalPixels: Int
     public let maxAllowedMAD: Double
 
     public private(set) var width: Int = 0
@@ -280,6 +333,11 @@ public final class ScrollImageStitcher {
     private var hasLockedSidebars: Bool = false
     private var cumulativeScrolledHeight: Int = 0
 
+    public var effectiveMaxTotalHeight: Int {
+        guard width > 0 else { return maxTotalHeight }
+        return min(maxTotalHeight, max(128, maxTotalPixels / width))
+    }
+
     public var totalStitchedHeight: Int {
         if committedSlices.isEmpty {
             return initialFrame?.height ?? 0
@@ -290,11 +348,34 @@ public final class ScrollImageStitcher {
     public init(
         scale: CGFloat = 2.0,
         maxTotalHeight: Int = 32_000,
-        maxAllowedMAD: Double = 8.5
+        maxAllowedMAD: Double = 8.5,
+        maxTotalPixels: Int = ScrollImageStitcher.defaultMaxTotalPixels
     ) {
-        self.scale = max(1, scale)
+        self.scale = scale.isFinite ? max(1, scale) : 2.0
         self.maxTotalHeight = max(128, maxTotalHeight)
-        self.maxAllowedMAD = max(0.5, maxAllowedMAD)
+        self.maxAllowedMAD = maxAllowedMAD.isFinite ? max(0.5, maxAllowedMAD) : 8.5
+        self.maxTotalPixels = max(65_536, maxTotalPixels)
+    }
+
+    /// Releases all retained frame buffers and stitched slices to free memory immediately.
+    public func clear() {
+        width = 0
+        initialFrame = nil
+        frontierFrame = nil
+        committedSlices.removeAll()
+        currentSlicesHeight = 0
+        latestBottomCap = nil
+        detectedStickyTop = 0
+        detectedStickyBottom = 0
+        detectedStickyLeft = 0
+        detectedStickyRight = 0
+        lockedBottomCapHeight = 0
+        leftSidebarFillStrip = nil
+        rightSidebarFillStrip = nil
+        hasLockedSidebars = false
+        cumulativeScrolledHeight = 0
+        stitchedFrameCount = 0
+        isAtHeightLimit = false
     }
 
     public func seed(_ frame: ScrollFrameBuffer) {
@@ -314,7 +395,7 @@ public final class ScrollImageStitcher {
         hasLockedSidebars = false
         cumulativeScrolledHeight = 0
         stitchedFrameCount = 1
-        isAtHeightLimit = frame.height >= maxTotalHeight
+        isAtHeightLimit = frame.height >= effectiveMaxTotalHeight
     }
 
     /// Minimum accumulated downward scroll (in pixels) required before locking static sidebars.
@@ -561,14 +642,15 @@ public final class ScrollImageStitcher {
                 hasLockedSidebars = false
             }
 
-            let baseHeight = min(commitBottom, maxTotalHeight - lockedBottomCapHeight)
+            let heightCap = effectiveMaxTotalHeight
+            let baseHeight = min(commitBottom, heightCap - lockedBottomCapHeight)
             guard baseHeight > 0, let baseSlice = frontier.cropCGImage(yStart: 0, height: baseHeight) else {
                 return false
             }
             committedSlices.append(baseSlice)
             currentSlicesHeight = baseSlice.height
 
-            let remaining = maxTotalHeight - currentSlicesHeight - lockedBottomCapHeight
+            let remaining = heightCap - currentSlicesHeight - lockedBottomCapHeight
             let allowedDy = min(match.dy, remaining)
             if allowedDy > 0,
                commitBottom - allowedDy >= detectedStickyTop,
@@ -582,7 +664,7 @@ public final class ScrollImageStitcher {
             }
             frontierFrame = frame
             stitchedFrameCount += 1
-            if totalStitchedHeight >= maxTotalHeight || allowedDy < match.dy {
+            if totalStitchedHeight >= heightCap || allowedDy < match.dy {
                 isAtHeightLimit = true
             }
             return true
@@ -615,7 +697,8 @@ public final class ScrollImageStitcher {
         guard let (_, match) = evaluated else { return false }
 
         let commitBottom = frameHeight - lockedBottomCapHeight
-        let remaining = maxTotalHeight - currentSlicesHeight - lockedBottomCapHeight
+        let heightCap = effectiveMaxTotalHeight
+        let remaining = heightCap - currentSlicesHeight - lockedBottomCapHeight
         let allowedDy = min(match.dy, remaining)
         guard allowedDy > 0 else {
             isAtHeightLimit = true
@@ -665,7 +748,7 @@ public final class ScrollImageStitcher {
 
         frontierFrame = frame
         stitchedFrameCount += 1
-        if totalStitchedHeight >= maxTotalHeight || allowedDy < match.dy {
+        if totalStitchedHeight >= heightCap || allowedDy < match.dy {
             isAtHeightLimit = true
         }
         return true
@@ -680,6 +763,8 @@ public final class ScrollImageStitcher {
 
         let totalHeight = totalStitchedHeight
         guard width > 0, totalHeight > 0 else { return nil }
+        let (pixelCount, pixelOverflow) = width.multipliedReportingOverflow(by: totalHeight)
+        guard !pixelOverflow, pixelCount <= max(maxTotalPixels, width * 128) else { return nil }
 
         guard let context = CGContext(
             data: nil,

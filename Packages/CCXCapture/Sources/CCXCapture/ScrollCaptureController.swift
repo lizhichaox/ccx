@@ -48,11 +48,14 @@ final class ScrollCaptureController {
     private var hudPanel: ScrollCaptureHUDPanel?
     private var previewPanel: ScrollCapturePreviewPanel?
 
-    nonisolated(unsafe) private var globalKeyMonitor: Any?
     nonisolated(unsafe) private var localKeyMonitor: Any?
+    nonisolated(unsafe) private var screenParametersObserver: NSObjectProtocol?
 
     private var isFinishing = false
     private var isClosed = false
+    private var isStreamReady = false
+    private var pendingAutoScrollStart = false
+    private var reachedHeightLimit = false
     private var initialPixelHeight: Int
     private var statusText = "Scroll down"
 
@@ -63,8 +66,24 @@ final class ScrollCaptureController {
         self.engine = ScrollCaptureEngine(request: request, fallbackInitialImage: request.initialImage)
     }
 
+    deinit {
+        if let monitor = localKeyMonitor {
+            let box = UncheckedSendableBox(monitor)
+            if Thread.isMainThread {
+                NSEvent.removeMonitor(box.value)
+            } else {
+                DispatchQueue.main.async {
+                    NSEvent.removeMonitor(box.value)
+                }
+            }
+        }
+        if let observer = screenParametersObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
+    }
+
     func start() {
-        let visibleFrame = Self.visibleFrame(for: request.screenRect)
+        let visibleFrame = Self.visibleFrame(for: request.displayID, captureRect: request.screenRect)
         let border = ScrollCaptureFramePanel(captureRect: request.screenRect)
         let hud = ScrollCaptureHUDPanel(captureRect: request.screenRect, visibleFrame: visibleFrame)
         let preview = ScrollCapturePreviewPanel.makeIfRoom(
@@ -104,11 +123,18 @@ final class ScrollCaptureController {
 
         wireCallbacks()
         installMonitors()
+        installScreenParametersObserver()
 
         Task { @MainActor [weak self] in
             guard let self, !self.isClosed else { return }
             do {
                 try await self.engine.start(excludingWindowIDs: excludedWindowIDs)
+                guard !self.isClosed, !self.isFinishing else { return }
+                self.isStreamReady = true
+                if self.pendingAutoScrollStart {
+                    self.pendingAutoScrollStart = false
+                    self.startAutoScroll()
+                }
             } catch {
                 guard !self.isClosed else { return }
                 Self.logger.error("Failed to start scroll capture: \(error.localizedDescription)")
@@ -128,7 +154,7 @@ final class ScrollCaptureController {
             PermissionManager.setScreenRecordingVerified(false)
             tearDown(outcome: .permissionDenied)
         } else {
-            tearDown(outcome: .failed(error.localizedDescription))
+            tearDown(outcome: .failed(ScreenSnapshotEngine.userFacingErrorMessage(for: error)))
         }
     }
 
@@ -142,6 +168,8 @@ final class ScrollCaptureController {
 
             let accent: ScrollCaptureVisualAccent
             if progress.reachedLimit {
+                self.reachedHeightLimit = true
+                self.pendingAutoScrollStart = false
                 self.autoScroll.stop()
                 self.statusText = "Max height"
                 accent = .warning
@@ -149,6 +177,10 @@ final class ScrollCaptureController {
                 self.statusText = "Auto-scrolling"
                 accent = .autoScroll
             } else {
+                // Recover cleanly from prior "Reached bottom" / "Needs Accessibility" warning once manual scroll advances.
+                if progress.frameCount > 1 {
+                    self.statusText = "Scroll down"
+                }
                 accent = .active
             }
 
@@ -175,7 +207,7 @@ final class ScrollCaptureController {
             let accent: ScrollCaptureVisualAccent = running ? .autoScroll : .active
             if running {
                 self.statusText = "Auto-scrolling"
-            } else if self.statusText == "Auto-scrolling" {
+            } else if self.statusText == "Auto-scrolling" || self.statusText == "Starting..." {
                 self.statusText = "Scroll down"
             }
             self.borderPanel?.setAccent(accent)
@@ -198,23 +230,43 @@ final class ScrollCaptureController {
     }
 
     private func toggleAutoScroll() {
-        guard !isFinishing, !isClosed else { return }
+        guard !isFinishing, !isClosed, !reachedHeightLimit else { return }
         if autoScroll.isRunning {
+            pendingAutoScrollStart = false
             autoScroll.stop()
-        } else {
-            let primaryHeight = CoordinateConverter.primaryScreenHeight(screens: NSScreen.screens.map(\.frame))
-            let currentHeight = hudPanel?.lastHeightPixels ?? initialPixelHeight
-            autoScroll.start(
-                captureScreenRect: request.screenRect,
-                primaryScreenHeight: primaryHeight,
-                currentPixelHeight: currentHeight
-            )
+            return
         }
+        guard isStreamReady else {
+            pendingAutoScrollStart.toggle()
+            if pendingAutoScrollStart {
+                statusText = "Starting..."
+                borderPanel?.setAccent(.autoScroll)
+                hudPanel?.updateAutoScroll(isRunning: true, status: statusText, accent: .autoScroll)
+            } else {
+                statusText = "Scroll down"
+                borderPanel?.setAccent(.active)
+                hudPanel?.updateAutoScroll(isRunning: false, status: statusText, accent: .active)
+            }
+            return
+        }
+        startAutoScroll()
+    }
+
+    private func startAutoScroll() {
+        let primaryHeight = CoordinateConverter.primaryScreenHeight(screens: NSScreen.screens.map(\.frame))
+        let currentHeight = max(hudPanel?.lastHeightPixels ?? initialPixelHeight, initialPixelHeight)
+        autoScroll.start(
+            captureScreenRect: request.screenRect,
+            primaryScreenHeight: primaryHeight,
+            currentPixelHeight: currentHeight,
+            avoiding: hudPanel?.frame
+        )
     }
 
     private func finish(kind: FinishKind) {
         guard !isFinishing, !isClosed else { return }
         isFinishing = true
+        pendingAutoScrollStart = false
         autoScroll.stop()
         removeMonitors()
         borderPanel?.orderOut(nil)
@@ -240,33 +292,59 @@ final class ScrollCaptureController {
     private func tearDown(outcome: SnipOutcome, cancelEngine: Bool = true) {
         guard !isClosed else { return }
         isClosed = true
+        pendingAutoScrollStart = false
         autoScroll.stop()
         removeMonitors()
+        removeScreenParametersObserver()
         if cancelEngine {
             engine.cancel()
         }
+        hudPanel?.delegate = nil
+        hudPanel?.onToggleAutoScroll = nil
+        hudPanel?.onOCR = nil
+        hudPanel?.onPin = nil
+        hudPanel?.onCopy = nil
+        hudPanel?.onSave = nil
+        hudPanel?.onCancel = nil
         borderPanel?.orderOut(nil)
         hudPanel?.orderOut(nil)
         previewPanel?.orderOut(nil)
+        borderPanel?.close()
+        hudPanel?.close()
+        previewPanel?.close()
         borderPanel = nil
         hudPanel = nil
         previewPanel = nil
         onFinish(outcome)
     }
 
+    private func ownedWindowNumbers() -> Set<Int> {
+        var numbers: Set<Int> = []
+        for panel in [borderPanel as NSPanel?, hudPanel, previewPanel] {
+            if let num = panel?.windowNumber, num > 0 {
+                numbers.insert(num)
+            }
+        }
+        return numbers
+    }
+
+    internal nonisolated static func shouldHandleLocalKeyEvent(
+        windowNumber: Int,
+        ownedWindowNumbers: Set<Int>,
+        isFieldEditorFirstResponder: Bool
+    ) -> Bool {
+        guard !isFieldEditorFirstResponder else { return false }
+        return ownedWindowNumbers.contains(windowNumber)
+    }
+
     private func installMonitors() {
         removeMonitors()
 
-        globalKeyMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            if event.keyCode == 53 {
-                Task { @MainActor [weak self] in
-                    self?.cancel()
-                }
-            }
-        }
-
+        // Shortcuts are strictly scoped to scroll-capture panels so keys in other foreground apps
+        // or other CCX windows (Settings, Onboarding, Pins, inline text editors) are never hijacked.
         localKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             let keyCode = event.keyCode
+            let windowNumber = event.windowNumber
             let mods = event.modifierFlags
                 .intersection(.deviceIndependentFlagsMask)
                 .subtracting([.capsLock, .numericPad, .function])
@@ -274,7 +352,15 @@ final class ScrollCaptureController {
 
             let handled = MainActor.assumeIsolated { () -> Bool in
                 guard let self, !self.isClosed, !self.isFinishing else { return false }
-                if keyCode == 53 {
+                let isFieldEditor = event.window?.firstResponder is NSTextView
+                guard Self.shouldHandleLocalKeyEvent(
+                    windowNumber: windowNumber,
+                    ownedWindowNumbers: self.ownedWindowNumbers(),
+                    isFieldEditorFirstResponder: isFieldEditor
+                ) else {
+                    return false
+                }
+                if keyCode == 53 && mods.isEmpty {
                     self.cancel()
                     return true
                 }
@@ -316,25 +402,93 @@ final class ScrollCaptureController {
     }
 
     private func removeMonitors() {
-        if let globalKeyMonitor {
-            NSEvent.removeMonitor(globalKeyMonitor)
-            self.globalKeyMonitor = nil
-        }
         if let localKeyMonitor {
             NSEvent.removeMonitor(localKeyMonitor)
             self.localKeyMonitor = nil
         }
     }
 
-    private static func visibleFrame(for rect: CGRect) -> CGRect {
-        let screen = NSScreen.screens.first { $0.frame.intersects(rect) } ?? NSScreen.main
-        return screen?.visibleFrame ?? CGRect(x: 0, y: 0, width: 1440, height: 900)
+    private func installScreenParametersObserver() {
+        removeScreenParametersObserver()
+        screenParametersObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.handleScreenParametersChanged()
+            }
+        }
+    }
+
+    private func removeScreenParametersObserver() {
+        if let screenParametersObserver {
+            NotificationCenter.default.removeObserver(screenParametersObserver)
+            self.screenParametersObserver = nil
+        }
+    }
+
+    private func handleScreenParametersChanged() {
+        guard !isClosed, !isFinishing else { return }
+        let matchingScreen = NSScreen.screens.first { screen in
+            guard let num = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else {
+                return false
+            }
+            return CGDirectDisplayID(num.uint32Value) == request.displayID
+        }
+        guard let matchingScreen,
+              abs(matchingScreen.frame.minX - request.displayFrame.minX) <= 1,
+              abs(matchingScreen.frame.minY - request.displayFrame.minY) <= 1,
+              abs(matchingScreen.frame.width - request.displayFrame.width) <= 1,
+              abs(matchingScreen.frame.height - request.displayFrame.height) <= 1
+        else {
+            tearDown(outcome: .failed("Display configuration changed during scroll capture"))
+            return
+        }
+    }
+
+    internal static func visibleFrame(
+        for displayID: CGDirectDisplayID,
+        captureRect: CGRect,
+        screens: [(displayID: CGDirectDisplayID, frame: CGRect, visibleFrame: CGRect)]
+    ) -> CGRect {
+        if let exact = screens.first(where: { $0.displayID == displayID }) {
+            return exact.visibleFrame
+        }
+        var bestScreen: (displayID: CGDirectDisplayID, frame: CGRect, visibleFrame: CGRect)?
+        var bestArea: CGFloat = 0
+        for screen in screens {
+            let overlap = screen.frame.intersection(captureRect)
+            guard !overlap.isNull, !overlap.isEmpty else { continue }
+            let area = overlap.width * overlap.height
+            if area > bestArea {
+                bestArea = area
+                bestScreen = screen
+            }
+        }
+        if let bestScreen {
+            return bestScreen.visibleFrame
+        }
+        return screens.first?.visibleFrame ?? CGRect(x: 0, y: 0, width: 1440, height: 900)
+    }
+
+    private static func visibleFrame(for displayID: CGDirectDisplayID, captureRect: CGRect) -> CGRect {
+        let descriptors: [(displayID: CGDirectDisplayID, frame: CGRect, visibleFrame: CGRect)] = NSScreen.screens.compactMap { screen in
+            guard let num = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else {
+                return nil
+            }
+            return (CGDirectDisplayID(num.uint32Value), screen.frame, screen.visibleFrame)
+        }
+        if descriptors.isEmpty {
+            return NSScreen.main?.visibleFrame ?? CGRect(x: 0, y: 0, width: 1440, height: 900)
+        }
+        return visibleFrame(for: displayID, captureRect: captureRect, screens: descriptors)
     }
 }
 
 // MARK: - Visual Styling & Auxiliary Panels
 
-private enum ScrollCaptureVisualAccent {
+enum ScrollCaptureVisualAccent {
     case active
     case autoScroll
     case warning
@@ -359,8 +513,8 @@ private final class ScrollCaptureFramePanel: NSPanel {
             backing: .buffered,
             defer: false
         )
-        level = .statusBar
         isFloatingPanel = true
+        level = .statusBar
         ignoresMouseEvents = true
         backgroundColor = .clear
         isOpaque = false
@@ -398,7 +552,11 @@ private final class ScrollBorderView: NSView {
 }
 
 @MainActor
-private final class ScrollCaptureHUDPanel: NSPanel {
+internal final class ScrollCaptureHUDPanel: NSPanel, NSWindowDelegate {
+    private static let panelHeight: CGFloat = 44
+    private static let cornerRadius: CGFloat = 14
+    private static let controlHeight: CGFloat = 30
+
     var onToggleAutoScroll: (() -> Void)?
     var onOCR: (() -> Void)?
     var onPin: (() -> Void)?
@@ -408,38 +566,49 @@ private final class ScrollCaptureHUDPanel: NSPanel {
 
     private(set) var lastHeightPixels = 0
 
+    var hudContentBounds: CGRect {
+        innerContainer.bounds
+    }
+
+    var hudControlFrames: [CGRect] {
+        controlViewsForTesting.map { view in
+            view.convert(view.bounds, to: innerContainer)
+        }
+    }
+
+    private let captureRect: CGRect
+    private let visibleFrame: CGRect
+    private var hasCustomPosition = false
+    private var isProgrammaticFrameUpdate = false
+
+    private let innerContainer = NSView()
+    private let rootStack = NSStackView()
     private let dotView = NSView()
     private let sizeLabel = NSTextField(labelWithString: "")
     private let statusLabel = NSTextField(labelWithString: "")
-    private let autoButton = NSButton()
+    private let textStack = NSStackView()
+    private let autoButton = ScrollAutoPillButton()
+    private let divider = NSView()
+    private var controlViewsForTesting: [NSView] = []
 
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
 
     init(captureRect: CGRect, visibleFrame: CGRect) {
-        let size = CGSize(width: 404, height: 42)
-        let gap: CGFloat = 8
-        var origin = CGPoint(x: captureRect.midX - size.width / 2, y: captureRect.minY - gap - size.height)
-        if origin.y < visibleFrame.minY + 6 {
-            let aboveY = captureRect.maxY + gap
-            if aboveY + size.height <= visibleFrame.maxY - 6 {
-                origin.y = aboveY
-            } else {
-                origin.y = visibleFrame.minY + 14
-            }
-        }
-        origin.x = min(max(origin.x, visibleFrame.minX + 8), max(visibleFrame.minX + 8, visibleFrame.maxX - size.width - 8))
-        origin.y = min(max(origin.y, visibleFrame.minY + 6), max(visibleFrame.minY + 6, visibleFrame.maxY - size.height - 6))
+        self.captureRect = captureRect
+        self.visibleFrame = visibleFrame
 
-        let frame = CGRect(origin: origin, size: size)
+        let initialSize = CGSize(width: 360, height: Self.panelHeight)
+        let initialFrame = CGRect(origin: visibleFrame.origin, size: initialSize)
         super.init(
-            contentRect: frame,
+            contentRect: initialFrame,
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
         )
-        level = .statusBar
         isFloatingPanel = true
+        level = NSWindow.Level(rawValue: NSWindow.Level.statusBar.rawValue + 1)
+        isMovableByWindowBackground = true
         isOpaque = false
         backgroundColor = .clear
         hasShadow = true
@@ -448,13 +617,21 @@ private final class ScrollCaptureHUDPanel: NSPanel {
         isReleasedWhenClosed = false
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient, .ignoresCycle]
         appearance = NSAppearance(named: .darkAqua)
+        delegate = self
 
-        let inner = NSView(frame: CGRect(origin: .zero, size: size))
-        setUpControls(in: inner)
-        let surface = Self.makeGlassSurface(contentView: inner, cornerRadius: 12)
-        surface.frame = CGRect(origin: .zero, size: size)
+        setUpControls()
+        let surface = Self.makeGlassSurface(contentView: innerContainer, cornerRadius: Self.cornerRadius)
         contentView = surface
-        setFrame(frame, display: true)
+
+        let initialWidth = captureRect.width.isFinite ? max(1, Int(captureRect.width.rounded())) : 1
+        let initialHeight = captureRect.height.isFinite ? max(1, Int(captureRect.height.rounded())) : 1
+        sizeLabel.stringValue = "\(initialWidth) × \(initialHeight)"
+        updateAutoScroll(isRunning: false, status: "Scroll down", accent: .active)
+    }
+
+    func windowDidMove(_ notification: Notification) {
+        guard !isProgrammaticFrameUpdate else { return }
+        hasCustomPosition = true
     }
 
     func updateMetrics(
@@ -472,28 +649,75 @@ private final class ScrollCaptureHUDPanel: NSPanel {
     func updateAutoScroll(isRunning: Bool, status: String, accent: ScrollCaptureVisualAccent) {
         dotView.layer?.backgroundColor = accent.nsColor.cgColor
         statusLabel.stringValue = status
-        statusLabel.textColor = isRunning ? NSColor.systemCyan : NSColor.white.withAlphaComponent(0.72)
-
-        let symbol = isRunning ? "pause.fill" : "play.fill"
-        autoButton.image = NSImage(systemSymbolName: symbol, accessibilityDescription: "Auto Scroll")
-        let title = isRunning ? "Pause" : "Auto"
-        autoButton.attributedTitle = NSAttributedString(
-            string: " \(title)",
-            attributes: [
-                .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
-                .foregroundColor: isRunning ? NSColor.black : NSColor.white,
-            ]
-        )
-        autoButton.contentTintColor = isRunning ? .black : .white
-        autoButton.layer?.backgroundColor = (isRunning ? NSColor.systemCyan : NSColor.white.withAlphaComponent(0.14)).cgColor
-        autoButton.toolTip = isRunning ? "Pause Auto-Scroll (Space)" : "Auto-Scroll Down (Space)"
+        statusLabel.toolTip = status == "Needs Accessibility"
+            ? "Enable Accessibility for CCX in System Settings to use Auto-Scroll, or scroll manually."
+            : nil
+        switch accent {
+        case .active:
+            statusLabel.textColor = NSColor.white.withAlphaComponent(0.74)
+        case .autoScroll:
+            statusLabel.textColor = .systemCyan
+        case .warning:
+            statusLabel.textColor = .systemOrange
+        }
+        autoButton.setRunning(isRunning)
+        resizeToFit()
     }
 
-    private func setUpControls(in container: NSView) {
+    private func resizeToFit() {
+        innerContainer.layoutSubtreeIfNeeded()
+        let fitting = rootStack.fittingSize
+        let maxAllowedWidth = max(260, visibleFrame.width - 16)
+        let targetWidth = min(maxAllowedWidth, ceil(max(fitting.width, 320)))
+        let targetSize = CGSize(width: targetWidth, height: Self.panelHeight)
+        let origin = desiredOrigin(for: targetSize)
+        let targetFrame = CGRect(origin: origin, size: targetSize)
+
+        guard targetFrame != frame else { return }
+        isProgrammaticFrameUpdate = true
+        setFrame(targetFrame, display: true)
+        isProgrammaticFrameUpdate = false
+        contentView?.frame = CGRect(origin: .zero, size: targetSize)
+        innerContainer.frame = CGRect(origin: .zero, size: targetSize)
+        innerContainer.layoutSubtreeIfNeeded()
+    }
+
+    private func desiredOrigin(for size: CGSize) -> CGPoint {
+        let minX = visibleFrame.minX + 8
+        let maxX = max(minX, visibleFrame.maxX - size.width - 8)
+        let minY = visibleFrame.minY + 6
+        let maxY = max(minY, visibleFrame.maxY - size.height - 6)
+
+        if hasCustomPosition {
+            let centeredX = frame.midX - size.width * 0.5
+            return CGPoint(
+                x: min(max(centeredX, minX), maxX),
+                y: min(max(frame.minY, minY), maxY)
+            )
+        }
+
+        let gap: CGFloat = 10
+        var y = captureRect.minY - gap - size.height
+        if y < minY {
+            let aboveY = captureRect.maxY + gap
+            y = (aboveY + size.height <= visibleFrame.maxY - 6) ? aboveY : (visibleFrame.minY + 14)
+        }
+        let x = captureRect.midX - size.width * 0.5
+        return CGPoint(
+            x: min(max(x, minX), maxX),
+            y: min(max(y, minY), maxY)
+        )
+    }
+
+    private func setUpControls() {
+        innerContainer.autoresizingMask = [.width, .height]
+
         dotView.wantsLayer = true
         dotView.layer?.cornerRadius = 4
         dotView.layer?.backgroundColor = NSColor.systemMint.cgColor
         dotView.translatesAutoresizingMaskIntoConstraints = false
+        dotView.setContentHuggingPriority(.required, for: .horizontal)
+        dotView.setContentCompressionResistancePriority(.required, for: .horizontal)
         NSLayoutConstraint.activate([
             dotView.widthAnchor.constraint(equalToConstant: 8),
             dotView.heightAnchor.constraint(equalToConstant: 8),
@@ -502,47 +726,78 @@ private final class ScrollCaptureHUDPanel: NSPanel {
         sizeLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 11.5, weight: .semibold)
         sizeLabel.textColor = .white
         sizeLabel.lineBreakMode = .byTruncatingTail
+        sizeLabel.setContentHuggingPriority(.required, for: .horizontal)
+        sizeLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
 
-        statusLabel.font = NSFont.systemFont(ofSize: 10, weight: .medium)
-        statusLabel.textColor = NSColor.white.withAlphaComponent(0.72)
+        statusLabel.font = NSFont.systemFont(ofSize: 10.5, weight: .medium)
+        statusLabel.textColor = NSColor.white.withAlphaComponent(0.74)
         statusLabel.lineBreakMode = .byTruncatingTail
+        statusLabel.setContentHuggingPriority(.required, for: .horizontal)
+        statusLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
 
-        let textStack = NSStackView(views: [sizeLabel, statusLabel])
         textStack.orientation = .vertical
         textStack.alignment = .leading
-        textStack.spacing = 0
+        textStack.spacing = 1
+        textStack.addArrangedSubview(sizeLabel)
+        textStack.addArrangedSubview(statusLabel)
         textStack.translatesAutoresizingMaskIntoConstraints = false
-        textStack.widthAnchor.constraint(greaterThanOrEqualToConstant: 108).isActive = true
+        textStack.setContentHuggingPriority(.required, for: .horizontal)
+        textStack.setContentCompressionResistancePriority(.required, for: .horizontal)
+        textStack.widthAnchor.constraint(greaterThanOrEqualToConstant: 84).isActive = true
 
-        autoButton.bezelStyle = .regularSquare
-        autoButton.isBordered = false
-        autoButton.imagePosition = .imageLeading
-        autoButton.wantsLayer = true
-        autoButton.layer?.cornerRadius = 7
         autoButton.target = self
         autoButton.action = #selector(autoPressed)
         autoButton.translatesAutoresizingMaskIntoConstraints = false
-        NSLayoutConstraint.activate([
-            autoButton.widthAnchor.constraint(equalToConstant: 66),
-            autoButton.heightAnchor.constraint(equalToConstant: 28),
-        ])
+        autoButton.heightAnchor.constraint(equalToConstant: Self.controlHeight).isActive = true
 
-        let ocrBtn = makeIconButton(symbol: "text.viewfinder", tint: .systemCyan, tip: "Copy Text (OCR) (T)", action: #selector(ocrPressed))
-        let pinBtn = makeIconButton(symbol: "pin", tint: .systemGreen, tip: "Pin (Return)", action: #selector(pinPressed))
-        let copyBtn = makeIconButton(symbol: "doc.on.doc", tint: .white, tip: "Copy (⌘C)", action: #selector(copyPressed))
-        let saveBtn = makeIconButton(symbol: "square.and.arrow.down", tint: .white, tip: "Save PNG (⌘S)", action: #selector(savePressed))
-        let cancelBtn = makeIconButton(symbol: "xmark", tint: .systemRed, tip: "Cancel (Esc)", action: #selector(cancelPressed))
-
-        let divider = NSView()
         divider.wantsLayer = true
         divider.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.18).cgColor
         divider.translatesAutoresizingMaskIntoConstraints = false
+        divider.setContentHuggingPriority(.required, for: .horizontal)
+        divider.setContentCompressionResistancePriority(.required, for: .horizontal)
         NSLayoutConstraint.activate([
             divider.widthAnchor.constraint(equalToConstant: 1),
-            divider.heightAnchor.constraint(equalToConstant: 20),
+            divider.heightAnchor.constraint(equalToConstant: 18),
         ])
 
-        let stack = NSStackView(views: [
+        let ocrBtn = ScrollHUDIconButton(
+            symbol: "text.viewfinder",
+            tint: .systemCyan,
+            tip: "Copy Text (OCR) (T)",
+            target: self,
+            action: #selector(ocrPressed)
+        )
+        let pinBtn = ScrollHUDIconButton(
+            symbol: "pin",
+            tint: .systemGreen,
+            tip: "Pin (Return)",
+            target: self,
+            action: #selector(pinPressed)
+        )
+        let copyBtn = ScrollHUDIconButton(
+            symbol: "doc.on.doc",
+            tint: .white,
+            tip: "Copy (⌘C)",
+            target: self,
+            action: #selector(copyPressed)
+        )
+        let saveBtn = ScrollHUDIconButton(
+            symbol: "square.and.arrow.down",
+            tint: .white,
+            tip: "Save PNG (⌘S)",
+            target: self,
+            action: #selector(savePressed)
+        )
+        let cancelBtn = ScrollHUDIconButton(
+            symbol: "xmark",
+            tint: .systemRed,
+            hoverTint: NSColor.systemRed.withAlphaComponent(0.22),
+            tip: "Cancel (Esc)",
+            target: self,
+            action: #selector(cancelPressed)
+        )
+
+        let controls: [NSView] = [
             dotView,
             textStack,
             autoButton,
@@ -552,39 +807,28 @@ private final class ScrollCaptureHUDPanel: NSPanel {
             copyBtn,
             saveBtn,
             cancelBtn,
-        ])
-        stack.orientation = .horizontal
-        stack.alignment = .centerY
-        stack.spacing = 6
-        stack.edgeInsets = NSEdgeInsets(top: 4, left: 10, bottom: 4, right: 8)
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        container.addSubview(stack)
-        NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            stack.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            stack.topAnchor.constraint(equalTo: container.topAnchor),
-            stack.bottomAnchor.constraint(equalTo: container.bottomAnchor),
-        ])
-    }
+        ]
+        controlViewsForTesting = controls
 
-    private func makeIconButton(symbol: String, tint: NSColor, tip: String, action: Selector) -> NSButton {
-        let button = NSButton()
-        button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: tip)
-        button.isBordered = false
-        button.bezelStyle = .regularSquare
-        button.imagePosition = .imageOnly
-        button.contentTintColor = tint
-        button.toolTip = tip
-        button.target = self
-        button.action = action
-        button.wantsLayer = true
-        button.layer?.cornerRadius = 7
-        button.translatesAutoresizingMaskIntoConstraints = false
+        for view in controls {
+            rootStack.addArrangedSubview(view)
+        }
+        rootStack.orientation = .horizontal
+        rootStack.alignment = .centerY
+        rootStack.spacing = 4
+        rootStack.edgeInsets = NSEdgeInsets(top: 7, left: 12, bottom: 7, right: 10)
+        rootStack.setCustomSpacing(8, after: dotView)
+        rootStack.setCustomSpacing(10, after: textStack)
+        rootStack.setCustomSpacing(8, after: autoButton)
+        rootStack.setCustomSpacing(8, after: divider)
+        rootStack.translatesAutoresizingMaskIntoConstraints = false
+        innerContainer.addSubview(rootStack)
         NSLayoutConstraint.activate([
-            button.widthAnchor.constraint(equalToConstant: 28),
-            button.heightAnchor.constraint(equalToConstant: 28),
+            rootStack.leadingAnchor.constraint(equalTo: innerContainer.leadingAnchor),
+            rootStack.trailingAnchor.constraint(equalTo: innerContainer.trailingAnchor),
+            rootStack.topAnchor.constraint(equalTo: innerContainer.topAnchor),
+            rootStack.bottomAnchor.constraint(equalTo: innerContainer.bottomAnchor),
         ])
-        return button
     }
 
     @objc private func autoPressed() { onToggleAutoScroll?() }
@@ -604,11 +848,13 @@ private final class ScrollCaptureHUDPanel: NSPanel {
         }
         let effect = NSVisualEffectView()
         effect.material = .hudWindow
-        effect.blendingMode = .withinWindow
+        effect.blendingMode = .behindWindow
         effect.state = .active
         effect.wantsLayer = true
         effect.layer?.cornerRadius = cornerRadius
         effect.layer?.masksToBounds = true
+        effect.layer?.borderWidth = 1
+        effect.layer?.borderColor = NSColor.white.withAlphaComponent(0.14).cgColor
         contentView.translatesAutoresizingMaskIntoConstraints = false
         effect.addSubview(contentView)
         NSLayoutConstraint.activate([
@@ -618,6 +864,169 @@ private final class ScrollCaptureHUDPanel: NSPanel {
             contentView.bottomAnchor.constraint(equalTo: effect.bottomAnchor),
         ])
         return effect
+    }
+}
+
+@MainActor
+private final class ScrollAutoPillButton: NSButton {
+    private static let horizontalPadding: CGFloat = 11
+    private static let iconTitleSpacing: CGFloat = 6
+    private static let pillHeight: CGFloat = 30
+
+    private var isHovered = false
+    private var isRunningState = false
+    private var hasConfiguredState = false
+
+    override var mouseDownCanMoveWindow: Bool { false }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        bezelStyle = .regularSquare
+        isBordered = false
+        imagePosition = .imageLeading
+        imageScaling = .scaleNone
+        wantsLayer = true
+        layer?.cornerRadius = Self.pillHeight * 0.5
+        layer?.masksToBounds = true
+        setContentHuggingPriority(.required, for: .horizontal)
+        setContentCompressionResistancePriority(.required, for: .horizontal)
+        setRunning(false)
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override var intrinsicContentSize: NSSize {
+        let iconWidth = image?.size.width ?? 12
+        let titleWidth = ceil(attributedTitle.size().width)
+        let explicitWidth = Self.horizontalPadding * 2 + iconWidth + Self.iconTitleSpacing + titleWidth
+        let width = max(68, max(ceil(super.intrinsicContentSize.width + 18), explicitWidth))
+        return NSSize(width: width, height: Self.pillHeight)
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        for area in trackingAreas {
+            removeTrackingArea(area)
+        }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        isHovered = true
+        applyAppearance()
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        isHovered = false
+        applyAppearance()
+    }
+
+    func setRunning(_ running: Bool) {
+        guard !hasConfiguredState || isRunningState != running else { return }
+        hasConfiguredState = true
+        isRunningState = running
+        let symbol = running ? "pause.fill" : "arrow.down.circle.fill"
+        let config = NSImage.SymbolConfiguration(pointSize: 12, weight: .semibold)
+        let rawImage = NSImage(systemSymbolName: symbol, accessibilityDescription: "Auto Scroll")
+        image = rawImage?.withSymbolConfiguration(config) ?? rawImage
+        let title = running ? "Pause" : "Auto"
+        attributedTitle = NSAttributedString(
+            string: " \(title)",
+            attributes: [
+                .font: NSFont.systemFont(ofSize: 11.5, weight: .semibold),
+                .foregroundColor: running ? NSColor.black : NSColor.white,
+            ]
+        )
+        toolTip = running ? "Pause Auto-Scroll (Space)" : "Auto-Scroll Down (Space)"
+        setAccessibilityLabel(running ? "Pause Auto-Scroll" : "Auto-Scroll Down")
+        applyAppearance()
+        invalidateIntrinsicContentSize()
+    }
+
+    private func applyAppearance() {
+        if isRunningState {
+            contentTintColor = .black
+            let alpha: CGFloat = isHovered ? 0.88 : 1.0
+            layer?.backgroundColor = NSColor.systemCyan.withAlphaComponent(alpha).cgColor
+        } else {
+            contentTintColor = .white
+            let alpha: CGFloat = isHovered ? 0.24 : 0.14
+            layer?.backgroundColor = NSColor.white.withAlphaComponent(alpha).cgColor
+        }
+    }
+}
+
+@MainActor
+private final class ScrollHUDIconButton: NSButton {
+    private static let buttonSize: CGFloat = 30
+    private let hoverBackground: NSColor
+    private var isHovered = false
+
+    override var mouseDownCanMoveWindow: Bool { false }
+
+    init(
+        symbol: String,
+        tint: NSColor,
+        hoverTint: NSColor = NSColor.white.withAlphaComponent(0.14),
+        tip: String,
+        target: AnyObject,
+        action: Selector
+    ) {
+        self.hoverBackground = hoverTint
+        super.init(frame: .zero)
+        let config = NSImage.SymbolConfiguration(pointSize: 13, weight: .medium)
+        let rawImage = NSImage(systemSymbolName: symbol, accessibilityDescription: tip)
+        image = rawImage?.withSymbolConfiguration(config) ?? rawImage
+        imageScaling = .scaleNone
+        isBordered = false
+        bezelStyle = .regularSquare
+        imagePosition = .imageOnly
+        contentTintColor = tint
+        toolTip = tip
+        self.target = target
+        self.action = action
+        wantsLayer = true
+        layer?.cornerRadius = 8
+        layer?.masksToBounds = true
+        translatesAutoresizingMaskIntoConstraints = false
+        setContentHuggingPriority(.required, for: .horizontal)
+        setContentCompressionResistancePriority(.required, for: .horizontal)
+        NSLayoutConstraint.activate([
+            widthAnchor.constraint(equalToConstant: Self.buttonSize),
+            heightAnchor.constraint(equalToConstant: Self.buttonSize),
+        ])
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        for area in trackingAreas {
+            removeTrackingArea(area)
+        }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        isHovered = true
+        layer?.backgroundColor = hoverBackground.cgColor
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        isHovered = false
+        layer?.backgroundColor = NSColor.clear.cgColor
     }
 }
 
@@ -676,8 +1085,8 @@ private final class ScrollCapturePreviewPanel: NSPanel {
             backing: .buffered,
             defer: false
         )
-        level = .statusBar
         isFloatingPanel = true
+        level = .statusBar
         ignoresMouseEvents = true
         isOpaque = false
         backgroundColor = .clear

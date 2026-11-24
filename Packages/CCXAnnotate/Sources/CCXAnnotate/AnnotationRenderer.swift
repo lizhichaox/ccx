@@ -17,7 +17,9 @@ public enum AnnotationRenderer {
         case let .rectangle(raw):
             let rect = raw.standardized
             guard rect.width >= 1, rect.height >= 1 else { return }
-            let path = CGPath(roundedRect: rect, cornerWidth: 2, cornerHeight: 2, transform: nil)
+            let cornerWidth = min(2, rect.width / 2)
+            let cornerHeight = min(2, rect.height / 2)
+            let path = CGPath(roundedRect: rect, cornerWidth: cornerWidth, cornerHeight: cornerHeight, transform: nil)
             context.setStrokeColor(item.style.color.cgColor)
             context.setLineWidth(item.style.size.lineWidth)
             context.setLineJoin(.round)
@@ -89,7 +91,8 @@ public enum AnnotationRenderer {
                     }
                 }
             } else {
-                context.setFillColor(NSColor(white: 0.25, alpha: 0.85).cgColor)
+                // Opaque privacy-preserving fallback so failed filtering never leaks redacted pixels beneath.
+                context.setFillColor(CGColor(srgbRed: 0.18, green: 0.18, blue: 0.20, alpha: 1.0))
                 context.fill(rect)
             }
             context.restoreGState()
@@ -204,33 +207,53 @@ public enum AnnotationRenderer {
         document: AnnotationDocument,
         mosaicCache: MosaicImageCache?
     ) -> CGImage? {
-        guard let cropped = baseImage.cropping(to: pixelCropRect) else { return nil }
+        guard !pixelCropRect.isNull,
+              !pixelCropRect.isInfinite,
+              pixelCropRect.origin.x.isFinite,
+              pixelCropRect.origin.y.isFinite,
+              pixelCropRect.width.isFinite,
+              pixelCropRect.height.isFinite,
+              baseImage.width > 0,
+              baseImage.height > 0
+        else { return nil }
+
+        let imageBounds = CGRect(x: 0, y: 0, width: baseImage.width, height: baseImage.height)
+        let clampedCrop = pixelCropRect.standardized.intersection(imageBounds).integral
+        guard !clampedCrop.isNull, clampedCrop.width >= 1, clampedCrop.height >= 1,
+              let cropped = baseImage.cropping(to: clampedCrop)
+        else { return nil }
         guard !document.items.isEmpty else { return cropped }
 
         let width = cropped.width
         let height = cropped.height
-        let colorSpace = baseImage.colorSpace.flatMap { $0.model == .rgb ? $0 : nil }
-            ?? CGColorSpace(name: CGColorSpace.sRGB)!
-        guard let context = CGContext(
-            data: nil,
-            width: width,
-            height: height,
-            bitsPerComponent: 8,
-            bytesPerRow: 0,
-            space: colorSpace,
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-        ) else { return cropped }
+        let (pixelCount, pixelOverflow) = width.multipliedReportingOverflow(by: height)
+        guard !pixelOverflow, pixelCount > 0, pixelCount <= 150_000_000 else { return nil }
+
+        guard let context = makeBakeContext(width: width, height: height, baseImage: baseImage) else {
+            return nil
+        }
 
         context.draw(cropped, in: CGRect(x: 0, y: 0, width: width, height: height))
 
-        let sx = screenSize.width > 0 ? CGFloat(baseImage.width) / screenSize.width : 1
-        let sy = screenSize.height > 0 ? CGFloat(baseImage.height) / screenSize.height : 1
+        let sx = (screenSize.width.isFinite && screenSize.width > 0) ? CGFloat(baseImage.width) / screenSize.width : 1
+        let sy = (screenSize.height.isFinite && screenSize.height > 0) ? CGFloat(baseImage.height) / screenSize.height : 1
         let scale = max(sx, sy)
-        let screenBounds = CGRect(origin: .zero, size: screenSize)
+        let screenBounds = CGRect(
+            origin: .zero,
+            size: CGSize(
+                width: (screenSize.width.isFinite && screenSize.width > 0) ? screenSize.width : CGFloat(baseImage.width),
+                height: (screenSize.height.isFinite && screenSize.height > 0) ? screenSize.height : CGFloat(baseImage.height)
+            )
+        )
+
+        // Anchor translation to the actual rounded/clamped `clampedCrop` origin so baked annotations and
+        // mosaic patches align pixel-for-pixel with `cropped` even for fractional or edge-clamped selections.
+        let cropOriginX = clampedCrop.minX / sx
+        let cropOriginY = (CGFloat(baseImage.height) - clampedCrop.maxY) / sy
 
         context.saveGState()
         context.scaleBy(x: sx, y: sy)
-        context.translateBy(x: -localSelectionRect.minX, y: -localSelectionRect.minY)
+        context.translateBy(x: -cropOriginX, y: -cropOriginY)
         for item in document.items {
             draw(item, in: context, screenBounds: screenBounds) { mode, size in
                 mosaicCache?.filteredImage(mode: mode, size: size, backingScale: scale)
@@ -238,7 +261,46 @@ public enum AnnotationRenderer {
         }
         context.restoreGState()
 
-        return context.makeImage() ?? cropped
+        return context.makeImage()
+    }
+
+    private static func makeBakeContext(width: Int, height: Int, baseImage: CGImage) -> CGContext? {
+        let preferredSpace = resolvedOutputRGBColorSpace(for: baseImage)
+        let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue
+        if let ctx = CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: preferredSpace,
+            bitmapInfo: bitmapInfo
+        ) {
+            return ctx
+        }
+        let srgbFallback = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+        return CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: srgbFallback,
+            bitmapInfo: bitmapInfo
+        )
+    }
+
+    private static func resolvedOutputRGBColorSpace(for image: CGImage) -> CGColorSpace {
+        if let space = image.colorSpace, space.model == .rgb {
+            if space.supportsOutput && !CGColorSpaceUsesExtendedRange(space) && !CGColorSpaceUsesITUR_2100TF(space) {
+                return space
+            }
+            // Extended/HDR RGB spaces cannot back 8-bit integer CGContexts directly; preserve wide gamut via Display P3.
+            if let displayP3 = CGColorSpace(name: CGColorSpace.displayP3) {
+                return displayP3
+            }
+        }
+        return CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
     }
 
     // MARK: - Primitives
@@ -353,8 +415,14 @@ public enum AnnotationRenderer {
         context.strokeEllipse(in: circle.insetBy(dx: 0.75, dy: 0.75))
 
         let labelColor: NSColor = style.color.isLightColor ? .black : .white
-        let font = NSFont.monospacedDigitSystemFont(ofSize: diameter * 0.52, weight: .bold)
-        let text = "\(number)" as NSString
+        let numberString = "\(number)"
+        let fontFactor: CGFloat = switch numberString.count {
+        case ...1: 0.52
+        case 2: 0.44
+        default: 0.34
+        }
+        let font = NSFont.monospacedDigitSystemFont(ofSize: diameter * fontFactor, weight: .bold)
+        let text = numberString as NSString
         let attrs: [NSAttributedString.Key: Any] = [
             .font: font,
             .foregroundColor: labelColor,

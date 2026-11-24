@@ -1,8 +1,10 @@
 import AppKit
 import ApplicationServices
+import CCXCore
 import CoreMedia
 import CoreVideo
 import Foundation
+import os
 import OSLog
 import ScreenCaptureKit
 
@@ -30,6 +32,7 @@ public final class ScrollCaptureEngine {
     private var stream: SCStream?
     private var streamOutput: StreamOutputHandler?
     private let streamQueue = DispatchQueue(label: "com.lizhichaox.ccx.scroll-stream", qos: .userInitiated)
+    private var isStarted = false
     private var isStopped = false
 
     public init(request: ScrollCaptureRequest, fallbackInitialImage: CGImage) {
@@ -39,16 +42,17 @@ public final class ScrollCaptureEngine {
     }
 
     public func start(excludingWindowIDs: Set<CGWindowID>) async throws {
-        guard !isStopped else { return }
+        guard !isStopped, !isStarted else { return }
+        isStarted = true
 
         if let seeded = ScrollFrameBuffer(cgImage: fallbackInitialImage) {
-            worker.seedInitial(seeded)
+            await worker.seedInitial(seeded)
         }
+        guard !isStopped else { return }
 
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-        guard !isStopped,
-              let display = content.displays.first(where: { $0.displayID == request.displayID })
-        else {
+        guard !isStopped else { return }
+        guard let display = content.displays.first(where: { $0.displayID == request.displayID }) else {
             throw ScreenSnapshotError.noDisplays
         }
 
@@ -91,10 +95,13 @@ public final class ScrollCaptureEngine {
             "Starting scroll stream sourceRect=\(sourceRectDescription, privacy: .public) config=\(streamWidth)x\(streamHeight) fallback=\(fallbackWidth)x\(fallbackHeight)"
         )
 
+        let stitchWorker = self.worker
         let handler = StreamOutputHandler(
-            onFrame: { [weak self] frame in
+            worker: stitchWorker,
+            onProgress: { [weak self] progress in
                 Task { @MainActor [weak self] in
-                    self?.submit(frame: frame)
+                    guard let self, !self.isStopped else { return }
+                    self.emitProgress(progress)
                 }
             },
             onStreamError: { [weak self] error in
@@ -106,48 +113,67 @@ public final class ScrollCaptureEngine {
             }
         )
 
-        let stream = SCStream(filter: filter, configuration: config, delegate: handler)
-        try stream.addStreamOutput(handler, type: .screen, sampleHandlerQueue: streamQueue)
-        self.stream = stream
+        let candidateStream = SCStream(filter: filter, configuration: config, delegate: handler)
+        try candidateStream.addStreamOutput(handler, type: .screen, sampleHandlerQueue: streamQueue)
+
+        do {
+            try await candidateStream.startCapture()
+        } catch {
+            try? candidateStream.removeStreamOutput(handler, type: .screen)
+            throw error
+        }
+
+        // Guard against `cancel()` or `finishAndBuildImage()` racing while `startCapture()` was in flight.
+        guard !isStopped else {
+            try? candidateStream.removeStreamOutput(handler, type: .screen)
+            try? await candidateStream.stopCapture()
+            return
+        }
+
+        self.stream = candidateStream
         self.streamOutput = handler
 
-        try await stream.startCapture()
-        emitProgress(worker.currentProgress(preview: true))
+        let initialProgress = await worker.currentProgress(preview: true)
+        guard !isStopped else { return }
+        emitProgress(initialProgress)
     }
 
     public func finishAndBuildImage() async -> CGImage? {
         guard !isStopped else { return fallbackInitialImage }
         isStopped = true
+        onProgress = nil
+        onError = nil
         let activeStream = stream
+        let activeOutput = streamOutput
         stream = nil
         streamOutput = nil
         if let activeStream {
+            if let activeOutput {
+                try? activeStream.removeStreamOutput(activeOutput, type: .screen)
+            }
             try? await activeStream.stopCapture()
         }
         return await worker.finalizeImage() ?? fallbackInitialImage
     }
 
     public func cancel() {
+        // Always cancel the stitch worker even if `finishAndBuildImage()` already set `isStopped`.
+        worker.cancel()
+        onProgress = nil
+        onError = nil
         guard !isStopped else { return }
         isStopped = true
         let activeStream = stream
+        let activeOutput = streamOutput
         stream = nil
         streamOutput = nil
-        worker.cancel()
         if let activeStream {
+            if let activeOutput {
+                try? activeStream.removeStreamOutput(activeOutput, type: .screen)
+            }
             let streamBox = UncheckedSendableBox(activeStream)
             Task.detached {
                 try? await streamBox.value.stopCapture()
-            }
-        }
-    }
-
-    private func submit(frame: ScrollFrameBuffer) {
-        guard !isStopped else { return }
-        worker.enqueue(frame) { [weak self] progress in
-            Task { @MainActor [weak self] in
-                guard let self, !self.isStopped else { return }
-                self.emitProgress(progress)
             }
         }
     }
@@ -159,14 +185,19 @@ public final class ScrollCaptureEngine {
 
 // MARK: - Serial Stitch Worker
 
+/// Serial off-main stitcher owning `ScrollImageStitcher` on `queue`, with lock-protected
+/// slot reservation so `StreamOutputHandler` drops backpressured frames before copying pixels.
 private final class ScrollStitchWorker: @unchecked Sendable {
     private static let logger = Logger(subsystem: "com.lizhichaox.ccx", category: "ScrollStitchWorker")
 
+    private struct GateState: Sendable {
+        var inFlightCount = 0
+        var isCancelled = false
+    }
+
     private let queue = DispatchQueue(label: "com.lizhichaox.ccx.scroll-stitch", qos: .userInitiated)
-    private let stateLock = NSLock()
+    private let gate = OSAllocatedUnfairLock(initialState: GateState())
     private let stitcher: ScrollImageStitcher
-    private var inFlightCount = 0
-    private var isCancelled = false
     private var hasReceivedStreamFrame = false
     private var rejectedFrameCount = 0
 
@@ -174,37 +205,53 @@ private final class ScrollStitchWorker: @unchecked Sendable {
         self.stitcher = ScrollImageStitcher(scale: scale)
     }
 
-    func seedInitial(_ frame: ScrollFrameBuffer) {
-        queue.sync {
-            hasReceivedStreamFrame = false
-            rejectedFrameCount = 0
-            stitcher.seed(frame)
+    func seedInitial(_ frame: ScrollFrameBuffer) async {
+        await withCheckedContinuation { continuation in
+            queue.async { [weak self] in
+                if let self, !self.cancelled() {
+                    self.hasReceivedStreamFrame = false
+                    self.rejectedFrameCount = 0
+                    self.stitcher.seed(frame)
+                }
+                continuation.resume()
+            }
         }
     }
 
-    func currentProgress(preview: Bool) -> ScrollCaptureProgress {
-        queue.sync {
-            makeProgress(includePreview: preview)
+    func currentProgress(preview: Bool) async -> ScrollCaptureProgress {
+        await withCheckedContinuation { continuation in
+            queue.async { [weak self] in
+                guard let self else {
+                    continuation.resume(returning: ScrollCaptureProgress(
+                        pixelWidth: 0, pixelHeight: 0, frameCount: 0, previewImage: nil, reachedLimit: false
+                    ))
+                    return
+                }
+                continuation.resume(returning: self.makeProgress(includePreview: preview))
+            }
         }
     }
 
-    func enqueue(_ frame: ScrollFrameBuffer, onUpdate: @escaping @Sendable (ScrollCaptureProgress) -> Void) {
-        stateLock.lock()
-        // Drop excess queued frames so ScreenCaptureKit backpressure never grows memory.
-        guard !isCancelled, inFlightCount < 2 else {
-            stateLock.unlock()
-            return
+    /// Reserves an in-flight stitching slot before allocating/copying `CVPixelBuffer` bytes.
+    func tryReserveSlot() -> Bool {
+        gate.withLock { state in
+            guard !state.isCancelled, state.inFlightCount < 2 else { return false }
+            state.inFlightCount += 1
+            return true
         }
-        inFlightCount += 1
-        stateLock.unlock()
+    }
 
+    /// Releases a previously reserved slot if `ScrollFrameBuffer` creation failed.
+    func releaseReservedSlot() {
+        gate.withLock { state in
+            state.inFlightCount = max(0, state.inFlightCount - 1)
+        }
+    }
+
+    func enqueueReserved(_ frame: ScrollFrameBuffer, onUpdate: @escaping @Sendable (ScrollCaptureProgress) -> Void) {
         queue.async { [weak self] in
             guard let self else { return }
-            defer {
-                self.stateLock.lock()
-                self.inFlightCount = max(0, self.inFlightCount - 1)
-                self.stateLock.unlock()
-            }
+            defer { self.releaseReservedSlot() }
             guard !self.cancelled() else { return }
 
             if !self.hasReceivedStreamFrame {
@@ -245,22 +292,22 @@ private final class ScrollStitchWorker: @unchecked Sendable {
                     continuation.resume(returning: nil)
                     return
                 }
-                continuation.resume(returning: self.stitcher.buildFinalImage())
+                let finalImage = self.stitcher.buildFinalImage()
+                self.stitcher.clear()
+                continuation.resume(returning: finalImage)
             }
         }
     }
 
     func cancel() {
-        stateLock.lock()
-        isCancelled = true
-        stateLock.unlock()
+        gate.withLock { $0.isCancelled = true }
+        queue.async { [weak self] in
+            self?.stitcher.clear()
+        }
     }
 
     private func cancelled() -> Bool {
-        stateLock.lock()
-        let result = isCancelled
-        stateLock.unlock()
-        return result
+        gate.withLock { $0.isCancelled }
     }
 
     private func makeProgress(includePreview: Bool) -> ScrollCaptureProgress {
@@ -276,15 +323,19 @@ private final class ScrollStitchWorker: @unchecked Sendable {
 
 // MARK: - SCStream Handler
 
+/// Bridges ScreenCaptureKit callbacks directly onto `ScrollStitchWorker` without bouncing frames through `@MainActor`.
 private final class StreamOutputHandler: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
-    private let onFrame: @Sendable (ScrollFrameBuffer) -> Void
+    private let worker: ScrollStitchWorker
+    private let onProgress: @Sendable (ScrollCaptureProgress) -> Void
     private let onStreamError: @Sendable (Error) -> Void
 
     init(
-        onFrame: @escaping @Sendable (ScrollFrameBuffer) -> Void,
+        worker: ScrollStitchWorker,
+        onProgress: @escaping @Sendable (ScrollCaptureProgress) -> Void,
         onStreamError: @escaping @Sendable (Error) -> Void
     ) {
-        self.onFrame = onFrame
+        self.worker = worker
+        self.onProgress = onProgress
         self.onStreamError = onStreamError
     }
 
@@ -300,11 +351,15 @@ private final class StreamOutputHandler: NSObject, SCStreamOutput, SCStreamDeleg
               status == .complete
         else { return }
 
+        guard worker.tryReserveSlot() else { return }
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer),
               let frame = ScrollFrameBuffer(pixelBuffer: pixelBuffer)
-        else { return }
+        else {
+            worker.releaseReservedSlot()
+            return
+        }
 
-        onFrame(frame)
+        worker.enqueueReserved(frame, onUpdate: onProgress)
     }
 
     func stream(_ stream: SCStream, didStopWithError error: any Error) {
@@ -314,8 +369,8 @@ private final class StreamOutputHandler: NSObject, SCStreamOutput, SCStreamDeleg
 
 // MARK: - Accessibility Auto-Scroll Driver
 
-/// Synthesizes smooth downward scroll-wheel events over the capture region and stops
-/// automatically once height stalls for several ticks.
+/// Synthesizes discrete wheel-line scroll events over the capture region while avoiding
+/// floating HUD chrome, and stops automatically once pixel height stalls or the user takes over.
 @MainActor
 public final class AutoScrollDriver {
     public var onStateChanged: ((Bool) -> Void)?
@@ -324,38 +379,112 @@ public final class AutoScrollDriver {
 
     public private(set) var isRunning = false
 
-    private var timer: Timer?
+    private let trustChecker: @Sendable () -> Bool
+    private let pointerLocationProvider: @MainActor () -> CGPoint
+    private let pointerWarper: @MainActor (CGPoint) -> Void
+    private let scrollPoster: @MainActor (CGPoint, Int32) -> Void
+    private let startDelay: TimeInterval
+    private let tickInterval: TimeInterval
+
+    private var loopTask: Task<Void, Never>?
     private var captureScreenRect: CGRect = .zero
+    private var targetAppKitPoint: CGPoint = .zero
+    private var targetQuartzPoint: CGPoint = .zero
     private var lastObservedHeight = 0
     private var stalledTicks = 0
-    private static let maxStalledTicks = 8
+    private var graceTicksRemaining = 0
 
-    public init() {}
+    private static let initialGraceTicks = 2
+    private static let maxStalledTicks = 12
+    private static let pointerTakeoverThreshold: CGFloat = 40
 
-    public func start(captureScreenRect: CGRect, primaryScreenHeight: CGFloat, currentPixelHeight: Int) {
+    public init(
+        trustChecker: (@Sendable () -> Bool)? = nil,
+        pointerLocationProvider: (@MainActor () -> CGPoint)? = nil,
+        pointerWarper: (@MainActor (CGPoint) -> Void)? = nil,
+        scrollPoster: (@MainActor (CGPoint, Int32) -> Void)? = nil,
+        startDelay: TimeInterval = 0.12,
+        tickInterval: TimeInterval = 0.18
+    ) {
+        self.trustChecker = trustChecker ?? { AXIsProcessTrusted() }
+        self.pointerLocationProvider = pointerLocationProvider ?? { NSEvent.mouseLocation }
+        self.pointerWarper = pointerWarper ?? { Self.defaultWarpPointer(to: $0) }
+        self.scrollPoster = scrollPoster ?? { Self.defaultPostScroll(at: $0, lines: $1) }
+        self.startDelay = startDelay
+        self.tickInterval = tickInterval
+    }
+
+    public static func scrollTargetPoint(in captureScreenRect: CGRect, avoiding hudFrame: CGRect? = nil) -> CGPoint {
+        let rect = captureScreenRect.standardized
+        let center = CGPoint(x: rect.midX, y: rect.midY)
+        guard let hudFrame, !hudFrame.isNull, !hudFrame.isEmpty else {
+            return center
+        }
+
+        let paddedHUD = hudFrame.insetBy(dx: -10, dy: -10)
+        guard paddedHUD.contains(center) else {
+            return center
+        }
+
+        let aboveBand = rect.maxY - paddedHUD.maxY
+        let belowBand = paddedHUD.minY - rect.minY
+        if aboveBand >= 24 || belowBand >= 24 {
+            if aboveBand >= belowBand {
+                return CGPoint(x: rect.midX, y: paddedHUD.maxY + aboveBand * 0.5)
+            }
+            return CGPoint(x: rect.midX, y: rect.minY + belowBand * 0.5)
+        }
+
+        let leftBand = paddedHUD.minX - rect.minX
+        let rightBand = rect.maxX - paddedHUD.maxX
+        if leftBand >= 24 || rightBand >= 24 {
+            if leftBand >= rightBand {
+                return CGPoint(x: rect.minX + leftBand * 0.5, y: rect.midY)
+            }
+            return CGPoint(x: paddedHUD.maxX + rightBand * 0.5, y: rect.midY)
+        }
+
+        return center
+    }
+
+    public static func scrollStepLines(for captureHeight: CGFloat) -> Int32 {
+        guard captureHeight.isFinite, captureHeight > 0 else { return 2 }
+        return Int32(min(max(Int((captureHeight / 180).rounded()), 2), 5))
+    }
+
+    public func start(
+        captureScreenRect: CGRect,
+        primaryScreenHeight: CGFloat,
+        currentPixelHeight: Int,
+        avoiding hudFrame: CGRect? = nil
+    ) {
         guard !isRunning else { return }
-        guard AXIsProcessTrusted() else {
+        guard trustChecker() else {
             onAccessibilityRequired?()
             return
         }
 
-        self.captureScreenRect = captureScreenRect
+        let rect = captureScreenRect.standardized
+        self.captureScreenRect = rect
         self.lastObservedHeight = currentPixelHeight
         self.stalledTicks = 0
-
-        // Position pointer inside the scrollable region once in Quartz coordinates.
-        let centerAppKit = CGPoint(x: captureScreenRect.midX, y: captureScreenRect.midY)
-        let centerQuartz = CGPoint(x: centerAppKit.x, y: primaryScreenHeight - centerAppKit.y)
-        CGWarpMouseCursorPosition(centerQuartz)
+        self.graceTicksRemaining = Self.initialGraceTicks
+        self.targetAppKitPoint = Self.scrollTargetPoint(in: rect, avoiding: hudFrame)
+        self.targetQuartzPoint = CoordinateConverter.appKitToQuartz(
+            targetAppKitPoint,
+            primaryScreenHeight: primaryScreenHeight
+        )
 
         isRunning = true
         onStateChanged?(true)
 
-        let stepPixels = Int32(min(max(captureScreenRect.height * 0.18, 70), 180))
-        timer = Timer.scheduledTimer(withTimeInterval: 0.15, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                self?.tick(stepPixels: stepPixels)
-            }
+        let stepLines = Self.scrollStepLines(for: rect.height)
+        if startDelay <= 0 {
+            pointerWarper(targetQuartzPoint)
+        }
+        loopTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.runScrollLoop(stepLines: stepLines, initialDelay: self.startDelay)
         }
     }
 
@@ -368,37 +497,94 @@ public final class AutoScrollDriver {
 
     public func stop() {
         let wasRunning = isRunning
-        timer?.invalidate()
-        timer = nil
+        loopTask?.cancel()
+        loopTask = nil
         isRunning = false
         if wasRunning {
             onStateChanged?(false)
         }
     }
 
-    private func tick(stepPixels: Int32) {
+    private func runScrollLoop(stepLines: Int32, initialDelay: TimeInterval) async {
+        let clampedDelay = initialDelay.isFinite ? min(max(initialDelay, 0), 60) : 0
+        if clampedDelay > 0 {
+            let delayNanoseconds = UInt64((clampedDelay * 1_000_000_000).rounded())
+            try? await Task.sleep(nanoseconds: delayNanoseconds)
+            guard !Task.isCancelled, isRunning else { return }
+            pointerWarper(targetQuartzPoint)
+        }
+
+        let clampedTick = tickInterval.isFinite ? min(max(tickInterval, 0.001), 60) : 0.18
+        let intervalNanoseconds = UInt64((clampedTick * 1_000_000_000).rounded())
+        while !Task.isCancelled, isRunning {
+            try? await Task.sleep(nanoseconds: intervalNanoseconds)
+            guard !Task.isCancelled, isRunning else { break }
+            tick(stepLines: stepLines)
+        }
+        loopTask = nil
+    }
+
+    private func tick(stepLines: Int32) {
         guard isRunning else { return }
-        // Pause if the user moves the pointer outside the capture region.
-        guard captureScreenRect.contains(NSEvent.mouseLocation) else {
+
+        let inGracePeriod = graceTicksRemaining > 0
+        let currentPointer = pointerLocationProvider()
+        let pointerDistance = hypot(
+            currentPointer.x - targetAppKitPoint.x,
+            currentPointer.y - targetAppKitPoint.y
+        )
+        let pointerDisplaced = !captureScreenRect.contains(currentPointer)
+            || pointerDistance > Self.pointerTakeoverThreshold
+
+        if inGracePeriod {
+            graceTicksRemaining -= 1
+            if pointerDisplaced {
+                // Re-assert pointer position while click release and warp suppression settle.
+                pointerWarper(targetQuartzPoint)
+            }
+        } else if pointerDisplaced {
             stop()
             return
         }
 
-        if let event = CGEvent(
-            scrollWheelEvent2Source: nil,
-            units: .pixel,
+        scrollPoster(targetQuartzPoint, stepLines)
+
+        if !inGracePeriod {
+            stalledTicks += 1
+            if stalledTicks >= Self.maxStalledTicks {
+                stop()
+                onReachedBottom?()
+            }
+        }
+    }
+
+    private static func defaultWarpPointer(to quartzPoint: CGPoint) {
+        let source = CGEventSource(stateID: .hidSystemState)
+        source?.localEventsSuppressionInterval = 0
+        CGAssociateMouseAndMouseCursorPosition(boolean_t(1))
+        CGWarpMouseCursorPosition(quartzPoint)
+        if let moved = CGEvent(
+            mouseEventSource: source,
+            mouseType: .mouseMoved,
+            mouseCursorPosition: quartzPoint,
+            mouseButton: .left
+        ) {
+            moved.post(tap: .cgSessionEventTap)
+        }
+    }
+
+    private static func defaultPostScroll(at quartzPoint: CGPoint, lines: Int32) {
+        let source = CGEventSource(stateID: .hidSystemState)
+        source?.localEventsSuppressionInterval = 0
+        guard let event = CGEvent(
+            scrollWheelEvent2Source: source,
+            units: .line,
             wheelCount: 1,
-            wheel1: -stepPixels,
+            wheel1: -lines,
             wheel2: 0,
             wheel3: 0
-        ) {
-            event.post(tap: .cghidEventTap)
-        }
-
-        stalledTicks += 1
-        if stalledTicks >= Self.maxStalledTicks {
-            stop()
-            onReachedBottom?()
-        }
+        ) else { return }
+        event.location = quartzPoint
+        event.post(tap: .cgSessionEventTap)
     }
 }

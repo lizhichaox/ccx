@@ -1,5 +1,7 @@
 import CoreGraphics
+import CoreVideo
 import Foundation
+import ScreenCaptureKit
 import Testing
 @testable import CCXCapture
 
@@ -767,5 +769,107 @@ struct ScrollImageStitcherTests {
         let final = try #require(stitcher.buildFinalImage())
         let expectedDoc = try #require(streamDoc.cropping(to: CGRect(x: 0, y: 0, width: 321, height: expectedHeight)))
         #expect(try maxPixelChannelDiff(final, expectedDoc) == 0)
+    }
+
+    @Test func pixelBudgetCapsTotalMemoryHDRSeedSucceedsAndPlanarPixelBufferRejected() throws {
+        // 1. maxTotalPixels enforces a pixel-area ceiling independently of maxTotalHeight, and clear() frees state.
+        let width = 400
+        let viewportH = 300
+        let doc = try renderSyntheticDocument(width: width, height: 1200)
+        // 400 * 480 = 192,000 pixels -> effectiveMaxTotalHeight = 480 even though maxTotalHeight = 32,000.
+        let stitcher = ScrollImageStitcher(scale: 2, maxTotalHeight: 32_000, maxTotalPixels: 192_000)
+        for offset in [0, 100, 220, 340] {
+            let img = try renderViewport(from: doc, scrollY: offset, viewportHeight: viewportH)
+            stitcher.append(try #require(ScrollFrameBuffer(cgImage: img)))
+        }
+        #expect(stitcher.effectiveMaxTotalHeight == 480)
+        #expect(stitcher.isAtHeightLimit)
+        #expect(stitcher.totalStitchedHeight == 480)
+        let final = try #require(stitcher.buildFinalImage())
+        #expect(final.width == width && final.height == 480)
+
+        stitcher.clear()
+        #expect(stitcher.width == 0)
+        #expect(stitcher.totalStitchedHeight == 0)
+        #expect(stitcher.stitchedFrameCount == 0)
+
+        // 2. Extended-range linear sRGB CGImage (HDR fallback) seeds cleanly into ScrollFrameBuffer.
+        let extendedCS = try #require(CGColorSpace(name: CGColorSpace.extendedLinearSRGB))
+        let hdrCtx = try #require(CGContext(
+            data: nil,
+            width: 64,
+            height: 64,
+            bitsPerComponent: 32,
+            bytesPerRow: 0,
+            space: extendedCS,
+            bitmapInfo: CGBitmapInfo.floatComponents.rawValue | CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue
+        ))
+        hdrCtx.setFillColor(red: 0.3, green: 0.5, blue: 0.7, alpha: 1)
+        hdrCtx.fill(CGRect(x: 0, y: 0, width: 64, height: 64))
+        let hdrImage = try #require(hdrCtx.makeImage())
+        let hdrBuf = try #require(ScrollFrameBuffer(cgImage: hdrImage))
+        #expect(hdrBuf.width == 64 && hdrBuf.height == 64)
+
+        // 3. Valid non-planar BGRA CVPixelBuffer succeeds, while planar NV12 CVPixelBuffer is rejected cleanly.
+        var bgraPB: CVPixelBuffer?
+        #expect(CVPixelBufferCreate(kCFAllocatorDefault, 64, 48, kCVPixelFormatType_32BGRA, nil, &bgraPB) == kCVReturnSuccess)
+        let validPB = try #require(bgraPB)
+        let pbBuf = try #require(ScrollFrameBuffer(pixelBuffer: validPB))
+        #expect(pbBuf.width == 64 && pbBuf.height == 48)
+
+        var planarPB: CVPixelBuffer?
+        #expect(CVPixelBufferCreate(kCFAllocatorDefault, 64, 48, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, nil, &planarPB) == kCVReturnSuccess)
+        #expect(ScrollFrameBuffer(pixelBuffer: try #require(planarPB)) == nil)
+    }
+
+    @MainActor
+    @Test func scrollCaptureEngineEarlyCancelReturnsCleanlyAndDeallocates() async throws {
+        let initial = try renderSyntheticDocument(width: 64, height: 64)
+        let request = ScrollCaptureRequest(
+            displayID: 1,
+            displayFrame: CGRect(x: 0, y: 0, width: 1000, height: 800),
+            localRect: CGRect(x: 100, y: 100, width: 64, height: 64),
+            screenRect: CGRect(x: 100, y: 100, width: 64, height: 64),
+            scale: 2,
+            initialImage: initial
+        )
+
+        weak var weakEngine: ScrollCaptureEngine?
+        do {
+            let engine = ScrollCaptureEngine(request: request, fallbackInitialImage: initial)
+            weakEngine = engine
+            engine.onProgress = { _ in _ = engine }
+            engine.onError = { _ in _ = engine }
+            engine.cancel()
+            try await engine.start(excludingWindowIDs: [])
+            let finished = await engine.finishAndBuildImage()
+            #expect(finished?.width == 64 && finished?.height == 64)
+        }
+        #expect(weakEngine == nil)
+    }
+
+    @MainActor
+    @Test func userFacingSnapshotErrorsAndAutoScrollStepGuards() {
+        let noDisplaysMsg = ScreenSnapshotEngine.userFacingErrorMessage(for: ScreenSnapshotError.noDisplays)
+        #expect(noDisplaysMsg == "No active display was found.")
+        #expect(!ScreenSnapshotError.noDisplays.localizedDescription.contains("CCXCapture"))
+
+        let captureFailedMsg = ScreenSnapshotEngine.userFacingErrorMessage(for: ScreenSnapshotError.captureFailed)
+        #expect(captureFailedMsg == "Could not capture the screen. Please try again.")
+
+        let systemStopped = NSError(domain: SCStreamErrorDomain, code: SCStreamError.systemStoppedStream.rawValue)
+        #expect(ScreenSnapshotEngine.userFacingErrorMessage(for: systemStopped) == "Screen capture was stopped by the system.")
+
+        let userDeclined = NSError(domain: SCStreamErrorDomain, code: SCStreamError.userDeclined.rawValue)
+        #expect(ScreenSnapshotEngine.isPermissionDeniedError(userDeclined))
+        #expect(ScreenSnapshotEngine.userFacingErrorMessage(for: userDeclined) == "Screen Recording permission is required.")
+
+        let genericOpaque = NSError(domain: "com.example.test", code: 99)
+        #expect(ScreenSnapshotEngine.userFacingErrorMessage(for: genericOpaque) == "Could not capture the screen. Please try again.")
+
+        #expect(AutoScrollDriver.scrollStepLines(for: .nan) == 2)
+        #expect(AutoScrollDriver.scrollStepLines(for: .infinity) == 2)
+        #expect(AutoScrollDriver.scrollStepLines(for: -50) == 2)
+        #expect(AutoScrollDriver.scrollStepLines(for: 900) == 5)
     }
 }

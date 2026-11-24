@@ -357,11 +357,239 @@ struct CCXAnnotateTests {
             #expect(cache.filteredImage(mode: .blur, size: size, backingScale: 2) != nil)
         }
 
-        // Sweep more than 8 distinct mosaic strengths to exercise bounded LRU eviction.
+        // Sweep distinct mosaic strengths to exercise cached base rasterization reuse and bounded LRU (cap 4).
         for i in 0...12 {
             let size = StrokeSize(progress: CGFloat(i) / 12.0)
             #expect(cache.filteredImage(mode: .pixelate, size: size, backingScale: 2) != nil)
             #expect(cache.filteredImage(mode: .blur, size: size, backingScale: 2) != nil)
         }
+        #expect(cache.baseRasterizationCount == 1)
+        #expect(cache.cachedVariantCount <= 4)
+    }
+
+    @Test func sharedToolbarPresetsSizeHUDLabelsAndDocumentReplaceAll() {
+        for preset in [AnnotationToolbarPreset.snip, .pin] {
+            let toolbar = AnnotationActionToolbar(preset: preset)
+            toolbar.layoutSubtreeIfNeeded()
+            let bounds = toolbar.primarySurfaceBounds
+            let frames = toolbar.primaryControlFrames
+            #expect(!frames.isEmpty)
+            #expect(bounds.height == AnnotationActionToolbar.primaryHeight)
+            #expect(bounds.width == AnnotationActionToolbar.preferredSize(for: preset).width)
+            for frame in frames {
+                #expect(frame.width > 0 && frame.height > 0)
+                #expect(frame.minX >= -0.5 && frame.maxX <= bounds.width + 0.5)
+                #expect(frame.minY >= -0.5 && frame.maxY <= bounds.height + 0.5)
+            }
+            for pair in zip(frames, frames.dropFirst()) {
+                #expect(pair.0.maxX <= pair.1.minX + 0.5)
+            }
+        }
+
+        #expect(AnnotationTool.pen.formattedSizeHUDLabel(for: .medium, mosaicMode: .pixelate) == "4 pt")
+        #expect(AnnotationTool.counter.formattedSizeHUDLabel(for: .minimum, mosaicMode: .pixelate) == "18 px")
+        #expect(AnnotationTool.mosaic.formattedSizeHUDLabel(for: .medium, mosaicMode: .pixelate) == "Mosaic 10")
+        #expect(AnnotationTool.mosaic.formattedSizeHUDLabel(for: .medium, mosaicMode: .blur) == "Blur 16")
+
+        let doc = AnnotationDocument()
+        let first = AnnotationItem(kind: .rectangle(CGRect(x: 10, y: 10, width: 30, height: 20)), style: AnnotationStyle())
+        let second = AnnotationItem(kind: .ellipse(CGRect(x: 40, y: 40, width: 20, height: 20)), style: AnnotationStyle())
+        doc.commit(first)
+        doc.commit(second)
+        #expect(doc.canUndo)
+        doc.replaceAll(items: [first], selectedID: first.id)
+        #expect(doc.items == [first])
+        #expect(doc.selectedID == first.id)
+        #expect(!doc.canUndo)
+        #expect(!doc.canRedo)
+    }
+
+    @Test func bakeHandlesExtendedRGBColorSpaceFractionalAlignmentOpaqueFallbackAndTinyRoundedRect() throws {
+        // 1. Extended-range linear sRGB (16-bit float, HDR-style) must still bake annotations & mosaic redactions
+        //    rather than silently returning the unredacted base image.
+        let extendedCS = try #require(CGColorSpace(name: CGColorSpace.extendedLinearSRGB))
+        let hdrCtx = try #require(CGContext(
+            data: nil,
+            width: 200,
+            height: 100,
+            bitsPerComponent: 32,
+            bytesPerRow: 0,
+            space: extendedCS,
+            bitmapInfo: CGBitmapInfo.floatComponents.rawValue | CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue
+        ))
+        hdrCtx.setFillColor(red: 1, green: 1, blue: 1, alpha: 1)
+        hdrCtx.fill(CGRect(x: 0, y: 0, width: 200, height: 100))
+        let hdrBase = try #require(hdrCtx.makeImage())
+
+        let doc = AnnotationDocument()
+        // Tiny 2x2 rectangle (< 4pt) must not assert/fail in CGPath(roundedRect:).
+        doc.commit(AnnotationItem(
+            kind: .rectangle(CGRect(x: 4, y: 4, width: 2, height: 2)),
+            style: AnnotationStyle(color: .red, size: .small)
+        ))
+        // Mosaic item baked WITHOUT a mosaicCache must render an opaque dark fallback (never leaking white beneath).
+        doc.commit(AnnotationItem(
+            kind: .mosaic(CGRect(x: 20, y: 10, width: 40, height: 30), .pixelate),
+            style: AnnotationStyle(color: .red, size: .medium, mosaicMode: .pixelate)
+        ))
+        // Multi-digit step counter (123) must also render cleanly.
+        doc.commit(AnnotationItem(
+            kind: .counter(center: CGPoint(x: 80, y: 25), number: 123),
+            style: AnnotationStyle(color: .blue, size: .medium)
+        ))
+
+        let bakedFallback = try #require(AnnotationRenderer.bake(
+            baseImage: hdrBase,
+            localSelectionRect: CGRect(x: 0, y: 0, width: 100, height: 50),
+            pixelCropRect: CGRect(x: 0, y: 0, width: 200, height: 100),
+            screenSize: CGSize(width: 100, height: 50),
+            document: doc,
+            mosaicCache: nil
+        ))
+        // Pixel inside mosaic box (point (40, 25) -> pixel (80, 50)) must be dark opaque fallback (~46, not bleached > 100).
+        let fallbackPx = try samplePixel(in: bakedFallback, x: 80, y: 50)
+        #expect(fallbackPx.r < 70 && fallbackPx.g < 70 && fallbackPx.b < 75)
+
+        // MosaicImageCache must also succeed on extended-range RGB images.
+        let hdrCache = MosaicImageCache(baseImage: hdrBase)
+        #expect(hdrCache.filteredImage(mode: .pixelate, size: .medium, backingScale: 2) != nil)
+        #expect(hdrCache.filteredImage(mode: .blur, size: .medium, backingScale: 2) != nil)
+
+        // 2. Clamped/out-of-bounds localSelectionRect aligns baked stroke to clamped pixelCropRect origin.
+        let srgbCtx = try #require(CGContext(
+            data: nil,
+            width: 200,
+            height: 100,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ))
+        srgbCtx.setFillColor(red: 0, green: 0, blue: 0, alpha: 1)
+        srgbCtx.fill(CGRect(x: 0, y: 0, width: 200, height: 100))
+        let srgbBase = try #require(srgbCtx.makeImage())
+
+        let alignDoc = AnnotationDocument()
+        // Solid green box at x = 10..20, y = 10..20 (points) -> pixels x = 20..40, cgY = 20..40 (top-down y = 60..80).
+        alignDoc.commit(AnnotationItem(
+            kind: .rectangle(CGRect(x: 10, y: 10, width: 10, height: 10)),
+            style: AnnotationStyle(color: .green, size: .large)
+        ))
+        // Pretend localSelectionRect extended to (-10, -5), while pixelCropRect was clamped to x=0, y=50, w=60, h=50.
+        let alignedBaked = try #require(AnnotationRenderer.bake(
+            baseImage: srgbBase,
+            localSelectionRect: CGRect(x: -10, y: -5, width: 40, height: 30),
+            pixelCropRect: CGRect(x: 0, y: 50, width: 60, height: 50),
+            screenSize: CGSize(width: 100, height: 50),
+            document: alignDoc,
+            mosaicCache: nil
+        ))
+        // Left border of rectangle at point x=10, y=15 -> cropped pixel x=20, top-down y=20 (since crop starts at top-down y=50).
+        let greenPx = try samplePixel(in: alignedBaked, x: 20, y: 20)
+        #expect(greenPx.g > 150)
+    }
+
+    @Test func mosaicCacheScaleAwarenessByteBudgetAndClear() throws {
+        let ctx = try #require(CGContext(
+            data: nil,
+            width: 100,
+            height: 100,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ))
+        ctx.setFillColor(red: 0.2, green: 0.4, blue: 0.8, alpha: 1)
+        ctx.fill(CGRect(x: 0, y: 0, width: 100, height: 100))
+        ctx.setFillColor(red: 1, green: 1, blue: 1, alpha: 1)
+        for x in stride(from: 0, to: 100, by: 8) {
+            ctx.fill(CGRect(x: x, y: 0, width: 4, height: 100))
+        }
+        let baseImage = try #require(ctx.makeImage())
+
+        // Each 100x100 RGBA image is 40,000 bytes; setting budget to 50,000 caps cache to 1 variant.
+        let budgeted = MosaicImageCache(baseImage: baseImage, maxCachedBytes: 50_000)
+        let img1x = try #require(budgeted.filteredImage(mode: .pixelate, size: .medium, backingScale: 1))
+        #expect(budgeted.cachedVariantCount == 1)
+        let img2x = try #require(budgeted.filteredImage(mode: .pixelate, size: .medium, backingScale: 2))
+        // Distinct scale produces a distinct entry and evicts 1x due to byte budget.
+        #expect(img1x !== img2x)
+        #expect(budgeted.cachedVariantCount == 1)
+        #expect(budgeted.cachedByteCount <= 50_000)
+
+        budgeted.clear()
+        #expect(budgeted.cachedVariantCount == 0)
+        #expect(budgeted.cachedByteCount == 0)
+    }
+
+    @Test func boundedGeometryTextWrappingNoOpReplaceAndToolbarPolish() {
+        let bounds = CGRect(x: 0, y: 0, width: 200, height: 150)
+
+        // Bounded square drawing stays inside bounds even when cursor pulls past an edge.
+        let boundedSquare = AnnotationItem.constrainedRect(
+            from: CGPoint(x: 160, y: 120),
+            to: CGPoint(x: 10, y: 145),
+            square: true,
+            within: bounds
+        )
+        #expect(bounds.contains(boundedSquare))
+        #expect(abs(boundedSquare.width - boundedSquare.height) < 0.01)
+        #expect(boundedSquare.width == 30)
+
+        // Shift-snapped arrow endpoint resizing stays inside bounds.
+        let arrow = AnnotationItem(
+            kind: .arrow(start: CGPoint(x: 100, y: 130), end: CGPoint(x: 150, y: 130)),
+            style: AnnotationStyle()
+        )
+        let resizedArrow = arrow.resized(handle: .end, to: CGPoint(x: 195, y: 148), constrain: true, within: bounds)
+        if case let .arrow(_, end) = resizedArrow.kind {
+            #expect(bounds.insetBy(dx: -0.01, dy: -0.01).contains(end))
+        } else {
+            Issue.record("Expected arrow item")
+        }
+
+        // Non-finite inputs are ignored cleanly without NaN propagation.
+        #expect(!arrow.hitTest(point: CGPoint(x: CGFloat.nan, y: 10)))
+        #expect(arrow.hitTestHandle(at: CGPoint(x: CGFloat.infinity, y: 10)) == nil)
+        #expect(arrow.translated(by: CGSize(width: CGFloat.nan, height: 5)) == arrow)
+        #expect(arrow.resized(handle: .end, to: CGPoint(x: CGFloat.nan, y: 0), constrain: false, within: bounds) == arrow)
+
+        // Text wrapping width & trailing newline height.
+        let origin = CGPoint(x: 10, y: 200)
+        let oneLine = AnnotationItem.textBoundingBox(origin: origin, content: "Hello world from CCX", fontSize: 18, maxWidth: 640)
+        let wrapped = AnnotationItem.textBoundingBox(origin: origin, content: "Hello world from CCX", fontSize: 18, maxWidth: 80)
+        #expect(wrapped.height > oneLine.height)
+        let withTrailingNewline = AnnotationItem.textBoundingBox(origin: origin, content: "Line 1\n", fontSize: 18, maxWidth: 640)
+        let withoutTrailingNewline = AnnotationItem.textBoundingBox(origin: origin, content: "Line 1", fontSize: 18, maxWidth: 640)
+        #expect(withTrailingNewline.height > withoutTrailingNewline.height)
+
+        // No-op replaceItem does not push a phantom undo snapshot.
+        let doc = AnnotationDocument()
+        let item = AnnotationItem(kind: .text(origin: origin, content: "Same"), style: AnnotationStyle())
+        doc.commit(item)
+        #expect(doc.replaceItem(item, recordUndo: true))
+        #expect(doc.undo())
+        #expect(doc.items.isEmpty) // Single undo reverted commit directly (no phantom snapshot).
+
+        // Toolbar tooltip adapts to active tool & cancelDragging resets drag cleanly.
+        let toolbar = AnnotationActionToolbar(preset: .snip)
+        toolbar.update(
+            activeTool: .mosaic,
+            style: AnnotationStyle(color: .red, size: .medium, mosaicMode: .blur),
+            showStyleBar: true,
+            canUndo: false,
+            canRedo: false
+        )
+        #expect(toolbar.sizeSliderToolTip?.hasPrefix("Blur ") == true)
+        toolbar.update(
+            activeTool: .counter,
+            style: AnnotationStyle(color: .red, size: .medium, mosaicMode: .pixelate),
+            showStyleBar: true,
+            canUndo: false,
+            canRedo: false
+        )
+        #expect(toolbar.sizeSliderToolTip?.contains("px") == true)
+        toolbar.cancelDragging()
+        #expect(!toolbar.isDragging)
     }
 }

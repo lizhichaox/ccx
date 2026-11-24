@@ -27,9 +27,11 @@ final class AnnotationCanvasView: NSView {
     override var isOpaque: Bool { false }
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
 
+    private static let redrawPadding: CGFloat = 64
+
     /// Invalidates the union of the previous and current active item bounds so dragging stays localized.
     func invalidate(rect: CGRect?) {
-        let padded = rect?.insetBy(dx: -40, dy: -40)
+        let padded = rect?.insetBy(dx: -Self.redrawPadding, dy: -Self.redrawPadding)
         let dirty: CGRect?
         switch (lastDirtyRect, padded) {
         case let (.some(prev), .some(curr)):
@@ -54,7 +56,7 @@ final class AnnotationCanvasView: NSView {
     func invalidateActiveRegion() {
         lastDirtyRect = nil
         if let clipRect {
-            let target = clipRect.insetBy(dx: -40, dy: -40).intersection(bounds)
+            let target = clipRect.insetBy(dx: -Self.redrawPadding, dy: -Self.redrawPadding).intersection(bounds)
             if !target.isNull, !target.isEmpty {
                 setNeedsDisplay(target)
                 return
@@ -73,7 +75,7 @@ final class AnnotationCanvasView: NSView {
         let scale = backingScale
         let cache = mosaicCache
         let screenBounds = bounds
-        let cullPadding: CGFloat = 48
+        let cullPadding = Self.redrawPadding
         for item in document.items where item.id != editingTextItemID {
             guard item.boundingBox.insetBy(dx: -cullPadding, dy: -cullPadding).intersects(dirtyRect) else {
                 continue

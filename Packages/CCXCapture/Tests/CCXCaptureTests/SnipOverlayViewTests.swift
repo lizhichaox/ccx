@@ -1176,4 +1176,399 @@ struct SnipOverlayViewTests {
             #expect(afterNS != previousProgress)
         }
     }
+
+    @Test func recordEntryShortcutAndDirectRecordSelectionMode() throws {
+        // 1. In normal `.snip` mode, pressing `r` after selecting a region emits `.record(rect)`.
+        let snipView = SnipOverlayView(snapshot: try makeSnapshot(size: CGSize(width: 400, height: 300)), topInset: 0)
+        var snipActions: [OverlayAction] = []
+        snipView.onFinish = { snipActions.append($0) }
+
+        let targetRect = CGRect(x: 40, y: 50, width: 200, height: 120)
+        try selectRect(targetRect, on: snipView)
+        snipView.keyDown(with: try makeKeyEvent(characters: "r", modifiers: [], keyCode: 15))
+        #expect(snipActions == [.record(targetRect)])
+
+        // 2. In `.record` mode, dragging a region immediately finishes with `.record(rect)`.
+        let dragView = SnipOverlayView(
+            snapshot: try makeSnapshot(size: CGSize(width: 400, height: 300)),
+            topInset: 0,
+            selectionMode: .record
+        )
+        var dragActions: [OverlayAction] = []
+        dragView.onFinish = { dragActions.append($0) }
+        try selectRect(targetRect, on: dragView)
+        #expect(dragActions == [.record(targetRect)])
+
+        // 3. In `.record` mode, Cmd+A while hovering immediately finishes with `.record(bounds)`.
+        let cmdAView = SnipOverlayView(
+            snapshot: try makeSnapshot(size: CGSize(width: 400, height: 300)),
+            topInset: 0,
+            selectionMode: .record
+        )
+        var cmdAActions: [OverlayAction] = []
+        cmdAView.onFinish = { cmdAActions.append($0) }
+        #expect(cmdAView.performKeyEquivalent(with: try makeKeyEvent(characters: "a", modifiers: [.command], keyCode: 0)))
+        #expect(cmdAActions == [.record(CGRect(x: 0, y: 0, width: 400, height: 300))])
+    }
+
+    @Test func scrollCaptureHUDPanelFitsAllControlsWithoutOverflow() throws {
+        let visibleFrame = CGRect(x: 0, y: 0, width: 1440, height: 900)
+        let hud = ScrollCaptureHUDPanel(
+            captureRect: CGRect(x: 220, y: 260, width: 520, height: 500),
+            visibleFrame: visibleFrame
+        )
+
+        func assertControlsFit() {
+            let contentBounds = hud.hudContentBounds
+            let frames = hud.hudControlFrames
+            #expect(contentBounds.height == 44)
+            #expect(frames.count == 9)
+            #expect(visibleFrame.contains(hud.frame))
+            for frame in frames {
+                #expect(frame.width > 0)
+                #expect(frame.height > 0)
+                #expect(contentBounds.contains(frame))
+            }
+            for i in 0 ..< frames.count {
+                for j in (i + 1) ..< frames.count {
+                    #expect(!frames[i].intersects(frames[j]))
+                }
+            }
+        }
+
+        assertControlsFit()
+
+        hud.updateMetrics(
+            width: 1440,
+            height: 12850,
+            status: "Auto-scrolling",
+            accent: .autoScroll,
+            isAutoScrolling: true
+        )
+        assertControlsFit()
+
+        hud.updateMetrics(
+            width: 2880,
+            height: 24500,
+            status: "Needs Accessibility",
+            accent: .warning,
+            isAutoScrolling: false
+        )
+        assertControlsFit()
+
+        hud.updateAutoScroll(isRunning: false, status: "Reached bottom", accent: .warning)
+        assertControlsFit()
+
+        let bottomHUD = ScrollCaptureHUDPanel(
+            captureRect: CGRect(x: 200, y: 8, width: 500, height: 500),
+            visibleFrame: visibleFrame
+        )
+        #expect(visibleFrame.contains(bottomHUD.frame))
+        #expect(bottomHUD.hudControlFrames.allSatisfy { bottomHUD.hudContentBounds.contains($0) })
+    }
+
+    @Test func autoScrollDriverAvoidsHUDAndPostsDiscreteScrollUntilBottomOrTakeover() async throws {
+        @MainActor
+        final class DriverProbe {
+            var pointerLocation: CGPoint
+            var warpedQuartz: [CGPoint] = []
+            var postedScrolls: [(point: CGPoint, lines: Int32)] = []
+            var reachedBottomCount = 0
+            var accessibilityCount = 0
+
+            init(pointerLocation: CGPoint) {
+                self.pointerLocation = pointerLocation
+            }
+        }
+
+        // 1. Target selection avoids HUD frame by picking the larger unobstructed vertical band.
+        let captureRect = CGRect(x: 100, y: 100, width: 400, height: 600)
+        #expect(AutoScrollDriver.scrollTargetPoint(in: captureRect, avoiding: nil) == CGPoint(x: 300, y: 400))
+
+        let centeredHUD = CGRect(x: 160, y: 378, width: 280, height: 44)
+        let avoidedTarget = AutoScrollDriver.scrollTargetPoint(in: captureRect, avoiding: centeredHUD)
+        #expect(captureRect.contains(avoidedTarget))
+        #expect(!centeredHUD.insetBy(dx: -10, dy: -10).contains(avoidedTarget))
+
+        let highHUD = CGRect(x: 160, y: 390, width: 280, height: 220)
+        let bottomTarget = AutoScrollDriver.scrollTargetPoint(in: captureRect, avoiding: highHUD)
+        #expect(bottomTarget.y < highHUD.minY - 10)
+
+        // 2. Step lines clamp cleanly between 2 and 5.
+        #expect(AutoScrollDriver.scrollStepLines(for: 200) == 2)
+        #expect(AutoScrollDriver.scrollStepLines(for: 540) == 3)
+        #expect(AutoScrollDriver.scrollStepLines(for: 2000) == 5)
+
+        // 3. Missing Accessibility permission triggers callback and refuses to start.
+        let untrustedProbe = DriverProbe(pointerLocation: .zero)
+        let untrustedDriver = AutoScrollDriver(
+            trustChecker: { false },
+            startDelay: 0,
+            tickInterval: 0.005
+        )
+        untrustedDriver.onAccessibilityRequired = { untrustedProbe.accessibilityCount += 1 }
+        untrustedDriver.start(captureScreenRect: captureRect, primaryScreenHeight: 900, currentPixelHeight: 1200)
+        #expect(!untrustedDriver.isRunning)
+        #expect(untrustedProbe.accessibilityCount == 1)
+
+        // 4. Grace ticks tolerate brief displacement (e.g. click on HUD), advance resets stall counter, then bottom stops.
+        let probe = DriverProbe(pointerLocation: CGPoint(x: 300, y: 720))
+        let driver = AutoScrollDriver(
+            trustChecker: { true },
+            pointerLocationProvider: { probe.pointerLocation },
+            pointerWarper: { quartz in
+                probe.warpedQuartz.append(quartz)
+                if probe.warpedQuartz.count >= 2 {
+                    probe.pointerLocation = CGPoint(x: quartz.x, y: 900 - quartz.y)
+                }
+            },
+            scrollPoster: { quartz, lines in
+                probe.postedScrolls.append((quartz, lines))
+            },
+            startDelay: 0,
+            tickInterval: 0.005
+        )
+        driver.onReachedBottom = { probe.reachedBottomCount += 1 }
+
+        driver.start(
+            captureScreenRect: captureRect,
+            primaryScreenHeight: 900,
+            currentPixelHeight: 1200,
+            avoiding: centeredHUD
+        )
+        #expect(driver.isRunning)
+        #expect(probe.warpedQuartz.count == 1)
+        #expect(probe.warpedQuartz[0].y == 900 - avoidedTarget.y)
+
+        for _ in 0 ..< 40 where probe.postedScrolls.count < 2 {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        #expect(driver.isRunning)
+        let ticksBeforeAdvance = probe.postedScrolls.count
+        #expect(ticksBeforeAdvance >= 2)
+        #expect(probe.postedScrolls.allSatisfy { $0.lines == AutoScrollDriver.scrollStepLines(for: 600) })
+
+        driver.notifyHeightAdvanced(1600)
+
+        for _ in 0 ..< 100 where driver.isRunning {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(!driver.isRunning)
+        #expect(probe.reachedBottomCount == 1)
+        #expect(probe.postedScrolls.count >= ticksBeforeAdvance + 10)
+
+        // 5. Deliberate pointer takeover outside captureRect pauses without reporting bottom.
+        let takeoverProbe = DriverProbe(pointerLocation: CGPoint(x: 300, y: 400))
+        let takeoverDriver = AutoScrollDriver(
+            trustChecker: { true },
+            pointerLocationProvider: { takeoverProbe.pointerLocation },
+            pointerWarper: { _ in },
+            scrollPoster: { quartz, lines in
+                takeoverProbe.postedScrolls.append((quartz, lines))
+            },
+            startDelay: 0,
+            tickInterval: 0.005
+        )
+        takeoverDriver.onReachedBottom = { takeoverProbe.reachedBottomCount += 1 }
+        takeoverDriver.start(captureScreenRect: captureRect, primaryScreenHeight: 900, currentPixelHeight: 1200)
+        for _ in 0 ..< 40 where takeoverProbe.postedScrolls.count < 2 {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        #expect(takeoverDriver.isRunning)
+        takeoverProbe.pointerLocation = CGPoint(x: 20, y: 20)
+        for _ in 0 ..< 100 where takeoverDriver.isRunning {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        #expect(!takeoverDriver.isRunning)
+        #expect(takeoverProbe.reachedBottomCount == 0)
+
+        // 6. Non-finite delays/intervals clamp safely without trapping.
+        let safeDriver = AutoScrollDriver(
+            trustChecker: { true },
+            pointerLocationProvider: { CGPoint(x: 300, y: 400) },
+            pointerWarper: { _ in },
+            scrollPoster: { _, _ in },
+            startDelay: .nan,
+            tickInterval: -.infinity
+        )
+        safeDriver.start(captureScreenRect: captureRect, primaryScreenHeight: 900, currentPixelHeight: 1200)
+        try await Task.sleep(for: .milliseconds(15))
+        safeDriver.stop()
+        #expect(!safeDriver.isRunning)
+    }
+
+    @Test func gpuPixelMagnifierOrientationEdgeClampingAndTinyBoundsFrame() throws {
+        // Build a 40x40 image whose TOP half (image y 0..<20) is pure RED and BOTTOM half (image y 20..<40) is pure BLUE.
+        let ctx = try #require(CGContext(
+            data: nil,
+            width: 40,
+            height: 40,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ))
+        ctx.setFillColor(red: 0, green: 0, blue: 1, alpha: 1)
+        ctx.fill(CGRect(x: 0, y: 0, width: 40, height: 20)) // CG bottom = image bottom (rows 20..<40)
+        ctx.setFillColor(red: 1, green: 0, blue: 0, alpha: 1)
+        ctx.fill(CGRect(x: 0, y: 20, width: 40, height: 20)) // CG top = image top (rows 0..<20)
+        let image = try #require(ctx.makeImage())
+
+        let magnifier = PixelMagnifierView(frame: CGRect(origin: .zero, size: PixelMagnifierView.preferredSize))
+        let sample = CCXColorSample(red: 255, green: 0, blue: 0)
+        // Center on the exact seam (pixelX = 20, pixelY = 20 -> rows 15..25: top 5 rows red, bottom 6 rows blue).
+        magnifier.update(image: image, pixelX: 20, pixelY: 20, sample: sample, format: .hex, sizeText: "40 × 40")
+        #expect(magnifier.displayedPositionText == "(20, 20)")
+        #expect(magnifier.displayedSizeText == "40 × 40")
+        #expect(magnifier.displayedColorText == "#FF0000")
+
+        // Render magnifier's CALayer tree into a bitmap context to empirically verify top-vs-bottom orientation.
+        let renderW = Int(PixelMagnifierView.preferredSize.width)
+        let renderH = Int(PixelMagnifierView.preferredSize.height)
+        let renderCtx = try #require(CGContext(
+            data: nil,
+            width: renderW,
+            height: renderH,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ))
+        let rootLayer = try #require(magnifier.layer)
+        rootLayer.render(in: renderCtx)
+        let rendered = try #require(renderCtx.makeImage())
+        // Top of magnifier grid (top-down y = 10, x = 20 -> away from center crosshair) must be RED.
+        let topSample = try #require(CCXColorSample.samplePixel(from: rendered, pixelX: 20, pixelY: 10))
+        // Bottom of magnifier grid (top-down y = 140, x = 20 -> inside gridSide = 154) must be BLUE.
+        let bottomSample = try #require(CCXColorSample.samplePixel(from: rendered, pixelX: 20, pixelY: 140))
+        #expect(topSample.red > 180 && topSample.blue < 40)
+        #expect(bottomSample.blue > 180 && bottomSample.red < 40)
+
+        // Edge pixel (0, 0) offsets pixelLayer frame cleanly inside grid.
+        magnifier.update(image: image, pixelX: 0, pixelY: 0, sample: sample, format: .rgb, sizeText: "")
+        #expect(magnifier.pixelLayerFrame.minX == 5 * PixelMagnifierView.cellSize)
+        #expect(magnifier.pixelLayerFrame.width == 6 * PixelMagnifierView.cellSize)
+        #expect(magnifier.displayedColorText == "rgb(255, 0, 0)")
+
+        // Tiny / degenerate bounds never invert PixelMagnifierView.frame origin below usable.minX/minY.
+        let tinyBounds = CGRect(x: 10, y: 20, width: 80, height: 80)
+        let clampedTiny = PixelMagnifierView.frame(near: CGPoint(x: 50, y: 60), in: tinyBounds, topInset: 10)
+        #expect(clampedTiny.minX >= tinyBounds.minX)
+        #expect(clampedTiny.minY >= tinyBounds.minY)
+        let nanCursor = PixelMagnifierView.frame(near: CGPoint(x: CGFloat.nan, y: CGFloat.infinity), in: tinyBounds, topInset: .nan)
+        #expect(nanCursor.minX.isFinite && nanCursor.minY.isFinite)
+
+        magnifier.clear()
+    }
+
+    @Test func inlineTextStyleRollbackFocusCommitCounterDuplicateEdgeExitLiveShiftAndTearDown() throws {
+        let size = CGSize(width: 400, height: 300)
+        let view = SnipOverlayView(snapshot: try makeSnapshot(size: size), topInset: 0)
+        let selection = CGRect(x: 20, y: 20, width: 220, height: 200)
+        try selectRect(selection, on: view)
+
+        // 1. Existing text edit: previewing style changes then cancelling with Esc leaves item & undo history untouched.
+        let originalStyle = AnnotationStyle(color: .red, size: .medium)
+        let textItem = AnnotationItem(kind: .text(origin: CGPoint(x: 40, y: 150), content: "Hello"), style: originalStyle)
+        view.annotations.commit(textItem)
+        let undoDepthBefore = view.annotations.canUndo
+        #expect(undoDepthBefore)
+
+        // Double-click existing text item in `.select` tool to open inline editor.
+        let box = textItem.boundingBox
+        view.mouseDown(with: try makeMouseEvent(type: .leftMouseDown, at: CGPoint(x: box.midX, y: box.midY), clickCount: 2))
+        #expect(view.isEditingTextForTesting)
+
+        // Preview blue color and large stroke while editing.
+        view.applyStyle(AnnotationStyle(color: .blue, size: .large))
+        view.applyStrokeSize(.maximum, recordUndo: true, showHUD: false)
+        // Underlying committed item must NOT be mutated while inline editor is still open.
+        #expect(view.annotations.selectedItem?.style == originalStyle)
+
+        // Cancel with Escape -> restores original style cleanly and pushes zero undo snapshots.
+        view.keyDown(with: try makeKeyEvent(characters: "\u{1B}", modifiers: [], keyCode: 53))
+        #expect(!view.isEditingTextForTesting)
+        #expect(view.currentStyle == originalStyle)
+        #expect(view.annotations.selectedItem?.style == originalStyle)
+        #expect(view.annotations.undo())
+        #expect(view.annotations.items.isEmpty) // Single undo undid the original commit directly.
+
+        // 2. External focus loss (`controlTextDidEndEditing`) commits inline text cleanly.
+        view.keyDown(with: try makeKeyEvent(characters: "7", modifiers: [], keyCode: 26)) // Text tool
+        view.mouseDown(with: try makeMouseEvent(type: .leftMouseDown, at: CGPoint(x: 50, y: 140)))
+        #expect(view.isEditingTextForTesting)
+        let field = try #require(view.inlineEditorFieldForTesting)
+        field.stringValue = "Committed on blur"
+        view.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification, object: field))
+        view.controlTextDidEndEditing(Notification(name: NSControl.textDidEndEditingNotification, object: field))
+        #expect(!view.isEditingTextForTesting)
+        #expect(view.annotations.items.count == 1)
+
+        // 3. Cmd+D on a step counter increments to the next counter number (1 -> 2).
+        view.keyDown(with: try makeKeyEvent(characters: "8", modifiers: [], keyCode: 28)) // Counter tool
+        view.mouseDown(with: try makeMouseEvent(type: .leftMouseDown, at: CGPoint(x: 100, y: 100)))
+        view.mouseUp(with: try makeMouseEvent(type: .leftMouseUp, at: CGPoint(x: 100, y: 100)))
+        #expect(view.performKeyEquivalent(with: try makeKeyEvent(characters: "d", modifiers: [.command], keyCode: 2)))
+        let counterNumbers = view.annotations.items.compactMap { item -> Int? in
+            if case let .counter(_, n) = item.kind { return n }
+            return nil
+        }
+        #expect(counterNumbers == [1, 2])
+
+        // 4. Live Shift toggle in flagsChanged updates an in-flight drag immediately without extra mouseDragged.
+        view.resetSelection()
+        view.mouseDown(with: try makeMouseEvent(type: .leftMouseDown, at: CGPoint(x: 50, y: 50)))
+        view.mouseDragged(with: try makeMouseEvent(type: .leftMouseDragged, at: CGPoint(x: 170, y: 100)))
+        #expect(view.machine.selectionRect == CGRect(x: 50, y: 50, width: 120, height: 50))
+        let shiftDown = try #require(NSEvent.keyEvent(
+            with: .flagsChanged, location: .zero, modifierFlags: [.shift], timestamp: 0,
+            windowNumber: 0, context: nil, characters: "", charactersIgnoringModifiers: "", isARepeat: false, keyCode: 56
+        ))
+        view.flagsChanged(with: shiftDown)
+        #expect(view.machine.selectionRect == CGRect(x: 50, y: 50, width: 120, height: 120))
+        view.mouseUp(with: try makeMouseEvent(type: .leftMouseUp, at: CGPoint(x: 170, y: 100)))
+
+        // 5. mouseExited at closed top/right edge (x == width or y == height) keeps hover & magnifier active.
+        view.resetSelection()
+        view.mouseMoved(with: try makeMouseEvent(type: .mouseMoved, at: CGPoint(x: 100, y: 100)))
+        #expect(!view.isMagnifierHidden)
+        let topEdgeExit = try #require(NSEvent.enterExitEvent(
+            with: .mouseExited, location: CGPoint(x: 200, y: size.height), modifierFlags: [],
+            timestamp: 0, windowNumber: 0, context: nil, eventNumber: 0, trackingNumber: 0, userData: nil
+        ))
+        view.mouseExited(with: topEdgeExit)
+        #expect(!view.isMagnifierHidden)
+
+        // 6. tearDown releases annotations, caches, and layers cleanly.
+        view.tearDown()
+        #expect(view.annotations.isEmpty)
+        #expect(view.borderLayerPath == nil)
+    }
+
+    @Test func scrollCaptureKeyMonitorScopingAndDisplayIDVisibleFrameMatching() {
+        // Local key monitor accepts only owned scroll-capture panel windows and never active field editors.
+        let owned: Set<Int> = [101, 102, 103]
+        #expect(ScrollCaptureController.shouldHandleLocalKeyEvent(windowNumber: 102, ownedWindowNumbers: owned, isFieldEditorFirstResponder: false))
+        #expect(!ScrollCaptureController.shouldHandleLocalKeyEvent(windowNumber: 999, ownedWindowNumbers: owned, isFieldEditorFirstResponder: false))
+        #expect(!ScrollCaptureController.shouldHandleLocalKeyEvent(windowNumber: 102, ownedWindowNumbers: owned, isFieldEditorFirstResponder: true))
+
+        // Adjacent display edge-touching selection resolves exact `displayID` visibleFrame instead of neighboring monitor.
+        let leftScreen = (
+            displayID: CGDirectDisplayID(1),
+            frame: CGRect(x: 0, y: 0, width: 1512, height: 982),
+            visibleFrame: CGRect(x: 0, y: 40, width: 1512, height: 904)
+        )
+        let rightScreen = (
+            displayID: CGDirectDisplayID(2),
+            frame: CGRect(x: 1512, y: 0, width: 1920, height: 1080),
+            visibleFrame: CGRect(x: 1512, y: 0, width: 1920, height: 1055)
+        )
+        let edgeRectOnRight = CGRect(x: 1512, y: 100, width: 600, height: 500)
+        let resolved = ScrollCaptureController.visibleFrame(
+            for: 2,
+            captureRect: edgeRectOnRight,
+            screens: [leftScreen, rightScreen]
+        )
+        #expect(resolved == rightScreen.visibleFrame)
+    }
 }

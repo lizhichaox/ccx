@@ -1410,7 +1410,7 @@ public final class SmartElementDetector {
 
 // MARK: - Shared AX IPC Helpers
 
-private enum AXElementReader {
+enum AXElementReader {
     struct NodeAttributes {
         let pid: pid_t
         let role: String?
@@ -1429,6 +1429,8 @@ private enum AXElementReader {
         let parent: AXUIElement?
         let timedOut: Bool
     }
+
+    private static let maxCoordinateMagnitude: CGFloat = 1_000_000
 
     private static let leafRolesToSkipChildren: Set<String> = [
         "AXStaticText",
@@ -1457,18 +1459,37 @@ private enum AXElementReader {
         status == .notImplemented || status == .illegalArgument
     }
 
-    private static func convertQuartzFrame(
+    static func convertQuartzFrame(
         position: CGPoint,
         size: CGSize,
         primaryScreenHeight: CGFloat
     ) -> CGRect? {
         guard position.x.isFinite, position.y.isFinite,
               size.width.isFinite, size.height.isFinite,
-              size.width > 0, size.height > 0
+              primaryScreenHeight.isFinite,
+              size.width > 0, size.height > 0,
+              abs(position.x) <= maxCoordinateMagnitude,
+              abs(position.y) <= maxCoordinateMagnitude,
+              size.width <= maxCoordinateMagnitude,
+              size.height <= maxCoordinateMagnitude
         else { return nil }
         let quartzRect = CGRect(origin: position, size: size)
         guard !quartzRect.isNull, !quartzRect.isInfinite else { return nil }
         return CoordinateConverter.quartzToAppKit(quartzRect, primaryScreenHeight: primaryScreenHeight)
+    }
+
+    /// Detects `AXValue` entries wrapping `kAXErrorCannotComplete` inside a multi-attribute result array.
+    static func containsCannotCompleteError(in values: [AnyObject]) -> Bool {
+        for value in values where CFGetTypeID(value) == AXValueGetTypeID() {
+            // swiftlint:disable:next force_cast
+            let axValue = value as! AXValue
+            guard AXValueGetType(axValue) == .axError else { continue }
+            var err: AXError = .success
+            if AXValueGetValue(axValue, .axError, &err), err == .cannotComplete {
+                return true
+            }
+        }
+        return false
     }
 
     static func readNodeAttributes(
@@ -1499,6 +1520,9 @@ private enum AXElementReader {
         if status == .success,
            let array = rawValues as? [AnyObject],
            array.count == attributes.count {
+            if containsCannotCompleteError(in: array) {
+                timedOut = true
+            }
             role = array[0] as? String
             subrole = array[1] as? String
             identifier = array[2] as? String
@@ -1568,6 +1592,9 @@ private enum AXElementReader {
         if status == .success,
            let array = rawValues as? [AnyObject],
            array.count == 4 {
+            if containsCannotCompleteError(in: array) {
+                timedOut = true
+            }
             role = array[0] as? String
             position = extractPoint(from: array[1])
             size = extractSize(from: array[2])
@@ -2199,13 +2226,17 @@ final class AXQueryWorker: Sendable {
         var cancelGeneration: UInt64 = 0
         var lastTargetWindowID: CGWindowID?
         var lastOverlayWindowID: CGWindowID?
-        var consecutiveTimeouts: Int = 0
+        var consecutiveTimeoutsByPID: [pid_t: Int] = [:]
+        var cooldownUntilByPID: [pid_t: TimeInterval] = [:]
     }
 
     /// Minimum interval between AX queries (~30 Hz).
     static let minimumInterval: TimeInterval = 1.0 / 30.0
     /// AX messaging timeout; slow apps (Chromium/Electron) fall back to Tier 1 window bounds.
     static let messagingTimeout: Float = 0.04
+    /// Hard wall-clock budget for one live Tier 2 AX query across all ancestor hops.
+    static let perQueryBudget: TimeInterval = 0.06
+    private static let maxTrackedPIDs = 64
 
     private let queue = DispatchQueue(label: "com.lizhichaox.ccx.ax-detector", qos: .userInteractive)
     private let excludedPID: pid_t
@@ -2229,10 +2260,10 @@ final class AXQueryWorker: Sendable {
             let nextOverlayID = request.overlayFallback?.windowID
             if state.lastTargetWindowID != nextTargetID || state.lastOverlayWindowID != nextOverlayID {
                 // Target switched: invalidate any in-flight IPC from the previous window/overlay.
+                // Per-PID timeout tracking is intentionally preserved across sibling windows of the same hung PID.
                 state.cancelGeneration &+= 1
                 state.lastTargetWindowID = nextTargetID
                 state.lastOverlayWindowID = nextOverlayID
-                state.consecutiveTimeouts = 0
             }
             state.pending = PendingWork(
                 request: request,
@@ -2241,7 +2272,7 @@ final class AXQueryWorker: Sendable {
             )
             guard !state.isScheduled else { return nil }
             state.isScheduled = true
-            return computeDelayLocked(state)
+            return computeDelayLocked(state, for: request)
         }
 
         if let delay = scheduleDelay {
@@ -2258,20 +2289,31 @@ final class AXQueryWorker: Sendable {
         }
     }
 
-    private func computeDelayLocked(_ state: State) -> TimeInterval {
-        let backoffMultiplier = state.consecutiveTimeouts > 0
-            ? min(Double(1 << min(state.consecutiveTimeouts, 2)), 4.0)
+    private static func primaryPID(for request: Request) -> pid_t? {
+        request.overlayFallback?.pid ?? request.targetWindow?.pid
+    }
+
+    private func computeDelayLocked(_ state: State, for request: Request?) -> TimeInterval {
+        let now = ProcessInfo.processInfo.systemUptime
+        let pid = request.flatMap(Self.primaryPID(for:))
+        let pidTimeouts = pid.flatMap { state.consecutiveTimeoutsByPID[$0] } ?? 0
+        let backoffMultiplier = pidTimeouts > 0
+            ? min(Double(1 << min(pidTimeouts, 2)), 4.0)
             : 1.0
         let effectiveInterval = min(0.15, minimumInterval * backoffMultiplier)
-        let elapsed = ProcessInfo.processInfo.systemUptime - state.lastQueryEndTime
-        return max(0, effectiveInterval - elapsed)
+        let elapsed = now - state.lastQueryEndTime
+        var delay = max(0, effectiveInterval - elapsed)
+        if let pid, let cooldownUntil = state.cooldownUntilByPID[pid], cooldownUntil > now {
+            delay = max(delay, cooldownUntil - now)
+        }
+        return delay
     }
 
     private func dispatchDrain(after delay: TimeInterval) {
         if delay <= 0 {
-            queue.async { self.drain() }
+            queue.async { [weak self] in self?.drain() }
         } else {
-            queue.asyncAfter(deadline: .now() + delay) { self.drain() }
+            queue.asyncAfter(deadline: .now() + delay) { [weak self] in self?.drain() }
         }
     }
 
@@ -2304,11 +2346,24 @@ final class AXQueryWorker: Sendable {
 
         let (shouldDeliver, nextDelay): (Bool, TimeInterval?) = state.withLock { state in
             // Stamp end-time after IPC completes so slow apps get real cooldown instead of 100% saturation.
-            state.lastQueryEndTime = ProcessInfo.processInfo.systemUptime
-            if result.timedOut {
-                state.consecutiveTimeouts = min(state.consecutiveTimeouts + 1, 3)
-            } else {
-                state.consecutiveTimeouts = 0
+            let now = ProcessInfo.processInfo.systemUptime
+            state.lastQueryEndTime = now
+            if let pid = Self.primaryPID(for: work.request) {
+                if result.timedOut {
+                    let count = min((state.consecutiveTimeoutsByPID[pid] ?? 0) + 1, 4)
+                    state.consecutiveTimeoutsByPID[pid] = count
+                    if count >= 3 {
+                        state.cooldownUntilByPID[pid] = now + min(0.5, 0.15 * Double(count - 1))
+                    }
+                    if state.consecutiveTimeoutsByPID.count > Self.maxTrackedPIDs {
+                        state.consecutiveTimeoutsByPID.removeAll()
+                        state.cooldownUntilByPID.removeAll()
+                        state.consecutiveTimeoutsByPID[pid] = count
+                    }
+                } else {
+                    state.consecutiveTimeoutsByPID.removeValue(forKey: pid)
+                    state.cooldownUntilByPID.removeValue(forKey: pid)
+                }
             }
 
             let stillValid = state.cancelGeneration == workGen
@@ -2317,7 +2372,7 @@ final class AXQueryWorker: Sendable {
             let delay: TimeInterval?
             if hasNewerPending {
                 state.isScheduled = true
-                delay = computeDelayLocked(state)
+                delay = computeDelayLocked(state, for: state.pending?.request)
             } else {
                 state.isScheduled = false
                 delay = nil
@@ -2348,6 +2403,7 @@ final class AXQueryWorker: Sendable {
 
     private func performQuery(_ request: Request, isCancelled: () -> Bool) -> QueryResult {
         var sawTimeout = false
+        let deadline = ProcessInfo.processInfo.systemUptime + Self.perQueryBudget
 
         if let overlay = request.overlayFallback, overlay.pid != excludedPID {
             guard !isCancelled() else { return QueryResult(rect: nil, isOverlay: false, timedOut: false) }
@@ -2360,6 +2416,7 @@ final class AXQueryWorker: Sendable {
                 primaryScreenHeight: request.primaryScreenHeight,
                 windowFrame: overlay.containerFrame,
                 timeout: Self.messagingTimeout,
+                deadline: deadline,
                 isCancelled: isCancelled,
                 timedOut: &sawTimeout
             ) {
@@ -2368,11 +2425,14 @@ final class AXQueryWorker: Sendable {
         }
 
         if let target = request.targetWindow, target.pid != excludedPID {
-            guard !isCancelled() else { return QueryResult(rect: nil, isOverlay: false, timedOut: sawTimeout) }
+            guard !isCancelled(), ProcessInfo.processInfo.systemUptime < deadline else {
+                return QueryResult(rect: nil, isOverlay: false, timedOut: sawTimeout)
+            }
             let rect = queryRefinedElement(
                 at: request.point,
                 target: target,
                 primaryScreenHeight: request.primaryScreenHeight,
+                deadline: deadline,
                 isCancelled: isCancelled,
                 timedOut: &sawTimeout
             )
@@ -2386,6 +2446,7 @@ final class AXQueryWorker: Sendable {
         at point: CGPoint,
         target: WindowTarget,
         primaryScreenHeight: CGFloat,
+        deadline: TimeInterval,
         isCancelled: () -> Bool,
         timedOut: inout Bool
     ) -> CGRect? {
@@ -2409,6 +2470,10 @@ final class AXQueryWorker: Sendable {
 
         for hop in 0..<6 {
             guard let node = current, !isCancelled() else { break }
+            if ProcessInfo.processInfo.systemUptime >= deadline {
+                timedOut = true
+                break
+            }
             let attrs = AXElementReader.readLightAttributesWithParent(
                 node,
                 primaryScreenHeight: primaryScreenHeight,
@@ -2443,5 +2508,9 @@ final class AXQueryWorker: Sendable {
             at: point,
             containerFrame: target.containerFrame
         )
+    }
+
+    internal func timeoutCountForTesting(pid: pid_t) -> Int {
+        state.withLock { $0.consecutiveTimeoutsByPID[pid] ?? 0 }
     }
 }

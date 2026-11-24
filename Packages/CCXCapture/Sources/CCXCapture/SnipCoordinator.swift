@@ -24,7 +24,10 @@ public final class SnipCoordinator {
     ///
     /// `completion` is called exactly once on the main actor. Calling this while a session is
     /// active is ignored.
-    public func startSnip(completion: @escaping @MainActor (SnipOutcome) -> Void) {
+    public func startSnip(
+        mode: SnipSelectionMode = .snip,
+        completion: @escaping @MainActor (SnipOutcome) -> Void
+    ) {
         guard !isSessionActive else { return }
         isSessionActive = true
         self.completion = completion
@@ -36,14 +39,20 @@ public final class SnipCoordinator {
         detector.refreshWindowList(screenFrames: geometries.values.map(\.frame))
 
         captureTask = Task { [weak self] in
+            let overlayPrepTask = Task { @MainActor in
+                await detector.prepareOverlayElements()
+            }
+            defer { overlayPrepTask.cancel() }
             do {
-                async let snapshotsTask = ScreenSnapshotEngine.capture(geometries: geometries)
-                async let overlayPrepTask: Void = detector.prepareOverlayElements()
-                let snapshots = try await snapshotsTask
-                await overlayPrepTask
+                let snapshots = try await ScreenSnapshotEngine.capture(geometries: geometries)
+                // Bound waiting on overlay AX pre-capture so a hung WidgetKit XPC can never stall snip launch.
+                await Self.awaitWithTimeout(nanoseconds: 160_000_000) {
+                    await overlayPrepTask.value
+                }
+                overlayPrepTask.cancel()
                 guard let self, self.isSessionActive, !Task.isCancelled else { return }
                 PermissionManager.setScreenRecordingVerified(true)
-                self.presentOverlay(snapshots: snapshots, detector: detector)
+                self.presentOverlay(snapshots: snapshots, detector: detector, selectionMode: mode)
             } catch {
                 guard let self, !Task.isCancelled else { return }
                 if ScreenSnapshotEngine.isPermissionDeniedError(error) {
@@ -52,9 +61,25 @@ public final class SnipCoordinator {
                     self.finish(.permissionDenied)
                 } else {
                     Self.logger.error("Snapshot failed: \(error.localizedDescription)")
-                    self.finish(.failed(error.localizedDescription))
+                    self.finish(.failed(ScreenSnapshotEngine.userFacingErrorMessage(for: error)))
                 }
             }
+        }
+    }
+
+    private static func awaitWithTimeout(
+        nanoseconds: UInt64,
+        operation: @escaping @Sendable () async -> Void
+    ) async {
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask {
+                await operation()
+            }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: nanoseconds)
+            }
+            _ = await group.next()
+            group.cancelAll()
         }
     }
 
@@ -64,11 +89,21 @@ public final class SnipCoordinator {
         finish(.cancelled)
     }
 
-    private func presentOverlay(snapshots: [DisplaySnapshot], detector: SmartElementDetector) {
+    /// Clears remembered per-display selection bounds so prior regions cannot be recalled.
+    public func clearLastSelections() {
+        lastSelectionByDisplay.removeAll()
+    }
+
+    private func presentOverlay(
+        snapshots: [DisplaySnapshot],
+        detector: SmartElementDetector,
+        selectionMode: SnipSelectionMode
+    ) {
         captureTask = nil
         let controller = SnipOverlayController(
             snapshots: snapshots,
             detector: detector,
+            selectionMode: selectionMode,
             initialStyle: lastAnnotationStyle,
             previousSelections: lastSelectionByDisplay,
             onStyleUpdated: { [weak self] style in

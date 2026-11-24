@@ -321,4 +321,34 @@ struct SelectionStateMachineTests {
             #expect(SelectionStateMachine.handlePoint(handle, for: rect) == dict[handle])
         }
     }
+
+    @Test func nonFiniteInputsAndDegenerateBoundsAreSafelyGuarded() {
+        let nullMachine = SelectionStateMachine(bounds: .null)
+        #expect(nullMachine.bounds == .zero)
+        let infMachine = SelectionStateMachine(bounds: .infinite)
+        #expect(infMachine.bounds == .zero)
+        let unstandardized = SelectionStateMachine(bounds: CGRect(x: 100, y: 100, width: -100, height: -50))
+        #expect(unstandardized.bounds == CGRect(x: 0, y: 50, width: 100, height: 50))
+
+        var machine = selected(CGRect(x: 100, y: 100, width: 200, height: 150))
+        let nudgeNan = machine.nudge(dx: .nan, dy: 5)
+        let nudgeInf = machine.nudge(dx: 5, dy: .infinity)
+        let resizeNan = machine.resizeBy(dw: .nan, dh: 10)
+        let resizeInf = machine.resizeBy(dw: 10, dh: -.infinity)
+        #expect(!nudgeNan)
+        #expect(!nudgeInf)
+        #expect(!resizeNan)
+        #expect(!resizeInf)
+        #expect(machine.selectionRect == CGRect(x: 100, y: 100, width: 200, height: 150))
+
+        machine.mouseDown(at: CGPoint(x: CGFloat.nan, y: 50))
+        machine.mouseDragged(to: CGPoint(x: CGFloat.infinity, y: 50))
+        #expect(machine.selectionRect == CGRect(x: 100, y: 100, width: 200, height: 150))
+
+        var hovering = SelectionStateMachine(bounds: bounds)
+        hovering.updateHover(detectedRect: CGRect(x: CGFloat.nan, y: 0, width: 100, height: 100))
+        #expect(hovering.highlightedRect == nil)
+        hovering.select(.infinite)
+        #expect(hovering.isHovering)
+    }
 }

@@ -36,6 +36,35 @@ public struct SnipResult: Sendable {
     }
 }
 
+/// Selection workflow mode for a snip overlay session.
+public enum SnipSelectionMode: Equatable, Sendable {
+    case snip
+    case record
+}
+
+/// Region selected via the overlay overlay to begin a screen recording session.
+public struct RecordRegionRequest: Equatable, Sendable {
+    public let displayID: CGDirectDisplayID
+    public let displayFrame: CGRect
+    public let localRect: CGRect
+    public let screenRect: CGRect
+    public let scale: CGFloat
+
+    public init(
+        displayID: CGDirectDisplayID,
+        displayFrame: CGRect,
+        localRect: CGRect,
+        screenRect: CGRect,
+        scale: CGFloat
+    ) {
+        self.displayID = displayID
+        self.displayFrame = displayFrame
+        self.localRect = localRect
+        self.screenRect = screenRect
+        self.scale = scale
+    }
+}
+
 /// The final outcome of a snip session.
 public enum SnipOutcome: Sendable {
     case pin(SnipResult)
@@ -43,6 +72,7 @@ public enum SnipOutcome: Sendable {
     case save(SnipResult)
     case quickSave(SnipResult)
     case ocr(SnipResult)
+    case record(RecordRegionRequest)
     case copiedColor(CCXColorSample, ColorFormat)
     case permissionDenied
     case failed(String)
