@@ -69,6 +69,7 @@ awk -v ver="$NEW_VERSION" '
   }
   { print }
 ' "$PROJECT_YML" > "$TMP_FILE"
+chmod 644 "$TMP_FILE"
 mv "$TMP_FILE" "$PROJECT_YML"
 trap - EXIT
 

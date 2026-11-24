@@ -149,10 +149,18 @@ CCX requests only the macOS permissions required for its three core features:
 
 ### Running Unit Tests
 ```bash
+# One-command local verification (secret check, shell lint, git diff check, and all 5 SwiftPM test suites):
+./scripts/verify-all.sh
+
+# Or run each SwiftPM package suite individually:
 for pkg in CCXCore CCXAnnotate CCXCapture CCXPin CCXRecord; do
   swift test --package-path "Packages/$pkg"
 done
 ```
+
+### Local Git Hooks
+Enable the repository's `pre-commit` and `pre-push` secret/local-config checks once per clone with `git config core.hooksPath .githooks`.
+See [SECURITY.md](SECURITY.md) for details on what the hooks verify and how to run `./scripts/check-secrets.sh --all`.
 
 ### Public Release Packaging (Universal Binary + Hardened Runtime)
 ```bash

@@ -172,6 +172,7 @@ if [[ "$BUMP_BUILD" -eq 1 ]]; then
     }
     { print }
   ' project.yml > "$TMP_PROJECT_YML"
+  chmod 644 "$TMP_PROJECT_YML"
   mv "$TMP_PROJECT_YML" project.yml
   trap - EXIT
   CURRENT_BUILD="$TARGET_BUILD"

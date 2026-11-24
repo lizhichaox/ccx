@@ -4,18 +4,19 @@ Instructions for agents working in this repository.
 
 ## Project
 
-**CCX (Control · Command · X)** is a native macOS screenshot, floating pin, and screen recording utility.
+**CCX (Control · Command · X)** is a native Swift 6 macOS menu bar utility focused strictly on three core workflows, plus a verified in-app updater and automatic `en`/`zh-Hans` localization:
 
-- **Capture (Snip)**: Full Snipaste parity — instant area/window/UI-element auto-detection, Retina HiDPI / Display P3 / HDR pixel magnifier and color picker (HEX / RGB / HSL), and a re-editable annotation canvas (shapes, arrows, freehand pen, highlighter, inline text, step counters, live GPU blur/mosaic, undo/redo).
-- **Paste (Pin)**: Always-on-top floating `NSPanel` windows across Spaces and full-screen apps with zoom, rotation/flip, opacity control, click-through mode, thumbnail collapse, pin groups, clipboard/snip history, and native `VisionKit` Live Text OCR / QR extraction.
-- **X (Screen Recording & Extended Workflows)**: Hardware-accelerated region/window/display screen recording (MP4/MOV via VideoToolbox, high-quality GIF, animated WebP) with system audio and microphone capture, pause/resume, live screen region PiP pins, pinned video/GIF loops, macOS 27 Instant Replay / quick trim, and Vision Smart Redact.
+- **Capture**: Smart Snip (`⌃⌘X`, customizable in Settings with conflict detection), Scroll Capture (`L`) with live preview, sticky header/sidebar detection, and memory-bounded stitching, non-destructive annotations (rectangle, ellipse, arrow, freehand pen, highlighter, inline text, auto-incrementing step counters, live GPU blur/mosaic, undo/redo), 120Hz GPU pixel magnifier & color picker (`HEX` / `RGB` / `HSL`, Retina HiDPI / Display P3), and on-device Apple Vision OCR (`T`).
+- **Pin**: Always-on-top floating `NSPanel` windows across Spaces and full-screen apps with GPU-accelerated zoom, 90° rotation, horizontal/vertical flip, opacity control, click-through mode, thumbnail collapse, inline re-editable annotation toolbar (entered via bottom-right hover button, double-click, right-click menu, `E`, `Space`, or `1`–`8`), on-device OCR, and persisted `RecentSnips` history (`0700`/`0600` user-only cache).
+- **Record**: Hardware-accelerated region and full-display screen recording (`MP4` H.264 / `MOV` HEVC via VideoToolbox, memory-bounded `GIF`) with optional system audio and microphone mixing, true pause/resume timeline offsetting, a dedicated recordings folder (`~/Movies/CCX`, configurable independently from PNG save paths), and non-destructive output actions.
+- **Verified In-App Updater & Localization**: Zero-dependency updater checking GitHub Releases over HTTPS with streaming SHA-256 verification against `SHA256SUMS.txt`, pre-extraction ZIP validation, and Apple `Security` framework code-signature validation (`SecStaticCodeCheckValidity`) before idle auto-install or quit-time replacement; automatic `en`/`zh-Hans` localization following macOS Language & Region (English default/fallback).
 
 ## Target Environment & Toolchain
 
 - **Primary Local Host**: Apple Silicon (M1 Max, Metal 4, 14" Liquid Retina XDR display with Notch) running **macOS 27.3**.
 - **Toolchain**: Full **Xcode 27.2**, **Swift 6.4.2**, **`MacOSX27.2.sdk`**, **XcodeGen 2.48.0**, `swiftlint`, `swiftformat`.
-- **Deployment Target**: **`macOS 15.0` (Sequoia)** baseline, compiled against `MacOSX27.2.sdk` with progressive `#available(macOS 26.0, *)` (HDR `SCScreenshotConfiguration`, Liquid Glass `NSGlassEffectView` / `.glassEffect()`) and `#available(macOS 27.0, *)` (`SCClipBufferingOutput`, `SCRecordingEditor`, `SCRecordingOutputConfiguration.mixesAudioWithMicrophone`) enhancements.
-- **Stack**: Pure native Swift 6 (`AppKit` + `SwiftUI` + `ScreenCaptureKit` + `Metal 4` / `CoreImage` + `AVFoundation` / `VideoToolbox` + `Vision` / `VisionKit`), organized as an XcodeGen (`project.yml`) `.app` target backed by local modular SwiftPM packages.
+- **Deployment Target**: **`macOS 15.0` (Sequoia)** baseline (Universal Binary `arm64` + `x86_64`), compiled against `MacOSX27.2.sdk` with progressive `#available(macOS 26.0, *)` enhancements (HDR `SCScreenshotConfiguration`, Liquid Glass `NSGlassEffectView` / `.glassEffect()`).
+- **Stack**: Pure native Swift 6 (`AppKit` + `SwiftUI` + `ScreenCaptureKit` + `Metal` / `CoreImage` + `AVFoundation` / `VideoToolbox` + `Vision` + `ImageIO` + `Security`) with zero third-party runtime dependencies, organized as an XcodeGen (`project.yml`) `.app` target backed by local modular SwiftPM packages.
 
 ## Build, Signing, and Launch
 
@@ -55,7 +56,7 @@ Full `.app` generation, `MetalToolchain` shader compilation (`~/Library/Develope
 
    ```bash
    ./scripts/build-and-run.sh
-   # Optional flags: --build-only (compile without replacing/launching), --no-install (run from .build/xcode), --release
+   # Optional flags: --build-only (compile without replacing/launching), --no-install (run from .build/xcode), --no-bump, --release
    ```
 
    Under the hood, `scripts/build-and-run.sh` runs `xcodegen generate`, builds with `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer`, replaces `/Applications/CCX.app` atomically, registers it with LaunchServices, and launches `/Applications/CCX.app`.
@@ -71,33 +72,64 @@ Full `.app` generation, `MetalToolchain` shader compilation (`~/Library/Develope
 ### Versioning & Build Management
 
 - `project.yml` is the single source of truth for `MARKETING_VERSION` (`MAJOR.MINOR.PATCH`) and `CURRENT_PROJECT_VERSION` (integer build number), injected into `App/Info.plist` via `$(MARKETING_VERSION)` and `$(CURRENT_PROJECT_VERSION)`.
-- Bump `MARKETING_VERSION` according to change size using `./scripts/bump-version.sh <patch|minor|major|X.Y.Z>` (`patch` = fixes, UI polish, or performance tweaks; `minor` = new features or capability expansions; `major` = major milestones or breaking changes).
+- Bump `MARKETING_VERSION` according to change size using `./scripts/bump-version.sh <patch|minor|major|X.Y.Z>`:
+  - Use **`./scripts/bump-version.sh patch`** (`0.8.x`) for small fixes, UI polish, performance tweaks, and security hardening.
+  - Reserve **`minor`** for new user-facing features or capability expansions, and **`major`** for major milestones or breaking changes.
 - `./scripts/build-and-run.sh` automatically increments `CURRENT_PROJECT_VERSION` by `+1` on every build (pass `--no-bump` only for dry rebuilds that should not advance the build number).
 
-## Planned Architecture
+## Architecture
 
 ```text
-project.yml            XcodeGen project manifest
-App/                   CCXApp target (Info.plist, entitlements, Assets, AppDelegate, MenuBar, TCC onboarding, Settings)
+project.yml            XcodeGen project manifest (version, build number, targets, build settings)
+SECURITY.md            Security policy, local-first privacy architecture, and vulnerability reporting
+App/                   CCXApp target (Info.plist, CCX.entitlements, Assets.xcassets, Resources,
+                       AppDelegate, MenuBarController, MenuBarPopoverView, SettingsWindowController,
+                       OnboardingWindowController, PermissionStatusModel, DismissibleWindow, ToastHUD)
 Packages/
-  CCXCore/             HiDPI/Notch/multi-display coordinate transforms (Quartz <-> AppKit), color math, Carbon hotkeys, history store
-  CCXCapture/          ScreenCaptureKit snapshot engine (15.0 + 26.0 HDR), CGWindowList + async AXUIElement detector, OverlayPanel, GPU magnifier
-  CCXAnnotate/         Non-destructive annotation scene graph, Metal/CoreImage live blur & mosaic, inline text, step counters, UndoManager, Smart Redact
-  CCXPin/              Floating PinPanel (.nonactivatingPanel, multi-Space/fullscreen), zoom/rotate/opacity/click-through/groups, VisionKit Live Text, Live PiP mirror
-  CCXRecord/           SCStream + CVMetalTextureCache compositor + AVAssetWriter/VideoToolbox (pause/resume, dual audio), macOS 27 Instant Replay & trim, GIF/WebP export
+  CCXCore/             CoordinateConverter (Quartz <-> AppKit, HiDPI/Notch/multi-display), ColorSample,
+                       HotKeys (Carbon + conflict detection), Localization (CCXL10n), PermissionManager,
+                       ClipboardStore, SnipHistoryPersistence (0700/0600), ImageFingerprint,
+                       TextRecognizer (Vision OCR), AppUpdater (verified GitHub Releases updater)
+  CCXAnnotate/         Non-destructive AnnotationDocument & AnnotationModels, AnnotationRenderer,
+                       MosaicImageCache (live GPU blur/mosaic), shared AnnotationActionToolbar
+  CCXCapture/          ScreenSnapshotEngine (ScreenCaptureKit 15.0 + 26.0 HDR), SmartElementDetector
+                       (CGWindowList + async AXUIElement), SelectionStateMachine, SnipCoordinator,
+                       SnipOverlayController/View, AnnotationCanvasView, PixelMagnifierView,
+                       SnipActionToolbar, ScrollCaptureEngine/Controller & ScrollImageStitcher
+  CCXPin/              Floating PinPanel (.nonactivatingPanel, multi-Space/full-screen), PinManager,
+                       PinModel, PinLayout, PinAnnotationController (inline re-editable annotations)
+  CCXRecord/           ScreenRecordingEngine (SCStream), VideoRecordingWriter (AVAssetWriter/VideoToolbox),
+                       GifRecordingEncoder (memory-bounded ImageIO), AudioSampleMixer (system audio + mic),
+                       RecordingTimeline (true pause/resume PTS shifting), RecordingFrameAdjuster,
+                       RecordingHUDPanels, RecordingCoordinator, RecordingFileSecurity
+scripts/
+  build-and-run.sh     Generates CCX.xcodeproj, signs, builds, installs /Applications/CCX.app, launches
+  bump-version.sh      Updates MARKETING_VERSION (patch|minor|major|X.Y.Z) in project.yml (0644)
+  package-release.sh   Builds signed Universal Binary with Hardened Runtime, verifies bundle, emits DMG/ZIP + SHA256SUMS.txt
+  check-secrets.sh     Audits tracked files (--all), staged changes (--staged), or pushed commits (--push) for secrets/local config
+  verify-all.sh        One-command local check: secrets audit, shell lint, git diff --check, 5-package tests, optional --build
+  generate-icons.py    Generates app icon assets into App/Assets.xcassets
+.githooks/
+  pre-commit           Runs scripts/check-secrets.sh --staged
+  pre-push             Runs scripts/check-secrets.sh --push
 ```
 
 ## Engineering & Verification Guardrails
 
 - **ScreenCaptureKit only for pixel capture**: Never call `CGWindowListCreateImage*` or `CGDisplayCreateImage` (marked `SCREEN_CAPTURE_OBSOLETE(..., 15.0)` in `MacOSX27.2.sdk`). `CGWindowListCopyWindowInfo` remains valid for Z-order window metadata and `CGWindowID` -> `SCWindow` matching.
 - **No iOS-only ScreenCaptureKit APIs**: Do not reference `SCVideoEffectOutput` (unavailable on macOS).
-- **Zero-copy GPU pipelines**: Route `SCStream` `IOSurface`-backed `CVPixelBuffer` frames through `CVMetalTextureCache` to Metal 4 / `AVAssetWriter` (VideoToolbox) and use `AVSampleBufferDisplayLayer` for Live Region PiP pins. Avoid CPU frame readbacks on hot paths.
-- **Primary recording engine**: Use `SCStream` + `AVAssetWriter` (VideoToolbox) for true pause/resume (PTS offset shifting) and GPU presenter compositing; optionally use macOS 27 `SCRecordingOutput` (`mixesAudioWithMicrophone`) as a fast path alongside `SCClipBufferingOutput` and `SCRecordingEditor`.
-- **Export encoder constraints**: `ImageIO` (`CGImageDestination`) is read-only for WebP on macOS — use `libwebp` for animated WebP export. Prefer `libgifski` for high-quality GIF export (with `ImageIO` / `ffmpeg` fallback).
+- **Zero-copy GPU pipelines & hardware recording**: Route `SCStream` `IOSurface`-backed `CVPixelBuffer` frames directly into `AVAssetWriter` (VideoToolbox) with `RecordingTimeline` PTS offset shifting for true pause/resume, avoiding CPU frame readbacks on hot paths. Keep GIF export memory-bounded via native `ImageIO` (`GifRecordingEncoder`) with zero third-party runtime dependencies.
 - **Non-blocking UI element detection**: Always run `AXUIElementCopyElementAtPosition` on a throttled/debounced background queue with timeout fallback to window bounds so 120Hz overlay tracking never stalls on Chromium/Electron apps.
-- **Global hotkeys without TCC friction**: Use Carbon `RegisterEventHotKey` for core shortcuts (Snip/Pin/Record/Toggle Pins); keep `CGEventTap` optional and gated on Accessibility trust.
+- **Global hotkeys without TCC friction**: Use Carbon `RegisterEventHotKey` for core shortcuts; keep `CGEventTap` optional and gated on Accessibility trust.
+- **UI & Localization Guardrails**:
+  - Support automatic `en` and `zh-Hans` localization via `CCXL10n` (following macOS System Settings → Language & Region, with English as the default and fallback for all other languages).
+  - Enforce **no wrapped, truncated, or folded prompts** across Settings (`368pt`), Menu Bar Popover (`316pt`), Setup Guide (`464 × 344`), and floating HUDs in both `en` and `zh-Hans` (verified by `NSFont` pixel-width unit tests).
+- **Security & Secret Hygiene Guardrails**:
+  - Enable local hooks once per clone via `git config core.hooksPath .githooks` so `pre-commit` and `pre-push` automatically run `scripts/check-secrets.sh`.
+  - Never commit `.env`, `Config/LocalSigning.xcconfig`, signing keys/certificates, hardcoded credentials, or local macOS home paths; audit anytime with `./scripts/check-secrets.sh --all`.
+  - Run `./scripts/verify-all.sh` (or `./scripts/verify-all.sh --build` for full Release compilation) before handing off changes.
 - **Language & repository discipline**:
   - Keep all code comments, repository documentation, and commit messages in English (localized UI strings belong only in localization resources).
   - Do not add GitHub Actions workflows unless explicitly requested; run tests, linting, and builds locally.
   - Make clean, atomic commits (one logical change per commit) and never modify sibling repositories.
-  - Before handing off changes, run `git diff --check`, applicable `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test` / build checks, and report any sandbox vs. code failures explicitly.
+  - Before handing off changes, run `./scripts/verify-all.sh` (or `git diff --check` and applicable `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test` / build checks), and report any sandbox vs. code failures explicitly.
