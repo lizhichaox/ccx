@@ -624,10 +624,14 @@ private struct RecentSnipThumbnail: View {
 
     var body: some View {
         Button(action: action) {
-            Image(decorative: entry.thumbnail, scale: 1.0)
-                .resizable()
-                .aspectRatio(contentMode: .fill)
+            Color.clear
                 .frame(width: 60.5, height: 38)
+                .overlay {
+                    Image(decorative: entry.thumbnail, scale: 1.0)
+                        .resizable()
+                        .aspectRatio(contentMode: .fill)
+                        .allowsHitTesting(false)
+                }
                 .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
                 .overlay(alignment: .topTrailing) {
                     if isPinned {
@@ -636,6 +640,7 @@ private struct RecentSnipThumbnail: View {
                             .frame(width: 7, height: 7)
                             .overlay(Circle().strokeBorder(.white, lineWidth: 1))
                             .padding(3)
+                            .allowsHitTesting(false)
                     }
                 }
                 .overlay(
@@ -644,9 +649,13 @@ private struct RecentSnipThumbnail: View {
                             isHovering ? Color.accentColor : Color.primary.opacity(0.14),
                             lineWidth: isHovering ? 1.5 : 1
                         )
+                        .allowsHitTesting(false)
                 )
+                .contentShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
         }
         .buttonStyle(.plain)
+        .frame(width: 60.5, height: 38)
+        .contentShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
         .help("\(entry.image.width) × \(entry.image.height) · \(isPinned ? "Already pinned" : "Click to pin")")
         .accessibilityLabel("Recent snip \(entry.image.width) by \(entry.image.height), \(isPinned ? "already pinned" : "click to pin")")
         .onHover { isHovering = $0 }
