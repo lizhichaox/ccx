@@ -1,5 +1,6 @@
 import AppKit
 import ApplicationServices
+import AVFoundation
 import CoreGraphics
 import Foundation
 import ScreenCaptureKit
@@ -8,38 +9,46 @@ import ScreenCaptureKit
 public struct CCXPermissionStatus: Equatable, Sendable {
     public var screenRecording: Bool
     public var accessibility: Bool
+    public var microphone: Bool
 
-    public init(screenRecording: Bool, accessibility: Bool) {
+    public init(screenRecording: Bool, accessibility: Bool, microphone: Bool = false) {
         self.screenRecording = screenRecording
         self.accessibility = accessibility
+        self.microphone = microphone
     }
 }
 
-/// Queries and requests Screen Recording and Accessibility permissions.
+/// Queries and requests Screen Recording, Accessibility, and Microphone permissions.
 @MainActor
 public enum PermissionManager {
-    private static var screenRecordingVerified = false
+    /// Tri-state override from live ScreenCaptureKit results:
+    /// - `nil`: defer to `CGPreflightScreenCaptureAccess()`.
+    /// - `true`: live ScreenCaptureKit access succeeded (overrides stale-false preflight).
+    /// - `false`: live ScreenCaptureKit access failed with permission denied (overrides stale-true preflight after revocation).
+    private static var liveScreenRecordingOverride: Bool?
 
     public static func setScreenRecordingVerified(_ granted: Bool) {
-        screenRecordingVerified = granted
+        liveScreenRecordingOverride = granted
+    }
+
+    static func resetScreenRecordingOverrideForTesting() {
+        liveScreenRecordingOverride = nil
     }
 
     public static func currentStatus() -> CCXPermissionStatus {
-        CCXPermissionStatus(
-            screenRecording: CGPreflightScreenCaptureAccess() || screenRecordingVerified,
-            accessibility: AXIsProcessTrusted()
+        let screenRecording = liveScreenRecordingOverride ?? CGPreflightScreenCaptureAccess()
+        return CCXPermissionStatus(
+            screenRecording: screenRecording,
+            accessibility: AXIsProcessTrusted(),
+            microphone: AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
         )
     }
 
-    /// Probes ScreenCaptureKit directly so macOS 15+ TCC grants that
-    /// `CGPreflightScreenCaptureAccess()` misses or caches as false are detected live.
+    /// Probes ScreenCaptureKit directly so both fresh macOS 15+ grants (stale-false preflight)
+    /// and mid-session revocations (stale-true preflight) are detected accurately.
     public static func verifyScreenRecordingLive() async -> Bool {
-        if CGPreflightScreenCaptureAccess() {
-            screenRecordingVerified = true
-            return true
-        }
         let granted = await hasLiveShareableDisplays()
-        screenRecordingVerified = granted
+        liveScreenRecordingOverride = granted
         return granted
     }
 
@@ -47,13 +56,14 @@ public enum PermissionManager {
     /// grant state; macOS only applies a new grant after the app relaunches.
     @discardableResult
     public static func requestScreenRecording() -> Bool {
-        if CGPreflightScreenCaptureAccess() {
-            screenRecordingVerified = true
+        if liveScreenRecordingOverride == true
+            || (liveScreenRecordingOverride == nil && CGPreflightScreenCaptureAccess()) {
+            liveScreenRecordingOverride = true
             return true
         }
         let granted = CGRequestScreenCaptureAccess()
-        Task.detached {
-            _ = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+        if granted {
+            liveScreenRecordingOverride = true
         }
         return granted
     }
@@ -72,6 +82,18 @@ public enum PermissionManager {
 
     public static func openAccessibilitySettings() {
         open("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
+    }
+
+    public static func microphoneAuthorizationStatus() -> AVAuthorizationStatus {
+        AVCaptureDevice.authorizationStatus(for: .audio)
+    }
+
+    public static func requestMicrophoneAccess() async -> Bool {
+        await AVCaptureDevice.requestAccess(for: .audio)
+    }
+
+    public static func openMicrophoneSettings() {
+        open("x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")
     }
 
     nonisolated private static func hasLiveShareableDisplays() async -> Bool {

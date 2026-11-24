@@ -109,6 +109,14 @@ enum KeyCodeNames {
             kVK_Delete: "⌫", kVK_ForwardDelete: "⌦", kVK_Home: "↖", kVK_End: "↘",
             kVK_PageUp: "⇞", kVK_PageDown: "⇟",
             kVK_LeftArrow: "←", kVK_RightArrow: "→", kVK_UpArrow: "↑", kVK_DownArrow: "↓",
+            kVK_ANSI_Keypad0: "Num 0", kVK_ANSI_Keypad1: "Num 1", kVK_ANSI_Keypad2: "Num 2",
+            kVK_ANSI_Keypad3: "Num 3", kVK_ANSI_Keypad4: "Num 4", kVK_ANSI_Keypad5: "Num 5",
+            kVK_ANSI_Keypad6: "Num 6", kVK_ANSI_Keypad7: "Num 7", kVK_ANSI_Keypad8: "Num 8",
+            kVK_ANSI_Keypad9: "Num 9", kVK_ANSI_KeypadDecimal: "Num .",
+            kVK_ANSI_KeypadMultiply: "Num *", kVK_ANSI_KeypadPlus: "Num +",
+            kVK_ANSI_KeypadClear: "Clear", kVK_ANSI_KeypadDivide: "Num /",
+            kVK_ANSI_KeypadEnter: "⌤", kVK_ANSI_KeypadMinus: "Num -",
+            kVK_ANSI_KeypadEquals: "Num =",
         ]
         let functionKeys = [
             kVK_F1, kVK_F2, kVK_F3, kVK_F4, kVK_F5, kVK_F6, kVK_F7, kVK_F8, kVK_F9, kVK_F10,
@@ -123,6 +131,13 @@ enum KeyCodeNames {
 
 /// Four-char code `'CCXH'` tagging every hotkey registered by CCX.
 private let ccxHotKeySignature: OSType = 0x4343_5848
+private let validCarbonModifierMask = UInt32(cmdKey | shiftKey | optionKey | controlKey)
+
+private struct SendableHotKeyTeardown: @unchecked Sendable {
+    let token: UInt
+    let hotKeyRefs: [EventHotKeyRef]
+    let eventHandlerRef: EventHandlerRef?
+}
 
 /// Carbon event callback. Carbon delivers hotkey events on the main thread through the
 /// application event target; the `userData` pointer carries an integer token (not a
@@ -148,6 +163,7 @@ private func ccxHotKeyEventHandler(
     }
 
     let token = UInt(bitPattern: userData)
+    guard token != 0 else { return OSStatus(eventNotHandledErr) }
     let carbonID = hotKeyID.id
     if Thread.isMainThread {
         MainActor.assumeIsolated {
@@ -168,8 +184,11 @@ public final class GlobalHotKeyManager {
     /// Called on the main actor whenever a registered hotkey is pressed.
     public var onAction: ((CCXHotKeyAction) -> Void)?
 
+    /// Most recent Carbon `OSStatus` returned when registering each action (`noErr` on success).
+    public private(set) var lastRegistrationStatus: [CCXHotKeyAction: OSStatus] = [:]
+
     private var combos: [CCXHotKeyAction: HotKeyCombo] = [:]
-    // Carbon refs are only touched on the main actor, plus once from `deinit`.
+    // Carbon refs are only mutated on `@MainActor` and handed off once from `deinit`.
     nonisolated(unsafe) private var hotKeyRefs: [CCXHotKeyAction: EventHotKeyRef] = [:]
     nonisolated(unsafe) private var eventHandlerRef: EventHandlerRef?
     private let token: UInt
@@ -183,18 +202,49 @@ public final class GlobalHotKeyManager {
     private static var instances: [UInt: WeakBox] = [:]
 
     public init() {
-        token = Self.nextToken
-        Self.nextToken += 1
         Self.instances = Self.instances.filter { $0.value.manager != nil }
+        token = Self.allocateToken()
         Self.instances[token] = WeakBox(self)
     }
 
     deinit {
-        for ref in hotKeyRefs.values {
+        let teardown = SendableHotKeyTeardown(
+            token: token,
+            hotKeyRefs: Array(hotKeyRefs.values),
+            eventHandlerRef: eventHandlerRef
+        )
+        if Thread.isMainThread {
+            MainActor.assumeIsolated {
+                Self.performTeardown(teardown)
+            }
+        } else {
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    Self.performTeardown(teardown)
+                }
+            }
+        }
+    }
+
+    private static func allocateToken() -> UInt {
+        var candidate = nextToken
+        if candidate == 0 { candidate = 1 }
+        while instances[candidate] != nil {
+            candidate &+= 1
+            if candidate == 0 { candidate = 1 }
+        }
+        nextToken = candidate &+ 1
+        if nextToken == 0 { nextToken = 1 }
+        return candidate
+    }
+
+    private static func performTeardown(_ teardown: SendableHotKeyTeardown) {
+        instances.removeValue(forKey: teardown.token)
+        for ref in teardown.hotKeyRefs {
             UnregisterEventHotKey(ref)
         }
-        if let eventHandlerRef {
-            RemoveEventHandler(eventHandlerRef)
+        if let handler = teardown.eventHandlerRef {
+            RemoveEventHandler(handler)
         }
     }
 
@@ -206,19 +256,40 @@ public final class GlobalHotKeyManager {
         manager.onAction?(action)
     }
 
+    static func registeredInstanceCountForTesting() -> Int {
+        instances.filter { $0.value.manager != nil }.count
+    }
+
+    /// Whether `action` currently has an active Carbon hotkey registration.
+    public func isRegistered(_ action: CCXHotKeyAction) -> Bool {
+        hotKeyRefs[action] != nil && combos[action] != nil
+    }
+
     /// Registers (or re-binds) `action` to `combo`. Returns `false` when the combo is
     /// already bound to another action of this manager or the system rejects it; in that
     /// case any previous binding of `action` is preserved.
     @discardableResult
     public func register(_ action: CCXHotKeyAction, combo: HotKeyCombo) -> Bool {
-        if combos[action] == combo, hotKeyRefs[action] != nil { return true }
-        if combos.contains(where: { $0.key != action && $0.value == combo }) { return false }
-        guard installEventHandlerIfNeeded() else { return false }
+        let normalized = HotKeyCombo(
+            keyCode: combo.keyCode,
+            carbonModifiers: combo.carbonModifiers & validCarbonModifierMask
+        )
+        if combos[action] == normalized, hotKeyRefs[action] != nil {
+            lastRegistrationStatus[action] = noErr
+            return true
+        }
+        if combos.contains(where: { $0.key != action && $0.value == normalized }) {
+            lastRegistrationStatus[action] = OSStatus(eventHotKeyExistsErr)
+            return false
+        }
+        guard installEventHandlerIfNeeded(for: action) else { return false }
 
         let previous = combos[action]
         unregister(action)
-        if registerCarbon(action, combo: combo) { return true }
+        if registerCarbon(action, combo: normalized) { return true }
+        let failureStatus = lastRegistrationStatus[action]
         if let previous { _ = registerCarbon(action, combo: previous) }
+        if let failureStatus { lastRegistrationStatus[action] = failureStatus }
         return false
     }
 
@@ -232,6 +303,14 @@ public final class GlobalHotKeyManager {
     public func unregisterAll() {
         for action in Array(combos.keys) {
             unregister(action)
+        }
+        for ref in hotKeyRefs.values {
+            UnregisterEventHotKey(ref)
+        }
+        hotKeyRefs.removeAll()
+        if let handler = eventHandlerRef {
+            RemoveEventHandler(handler)
+            eventHandlerRef = nil
         }
     }
 
@@ -251,19 +330,20 @@ public final class GlobalHotKeyManager {
         let hotKeyID = EventHotKeyID(signature: ccxHotKeySignature, id: action.carbonID)
         let status = RegisterEventHotKey(
             combo.keyCode,
-            combo.carbonModifiers,
+            combo.carbonModifiers & validCarbonModifierMask,
             hotKeyID,
             GetApplicationEventTarget(),
             0,
             &ref
         )
+        lastRegistrationStatus[action] = status
         guard status == noErr, let ref else { return false }
         hotKeyRefs[action] = ref
         combos[action] = combo
         return true
     }
 
-    private func installEventHandlerIfNeeded() -> Bool {
+    private func installEventHandlerIfNeeded(for action: CCXHotKeyAction) -> Bool {
         if eventHandlerRef != nil { return true }
         var spec = EventTypeSpec(
             eventClass: OSType(kEventClassKeyboard),
@@ -278,7 +358,10 @@ public final class GlobalHotKeyManager {
             UnsafeMutableRawPointer(bitPattern: token),
             &handler
         )
-        guard status == noErr, let handler else { return false }
+        guard status == noErr, let handler else {
+            lastRegistrationStatus[action] = status
+            return false
+        }
         eventHandlerRef = handler
         return true
     }

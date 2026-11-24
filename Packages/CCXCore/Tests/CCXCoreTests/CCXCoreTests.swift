@@ -1,6 +1,7 @@
 import AppKit
 import Carbon.HIToolbox
 import CoreGraphics
+import Darwin
 @testable import CCXCore
 import XCTest
 
@@ -89,6 +90,42 @@ final class CoordinateConverterTests: XCTestCase {
         XCTAssertEqual(CoordinateConverter.snapToEvenPixels(CGRect(x: 0, y: 0, width: 0.5, height: 1)).size,
                        CGSize(width: 2, height: 2))
     }
+
+    func testNonFiniteAndExtremeInputsNeverTrap() {
+        let nanRect = CGRect(x: CGFloat.nan, y: 10, width: 100, height: 100)
+        let infSize = CGSize(width: CGFloat.infinity, height: 100)
+        let hugeRect = CGRect(x: 0, y: 0, width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+
+        XCTAssertEqual(CoordinateConverter.primaryScreenHeight(screens: [.null, .infinite, nanRect]), 0)
+        XCTAssertEqual(CoordinateConverter.quartzToAppKit(.null, primaryScreenHeight: 1000), .zero)
+        XCTAssertEqual(CoordinateConverter.quartzToAppKit(.infinite, primaryScreenHeight: 1000), .zero)
+        XCTAssertEqual(CoordinateConverter.quartzToAppKit(nanRect, primaryScreenHeight: 1000), .zero)
+        XCTAssertEqual(CoordinateConverter.appKitToQuartz(CGRect(x: 0, y: 0, width: 10, height: 10), primaryScreenHeight: .nan), .zero)
+        XCTAssertEqual(CoordinateConverter.appKitToQuartz(CGPoint(x: CGFloat.nan, y: 10), primaryScreenHeight: 1000), .zero)
+        XCTAssertEqual(CoordinateConverter.appKitToQuartz(CGPoint(x: 10, y: 10), primaryScreenHeight: .infinity), .zero)
+
+        XCTAssertEqual(
+            CoordinateConverter.appKitLocalRectToImagePixelRect(.null, screenSize: CGSize(width: 100, height: 100), imageSize: CGSize(width: 200, height: 200)),
+            .zero
+        )
+        XCTAssertEqual(
+            CoordinateConverter.appKitLocalRectToImagePixelRect(CGRect(x: 0, y: 0, width: 10, height: 10), screenSize: infSize, imageSize: CGSize(width: 200, height: 200)),
+            .zero
+        )
+        XCTAssertEqual(
+            CoordinateConverter.appKitLocalRectToImagePixelRect(CGRect(x: 0, y: 0, width: 10, height: 10), screenSize: CGSize(width: 100, height: 100), imageSize: infSize),
+            .zero
+        )
+
+        for degenerate in [CGRect.null, CGRect.infinite, nanRect] {
+            let snapped = CoordinateConverter.snapToEvenPixels(degenerate)
+            XCTAssertEqual(snapped, CGRect(x: 0, y: 0, width: 2, height: 2))
+        }
+        let hugeSnapped = CoordinateConverter.snapToEvenPixels(hugeRect)
+        XCTAssertTrue(hugeSnapped.width.isFinite && hugeSnapped.height.isFinite)
+        XCTAssertEqual(Int(hugeSnapped.width) % 2, 0)
+        XCTAssertEqual(Int(hugeSnapped.height) % 2, 0)
+    }
 }
 
 final class ColorSampleTests: XCTestCase {
@@ -135,6 +172,12 @@ final class ColorSampleTests: XCTestCase {
         XCTAssertNil(CCXColorSample.parseHex("#"))
         XCTAssertNil(CCXColorSample.parseHex("hello world"))
         XCTAssertNil(CCXColorSample.parseHex("#ＦＦ0000"))
+
+        // Multi-MB non-color text must be rejected immediately in O(1) without allocating a copy.
+        let huge = String(repeating: "A", count: 2_000_000)
+        XCTAssertNil(CCXColorSample.parseHex(huge))
+        let hugePadded = "   " + huge + "\n"
+        XCTAssertNil(CCXColorSample.parseHex(hugePadded))
     }
 
     func testHexRoundTrip() {
@@ -240,6 +283,8 @@ final class HotKeyComboTests: XCTestCase {
                               carbonModifiers: UInt32(cmdKey | shiftKey | optionKey | controlKey))
         XCTAssertEqual(all.displayString, "⌃⌥⇧⌘A")
         XCTAssertEqual(HotKeyCombo(keyCode: 9999, carbonModifiers: 0).displayString, "Key 9999")
+        XCTAssertEqual(HotKeyCombo(keyCode: UInt32(kVK_ANSI_Keypad0), carbonModifiers: UInt32(cmdKey)).displayString, "⌘Num 0")
+        XCTAssertEqual(HotKeyCombo(keyCode: UInt32(kVK_ANSI_KeypadEnter), carbonModifiers: 0).displayString, "⌤")
     }
 
     func testModifierFlagConversion() {
@@ -309,16 +354,57 @@ final class GlobalHotKeyManagerTests: XCTestCase {
         }
         XCTAssertEqual(received, registered ? [.snip] : [])
         manager.unregisterAll()
+        XCTAssertFalse(manager.isRegistered(.snip))
+    }
+
+    func testModifierMaskingAndInstanceCleanupOnDeinit() {
+        let baselineCount = GlobalHotKeyManager.registeredInstanceCountForTesting()
+        do {
+            let manager = GlobalHotKeyManager()
+            XCTAssertEqual(GlobalHotKeyManager.registeredInstanceCountForTesting(), baselineCount + 1)
+            XCTAssertFalse(manager.isRegistered(.snip))
+            let comboWithStrayBits = HotKeyCombo(
+                keyCode: UInt32(kVK_F19),
+                carbonModifiers: UInt32(controlKey | optionKey | shiftKey | alphaLock)
+            )
+            if manager.register(.snip, combo: comboWithStrayBits) {
+                XCTAssertTrue(manager.isRegistered(.snip))
+                XCTAssertEqual(manager.lastRegistrationStatus[.snip], noErr)
+                XCTAssertEqual(
+                    manager.currentCombo(for: .snip),
+                    HotKeyCombo(keyCode: UInt32(kVK_F19), carbonModifiers: UInt32(controlKey | optionKey | shiftKey))
+                )
+            }
+            manager.unregisterAll()
+            XCTAssertFalse(manager.isRegistered(.snip))
+        }
+        XCTAssertEqual(GlobalHotKeyManager.registeredInstanceCountForTesting(), baselineCount)
     }
 }
 
 @MainActor
 final class PermissionManagerTests: XCTestCase {
     func testCurrentStatusDoesNotPrompt() {
+        PermissionManager.resetScreenRecordingOverrideForTesting()
+        defer { PermissionManager.resetScreenRecordingOverrideForTesting() }
+
         let status = PermissionManager.currentStatus()
         XCTAssertEqual(status, CCXPermissionStatus(screenRecording: status.screenRecording,
-                                                   accessibility: status.accessibility))
+                                                   accessibility: status.accessibility,
+                                                   microphone: status.microphone))
         XCTAssertEqual(PermissionManager.requestAccessibility(prompt: false), status.accessibility)
+    }
+
+    func testTriStateScreenRecordingOverrideHandlesBothGrantAndRevocation() {
+        PermissionManager.resetScreenRecordingOverrideForTesting()
+        defer { PermissionManager.resetScreenRecordingOverrideForTesting() }
+
+        PermissionManager.setScreenRecordingVerified(true)
+        XCTAssertTrue(PermissionManager.currentStatus().screenRecording)
+
+        // Revocation (false) must override even if CGPreflightScreenCaptureAccess() stays stale true.
+        PermissionManager.setScreenRecordingVerified(false)
+        XCTAssertFalse(PermissionManager.currentStatus().screenRecording)
     }
 }
 
@@ -440,6 +526,145 @@ final class ClipboardStoreTests: XCTestCase {
         XCTAssertEqual(store.peekPinBadge(), .image)
     }
 
+    func testClearHistoryAndClipboardClearsHistoryImageTextFileURLAndBadge() throws {
+        let pb = InMemoryClipboardPasteboard()
+        let store = ClipboardStore(pasteboard: pb)
+        let image = makeTestImage(width: 6, height: 4) { _, _ in (200, 100, 50, 255) }
+        store.recordSnip(image: image, scale: 2, screenRect: CGRect(x: 10, y: 20, width: 3, height: 2))
+        store.copyImage(image, scale: 2)
+
+        XCTAssertEqual(store.history.count, 1)
+        XCTAssertEqual(store.peekPinBadge(), .image)
+        XCTAssertNotNil(store.readPinPayload())
+
+        store.clearHistoryAndClipboard()
+        XCTAssertTrue(store.history.isEmpty)
+        XCTAssertEqual(store.peekPinBadge(), .empty)
+        XCTAssertNil(store.readPinPayload())
+        XCTAssertNil(pb.data(forType: .png))
+        XCTAssertNil(pb.data(forType: .tiff))
+
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("ccx-clear-\(UUID().uuidString).png")
+        defer { try? FileManager.default.removeItem(at: url) }
+        try store.savePNG(image, to: url)
+        store.copyFileURL(url)
+        XCTAssertEqual(store.peekPinBadge(), .image)
+        XCTAssertNotNil(store.readPinPayload())
+
+        store.clearClipboard()
+        XCTAssertEqual(store.peekPinBadge(), .empty)
+        XCTAssertNil(store.readPinPayload())
+        XCTAssertTrue(pb.readImageFileURLs().isEmpty)
+
+        store.copyText("secret")
+        XCTAssertEqual(store.peekPinBadge(), .text)
+        store.clearClipboard()
+        XCTAssertEqual(store.peekPinBadge(), .empty)
+        XCTAssertNil(store.readPinPayload())
+    }
+
+    func testImageFingerprintMatchesAcrossPNGRoundTripAndDistinguishesDifferentImages() throws {
+        let pb = InMemoryClipboardPasteboard()
+        let store = ClipboardStore(pasteboard: pb)
+        let redStripe = makeTestImage(width: 40, height: 30) { x, _ in
+            x < 20 ? (255, 40, 40, 255) : (40, 40, 255, 255)
+        }
+        let greenStripe = makeTestImage(width: 40, height: 30) { x, _ in
+            x < 20 ? (40, 220, 80, 255) : (240, 200, 40, 255)
+        }
+        let differentSize = makeTestImage(width: 44, height: 30) { x, _ in
+            x < 20 ? (255, 40, 40, 255) : (40, 40, 255, 255)
+        }
+
+        let fpRed = ImageFingerprint(image: redStripe)
+        let fpGreen = ImageFingerprint(image: greenStripe)
+        let fpDiffSize = ImageFingerprint(image: differentSize)
+
+        let pngData = try XCTUnwrap(ClipboardStore.encode(redStripe, type: .png, scale: 2))
+        let decodedRed = try XCTUnwrap(ClipboardStore.decode(pngData)).0
+        let fpDecodedRed = ImageFingerprint(image: decodedRed)
+
+        XCTAssertTrue(fpRed.matches(fpDecodedRed))
+        XCTAssertFalse(fpRed.matches(fpGreen))
+        XCTAssertFalse(fpRed.matches(fpDiffSize))
+
+        let entry = store.recordSnip(image: redStripe, scale: 2, screenRect: .zero)
+        XCTAssertFalse(store.hasClipboardChangedSinceLatestSnip)
+        store.copyText("copied after snip")
+        XCTAssertTrue(store.hasClipboardChangedSinceLatestSnip)
+        store.copyImage(redStripe, scale: 2, historyEntryID: entry?.id)
+        XCTAssertEqual(store.cachedClipboardIdentityIfKnown(), entry?.pinIdentity)
+    }
+
+    func testHistoryPersistsAcrossRestartsPrunesEvictedAndDeletesOnClear() async throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ccx-history-persist-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let img1 = makeTestImage(width: 8, height: 6) { _, _ in (220, 20, 20, 255) }
+        let img2 = makeTestImage(width: 8, height: 6) { _, _ in (20, 220, 20, 255) }
+        let img3 = makeTestImage(width: 8, height: 6) { _, _ in (20, 20, 220, 255) }
+        let img4 = makeTestImage(width: 10, height: 8) { _, _ in (240, 200, 40, 255) }
+
+        let store1 = ClipboardStore(maxHistoryCount: 3, pasteboard: InMemoryClipboardPasteboard(), historyDirectoryURL: dir)
+        let s1 = try XCTUnwrap(store1.recordSnip(image: img1, scale: 2, screenRect: CGRect(x: 1, y: 1, width: 4, height: 3)))
+        let _ = try XCTUnwrap(store1.recordSnip(image: img2, scale: 2, screenRect: CGRect(x: 2, y: 2, width: 4, height: 3)))
+        let s3 = try XCTUnwrap(store1.recordSnip(image: img3, scale: 2, screenRect: CGRect(x: 3, y: 3, width: 4, height: 3)))
+        let s4 = try XCTUnwrap(store1.recordSnip(image: img4, scale: 2, screenRect: CGRect(x: 4, y: 4, width: 5, height: 4)))
+        let s2ID = store1.history[2].id
+        store1.flushPendingPersistence()
+
+        let files1 = try FileManager.default.contentsOfDirectory(atPath: dir.path).sorted()
+        XCTAssertTrue(files1.contains("index.json"))
+        let pngs1 = files1.filter { $0.hasSuffix(".png") }
+        XCTAssertEqual(pngs1.count, 3)
+        XCTAssertFalse(pngs1.contains("\(s1.id.uuidString).png"))
+
+        // Reload in a fresh ClipboardStore (simulating app restart).
+        let store2 = ClipboardStore(maxHistoryCount: 3, pasteboard: InMemoryClipboardPasteboard(), historyDirectoryURL: dir)
+        try await waitUntil { store2.history.count == 3 }
+        XCTAssertEqual(store2.history.map(\.id), [s4.id, s3.id, s2ID])
+        XCTAssertEqual(store2.history.first?.scale, 2)
+        XCTAssertEqual(store2.history.first?.screenRect, CGRect(x: 4, y: 4, width: 5, height: 4))
+        XCTAssertTrue(store2.history.first?.fingerprint.matches(s4.fingerprint) == true)
+
+        // Clear removes memory + disk files + clipboard.
+        store2.clearHistoryAndClipboard()
+        store2.flushPendingPersistence()
+        XCTAssertTrue(store2.history.isEmpty)
+        let filesAfterClear = try FileManager.default.contentsOfDirectory(atPath: dir.path)
+        XCTAssertTrue(filesAfterClear.isEmpty)
+
+        // Fresh restart after Clear stays empty.
+        let store3 = ClipboardStore(maxHistoryCount: 3, pasteboard: InMemoryClipboardPasteboard(), historyDirectoryURL: dir)
+        store3.flushPendingPersistence()
+        await Task.yield()
+        XCTAssertTrue(store3.history.isEmpty)
+
+        // Race safety: clearing immediately after launch before async load delivers must win.
+        let seedStore = ClipboardStore(maxHistoryCount: 3, pasteboard: InMemoryClipboardPasteboard(), historyDirectoryURL: dir)
+        seedStore.recordSnip(image: img4, scale: 2, screenRect: .zero)
+        seedStore.flushPendingPersistence()
+
+        let store4 = ClipboardStore(maxHistoryCount: 3, pasteboard: InMemoryClipboardPasteboard(), historyDirectoryURL: dir)
+        store4.clearHistory()
+        store4.flushPendingPersistence()
+        try await Task.sleep(for: .milliseconds(30))
+        XCTAssertTrue(store4.history.isEmpty)
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: dir.path).isEmpty)
+    }
+
+    private func waitUntil(timeoutSeconds: TimeInterval = 2, _ condition: () -> Bool) async throws {
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        while !condition() {
+            if Date() >= deadline {
+                XCTFail("Timed out waiting for async persistence load")
+                return
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+    }
+
     func testSnipHistoryEntryThumbnailDownsamplesLargeImages() {
         let small = makeTestImage(width: 8, height: 8) { _, _ in (1, 2, 3, 255) }
         let smallEntry = SnipHistoryEntry(image: small, scale: 2, screenRect: .zero)
@@ -458,9 +683,228 @@ final class ClipboardStoreTests: XCTestCase {
         XCTAssertEqual(tallEntry.thumbnail.height, 160)
         XCTAssertGreaterThan(CCXColorSample.samplePixel(from: tallEntry.thumbnail, pixelX: 10, pixelY: 10)?.red ?? 0, 200)
     }
+
+    func testPersistenceEnforcesPrivatePermissions0700And0600() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ccx-perms-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let store = ClipboardStore(maxHistoryCount: 3, pasteboard: InMemoryClipboardPasteboard(), historyDirectoryURL: dir)
+        let img = makeTestImage(width: 8, height: 6) { _, _ in (120, 80, 40, 255) }
+        let entry = try XCTUnwrap(store.recordSnip(image: img, scale: 2, screenRect: CGRect(x: 0, y: 0, width: 4, height: 3)))
+        store.flushPendingPersistence()
+
+        var dirStat = stat()
+        XCTAssertEqual(Darwin.lstat(dir.path, &dirStat), 0)
+        XCTAssertEqual(dirStat.st_mode & 0o777, 0o700)
+
+        let pngPath = dir.appendingPathComponent("\(entry.id.uuidString).png").path
+        var pngStat = stat()
+        XCTAssertEqual(Darwin.lstat(pngPath, &pngStat), 0)
+        XCTAssertEqual(pngStat.st_mode & 0o777, 0o600)
+
+        let indexPath = dir.appendingPathComponent("index.json").path
+        var idxStat = stat()
+        XCTAssertEqual(Darwin.lstat(indexPath, &idxStat), 0)
+        XCTAssertEqual(idxStat.st_mode & 0o777, 0o600)
+    }
+
+    func testPersistenceRejectsSymlinkDirectoryAndSymlinkFiles() async throws {
+        let realTargetDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ccx-sym-target-\(UUID().uuidString)", isDirectory: true)
+        let symlinkDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ccx-sym-link-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: realTargetDir, withIntermediateDirectories: true)
+        let sentinel = realTargetDir.appendingPathComponent("sentinel.txt")
+        try Data("keep".utf8).write(to: sentinel)
+        try FileManager.default.createSymbolicLink(at: symlinkDir, withDestinationURL: realTargetDir)
+        defer {
+            try? FileManager.default.removeItem(at: symlinkDir)
+            try? FileManager.default.removeItem(at: realTargetDir)
+        }
+
+        let store = ClipboardStore(maxHistoryCount: 3, pasteboard: InMemoryClipboardPasteboard(), historyDirectoryURL: symlinkDir)
+        let img = makeTestImage(width: 4, height: 4) { _, _ in (10, 20, 30, 255) }
+        store.recordSnip(image: img, scale: 1, screenRect: .zero)
+        store.flushPendingPersistence()
+        // Save through a symlinked directory must be refused.
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: realTargetDir.path), ["sentinel.txt"])
+
+        // Clear through a symlinked directory must NOT delete files in the target directory.
+        store.clearHistory()
+        store.flushPendingPersistence()
+        XCTAssertTrue(FileManager.default.fileExists(atPath: sentinel.path))
+    }
+
+    func testPersistenceRecoversFromCorruptJSONCorruptPNGAndNonFiniteMetadata() async throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ccx-corrupt-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        // 1. Corrupt index.json self-heals and cleans orphaned PNGs.
+        let orphanPNG = dir.appendingPathComponent("\(UUID().uuidString).png")
+        try Data([0x00, 0x01, 0x02]).write(to: orphanPNG)
+        try Data("{not valid json".utf8).write(to: dir.appendingPathComponent("index.json"))
+
+        let store1 = ClipboardStore(maxHistoryCount: 5, pasteboard: InMemoryClipboardPasteboard(), historyDirectoryURL: dir)
+        store1.flushPendingPersistence()
+        try await Task.sleep(for: .milliseconds(30))
+        XCTAssertTrue(store1.history.isEmpty)
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: dir.path).isEmpty)
+
+        // 2. Valid PNG paired with out-of-range scale and negative-size rect sanitizes cleanly;
+        //    corrupt PNG entry is skipped and pruned.
+        let goodID = UUID()
+        let badID = UUID()
+        let goodImg = makeTestImage(width: 8, height: 8) { _, _ in (50, 100, 150, 255) }
+        let goodData = try XCTUnwrap(ClipboardStore.encodePNG(goodImg, scale: 2))
+        try goodData.write(to: dir.appendingPathComponent("\(goodID.uuidString).png"))
+        try Data("corrupt-png".utf8).write(to: dir.appendingPathComponent("\(badID.uuidString).png"))
+
+        let badMetaRecords = [
+            SnipHistoryManifestRecord(id: goodID, timestamp: Date(), scale: -5, screenRect: CGRect(x: 0, y: 0, width: -10, height: 20)),
+            SnipHistoryManifestRecord(id: badID, timestamp: Date(), scale: 2, screenRect: .zero),
+        ]
+        try JSONEncoder().encode(badMetaRecords).write(to: dir.appendingPathComponent("index.json"))
+
+        let store2 = ClipboardStore(maxHistoryCount: 5, pasteboard: InMemoryClipboardPasteboard(), historyDirectoryURL: dir)
+        try await waitUntil { store2.history.count == 1 }
+        store2.flushPendingPersistence()
+        XCTAssertEqual(store2.history.first?.id, goodID)
+        XCTAssertEqual(store2.history.first?.scale, 1)
+        XCTAssertEqual(store2.history.first?.screenRect, .zero)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: dir.appendingPathComponent("\(badID.uuidString).png").path))
+    }
+
+    func testHistoryMemoryBudgetEvictsOldestEntriesAndKeepsAtLeastOne() async throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ccx-mem-cap-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        // Each 100x100 RGBA image is 40,000 bytes; 90,000-byte budget fits at most 2 images.
+        let img1 = makeTestImage(width: 100, height: 100) { _, _ in (255, 0, 0, 255) }
+        let img2 = makeTestImage(width: 100, height: 100) { _, _ in (0, 255, 0, 255) }
+        let img3 = makeTestImage(width: 100, height: 100) { _, _ in (0, 0, 255, 255) }
+
+        let store = ClipboardStore(
+            maxHistoryCount: 10,
+            pasteboard: InMemoryClipboardPasteboard(),
+            historyDirectoryURL: dir,
+            maxHistoryMemoryBytes: 90_000
+        )
+        _ = store.recordSnip(image: img1, scale: 1, screenRect: .zero)
+        let e2 = try XCTUnwrap(store.recordSnip(image: img2, scale: 1, screenRect: .zero))
+        let e3 = try XCTUnwrap(store.recordSnip(image: img3, scale: 1, screenRect: .zero))
+        XCTAssertEqual(store.history.map(\.id), [e3.id, e2.id])
+        store.flushPendingPersistence()
+
+        // Reloading with an even smaller 10,000-byte budget still retains the single newest entry.
+        let tightStore = ClipboardStore(
+            maxHistoryCount: 10,
+            pasteboard: InMemoryClipboardPasteboard(),
+            historyDirectoryURL: dir,
+            maxHistoryMemoryBytes: 10_000
+        )
+        try await waitUntil { tightStore.history.count == 1 }
+        XCTAssertEqual(tightStore.history.map(\.id), [e3.id])
+    }
+
+    func testDecodeRejectsDecompressionBombAndNonRegularFiles() throws {
+        // Minimal PNG signature + IHDR declaring 50,000 x 50,000 pixels (exceeds maxDecodeDimension & maxDecodePixels).
+        var fakePNG = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+        // Chunk length 13
+        fakePNG.append(contentsOf: [0x00, 0x00, 0x00, 0x0D])
+        // Chunk type "IHDR"
+        fakePNG.append(contentsOf: [0x49, 0x48, 0x44, 0x52])
+        // Width = 50000 (0x0000C350), Height = 50000 (0x0000C350)
+        fakePNG.append(contentsOf: [0x00, 0x00, 0xC3, 0x50, 0x00, 0x00, 0xC3, 0x50])
+        // Bit depth 8, color type 6 (RGBA), compression 0, filter 0, interlace 0
+        fakePNG.append(contentsOf: [0x08, 0x06, 0x00, 0x00, 0x00])
+        // Placeholder CRC
+        fakePNG.append(contentsOf: [0x00, 0x00, 0x00, 0x00])
+        XCTAssertNil(ClipboardStore.decode(fakePNG))
+        XCTAssertNil(ClipboardStore.decode(Data()))
+
+        // Directory and FIFO must be rejected immediately without blocking.
+        let dirURL = FileManager.default.temporaryDirectory
+        XCTAssertNil(ClipboardStore.decodeImageFile(at: dirURL))
+
+        let fifoURL = FileManager.default.temporaryDirectory.appendingPathComponent("ccx-fifo-\(UUID().uuidString)")
+        defer { _ = Darwin.unlink(fifoURL.path) }
+        if Darwin.mkfifo(fifoURL.path, 0o600) == 0 {
+            XCTAssertNil(ClipboardStore.decodeImageFile(at: fifoURL))
+        }
+    }
+
+    func testHasPasteboardContentForNonImageFileURLsAndLocalizedErrorDescriptions() {
+        let pb = InMemoryClipboardPasteboard()
+        let store = ClipboardStore(pasteboard: pb)
+        XCTAssertFalse(store.hasPasteboardContent)
+
+        let mp4URL = URL(fileURLWithPath: "/tmp/recording.mp4")
+        let beforeCount = pb.changeCount
+        store.copyFileURL(mp4URL)
+        XCTAssertEqual(pb.changeCount, beforeCount + 1)
+        XCTAssertEqual(store.peekPinBadge(), .empty)
+        XCTAssertTrue(store.hasPasteboardContent)
+
+        store.clearClipboard()
+        XCTAssertFalse(store.hasPasteboardContent)
+
+        XCTAssertFalse((ClipboardStoreError.encodingFailed.errorDescription ?? "").isEmpty)
+        XCTAssertFalse((ClipboardStoreError.writeFailed.errorDescription ?? "").isEmpty)
+    }
+
+    func testLazyTIFFDataProviderInvalidationPreventsSettingData() {
+        let provider = LazyTIFFDataProvider {
+            Data([0x49, 0x49, 0x2A, 0x00])
+        }
+        provider.invalidate()
+        XCTAssertTrue(provider.invalidated)
+
+        let item = NSPasteboardItem()
+        provider.pasteboard(nil, item: item, provideDataForType: .tiff)
+        XCTAssertNil(item.data(forType: .tiff))
+    }
+
+    func testAtomicSavePNGPreservesExistingFileOnWriteFailure() throws {
+        let store = ClipboardStore(pasteboard: InMemoryClipboardPasteboard())
+        let img = makeTestImage(width: 4, height: 4) { _, _ in (10, 20, 30, 255) }
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ccx-atomic-save-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let targetURL = dir.appendingPathComponent("existing.png")
+        let sentinel = Data("original-bytes".utf8)
+        try sentinel.write(to: targetURL)
+
+        // Writing to a subdirectory path that is actually a file must fail while preserving targetURL.
+        let invalidSubPath = targetURL.appendingPathComponent("nested.png")
+        XCTAssertThrowsError(try store.savePNG(img, to: invalidSubPath))
+        XCTAssertEqual(try Data(contentsOf: targetURL), sentinel)
+    }
 }
 
 final class TextRecognizerTests: XCTestCase {
+    @MainActor
+    func testRecognizeTextRespectsPreCancelledTask() async {
+        let image = makeTestImage(width: 16, height: 16) { _, _ in (255, 255, 255, 255) }
+        let task = Task<String, Error> {
+            try await TextRecognizer.recognizeText(in: image)
+        }
+        task.cancel()
+        do {
+            _ = try await task.value
+            XCTFail("Expected CancellationError for cancelled OCR task")
+        } catch is CancellationError {
+            // Expected
+        } catch {
+            XCTFail("Expected CancellationError, got: \(error)")
+        }
+    }
+
     @MainActor
     func testRecognizeHighContrastBannerText() async throws {
         let width = 360
