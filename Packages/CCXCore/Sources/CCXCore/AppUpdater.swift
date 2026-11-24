@@ -205,9 +205,7 @@ public enum AppUpdateURLPolicy {
         "github-releases.githubusercontent.com",
     ]
 
-    private static let githubUserContentSuffix = ".githubusercontent.com"
-
-    /// Returns `true` only for credential-free `https://` URLs targeting official GitHub hosts.
+    /// Returns `true` only for credential-free `https://` URLs targeting exact official GitHub release hosts.
     public static func isAllowedDownloadURL(_ url: URL) -> Bool {
         guard let components = URLComponents(url: url, resolvingAgainstBaseURL: true),
               components.scheme?.lowercased() == "https",
@@ -227,33 +225,7 @@ public enum AppUpdateURLPolicy {
             return false
         }
         let host = rawHost.lowercased()
-
-        if allowedExactHosts.contains(host) {
-            return true
-        }
-
-        guard host.hasSuffix(githubUserContentSuffix) else {
-            return false
-        }
-
-        let subdomain = String(host.dropLast(githubUserContentSuffix.count))
-        guard !subdomain.isEmpty else { return false }
-
-        let labels = subdomain.split(separator: ".", omittingEmptySubsequences: false)
-        guard !labels.isEmpty else { return false }
-        for label in labels {
-            guard !label.isEmpty,
-                  label.first != "-",
-                  label.last != "-",
-                  label.unicodeScalars.allSatisfy({ scalar in
-                      let v = scalar.value
-                      return (v >= 97 && v <= 122) || (v >= 48 && v <= 57) || v == 45
-                  })
-            else {
-                return false
-            }
-        }
-        return true
+        return allowedExactHosts.contains(host)
     }
 }
 
@@ -332,7 +304,10 @@ public enum GitHubReleaseParser {
 
         guard let releaseURL = URL(string: payload.htmlURL),
               AppUpdateURLPolicy.isAllowedDownloadURL(releaseURL),
-              releaseURL.host?.lowercased() == "github.com"
+              releaseURL.host?.lowercased() == "github.com",
+              releaseURL.path.lowercased().hasPrefix("/lizhichaox/ccx/releases/"),
+              releaseURL.standardized.path.lowercased().hasPrefix("/lizhichaox/ccx/releases/"),
+              !releaseURL.path.split(separator: "/").contains("..")
         else {
             throw AppUpdateError.untrustedURL
         }
@@ -780,6 +755,255 @@ public enum AppCodeSignatureVerifier {
     }
 }
 
+// MARK: - ZIP Archive Pre-Inspection
+
+/// Zero-dependency ZIP Central Directory validator invoked before `/usr/bin/ditto` to fail closed
+/// on decompression bombs, path traversal, symlinks/special files, setuid/setgid bits, and
+/// unexpected archive roots.
+public enum AppUpdateArchiveValidator {
+    public static let maxZipEntries = 2_000
+    public static let maxExtractedBytes: UInt64 = 250 * 1024 * 1024
+
+    private static let eocdSignature: UInt32 = 0x0605_4B50
+    private static let centralDirSignature: UInt32 = 0x0201_4B50
+    private static let eocdMinSize = 22
+    private static let maxEOCDSearchBytes: UInt64 = 65_557 // 22 + 65,535 max comment
+    private static let centralDirHeaderMinSize = 46
+
+    /// Validates the ZIP archive at `zipURL` via `O_NOFOLLOW`, `fstat`, and bounded `pread`
+    /// over its End of Central Directory and Central Directory File Headers.
+    public static func validateZipArchive(at zipURL: URL) throws {
+        let uid = Darwin.getuid()
+        let path = normalizedPath(zipURL.path)
+        let fd = Darwin.open(path, O_RDONLY | O_NOFOLLOW)
+        guard fd >= 0 else {
+            throw AppUpdateError.extractionFailed
+        }
+        defer { _ = Darwin.close(fd) }
+
+        var st = stat()
+        guard Darwin.fstat(fd, &st) == 0,
+              (st.st_mode & S_IFMT) == S_IFREG,
+              st.st_uid == uid
+        else {
+            throw AppUpdateError.extractionFailed
+        }
+
+        guard st.st_size > Int64(eocdMinSize) else {
+            throw AppUpdateError.extractionFailed
+        }
+        guard st.st_size <= GitHubReleaseParser.maxArchiveBytes else {
+            throw AppUpdateError.responseTooLarge
+        }
+
+        let fileSize = UInt64(st.st_size)
+        let tailLength = Int(min(fileSize, maxEOCDSearchBytes))
+        let tailStartOffset = fileSize - UInt64(tailLength)
+        let tailBytes = try readExact(from: fd, offset: tailStartOffset, count: tailLength)
+
+        var foundEOCDIndex: Int?
+        var foundEOCDOffset: UInt64 = 0
+        var idx = tailLength - eocdMinSize
+        while idx >= 0 {
+            if readUInt32LE(tailBytes, at: idx) == eocdSignature {
+                let commentLen = UInt64(readUInt16LE(tailBytes, at: idx + 20))
+                let candidateOffset = tailStartOffset + UInt64(idx)
+                let (expectedEnd, endOverflow) = candidateOffset.addingReportingOverflow(
+                    UInt64(eocdMinSize) + commentLen
+                )
+                if !endOverflow && expectedEnd == fileSize {
+                    foundEOCDIndex = idx
+                    foundEOCDOffset = candidateOffset
+                    break
+                }
+            }
+            idx -= 1
+        }
+
+        guard let eocdIndex = foundEOCDIndex else {
+            throw AppUpdateError.extractionFailed
+        }
+
+        let diskNumber = readUInt16LE(tailBytes, at: eocdIndex + 4)
+        let cdStartDisk = readUInt16LE(tailBytes, at: eocdIndex + 6)
+        let entriesOnDisk = readUInt16LE(tailBytes, at: eocdIndex + 8)
+        let totalEntries = readUInt16LE(tailBytes, at: eocdIndex + 10)
+        let cdSize = readUInt32LE(tailBytes, at: eocdIndex + 12)
+        let cdOffset = readUInt32LE(tailBytes, at: eocdIndex + 16)
+
+        guard diskNumber == 0,
+              cdStartDisk == 0,
+              totalEntries > 0,
+              entriesOnDisk == totalEntries,
+              totalEntries != 0xFFFF,
+              cdSize != 0xFFFF_FFFF,
+              cdOffset != 0xFFFF_FFFF,
+              Int(totalEntries) <= maxZipEntries
+        else {
+            throw AppUpdateError.extractionFailed
+        }
+
+        let cdOffset64 = UInt64(cdOffset)
+        let cdSize64 = UInt64(cdSize)
+        let (cdEndOffset, cdOverflow) = cdOffset64.addingReportingOverflow(cdSize64)
+        guard !cdOverflow,
+              cdSize64 > 0,
+              cdEndOffset <= foundEOCDOffset,
+              cdSize64 <= UInt64(Int.max)
+        else {
+            throw AppUpdateError.extractionFailed
+        }
+
+        let cdBytes = try readExact(from: fd, offset: cdOffset64, count: Int(cdSize64))
+        var cursor = 0
+        var totalUncompressedBytes: UInt64 = 0
+        var hasCCXAppEntry = false
+
+        for _ in 0..<Int(totalEntries) {
+            guard cdBytes.count - cursor >= centralDirHeaderMinSize else {
+                throw AppUpdateError.extractionFailed
+            }
+            guard readUInt32LE(cdBytes, at: cursor) == centralDirSignature else {
+                throw AppUpdateError.extractionFailed
+            }
+
+            let versionMadeBy = readUInt16LE(cdBytes, at: cursor + 4)
+            let compressedSize = readUInt32LE(cdBytes, at: cursor + 20)
+            let uncompressedSize = readUInt32LE(cdBytes, at: cursor + 24)
+            let nameLen = Int(readUInt16LE(cdBytes, at: cursor + 28))
+            let extraLen = Int(readUInt16LE(cdBytes, at: cursor + 30))
+            let commentLen = Int(readUInt16LE(cdBytes, at: cursor + 32))
+            let diskNumberStart = readUInt16LE(cdBytes, at: cursor + 34)
+            let externalAttrs = readUInt32LE(cdBytes, at: cursor + 38)
+            let localHeaderOffset = readUInt32LE(cdBytes, at: cursor + 42)
+
+            guard diskNumberStart == 0,
+                  compressedSize != 0xFFFF_FFFF,
+                  uncompressedSize != 0xFFFF_FFFF,
+                  localHeaderOffset != 0xFFFF_FFFF
+            else {
+                throw AppUpdateError.extractionFailed
+            }
+
+            let entryHeaderTotal = centralDirHeaderMinSize + nameLen + extraLen + commentLen
+            guard entryHeaderTotal <= cdBytes.count - cursor else {
+                throw AppUpdateError.extractionFailed
+            }
+
+            let (nextTotal, sizeOverflow) = totalUncompressedBytes.addingReportingOverflow(UInt64(uncompressedSize))
+            if sizeOverflow || nextTotal > maxExtractedBytes {
+                throw AppUpdateError.responseTooLarge
+            }
+            totalUncompressedBytes = nextTotal
+
+            guard nameLen > 0 else {
+                throw AppUpdateError.extractionFailed
+            }
+            let nameStart = cursor + centralDirHeaderMinSize
+            let nameEnd = nameStart + nameLen
+            let nameSlice = cdBytes[nameStart..<nameEnd]
+            guard !nameSlice.contains(0),
+                  let entryName = String(bytes: nameSlice, encoding: .utf8),
+                  !entryName.contains("\0"),
+                  !entryName.contains("\\"),
+                  !entryName.hasPrefix("/"),
+                  !entryName.contains("//")
+            else {
+                throw AppUpdateError.extractionFailed
+            }
+
+            let components = entryName.split(separator: "/", omittingEmptySubsequences: true)
+            guard !components.isEmpty else {
+                throw AppUpdateError.extractionFailed
+            }
+            for component in components {
+                if component == "." || component == ".." {
+                    throw AppUpdateError.extractionFailed
+                }
+            }
+
+            guard entryName == "CCX.app"
+                || entryName.hasPrefix("CCX.app/")
+                || entryName.hasPrefix("__MACOSX/CCX.app/")
+            else {
+                throw AppUpdateError.extractionFailed
+            }
+            if entryName.hasPrefix("CCX.app/") {
+                hasCCXAppEntry = true
+            }
+
+            let hostOS = versionMadeBy >> 8
+            if hostOS == 3 || hostOS == 19 {
+                let mode = UInt16((externalAttrs >> 16) & 0xFFFF)
+                if (mode & 0o6000) != 0 {
+                    throw AppUpdateError.extractionFailed
+                }
+                let fileType = mode & UInt16(S_IFMT)
+                guard fileType == 0
+                    || fileType == UInt16(S_IFREG)
+                    || fileType == UInt16(S_IFDIR)
+                else {
+                    throw AppUpdateError.extractionFailed
+                }
+            }
+
+            cursor += entryHeaderTotal
+        }
+
+        guard cursor == cdBytes.count, hasCCXAppEntry else {
+            throw AppUpdateError.extractionFailed
+        }
+    }
+
+    private static func readExact(from fd: Int32, offset: UInt64, count: Int) throws -> [UInt8] {
+        guard count >= 0 else {
+            throw AppUpdateError.extractionFailed
+        }
+        let (endOffset, overflow) = offset.addingReportingOverflow(UInt64(count))
+        guard !overflow, endOffset <= UInt64(Int64.max) else {
+            throw AppUpdateError.extractionFailed
+        }
+        var buffer = [UInt8](repeating: 0, count: count)
+        var totalRead = 0
+        while totalRead < count {
+            let currentOffset = off_t(offset) + off_t(totalRead)
+            let bytesRead = buffer.withUnsafeMutableBytes { rawBuffer -> Int in
+                guard let base = rawBuffer.baseAddress else { return -1 }
+                return Darwin.pread(fd, base.advanced(by: totalRead), count - totalRead, currentOffset)
+            }
+            if bytesRead > 0 {
+                totalRead += bytesRead
+            } else if bytesRead == 0 {
+                throw AppUpdateError.extractionFailed
+            } else if errno == EINTR {
+                continue
+            } else {
+                throw AppUpdateError.extractionFailed
+            }
+        }
+        return buffer
+    }
+
+    private static func readUInt16LE(_ bytes: [UInt8], at offset: Int) -> UInt16 {
+        UInt16(bytes[offset]) | (UInt16(bytes[offset + 1]) << 8)
+    }
+
+    private static func readUInt32LE(_ bytes: [UInt8], at offset: Int) -> UInt32 {
+        UInt32(bytes[offset])
+            | (UInt32(bytes[offset + 1]) << 8)
+            | (UInt32(bytes[offset + 2]) << 16)
+            | (UInt32(bytes[offset + 3]) << 24)
+    }
+
+    private static func normalizedPath(_ path: String) -> String {
+        var result = path
+        while result.count > 1 && result.hasSuffix("/") {
+            result.removeLast()
+        }
+        return result
+    }
+}
+
 // MARK: - Install Eligibility & Atomic Installer
 
 /// Whether the running `.app` bundle can be atomically replaced in place or requires manual update.
@@ -939,8 +1163,31 @@ public enum AppUpdateInstaller {
         }
     }
 
-    /// Extracts a downloaded `.zip` archive using `/usr/bin/ditto` and validates that `CCX.app`
-    /// is present as a real, non-symlink directory owned by the current user.
+    /// Safely removes a user-owned staging directory strictly inside `<tmp>/CCXUpdates`.
+    /// If the path is a symlink strictly inside `<tmp>/CCXUpdates`, unlinks only the symlink
+    /// without following it. Refuses paths outside `<tmp>/CCXUpdates` or the root directory itself.
+    public static func removeOwnedStagingDirectoryIfPresent(at url: URL) {
+        let uid = Darwin.getuid()
+        let path = normalizedPath(url.path)
+        guard isStrictlyInsideUpdatesRoot(path: path, uid: uid) else {
+            return
+        }
+
+        var st = stat()
+        guard Darwin.lstat(path, &st) == 0, st.st_uid == uid else {
+            return
+        }
+
+        let fileType = st.st_mode & S_IFMT
+        if fileType == S_IFLNK {
+            _ = Darwin.unlink(path)
+        } else if fileType == S_IFDIR {
+            try? FileManager.default.removeItem(atPath: path)
+        }
+    }
+
+    /// Pre-inspects and extracts a downloaded `.zip` archive using `/usr/bin/ditto` and validates
+    /// that `CCX.app` is present as a real, non-symlink directory owned by the current user.
     public static func extractZip(at zipURL: URL, to destinationDir: URL) throws -> URL {
         let uid = Darwin.getuid()
         let zipPath = normalizedPath(zipURL.path)
@@ -952,6 +1199,8 @@ public enum AppUpdateInstaller {
         else {
             throw AppUpdateError.extractionFailed
         }
+
+        try AppUpdateArchiveValidator.validateZipArchive(at: zipURL)
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
@@ -1024,21 +1273,66 @@ public enum AppUpdateInstaller {
         currentPID: Int32 = ProcessInfo.processInfo.processIdentifier,
         relaunch: Bool = true
     ) throws {
+        let uid = Darwin.getuid()
         let stagedPath = normalizedPath(stagedSiblingAppURL.path)
         let targetPath = normalizedPath(targetAppURL.path)
         let cleanupPath = normalizedPath(cleanupDirectoryURL.path)
 
-        var stagedStat = stat()
+        let normalizedStagedURL = URL(fileURLWithPath: stagedPath, isDirectory: true)
+        let normalizedTargetURL = URL(fileURLWithPath: targetPath, isDirectory: true)
+        let normalizedCleanupURL = URL(fileURLWithPath: cleanupPath, isDirectory: true)
+
         var targetStat = stat()
-        guard Darwin.lstat(stagedPath, &stagedStat) == 0,
-              (stagedStat.st_mode & S_IFMT) == S_IFDIR,
+        guard !stagedPath.split(separator: "/").contains(".."),
+              !targetPath.split(separator: "/").contains(".."),
+              !cleanupPath.split(separator: "/").contains(".."),
+              isOwnedRealDirectory(at: normalizedStagedURL, uid: uid),
+              normalizedStagedURL.lastPathComponent.hasPrefix(".CCX-update-"),
+              normalizedStagedURL.pathExtension == "app",
               Darwin.lstat(targetPath, &targetStat) == 0,
-              (targetStat.st_mode & S_IFMT) == S_IFDIR
+              (targetStat.st_mode & S_IFMT) == S_IFDIR,
+              normalizedTargetURL.pathExtension == "app",
+              normalizedStagedURL.lastPathComponent != normalizedTargetURL.lastPathComponent
         else {
             throw AppUpdateError.installFailed(Messages.verifyUpdateBundleFailed)
         }
 
-        let parentDir = URL(fileURLWithPath: targetPath, isDirectory: true).deletingLastPathComponent()
+        let resolvedStagedParent = normalizedPath(
+            normalizedStagedURL.deletingLastPathComponent().resolvingSymlinksInPath().standardizedFileURL.path
+        )
+        let resolvedTargetParent = normalizedPath(
+            normalizedTargetURL.deletingLastPathComponent().resolvingSymlinksInPath().standardizedFileURL.path
+        )
+        guard resolvedStagedParent == resolvedTargetParent else {
+            throw AppUpdateError.installFailed(Messages.verifyUpdateBundleFailed)
+        }
+
+        guard isOwnedRealDirectory(at: normalizedCleanupURL, uid: uid),
+              isStrictlyInsideUpdatesRoot(path: cleanupPath, uid: uid)
+        else {
+            throw AppUpdateError.installFailed(Messages.verifyUpdateBundleFailed)
+        }
+
+        let resolvedRootPath = normalizedPath(
+            updatesRootDirectoryURL().resolvingSymlinksInPath().standardizedFileURL.path
+        )
+        let resolvedCleanupPath = normalizedPath(
+            normalizedCleanupURL.resolvingSymlinksInPath().standardizedFileURL.path
+        )
+        let rootPrefix = resolvedRootPath.hasSuffix("/") ? resolvedRootPath : resolvedRootPath + "/"
+        guard resolvedCleanupPath != resolvedRootPath,
+              resolvedCleanupPath.hasPrefix(rootPrefix)
+        else {
+            throw AppUpdateError.installFailed(Messages.verifyUpdateBundleFailed)
+        }
+
+        let parentDir = URL(fileURLWithPath: resolvedTargetParent, isDirectory: true)
+        let canonicalStagedPath = normalizedPath(
+            parentDir.appendingPathComponent(normalizedStagedURL.lastPathComponent, isDirectory: true).path
+        )
+        let canonicalTargetPath = normalizedPath(
+            parentDir.appendingPathComponent(normalizedTargetURL.lastPathComponent, isDirectory: true).path
+        )
         let backupPath = normalizedPath(
             parentDir.appendingPathComponent(".CCX-backup-\(UUID().uuidString).app", isDirectory: true).path
         )
@@ -1083,10 +1377,10 @@ public enum AppUpdateInstaller {
             script,
             "ccx-updater",
             String(currentPID),
-            stagedPath,
-            targetPath,
+            canonicalStagedPath,
+            canonicalTargetPath,
             backupPath,
-            cleanupPath,
+            resolvedCleanupPath,
             relaunch ? "1" : "0",
         ]
         process.standardInput = FileHandle.nullDevice
@@ -1125,6 +1419,42 @@ public enum AppUpdateInstaller {
             return false
         }
         return Darwin.chmod(path, 0o700) == 0
+    }
+
+    private static func isStrictlyInsideUpdatesRoot(path: String, uid: uid_t) -> Bool {
+        let rootURL = updatesRootDirectoryURL()
+        guard isOwnedRealDirectory(at: rootURL, uid: uid) else {
+            return false
+        }
+
+        let normalizedCandidate = normalizedPath(path)
+        guard !normalizedCandidate.isEmpty,
+              normalizedCandidate != "/"
+        else {
+            return false
+        }
+        let rawComponents = normalizedCandidate.split(separator: "/")
+        guard !rawComponents.contains("."), !rawComponents.contains("..") else {
+            return false
+        }
+
+        let candidateURL = URL(fileURLWithPath: normalizedCandidate, isDirectory: false)
+        let leafName = candidateURL.lastPathComponent
+        guard !leafName.isEmpty, leafName != ".", leafName != "..", leafName != "/" else {
+            return false
+        }
+
+        let resolvedRoot = normalizedPath(rootURL.resolvingSymlinksInPath().standardizedFileURL.path)
+        let rootPrefix = resolvedRoot.hasSuffix("/") ? resolvedRoot : resolvedRoot + "/"
+        let resolvedParent = normalizedPath(
+            candidateURL.deletingLastPathComponent().resolvingSymlinksInPath().standardizedFileURL.path
+        )
+        guard resolvedParent == resolvedRoot || resolvedParent.hasPrefix(rootPrefix) else {
+            return false
+        }
+
+        let canonicalCandidate = resolvedParent == "/" ? "/\(leafName)" : "\(resolvedParent)/\(leafName)"
+        return canonicalCandidate != resolvedRoot && canonicalCandidate.hasPrefix(rootPrefix)
     }
 
     private static func isOwnedRealDirectory(at url: URL, uid: uid_t) -> Bool {
@@ -1788,10 +2118,10 @@ public final class AppUpdateManager: ObservableObject {
         idleInstallTask?.cancel()
         activeTask?.cancel()
         if let stagingDir = activeStagingDirURL {
-            try? FileManager.default.removeItem(at: stagingDir)
+            AppUpdateInstaller.removeOwnedStagingDirectoryIfPresent(at: stagingDir)
         }
         if let preparedStagingDir = preparedUpdate?.stagingDirURL {
-            try? FileManager.default.removeItem(at: preparedStagingDir)
+            AppUpdateInstaller.removeOwnedStagingDirectoryIfPresent(at: preparedStagingDir)
         }
     }
 
@@ -2033,7 +2363,7 @@ public final class AppUpdateManager: ObservableObject {
         activeTaskID = UUID()
 
         if let stagingDir = activeStagingDirURL {
-            try? FileManager.default.removeItem(at: stagingDir)
+            AppUpdateInstaller.removeOwnedStagingDirectoryIfPresent(at: stagingDir)
             activeStagingDirURL = nil
         }
 
@@ -2088,7 +2418,7 @@ public final class AppUpdateManager: ObservableObject {
 
     private func clearPreparedUpdate() {
         if let prepared = preparedUpdate {
-            try? FileManager.default.removeItem(at: prepared.stagingDirURL)
+            AppUpdateInstaller.removeOwnedStagingDirectoryIfPresent(at: prepared.stagingDirURL)
             preparedUpdate = nil
         }
     }
@@ -2269,7 +2599,7 @@ public final class AppUpdateManager: ObservableObject {
         var retainedStagingDir = false
         defer {
             if !retainedStagingDir, let stagingDirURL {
-                try? FileManager.default.removeItem(at: stagingDirURL)
+                AppUpdateInstaller.removeOwnedStagingDirectoryIfPresent(at: stagingDirURL)
             }
             if self.activeTaskID == taskID {
                 self.activeStagingDirURL = nil

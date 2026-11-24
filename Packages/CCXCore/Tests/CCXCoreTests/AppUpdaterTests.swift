@@ -212,7 +212,6 @@ final class AppUpdaterTests: XCTestCase {
             "https://objects.githubusercontent.com/github-production-release-asset-2e65be/test.zip",
             "https://release-assets.githubusercontent.com/assets/test.zip",
             "https://github-releases.githubusercontent.com/12345/test.zip",
-            "https://cdn-1.githubusercontent.com/asset.zip",
         ]
         for raw in allowed {
             XCTAssertTrue(AppUpdateURLPolicy.isAllowedDownloadURL(URL(string: raw)!), "Expected allowed: \(raw)")
@@ -221,6 +220,10 @@ final class AppUpdaterTests: XCTestCase {
         let rejected = [
             "http://github.com/lizhichaox/ccx/releases/latest",
             "http://objects.githubusercontent.com/test.zip",
+            "https://raw.githubusercontent.com/lizhichaox/ccx/main/README.md",
+            "https://gist.githubusercontent.com/attacker/12345/raw/evil.zip",
+            "https://user-images.githubusercontent.com/12345/evil.zip",
+            "https://cdn-1.githubusercontent.com/asset.zip",
             "https://evilgithub.com/lizhichaox/ccx/releases/latest",
             "https://github.com.evil.example/test.zip",
             "https://evilgithubusercontent.com/test.zip",
@@ -347,6 +350,25 @@ final class AppUpdaterTests: XCTestCase {
         ])
         XCTAssertThrowsError(try GitHubReleaseParser.parseLatestRelease(data: oversizedAsset, currentVersion: current)) { error in
             XCTAssertEqual(error as? AppUpdateError, .responseTooLarge)
+        }
+    }
+
+    func testReleaseParserRejectsSpoofedReleaseHTMLURL() throws {
+        let current = AppSemanticVersion(major: 0, minor: 4, patch: 4)
+        let spoofedURLs = [
+            "https://github.com/other/repo/releases/tag/v0.5.0",
+            "https://github.com/lizhichaox/ccx/issues/1",
+            "https://github.com/lizhichaox/ccx/releases/../../other/repo/releases/tag/v0.5.0",
+            "https://api.github.com/lizhichaox/ccx/releases/tag/v0.5.0",
+        ]
+        for htmlURL in spoofedURLs {
+            let data = try makeReleaseJSON(htmlURL: htmlURL)
+            XCTAssertThrowsError(
+                try GitHubReleaseParser.parseLatestRelease(data: data, currentVersion: current),
+                "Expected spoofed html_url to be rejected: \(htmlURL)"
+            ) { error in
+                XCTAssertEqual(error as? AppUpdateError, .untrustedURL)
+            }
         }
     }
 
@@ -1366,15 +1388,280 @@ final class AppUpdaterTests: XCTestCase {
         }
     }
 
+    // MARK: 10. ZIP Archive Pre-Inspection & Scoped Atomic Replace Hardening
+
+    private struct SyntheticZipEntry {
+        let name: String
+        let payload: Data
+        let uncompressedSize: UInt32
+        let compressedSize: UInt32
+        let versionMadeBy: UInt16
+        let externalAttributes: UInt32
+
+        init(
+            name: String,
+            payload: Data = Data(),
+            uncompressedSize: UInt32? = nil,
+            compressedSize: UInt32? = nil,
+            versionMadeBy: UInt16 = (3 << 8) | 20,
+            unixMode: UInt16 = UInt16(S_IFREG) | 0o644
+        ) {
+            self.name = name
+            self.payload = payload
+            self.uncompressedSize = uncompressedSize ?? UInt32(payload.count)
+            self.compressedSize = compressedSize ?? UInt32(payload.count)
+            self.versionMadeBy = versionMadeBy
+            self.externalAttributes = UInt32(unixMode) << 16
+        }
+    }
+
+    private func makeSyntheticZipData(entries: [SyntheticZipEntry]) -> Data {
+        var data = Data()
+        var centralDirectory = Data()
+
+        func appendUInt16LE(_ value: UInt16, to target: inout Data) {
+            target.append(UInt8(value & 0xFF))
+            target.append(UInt8((value >> 8) & 0xFF))
+        }
+
+        func appendUInt32LE(_ value: UInt32, to target: inout Data) {
+            target.append(UInt8(value & 0xFF))
+            target.append(UInt8((value >> 8) & 0xFF))
+            target.append(UInt8((value >> 16) & 0xFF))
+            target.append(UInt8((value >> 24) & 0xFF))
+        }
+
+        for entry in entries {
+            let nameBytes = Data(entry.name.utf8)
+            let localHeaderOffset = UInt32(data.count)
+
+            // Local File Header (30 bytes + name + payload)
+            appendUInt32LE(0x0403_4B50, to: &data)
+            appendUInt16LE(20, to: &data)
+            appendUInt16LE(0, to: &data)
+            appendUInt16LE(0, to: &data)
+            appendUInt16LE(0, to: &data)
+            appendUInt16LE(0, to: &data)
+            appendUInt32LE(0, to: &data)
+            appendUInt32LE(entry.compressedSize, to: &data)
+            appendUInt32LE(entry.uncompressedSize, to: &data)
+            appendUInt16LE(UInt16(nameBytes.count), to: &data)
+            appendUInt16LE(0, to: &data)
+            data.append(nameBytes)
+            data.append(entry.payload)
+
+            // Central Directory File Header (46 bytes + name)
+            appendUInt32LE(0x0201_4B50, to: &centralDirectory)
+            appendUInt16LE(entry.versionMadeBy, to: &centralDirectory)
+            appendUInt16LE(20, to: &centralDirectory)
+            appendUInt16LE(0, to: &centralDirectory)
+            appendUInt16LE(0, to: &centralDirectory)
+            appendUInt16LE(0, to: &centralDirectory)
+            appendUInt16LE(0, to: &centralDirectory)
+            appendUInt32LE(0, to: &centralDirectory)
+            appendUInt32LE(entry.compressedSize, to: &centralDirectory)
+            appendUInt32LE(entry.uncompressedSize, to: &centralDirectory)
+            appendUInt16LE(UInt16(nameBytes.count), to: &centralDirectory)
+            appendUInt16LE(0, to: &centralDirectory)
+            appendUInt16LE(0, to: &centralDirectory)
+            appendUInt16LE(0, to: &centralDirectory)
+            appendUInt16LE(0, to: &centralDirectory)
+            appendUInt32LE(entry.externalAttributes, to: &centralDirectory)
+            appendUInt32LE(localHeaderOffset, to: &centralDirectory)
+            centralDirectory.append(nameBytes)
+        }
+
+        let cdOffset = UInt32(data.count)
+        let cdSize = UInt32(centralDirectory.count)
+        data.append(centralDirectory)
+
+        let entryCount = UInt16(entries.count)
+        appendUInt32LE(0x0605_4B50, to: &data)
+        appendUInt16LE(0, to: &data)
+        appendUInt16LE(0, to: &data)
+        appendUInt16LE(entryCount, to: &data)
+        appendUInt16LE(entryCount, to: &data)
+        appendUInt32LE(cdSize, to: &data)
+        appendUInt32LE(cdOffset, to: &data)
+        appendUInt16LE(0, to: &data)
+
+        return data
+    }
+
+    func testArchiveValidatorAndExtractZipWithRealDittoBundle() throws {
+        let dir = try makeTempDirectory()
+        let sourceApp = dir.appendingPathComponent("CCX.app", isDirectory: true)
+        let macOSDir = sourceApp.appendingPathComponent("Contents/MacOS", isDirectory: true)
+        try FileManager.default.createDirectory(at: macOSDir, withIntermediateDirectories: true)
+        try Data("info-plist-content".utf8).write(
+            to: sourceApp.appendingPathComponent("Contents/Info.plist")
+        )
+        let execURL = macOSDir.appendingPathComponent("CCX")
+        try Data("#!/bin/sh\necho ccx\n".utf8).write(to: execURL)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: execURL.path)
+
+        let zipURL = dir.appendingPathComponent("CCX-0.9.0-macOS-universal.zip")
+        let ditto = Process()
+        ditto.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+        ditto.arguments = ["-c", "-k", "--keepParent", sourceApp.path, zipURL.path]
+        try ditto.run()
+        ditto.waitUntilExit()
+        XCTAssertEqual(ditto.terminationStatus, 0)
+
+        XCTAssertNoThrow(try AppUpdateArchiveValidator.validateZipArchive(at: zipURL))
+
+        let extractDir = dir.appendingPathComponent("extracted", isDirectory: true)
+        try FileManager.default.createDirectory(at: extractDir, withIntermediateDirectories: true)
+        let extractedApp = try AppUpdateInstaller.extractZip(at: zipURL, to: extractDir)
+        XCTAssertEqual(extractedApp.lastPathComponent, "CCX.app")
+        XCTAssertEqual(
+            try Data(contentsOf: extractedApp.appendingPathComponent("Contents/Info.plist")),
+            Data("info-plist-content".utf8)
+        )
+    }
+
+    func testArchiveValidatorRejectsZipBombTraversalSymlinkSetuidAndUnexpectedRoot() throws {
+        let dir = try makeTempDirectory()
+        let extractDir = dir.appendingPathComponent("extract-target", isDirectory: true)
+        try FileManager.default.createDirectory(at: extractDir, withIntermediateDirectories: true)
+
+        // Baseline valid synthetic archive (including __MACOSX/CCX.app/ metadata) passes validation.
+        let validZip = dir.appendingPathComponent("valid.zip")
+        try makeSyntheticZipData(entries: [
+            SyntheticZipEntry(name: "CCX.app/", unixMode: UInt16(S_IFDIR) | 0o755),
+            SyntheticZipEntry(name: "CCX.app/Contents/Info.plist", payload: Data("ok".utf8)),
+            SyntheticZipEntry(name: "__MACOSX/CCX.app/._Info.plist", payload: Data("md".utf8)),
+        ]).write(to: validZip)
+        XCTAssertNoThrow(try AppUpdateArchiveValidator.validateZipArchive(at: validZip))
+
+        // 1. Synthetic ZIP bomb (> 250 MB declared uncompressed) -> .responseTooLarge
+        let bombZip = dir.appendingPathComponent("bomb.zip")
+        let overLimitSize = UInt32(AppUpdateArchiveValidator.maxExtractedBytes + 1)
+        try makeSyntheticZipData(entries: [
+            SyntheticZipEntry(
+                name: "CCX.app/Contents/MacOS/CCX",
+                payload: Data("tiny".utf8),
+                uncompressedSize: overLimitSize,
+                compressedSize: 4
+            ),
+        ]).write(to: bombZip)
+        XCTAssertThrowsError(try AppUpdateArchiveValidator.validateZipArchive(at: bombZip)) { error in
+            XCTAssertEqual(error as? AppUpdateError, .responseTooLarge)
+        }
+        XCTAssertThrowsError(try AppUpdateInstaller.extractZip(at: bombZip, to: extractDir)) { error in
+            XCTAssertEqual(error as? AppUpdateError, .responseTooLarge)
+        }
+
+        // 2. Path traversal entry (../escape.txt and CCX.app/Contents/../escape.txt) -> .extractionFailed
+        let traversalZip = dir.appendingPathComponent("traversal.zip")
+        try makeSyntheticZipData(entries: [
+            SyntheticZipEntry(name: "CCX.app/", unixMode: UInt16(S_IFDIR) | 0o755),
+            SyntheticZipEntry(name: "../escape.txt", payload: Data("pwn".utf8)),
+        ]).write(to: traversalZip)
+        XCTAssertThrowsError(try AppUpdateArchiveValidator.validateZipArchive(at: traversalZip)) { error in
+            XCTAssertEqual(error as? AppUpdateError, .extractionFailed)
+        }
+        XCTAssertThrowsError(try AppUpdateInstaller.extractZip(at: traversalZip, to: extractDir)) { error in
+            XCTAssertEqual(error as? AppUpdateError, .extractionFailed)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: dir.appendingPathComponent("escape.txt").path))
+
+        let nestedTraversalZip = dir.appendingPathComponent("nested-traversal.zip")
+        try makeSyntheticZipData(entries: [
+            SyntheticZipEntry(name: "CCX.app/Contents/../escape.txt", payload: Data("pwn".utf8)),
+        ]).write(to: nestedTraversalZip)
+        XCTAssertThrowsError(try AppUpdateArchiveValidator.validateZipArchive(at: nestedTraversalZip)) { error in
+            XCTAssertEqual(error as? AppUpdateError, .extractionFailed)
+        }
+
+        // 3. Unix symlink (S_IFLNK) entry -> .extractionFailed
+        let symlinkEntryZip = dir.appendingPathComponent("symlink-entry.zip")
+        try makeSyntheticZipData(entries: [
+            SyntheticZipEntry(name: "CCX.app/", unixMode: UInt16(S_IFDIR) | 0o755),
+            SyntheticZipEntry(
+                name: "CCX.app/Contents/EvilLink",
+                payload: Data("/etc/passwd".utf8),
+                unixMode: UInt16(S_IFLNK) | 0o777
+            ),
+        ]).write(to: symlinkEntryZip)
+        XCTAssertThrowsError(try AppUpdateArchiveValidator.validateZipArchive(at: symlinkEntryZip)) { error in
+            XCTAssertEqual(error as? AppUpdateError, .extractionFailed)
+        }
+        XCTAssertThrowsError(try AppUpdateInstaller.extractZip(at: symlinkEntryZip, to: extractDir)) { error in
+            XCTAssertEqual(error as? AppUpdateError, .extractionFailed)
+        }
+
+        // 4. Special file (FIFO) and setuid bit -> .extractionFailed
+        let fifoZip = dir.appendingPathComponent("fifo.zip")
+        try makeSyntheticZipData(entries: [
+            SyntheticZipEntry(name: "CCX.app/Contents/pipe", unixMode: UInt16(S_IFIFO) | 0o600),
+        ]).write(to: fifoZip)
+        XCTAssertThrowsError(try AppUpdateArchiveValidator.validateZipArchive(at: fifoZip)) { error in
+            XCTAssertEqual(error as? AppUpdateError, .extractionFailed)
+        }
+
+        let setuidZip = dir.appendingPathComponent("setuid.zip")
+        try makeSyntheticZipData(entries: [
+            SyntheticZipEntry(name: "CCX.app/Contents/MacOS/CCX", unixMode: UInt16(S_IFREG) | 0o4755),
+        ]).write(to: setuidZip)
+        XCTAssertThrowsError(try AppUpdateArchiveValidator.validateZipArchive(at: setuidZip)) { error in
+            XCTAssertEqual(error as? AppUpdateError, .extractionFailed)
+        }
+
+        // 5. Unexpected root (Evil.app/Info.plist) -> .extractionFailed
+        let unexpectedRootZip = dir.appendingPathComponent("evil-root.zip")
+        try makeSyntheticZipData(entries: [
+            SyntheticZipEntry(name: "Evil.app/Info.plist", payload: Data("evil".utf8)),
+        ]).write(to: unexpectedRootZip)
+        XCTAssertThrowsError(try AppUpdateArchiveValidator.validateZipArchive(at: unexpectedRootZip)) { error in
+            XCTAssertEqual(error as? AppUpdateError, .extractionFailed)
+        }
+        XCTAssertThrowsError(try AppUpdateInstaller.extractZip(at: unexpectedRootZip, to: extractDir)) { error in
+            XCTAssertEqual(error as? AppUpdateError, .extractionFailed)
+        }
+
+        // 6. Missing CCX.app/ entry (only __MACOSX metadata) -> .extractionFailed
+        let macosxOnlyZip = dir.appendingPathComponent("macosx-only.zip")
+        try makeSyntheticZipData(entries: [
+            SyntheticZipEntry(name: "__MACOSX/CCX.app/._Info.plist", payload: Data("md".utf8)),
+        ]).write(to: macosxOnlyZip)
+        XCTAssertThrowsError(try AppUpdateArchiveValidator.validateZipArchive(at: macosxOnlyZip)) { error in
+            XCTAssertEqual(error as? AppUpdateError, .extractionFailed)
+        }
+
+        // 7. ZIP64 sentinel & entry count limit -> .extractionFailed
+        let zip64SentinelZip = dir.appendingPathComponent("zip64.zip")
+        try makeSyntheticZipData(entries: [
+            SyntheticZipEntry(
+                name: "CCX.app/Contents/Info.plist",
+                payload: Data("x".utf8),
+                uncompressedSize: 0xFFFF_FFFF,
+                compressedSize: 1
+            ),
+        ]).write(to: zip64SentinelZip)
+        XCTAssertThrowsError(try AppUpdateArchiveValidator.validateZipArchive(at: zip64SentinelZip)) { error in
+            XCTAssertEqual(error as? AppUpdateError, .extractionFailed)
+        }
+
+        let tooManyEntriesZip = dir.appendingPathComponent("too-many.zip")
+        let entries = (0...AppUpdateArchiveValidator.maxZipEntries).map { idx in
+            SyntheticZipEntry(name: "CCX.app/Contents/Resources/f\(idx).txt", payload: Data())
+        }
+        try makeSyntheticZipData(entries: entries).write(to: tooManyEntriesZip)
+        XCTAssertThrowsError(try AppUpdateArchiveValidator.validateZipArchive(at: tooManyEntriesZip)) { error in
+            XCTAssertEqual(error as? AppUpdateError, .extractionFailed)
+        }
+    }
+
     func testLaunchAtomicReplaceWithoutRelaunchSwapsBundlesCleanly() async throws {
         let dir = try makeTempDirectory()
         let targetApp = dir.appendingPathComponent("CCX.app", isDirectory: true)
         let stagedApp = dir.appendingPathComponent(".CCX-update-test.app", isDirectory: true)
-        let cleanupDir = dir.appendingPathComponent("cleanup-staging", isDirectory: true)
+        let cleanupDir = try AppUpdateInstaller.createPrivateStagingDirectory()
+        defer { AppUpdateInstaller.removeOwnedStagingDirectoryIfPresent(at: cleanupDir) }
 
         try FileManager.default.createDirectory(at: targetApp, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: stagedApp, withIntermediateDirectories: true)
-        try FileManager.default.createDirectory(at: cleanupDir, withIntermediateDirectories: true)
         try Data("v0.7.0".utf8).write(to: targetApp.appendingPathComponent("version.txt"))
         try Data("v0.8.0".utf8).write(to: stagedApp.appendingPathComponent("version.txt"))
 
@@ -1404,6 +1691,131 @@ final class AppUpdaterTests: XCTestCase {
             try await Task.sleep(for: .milliseconds(50))
         }
         XCTFail("Expected atomic swap with relaunch: false to replace target and clean up staging dir")
+    }
+
+    func testLaunchAtomicReplaceRejectsUnscopedPathsAndSymlinks() throws {
+        let dir = try makeTempDirectory()
+        let otherDir = try makeTempDirectory()
+        let targetApp = dir.appendingPathComponent("CCX.app", isDirectory: true)
+        let validStagedApp = dir.appendingPathComponent(".CCX-update-valid.app", isDirectory: true)
+        let validCleanupDir = try AppUpdateInstaller.createPrivateStagingDirectory()
+        defer { AppUpdateInstaller.removeOwnedStagingDirectoryIfPresent(at: validCleanupDir) }
+
+        try FileManager.default.createDirectory(at: targetApp, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: validStagedApp, withIntermediateDirectories: true)
+
+        // 1. cleanupDirectoryURL outside updatesRootDirectoryURL()
+        let outsideCleanupDir = dir.appendingPathComponent("outside-cleanup", isDirectory: true)
+        try FileManager.default.createDirectory(at: outsideCleanupDir, withIntermediateDirectories: true)
+        let sentinel = outsideCleanupDir.appendingPathComponent("keep.txt")
+        try Data("keep".utf8).write(to: sentinel)
+
+        XCTAssertThrowsError(
+            try AppUpdateInstaller.launchAtomicReplaceAndRelaunch(
+                stagedSiblingAppURL: validStagedApp,
+                targetAppURL: targetApp,
+                cleanupDirectoryURL: outsideCleanupDir,
+                currentPID: ProcessInfo.processInfo.processIdentifier,
+                relaunch: false
+            )
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: sentinel.path))
+
+        // 2. cleanupDirectoryURL equal to updatesRootDirectoryURL() itself
+        XCTAssertThrowsError(
+            try AppUpdateInstaller.launchAtomicReplaceAndRelaunch(
+                stagedSiblingAppURL: validStagedApp,
+                targetAppURL: targetApp,
+                cleanupDirectoryURL: AppUpdateInstaller.updatesRootDirectoryURL(),
+                currentPID: ProcessInfo.processInfo.processIdentifier,
+                relaunch: false
+            )
+        )
+
+        // 3. stagedSiblingAppURL without .CCX-update- prefix
+        let badPrefixStaged = dir.appendingPathComponent("NotPrefixed.app", isDirectory: true)
+        try FileManager.default.createDirectory(at: badPrefixStaged, withIntermediateDirectories: true)
+        XCTAssertThrowsError(
+            try AppUpdateInstaller.launchAtomicReplaceAndRelaunch(
+                stagedSiblingAppURL: badPrefixStaged,
+                targetAppURL: targetApp,
+                cleanupDirectoryURL: validCleanupDir,
+                currentPID: ProcessInfo.processInfo.processIdentifier,
+                relaunch: false
+            )
+        )
+
+        // 4. stagedSiblingAppURL in a different parent directory
+        let differentParentStaged = otherDir.appendingPathComponent(".CCX-update-other.app", isDirectory: true)
+        try FileManager.default.createDirectory(at: differentParentStaged, withIntermediateDirectories: true)
+        XCTAssertThrowsError(
+            try AppUpdateInstaller.launchAtomicReplaceAndRelaunch(
+                stagedSiblingAppURL: differentParentStaged,
+                targetAppURL: targetApp,
+                cleanupDirectoryURL: validCleanupDir,
+                currentPID: ProcessInfo.processInfo.processIdentifier,
+                relaunch: false
+            )
+        )
+
+        // 5. Symlinked stagedSiblingAppURL
+        let symlinkStaged = dir.appendingPathComponent(".CCX-update-symlink.app")
+        try FileManager.default.createSymbolicLink(at: symlinkStaged, withDestinationURL: validStagedApp)
+        XCTAssertThrowsError(
+            try AppUpdateInstaller.launchAtomicReplaceAndRelaunch(
+                stagedSiblingAppURL: symlinkStaged,
+                targetAppURL: targetApp,
+                cleanupDirectoryURL: validCleanupDir,
+                currentPID: ProcessInfo.processInfo.processIdentifier,
+                relaunch: false
+            )
+        )
+
+        // 6. Symlinked cleanupDirectoryURL inside updatesRootDirectoryURL()
+        let symlinkCleanup = AppUpdateInstaller.updatesRootDirectoryURL()
+            .appendingPathComponent("update-symlink-\(UUID().uuidString)")
+        try FileManager.default.createSymbolicLink(at: symlinkCleanup, withDestinationURL: outsideCleanupDir)
+        defer { AppUpdateInstaller.removeOwnedStagingDirectoryIfPresent(at: symlinkCleanup) }
+        XCTAssertThrowsError(
+            try AppUpdateInstaller.launchAtomicReplaceAndRelaunch(
+                stagedSiblingAppURL: validStagedApp,
+                targetAppURL: targetApp,
+                cleanupDirectoryURL: symlinkCleanup,
+                currentPID: ProcessInfo.processInfo.processIdentifier,
+                relaunch: false
+            )
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: sentinel.path))
+    }
+
+    func testRemoveOwnedStagingDirectoryScopesToUpdatesRootAndUnlinksSymlinks() throws {
+        // 1. Owned real staging directory inside updatesRoot is removed.
+        let stagingDir = try AppUpdateInstaller.createPrivateStagingDirectory()
+        XCTAssertTrue(FileManager.default.fileExists(atPath: stagingDir.path))
+        AppUpdateInstaller.removeOwnedStagingDirectoryIfPresent(at: stagingDir)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: stagingDir.path))
+
+        // 2. Directory outside updatesRoot is NOT touched.
+        let outsideDir = try makeTempDirectory()
+        let outsideSentinel = outsideDir.appendingPathComponent("sentinel.txt")
+        try Data("do-not-delete".utf8).write(to: outsideSentinel)
+        AppUpdateInstaller.removeOwnedStagingDirectoryIfPresent(at: outsideDir)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: outsideSentinel.path))
+
+        // 3. Symlink inside updatesRoot pointing outside is unlinked without touching target.
+        let rootURL = AppUpdateInstaller.updatesRootDirectoryURL()
+        let symlinkEntry = rootURL.appendingPathComponent("symlink-staging-\(UUID().uuidString)")
+        try FileManager.default.createSymbolicLink(at: symlinkEntry, withDestinationURL: outsideDir)
+        defer { _ = Darwin.unlink(symlinkEntry.path) }
+
+        AppUpdateInstaller.removeOwnedStagingDirectoryIfPresent(at: symlinkEntry)
+        var st = stat()
+        XCTAssertNotEqual(Darwin.lstat(symlinkEntry.path, &st), 0)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: outsideSentinel.path))
+
+        // 4. updatesRoot itself is NOT deleted.
+        AppUpdateInstaller.removeOwnedStagingDirectoryIfPresent(at: rootURL)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: rootURL.path))
     }
 
     @MainActor

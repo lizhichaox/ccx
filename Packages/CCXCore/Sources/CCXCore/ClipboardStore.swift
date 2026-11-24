@@ -654,8 +654,20 @@ public final class ClipboardStore {
         encode(image, type: .png, scale: scale)
     }
 
-    /// Atomically writes pre-encoded PNG data to `url`, preserving any existing file if writing fails.
+    /// Atomically writes pre-encoded PNG data to `url`, refusing symlink destinations and preserving
+    /// any existing file if writing fails.
     public nonisolated static func writePNGDataAtomically(_ data: Data, to url: URL) throws {
+        guard url.isFileURL else {
+            throw ClipboardStoreError.writeFailed
+        }
+        var path = url.path
+        while path.count > 1 && path.hasSuffix("/") {
+            path.removeLast()
+        }
+        var st = stat()
+        if Darwin.lstat(path, &st) == 0, (st.st_mode & S_IFMT) == S_IFLNK {
+            throw ClipboardStoreError.writeFailed
+        }
         do {
             try data.write(to: url, options: .atomic)
         } catch {

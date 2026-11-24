@@ -906,6 +906,40 @@ final class ClipboardStoreTests: XCTestCase {
         XCTAssertThrowsError(try store.savePNG(img, to: invalidSubPath))
         XCTAssertEqual(try Data(contentsOf: targetURL), sentinel)
     }
+
+    func testWritePNGDataAtomicallyRejectsSymlinkDestinationWithoutModifyingTarget() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ccx-atomic-symlink-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let targetURL = dir.appendingPathComponent("victim.txt")
+        let sentinel = Data("untouched-target-content".utf8)
+        try sentinel.write(to: targetURL)
+
+        let symlinkURL = dir.appendingPathComponent("export.png")
+        try FileManager.default.createSymbolicLink(at: symlinkURL, withDestinationURL: targetURL)
+
+        let img = makeTestImage(width: 4, height: 4) { _, _ in (200, 100, 50, 255) }
+        let pngData = try XCTUnwrap(ClipboardStore.encodePNG(img, scale: 1))
+
+        XCTAssertThrowsError(try ClipboardStore.writePNGDataAtomically(pngData, to: symlinkURL)) { error in
+            XCTAssertEqual(error as? ClipboardStoreError, .writeFailed)
+        }
+        XCTAssertEqual(try Data(contentsOf: targetURL), sentinel)
+
+        // Trailing slash on symlink path must also be inspected via lstat and rejected.
+        let symlinkWithTrailingSlash = URL(fileURLWithPath: symlinkURL.path + "/", isDirectory: true)
+        XCTAssertThrowsError(try ClipboardStore.writePNGDataAtomically(pngData, to: symlinkWithTrailingSlash)) { error in
+            XCTAssertEqual(error as? ClipboardStoreError, .writeFailed)
+        }
+        XCTAssertEqual(try Data(contentsOf: targetURL), sentinel)
+
+        // Verify the symlink itself was not replaced by a regular file.
+        var st = stat()
+        XCTAssertEqual(Darwin.lstat(symlinkURL.path, &st), 0)
+        XCTAssertEqual(st.st_mode & S_IFMT, S_IFLNK)
+    }
 }
 
 final class TextRecognizerTests: XCTestCase {
