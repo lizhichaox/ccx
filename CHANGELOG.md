@@ -2,6 +2,14 @@
 
 All notable changes to **CCX (Control · Command · X)** are documented in this file.
 
+## [0.6.0] - 2026-11-24
+
+### Added
+- **Customizable Global Snip Shortcut with Conflict Detection**: Click the **Snip Shortcut** keycaps in **Settings** to record any custom global shortcut (`UserDefaults`-persisted with one-click reset to `⌃⌘X` and live sync across **Settings**, the **Menu Bar Popover**, and the **Setup Guide**). Includes comprehensive validation and inline conflict prompts covering shortcut structure, reserved macOS/app shortcuts, active macOS system shortcuts via Carbon `CopySymbolicHotKeys`, internal duplicates, and live `kEventHotKeyExclusive` conflict detection against other running apps while preserving your previous working binding on conflict.
+
+### Improved
+- **Two-Card Settings Layout**: Reorganized the **Settings** window into two clean Liquid Glass cards — **Preferences** grouped cleanly by control type (**Updates**, **Launch at Login**, **Recordings**, and **Snip Shortcut**) and **Permissions** (**Screen Recording**, **Accessibility**, and **Microphone**) — so toggles align cleanly and shortcut recording or conflict hints expand smoothly without shifting neighboring controls.
+
 ## [0.5.0] - 2026-11-24
 
 ### Added

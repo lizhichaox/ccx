@@ -11,7 +11,7 @@
 ## Core Features
 
 ### 1. Capture (Smart Snip, Scroll Capture & Annotations)
-- **Instant Smart Auto-Detection (`⌃⌘X`)**: Freezes all displays via ScreenCaptureKit and automatically highlights windows and UI elements with non-blocking Accessibility queries.
+- **Instant Smart Auto-Detection (`⌃⌘X`, customizable in Settings)**: Freezes all displays via ScreenCaptureKit and automatically highlights windows and UI elements with non-blocking Accessibility queries. Customize your global Snip shortcut anytime in **Settings** with real-time macOS system, reserved-shortcut, and running-app conflict detection plus one-click reset.
 - **GPU Pixel Magnifier & Color Picker**: 120Hz GPU-composited pixel loupe with Retina HiDPI / Display P3 support and one-key color copy (`HEX`, `RGB`, `HSL`).
 - **Non-Destructive Annotations**: Rectangle, ellipse, arrow, freehand pen, highlighter, inline text, auto-incrementing step counters, and live GPU mosaic/blur with continuous stroke sizing and undo/redo.
 - **Scrolling Capture (`L`)**: Captures tall pages and documents with live preview, sticky header/sidebar detection, manual or auto-scroll, and memory-bounded stitching.
@@ -32,7 +32,7 @@
 
 ## Installation
 
-1. Download the latest `CCX-0.5.0-macOS-universal.dmg` (or `.zip`).
+1. Download the latest `CCX-0.6.0-macOS-universal.dmg` (or `.zip`).
 2. Open the disk image and drag **CCX.app** into **Applications**.
 3. Launch **CCX** from `/Applications` or Spotlight.
 
@@ -66,7 +66,7 @@ CCX requests only the macOS permissions required for its three core features:
 ### Global & Menu Bar
 | Shortcut | Action |
 | --- | --- |
-| `⌃⌘X` | Start Smart Snip |
+| `⌃⌘X` | Start Smart Snip (customizable in **Settings → Snip Shortcut** with conflict detection) |
 | Click menu bar icon | Open / close CCX popover (left or right click) |
 | `⌘,` | Open Settings (when popover is open) |
 | `Esc` / `⌘W` | Dismiss popover, Settings, or Setup Guide |
@@ -153,7 +153,7 @@ done
 ### Public Release Packaging (Universal Binary + Hardened Runtime)
 ```bash
 # Bump version in project.yml when preparing a release:
-./scripts/bump-version.sh 0.5.0
+./scripts/bump-version.sh 0.6.0
 
 # Build signed Universal Binary (arm64 + x86_64), verify dylibs/codesign/entitlements,
 # and emit dist/CCX-<version>-macOS-universal.{dmg,zip} + dist/SHA256SUMS.txt:
