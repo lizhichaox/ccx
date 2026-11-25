@@ -2,6 +2,15 @@
 
 All notable changes to **CCX (Control · Command · X)** are documented in this file.
 
+## [0.8.3] - 2026-11-25
+
+### Fixed
+- **Menu Bar Popover Liquid Glass Corner & Shadow Clipping (`App`)**: Removed `.fullSizeContentView` from the borderless `MenuBarPanel`, clipped `NSHostingView`'s backing layer to a continuous `16pt` corner radius (`masksToBounds = true`), unified `ccxPopoverSurface` on `RoundedRectangle(cornerRadius:style: .continuous)` with `.clipShape`, and removed the redundant macOS 26+ border stroke so Liquid Glass backdrop layers no longer leak alpha into square window corners or produce rectangular WindowServer shadow edges.
+- **Floating HUD `NSGlassEffectView` Continuous Corner Clipping (`CCXAnnotate`, `CCXCapture`, `CCXRecord`)**: Hardened floating Liquid Glass HUD surfaces across `AnnotationActionToolbar` (`12pt` primary / `10pt` style), `ScrollCaptureHUDPanel` (`14pt`), and `RecordingControlPanel` (`14pt`) by explicitly clipping each `NSGlassEffectView` backing layer (`wantsLayer`, continuous `cornerRadius`, `masksToBounds = true`), aligned macOS 15 `NSVisualEffectView` fallbacks on `.continuous` corner curves, and added unit tests verifying rounded-corner clipping across all floating HUD panels.
+
+### Improved
+- **Annotation Toolbar Brush & Locale-Independent Text Input Icons (`CCXAnnotate`)**: Replaced the pen nib icon (`pencil.tip`) with a clearer artist brush silhouette (`paintbrush.pointed`), replaced the locale-dependent `textformat` symbol (which rendered Chinese `格式` glyphs under `zh-Hans`) with a custom locale-independent vector template `NSImage` (`T` + I-beam insertion cursor, fallback symbol `t.square`), unified hover/selection pill sizing across all toolbar buttons (`alignmentRectInsets = NSEdgeInsetsZero`), and added unit tests verifying byte-identical `en` and `zh-Hans` icon rendering across `.snip` and `.pin` toolbars.
+
 ## [0.8.2] - 2026-11-24
 
 ### Security
