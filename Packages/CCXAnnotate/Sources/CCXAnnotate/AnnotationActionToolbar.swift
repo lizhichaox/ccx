@@ -83,6 +83,7 @@ public final class AnnotationActionToolbar: NSView {
     private let sizeSlider = StrokeSizeSlider()
     public var sizeSliderView: NSView { sizeSlider }
     internal var sizeSliderToolTip: String? { sizeSlider.toolTip }
+    internal func toolButtonImage(for tool: AnnotationTool) -> NSImage? { toolButtons[tool]?.image }
 
     public var primarySurfaceBounds: CGRect { primarySurface.bounds }
     public var primaryControlFrames: [CGRect] {
@@ -343,7 +344,7 @@ public final class AnnotationActionToolbar: NSView {
 
         for tool in AnnotationTool.drawingTools {
             let tip = tool.shortcutHint.map { "\(tool.displayName) (\($0))" } ?? tool.displayName
-            let button = ToolToggleButton(tool: tool, symbol: tool.symbolName, tooltip: tip)
+            let button = ToolToggleButton(tool: tool, tooltip: tip)
             button.target = self
             button.action = #selector(toolPressed(_:))
             toolButtons[tool] = button
@@ -622,6 +623,9 @@ private class HoverButton: NSButton {
     private var hoverArea: NSTrackingArea?
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    // Keep button frames exact (30x30) regardless of SF Symbol vs custom image alignment insets
+    // so selection/hover pills stay uniformly sized across all toolbar tools.
+    override var alignmentRectInsets: NSEdgeInsets { NSEdgeInsetsZero }
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
@@ -656,12 +660,10 @@ private final class ToolToggleButton: HoverButton {
         }
     }
 
-    init(tool: AnnotationTool, symbol: String, tooltip: String) {
+    init(tool: AnnotationTool, tooltip: String) {
         self.tool = tool
         super.init(frame: .zero)
-        let config = NSImage.SymbolConfiguration(pointSize: 13, weight: .medium)
-        let rawImage = NSImage(systemSymbolName: symbol, accessibilityDescription: tooltip)
-        self.image = rawImage?.withSymbolConfiguration(config) ?? rawImage ?? NSImage()
+        self.image = tool.toolbarIconImage(accessibilityDescription: tooltip)
         self.imageScaling = .scaleNone
         isBordered = false
         bezelStyle = .regularSquare

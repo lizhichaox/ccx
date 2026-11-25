@@ -32,12 +32,69 @@ public enum AnnotationTool: String, CaseIterable, Sendable {
         case .rectangle: "rectangle"
         case .ellipse: "circle"
         case .arrow: "arrow.up.right"
-        case .pen: "pencil.tip"
+        case .pen: "paintbrush.pointed"
         case .highlighter: "highlighter"
         case .mosaic: "checkerboard.rectangle"
-        case .text: "textformat"
+        case .text: "t.square"
         case .counter: "number.circle"
         }
+    }
+
+    /// Returns the crisp template icon rendered in the floating annotation toolbar.
+    ///
+    /// `.text` uses a custom locale-independent vector glyph (`T` + I-beam insertion
+    /// cursor) rather than Apple's `"textformat"` / `"text.cursor"` SF Symbols, which
+    /// localize into Chinese characters under `zh-Hans`.
+    public func toolbarIconImage(accessibilityDescription: String? = nil) -> NSImage {
+        switch self {
+        case .text:
+            return Self.makeTextInputIcon(accessibilityDescription: accessibilityDescription)
+        default:
+            let config = NSImage.SymbolConfiguration(pointSize: 13, weight: .medium)
+            let raw = NSImage(systemSymbolName: symbolName, accessibilityDescription: accessibilityDescription)
+            let configured = raw?.withSymbolConfiguration(config) ?? raw ?? NSImage()
+            configured.isTemplate = true
+            return configured
+        }
+    }
+
+    private static func makeTextInputIcon(accessibilityDescription: String?) -> NSImage {
+        let image = NSImage(size: NSSize(width: 18, height: 16), flipped: false) { _ in
+            NSColor.black.setStroke()
+
+            // Typographic "T" on the left (x: 2.25...10.25, y: 3.25...12.5).
+            let letter = NSBezierPath()
+            letter.lineWidth = 1.45
+            letter.lineCapStyle = .round
+            letter.lineJoinStyle = .round
+            letter.move(to: NSPoint(x: 2.25, y: 11.35))
+            letter.line(to: NSPoint(x: 2.25, y: 12.5))
+            letter.line(to: NSPoint(x: 10.25, y: 12.5))
+            letter.line(to: NSPoint(x: 10.25, y: 11.35))
+            letter.move(to: NSPoint(x: 6.25, y: 12.5))
+            letter.line(to: NSPoint(x: 6.25, y: 3.25))
+            letter.move(to: NSPoint(x: 4.5, y: 3.25))
+            letter.line(to: NSPoint(x: 8.0, y: 3.25))
+            letter.stroke()
+
+            // Vertical I-beam text-insertion cursor on the right (x: 14.25, y: 2.0...14.0).
+            let cursor = NSBezierPath()
+            cursor.lineWidth = 1.25
+            cursor.lineCapStyle = .round
+            cursor.lineJoinStyle = .round
+            cursor.move(to: NSPoint(x: 14.25, y: 2.0))
+            cursor.line(to: NSPoint(x: 14.25, y: 14.0))
+            cursor.move(to: NSPoint(x: 12.5, y: 14.0))
+            cursor.line(to: NSPoint(x: 16.0, y: 14.0))
+            cursor.move(to: NSPoint(x: 12.5, y: 2.0))
+            cursor.line(to: NSPoint(x: 16.0, y: 2.0))
+            cursor.stroke()
+
+            return true
+        }
+        image.isTemplate = true
+        image.accessibilityDescription = accessibilityDescription
+        return image
     }
 
     public var displayName: String {

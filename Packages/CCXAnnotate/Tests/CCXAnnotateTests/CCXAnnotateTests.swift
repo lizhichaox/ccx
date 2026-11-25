@@ -734,4 +734,84 @@ struct CCXAnnotateTests {
             }
         }
     }
+
+    private func alphaHistogramAndDigest(of image: NSImage) throws -> (nonZeroPixels: Int, digest: UInt64) {
+        let width = 60
+        let height = 60
+        var rgba = [UInt8](repeating: 0, count: width * height * 4)
+        let ctx = try #require(CGContext(
+            data: &rgba,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: width * 4,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ))
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: ctx, flipped: false)
+        ctx.scaleBy(x: 2, y: 2)
+        let drawRect = CGRect(
+            x: (30 - image.size.width) / 2,
+            y: (30 - image.size.height) / 2,
+            width: image.size.width,
+            height: image.size.height
+        )
+        image.draw(in: drawRect)
+        NSGraphicsContext.restoreGraphicsState()
+
+        var nonZero = 0
+        var fnv: UInt64 = 14_695_981_039_346_656_037
+        for i in stride(from: 3, to: rgba.count, by: 4) {
+            let alpha = rgba[i]
+            if alpha > 20 { nonZero += 1 }
+            fnv ^= UInt64(alpha)
+            fnv = fnv &* 1_099_511_628_211
+        }
+        return (nonZero, fnv)
+    }
+
+    @Test func penAndTextIconsAreTemplateNonEmptyAndLocaleIndependentAcrossToolbar() throws {
+        // Brush uses an unmistakable non-localized paintbrush SF Symbol; text avoids localized SF Symbols.
+        #expect(AnnotationTool.pen.symbolName == "paintbrush.pointed")
+        #expect(AnnotationTool.text.symbolName != "textformat")
+        #expect(AnnotationTool.text.symbolName != "text.cursor")
+        #expect(AnnotationTool.text.symbolName != "character.cursor.ibeam")
+        #expect(AnnotationTool.text.symbolName != "character.textbox")
+
+        for tool in [AnnotationTool.pen, .text] {
+            let icon = tool.toolbarIconImage(accessibilityDescription: tool.displayName)
+            #expect(icon.isTemplate)
+            #expect(icon.size.width > 0 && icon.size.height > 0)
+            let rendered = try alphaHistogramAndDigest(of: icon)
+            #expect(rendered.nonZeroPixels > 20)
+        }
+
+        // Every button icon in both toolbar presets must render non-empty template ink
+        // identically in `en` and `zh-Hans` (no localized Chinese characters in the toolbar).
+        let enLocale = Locale(identifier: "en")
+        let zhLocale = Locale(identifier: "zh-Hans")
+        for preset in [AnnotationToolbarPreset.snip, .pin] {
+            let toolbar = AnnotationActionToolbar(preset: preset)
+            toolbar.layoutSubtreeIfNeeded()
+            for tool in AnnotationTool.drawingTools {
+                let buttonImage = try #require(toolbar.toolButtonImage(for: tool))
+                #expect(buttonImage.isTemplate)
+                #expect(buttonImage.size.width > 0 && buttonImage.size.height > 0)
+            }
+
+            let buttons = toolbar.primaryStack.arrangedSubviews.compactMap { $0 as? NSButton }
+            #expect(!buttons.isEmpty)
+            for button in buttons {
+                #expect(button.frame.height == 30)
+                let image = try #require(button.image)
+                #expect(image.isTemplate)
+                #expect(image.size.width > 0 && image.size.height > 0)
+                let enRendered = try alphaHistogramAndDigest(of: image.withLocale(enLocale))
+                let zhRendered = try alphaHistogramAndDigest(of: image.withLocale(zhLocale))
+                #expect(enRendered.nonZeroPixels > 10)
+                #expect(enRendered.digest == zhRendered.digest)
+            }
+        }
+    }
 }
