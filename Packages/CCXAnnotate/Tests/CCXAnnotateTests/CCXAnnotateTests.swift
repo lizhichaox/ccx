@@ -898,6 +898,95 @@ struct CCXAnnotateTests {
         return try #require(ctx.makeImage())
     }
 
+    @Test func vectorAnnotationsPaintOnTransparentCanvasesAndTranslucentChrome() throws {
+        let bounds = CGRect(x: 0, y: 0, width: 120, height: 80)
+        let padded = try makeRoundedImage(
+            width: 120, height: 80,
+            topLeftRadius: 0, topRightRadius: 0, bottomLeftRadius: 0, bottomRightRadius: 0
+        ) { context in
+            context.setFillColor(red: 0, green: 0, blue: 1, alpha: 1)
+            context.fill(bounds.insetBy(dx: 30, dy: 20))
+        }
+        let translucent = try makeRoundedImage(
+            width: 120, height: 80,
+            topLeftRadius: 20, topRightRadius: 20, bottomLeftRadius: 20, bottomRightRadius: 20
+        ) { context in
+            context.setFillColor(red: 0, green: 0, blue: 1, alpha: 0.65)
+            context.fill(bounds)
+        }
+
+        let document = AnnotationDocument()
+        document.commit(AnnotationItem(
+            kind: .pen([CGPoint(x: 5, y: 8), CGPoint(x: 90, y: 8)]),
+            style: AnnotationStyle(color: .red, size: .large)
+        ))
+        document.commit(AnnotationItem(kind: .rectangle(bounds), style: AnnotationStyle(color: .red, size: .maximum)))
+
+        for image in [padded, translucent] {
+            let baked = try #require(AnnotationRenderer.bake(
+                baseImage: image, localSelectionRect: bounds, pixelCropRect: bounds,
+                screenSize: bounds.size, document: document, mosaicCache: nil
+            ))
+            let stroke = try sampleRGBA(in: baked, x: 60, y: 71)
+            #expect(stroke.a == 255 && stroke.r > 200)
+            let corner = try sampleRGBA(in: baked, x: 1, y: 1)
+            if image === translucent {
+                #expect(corner.a == 0)
+            } else {
+                #expect(corner.a > 0)
+            }
+        }
+    }
+
+    @Test(arguments: [MosaicMode.blur, .pixelate])
+    func bakedRedactionReplacesTranslucentAndAntialiasedPixels(mode: MosaicMode) throws {
+        let width = 120
+        let height = 80
+        let bounds = CGRect(x: 0, y: 0, width: width, height: height)
+        let image = try makeRoundedImage(
+            width: width, height: height,
+            topLeftRadius: 24, topRightRadius: 24, bottomLeftRadius: 24, bottomRightRadius: 24
+        ) { context in
+            context.setFillColor(red: 0, green: 0, blue: 1, alpha: 160.0 / 255)
+            context.fill(bounds)
+            context.setBlendMode(.copy)
+            context.setFillColor(red: 1, green: 0, blue: 0, alpha: 160.0 / 255)
+            context.fill(CGRect(x: 0, y: height / 2 - 1, width: width, height: 1))
+        }
+
+        let document = AnnotationDocument()
+        document.commit(AnnotationItem(kind: .mosaic(bounds, mode), style: AnnotationStyle(size: .large, mosaicMode: mode)))
+        let cache = MosaicImageCache(baseImage: image)
+        let filtered = try #require(cache.filteredImage(mode: mode, size: .large, backingScale: 1))
+        let baked = try #require(AnnotationRenderer.bake(
+            baseImage: image, localSelectionRect: bounds, pixelCropRect: bounds,
+            screenSize: bounds.size, document: document, mosaicCache: cache
+        ))
+        let fallback = try #require(AnnotationRenderer.bake(
+            baseImage: image, localSelectionRect: bounds, pixelCropRect: bounds,
+            screenSize: bounds.size, document: document, mosaicCache: nil
+        ))
+
+        let center = try sampleRGBA(in: baked, x: width / 2, y: height / 2)
+        #expect(center.a == 160 && center.r < 60)
+        var checkedEdge = false
+        for y in 0..<24 {
+            for x in 0..<24 {
+                let original = try sampleRGBA(in: image, x: x, y: y)
+                guard original.a > 30, original.a < 130 else { continue }
+                let redacted = try sampleRGBA(in: baked, x: x, y: y)
+                let expected = try sampleRGBA(in: filtered, x: x, y: y)
+                #expect(redacted == expected)
+                #expect(redacted.a == original.a)
+                #expect(try sampleRGBA(in: fallback, x: x, y: y).a == original.a)
+                checkedEdge = true
+            }
+        }
+        #expect(checkedEdge)
+        #expect(try sampleRGBA(in: baked, x: 0, y: 0).a == 0)
+        #expect(try sampleRGBA(in: fallback, x: width / 2, y: height / 2).a == 160)
+    }
+
     @Test func mosaicCachePreservesTransparentRoundedCornersInBlurAndPixelate() throws {
         let width = 200
         let height = 120

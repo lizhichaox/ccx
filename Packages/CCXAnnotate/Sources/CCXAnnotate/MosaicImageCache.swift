@@ -303,7 +303,12 @@ public final class MosaicImageCache {
             for col in 0..<gridWidth {
                 let offset = row * gridBytesPerRow + col * 4
                 let rawAlpha = gridBytes[offset + 3]
-                guard rawAlpha > 0 else { continue }
+                guard rawAlpha > 0 else {
+                    // Resampling can round sparse coverage down to zero. Keep the tile opaque
+                    // until destination-in restores the original per-pixel alpha.
+                    Self.writeOpaqueFallback(into: &gridBytes, at: offset)
+                    continue
+                }
 
                 let alpha = Float(rawAlpha) / 255.0
                 var r = min(1.0, (Float(gridBytes[offset]) / 255.0) / alpha)
@@ -494,7 +499,9 @@ public final class MosaicImageCache {
                     continue
                 }
                 let dstA = dstBytes[offset + 3]
-                if dstA > 0 && dstA < 255 {
+                if dstA == 0 {
+                    Self.writeOpaqueFallback(into: &dstBytes, at: offset)
+                } else if dstA < 255 {
                     let inv = 255.0 / Float(dstA)
                     dstBytes[offset] = UInt8(min(255, Int((Float(dstBytes[offset]) * inv).rounded())))
                     dstBytes[offset + 1] = UInt8(min(255, Int((Float(dstBytes[offset + 1]) * inv).rounded())))
@@ -524,5 +531,12 @@ public final class MosaicImageCache {
             }
             return outContext.makeImage()
         }
+    }
+
+    private static func writeOpaqueFallback(into bytes: inout [UInt8], at offset: Int) {
+        bytes[offset] = 46
+        bytes[offset + 1] = 46
+        bytes[offset + 2] = 51
+        bytes[offset + 3] = 255
     }
 }

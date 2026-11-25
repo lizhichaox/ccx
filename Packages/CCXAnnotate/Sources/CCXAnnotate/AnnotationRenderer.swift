@@ -245,40 +245,55 @@ public enum AnnotationRenderer {
         let cropOriginX = clampedCrop.minX / sx
         let cropOriginY = (CGFloat(baseImage.height) - clampedCrop.maxY) / sy
 
-        let drawAnnotations: (CGContext) -> Void = { context in
-            context.saveGState()
-            context.scaleBy(x: sx, y: sy)
-            context.translateBy(x: -cropOriginX, y: -cropOriginY)
-            for item in document.items {
-                draw(item, in: context, screenBounds: screenBounds) { mode, size in
-                    mosaicCache?.filteredImage(mode: mode, size: size, backingScale: scale)
-                }
-            }
-            context.restoreGState()
-        }
-
-        if hasTransparentExteriorCorners(cropped) {
-            return bakePreservingExteriorCorners(
-                cropped: cropped,
-                baseImage: baseImage,
-                width: width,
-                height: height,
-                pixelCount: pixelCount,
-                drawAnnotations: drawAnnotations
-            )
-        }
-
         guard let context = makeBakeContext(width: width, height: height, baseImage: baseImage) else {
             return nil
         }
 
-        context.draw(cropped, in: CGRect(x: 0, y: 0, width: width, height: height))
-        drawAnnotations(context)
+        let canvas = CGRect(x: 0, y: 0, width: width, height: height)
+        context.draw(cropped, in: canvas)
+
+        let cornerPath = exteriorCornerPath(in: cropped, scaleX: sx, scaleY: sy)
+        let interiorPath = CGMutablePath()
+        if let cornerPath {
+            interiorPath.addRect(canvas)
+            interiorPath.addPath(cornerPath)
+        }
+
+        func drawInSelection(_ item: AnnotationItem, filtered: CGImage? = nil) {
+            context.scaleBy(x: sx, y: sy)
+            context.translateBy(x: -cropOriginX, y: -cropOriginY)
+            draw(item, in: context, screenBounds: screenBounds) { _, _ in filtered }
+        }
+
+        for item in document.items {
+            context.saveGState()
+            if case let .mosaic(_, mode) = item.kind {
+                let filtered = mosaicCache?.filteredImage(mode: mode, size: item.style.size, backingScale: scale)
+                // The filtered image already carries the backing alpha. Copy it so no unfiltered
+                // pixels are blended back in. The opaque fallback uses the destination alpha once.
+                context.setBlendMode(filtered == nil ? .sourceAtop : .copy)
+                drawInSelection(item, filtered: filtered)
+            } else if let cornerPath {
+                context.saveGState()
+                context.addPath(interiorPath)
+                context.clip(using: .evenOdd)
+                drawInSelection(item)
+                context.restoreGState()
+
+                context.addPath(cornerPath)
+                context.clip()
+                context.setBlendMode(.sourceAtop)
+                drawInSelection(item)
+            } else {
+                drawInSelection(item)
+            }
+            context.restoreGState()
+        }
 
         return context.makeImage()
     }
 
-    private static let exteriorCornerAlphaThreshold: UInt8 = 250
+    private static let exteriorAlphaThreshold: UInt8 = 8
     private static let bakeBitmapInfo: UInt32 =
         CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue
 
@@ -286,254 +301,133 @@ public enum AnnotationRenderer {
         switch image.alphaInfo {
         case .none, .noneSkipFirst, .noneSkipLast:
             return false
-        case .premultipliedFirst, .premultipliedLast, .first, .last, .alphaOnly:
-            break
-        @unknown default:
+        default:
             break
         }
 
-        let width = image.width
-        let height = image.height
-        guard width > 0, height > 0 else { return false }
+        let lastX = image.width - 1
+        let lastY = image.height - 1
+        let middleX = image.width / 2
+        let middleY = image.height / 2
+        guard lastX > 0, lastY > 0,
+              let sample = makeBakeContext(width: 1, height: 1, baseImage: image),
+              let rgba = sample.data?.assumingMemoryBound(to: UInt8.self)
+        else { return false }
 
-        var pixel = [UInt8](repeating: 0, count: 4)
-        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
-        let corners: [(Int, Int)] = [
-            (0, 0),
-            (width - 1, 0),
-            (0, height - 1),
-            (width - 1, height - 1),
-        ]
+        sample.setBlendMode(.copy)
+        func alphaAt(_ x: Int, _ y: Int) -> UInt8? {
+            guard let pixel = image.cropping(to: CGRect(x: x, y: y, width: 1, height: 1)) else { return nil }
+            sample.draw(pixel, in: CGRect(x: 0, y: 0, width: 1, height: 1))
+            return rgba[3]
+        }
 
-        return pixel.withUnsafeMutableBytes { rawBuffer in
-            guard let baseAddress = rawBuffer.baseAddress,
-                  let ctx = CGContext(
-                      data: baseAddress,
-                      width: 1,
-                      height: 1,
-                      bitsPerComponent: 8,
-                      bytesPerRow: 4,
-                      space: colorSpace,
-                      bitmapInfo: bakeBitmapInfo
-                  )
-            else {
-                return false
-            }
-            ctx.setBlendMode(.copy)
-            let unitRect = CGRect(x: 0, y: 0, width: 1, height: 1)
-            for (x, y) in corners {
-                guard let cornerCrop = image.cropping(to: CGRect(x: x, y: y, width: 1, height: 1)) else {
-                    continue
-                }
-                ctx.draw(cornerCrop, in: unitRect)
-                if rawBuffer[3] < exteriorCornerAlphaThreshold {
-                    return true
-                }
-            }
+        let corners = [(0, 0), (lastX, 0), (0, lastY), (lastX, lastY)]
+        guard corners.contains(where: { alphaAt($0.0, $0.1) ?? 255 < exteriorAlphaThreshold }) else {
             return false
         }
+        // An ordinary padded image has a transparent edge midpoint. Window chrome can be translucent.
+        let midpoints = [(0, middleY), (lastX, middleY), (middleX, 0), (middleX, lastY)]
+        return midpoints.allSatisfy { alphaAt($0.0, $0.1) ?? 0 >= 16 }
     }
 
-    private static func bakePreservingExteriorCorners(
-        cropped: CGImage,
-        baseImage: CGImage,
-        width: Int,
-        height: Int,
-        pixelCount: Int,
-        drawAnnotations: (CGContext) -> Void
-    ) -> CGImage? {
-        let (bytesPerRow, rowOverflow) = width.multipliedReportingOverflow(by: 4)
-        guard !rowOverflow else { return nil }
-        let (byteCount, countOverflow) = height.multipliedReportingOverflow(by: bytesPerRow)
-        guard !countOverflow else { return nil }
+    private static func exteriorCornerPath(in image: CGImage, scaleX: CGFloat, scaleY: CGFloat) -> CGPath? {
+        guard hasTransparentExteriorCorners(image) else { return nil }
 
-        var baseBytes = [UInt8](repeating: 0, count: byteCount)
-        let drewBase = baseBytes.withUnsafeMutableBytes { rawBuffer -> Bool in
-            guard let baseAddress = rawBuffer.baseAddress,
-                  let ctx = makeBakeContext(
-                      data: baseAddress,
-                      width: width,
-                      height: height,
-                      bytesPerRow: bytesPerRow,
-                      baseImage: baseImage
-                  )
-            else {
-                return false
-            }
-            ctx.draw(cropped, in: CGRect(x: 0, y: 0, width: width, height: height))
-            return true
-        }
-        guard drewBase else { return nil }
+        // Match the capture corner span and bound work even for malformed image scale metadata.
+        let width = min(image.width / 2, Int((72 * min(max(scaleX, 1), 4)).rounded(.up)))
+        let height = min(image.height / 2, Int((72 * min(max(scaleY, 1), 4)).rounded(.up)))
+        guard width >= 2, height >= 2,
+              let raster = makeBakeContext(width: width, height: height, baseImage: image),
+              let rgba = raster.data?.assumingMemoryBound(to: UInt8.self)
+        else { return nil }
 
-        var annotationBytes = [UInt8](repeating: 0, count: byteCount)
-        let drewAnnotations = annotationBytes.withUnsafeMutableBytes { rawBuffer -> Bool in
-            guard let baseAddress = rawBuffer.baseAddress,
-                  let ctx = makeBakeContext(
-                      data: baseAddress,
-                      width: width,
-                      height: height,
-                      bytesPerRow: bytesPerRow,
-                      baseImage: baseImage
-                  )
-            else {
-                return false
-            }
-            drawAnnotations(ctx)
-            return true
-        }
-        guard drewAnnotations else { return nil }
+        let path = CGMutablePath()
+        let rowBytes = raster.bytesPerRow
+        raster.setBlendMode(.copy)
 
-        let exteriorMask = exteriorCornerMask(from: baseBytes, width: width, height: height, pixelCount: pixelCount)
+        for y in [0, image.height - height] {
+            for x in [0, image.width - width] {
+                guard let patch = image.cropping(to: CGRect(x: x, y: y, width: width, height: height)) else { continue }
+                raster.draw(patch, in: CGRect(x: 0, y: 0, width: width, height: height))
+                let cornerX = x == 0 ? 0 : width - 1
+                let cornerY = y == 0 ? 0 : height - 1
+                let innerX = width - 1 - cornerX
+                let innerY = height - 1 - cornerY
+                func alphaAt(_ pixel: Int) -> UInt8 {
+                    rgba[(pixel / width) * rowBytes + (pixel % width) * 4 + 3]
+                }
 
-        baseBytes.withUnsafeMutableBufferPointer { baseBuf in
-            annotationBytes.withUnsafeBufferPointer { annBuf in
-                exteriorMask.withUnsafeBufferPointer { maskBuf in
-                    for pixelIndex in 0..<pixelCount {
-                        let offset = pixelIndex * 4
-                        let sa = annBuf[offset + 3]
-                        guard sa > 0 else { continue }
+                let seed = cornerY * width + cornerX
+                guard alphaAt(seed) < exteriorAlphaThreshold else { continue }
+                var exterior = [Bool](repeating: false, count: width * height)
+                exterior[seed] = true
+                var pending = [seed]
+                var reachesInnerEdge = false
+                while let pixel = pending.popLast() {
+                    let row = pixel / width
+                    let column = pixel % width
+                    if row == innerY || column == innerX {
+                        reachesInnerEdge = true
+                        break
+                    }
+                    func visit(_ neighbor: Int) {
+                        guard !exterior[neighbor], alphaAt(neighbor) < exteriorAlphaThreshold else { return }
+                        exterior[neighbor] = true
+                        pending.append(neighbor)
+                    }
+                    if column > 0 { visit(pixel - 1) }
+                    if column + 1 < width { visit(pixel + 1) }
+                    if row > 0 { visit(pixel - width) }
+                    if row + 1 < height { visit(pixel + width) }
+                }
+                guard !reachesInnerEdge else { continue }
 
-                        let da = baseBuf[offset + 3]
-                        let invSa = UInt32(255 - sa)
+                // Include the nearby antialiasing fringe while leaving translucent chrome
+                // farther from the exterior available for ordinary source-over drawing.
+                func isProtected(_ column: Int, _ row: Int) -> Bool {
+                    let pixel = row * width + column
+                    if exterior[pixel] { return true }
+                    guard alphaAt(pixel) < 255 else { return false }
+                    for nearbyRow in max(0, row - 2)...min(height - 1, row + 2) {
+                        for nearbyColumn in max(0, column - 2)...min(width - 1, column + 2)
+                            where exterior[nearbyRow * width + nearbyColumn] {
+                            return true
+                        }
+                    }
+                    return false
+                }
 
-                        if maskBuf[pixelIndex] != 0 {
-                            // Exterior-connected corner / anti-aliased edge: Porter-Duff sourceAtop preserves
-                            // exact `da` (`0` outside rounded corners, smooth anti-aliased alpha along the curve).
-                            guard da > 0 else { continue }
-                            let da32 = UInt32(da)
-                            baseBuf[offset] = UInt8(min(255, (UInt32(annBuf[offset]) * da32 + UInt32(baseBuf[offset]) * invSa + 127) / 255))
-                            baseBuf[offset + 1] = UInt8(min(255, (UInt32(annBuf[offset + 1]) * da32 + UInt32(baseBuf[offset + 1]) * invSa + 127) / 255))
-                            baseBuf[offset + 2] = UInt8(min(255, (UInt32(annBuf[offset + 2]) * da32 + UInt32(baseBuf[offset + 2]) * invSa + 127) / 255))
-                        } else if sa == 255 {
-                            baseBuf[offset] = annBuf[offset]
-                            baseBuf[offset + 1] = annBuf[offset + 1]
-                            baseBuf[offset + 2] = annBuf[offset + 2]
-                            baseBuf[offset + 3] = 255
-                        } else {
-                            // Interior pixel: standard Porter-Duff sourceOver leaves translucent interior content
-                            // unharmed while compositing annotations normally.
-                            baseBuf[offset] = UInt8(min(255, UInt32(annBuf[offset]) + (UInt32(baseBuf[offset]) * invSa + 127) / 255))
-                            baseBuf[offset + 1] = UInt8(min(255, UInt32(annBuf[offset + 1]) + (UInt32(baseBuf[offset + 1]) * invSa + 127) / 255))
-                            baseBuf[offset + 2] = UInt8(min(255, UInt32(annBuf[offset + 2]) + (UInt32(baseBuf[offset + 2]) * invSa + 127) / 255))
-                            baseBuf[offset + 3] = UInt8(min(255, UInt32(sa) + (UInt32(da) * invSa + 127) / 255))
+                for row in 0..<height {
+                    var start: Int?
+                    for column in 0...width {
+                        if column < width && isProtected(column, row) {
+                            if start == nil { start = column }
+                        } else if let first = start {
+                            path.addRect(CGRect(
+                                x: x + first, y: image.height - y - row - 1,
+                                width: column - first, height: 1
+                            ))
+                            start = nil
                         }
                     }
                 }
             }
         }
-
-        return baseBytes.withUnsafeMutableBytes { rawBuffer -> CGImage? in
-            guard let baseAddress = rawBuffer.baseAddress,
-                  let ctx = makeBakeContext(
-                      data: baseAddress,
-                      width: width,
-                      height: height,
-                      bytesPerRow: bytesPerRow,
-                      baseImage: baseImage
-                  )
-            else {
-                return nil
-            }
-            return ctx.makeImage()
-        }
-    }
-
-    /// Flood-fills exterior-connected transparent pixels (and their 1px anti-aliased fringe)
-    /// starting only from corners whose alpha is below `exteriorCornerAlphaThreshold`.
-    private static func exteriorCornerMask(
-        from rgbaBytes: [UInt8],
-        width: Int,
-        height: Int,
-        pixelCount: Int
-    ) -> [UInt8] {
-        var visited = [UInt8](repeating: 0, count: pixelCount)
-        var stack: [Int] = []
-        stack.reserveCapacity(min(pixelCount, 1024))
-
-        let cornerSeeds = [
-            0,
-            width - 1,
-            (height - 1) * width,
-            (height - 1) * width + (width - 1),
-        ]
-        for seed in cornerSeeds where visited[seed] == 0 {
-            if rgbaBytes[seed * 4 + 3] < exteriorCornerAlphaThreshold {
-                visited[seed] = 1
-                stack.append(seed)
-            }
-        }
-
-        while let idx = stack.popLast() {
-            let row = idx / width
-            let col = idx - row * width
-
-            if col > 0 {
-                let left = idx - 1
-                if visited[left] == 0 {
-                    let a = rgbaBytes[left * 4 + 3]
-                    if a < exteriorCornerAlphaThreshold {
-                        visited[left] = 1
-                        stack.append(left)
-                    } else if a < 255 {
-                        visited[left] = 1
-                    }
-                }
-            }
-            if col + 1 < width {
-                let right = idx + 1
-                if visited[right] == 0 {
-                    let a = rgbaBytes[right * 4 + 3]
-                    if a < exteriorCornerAlphaThreshold {
-                        visited[right] = 1
-                        stack.append(right)
-                    } else if a < 255 {
-                        visited[right] = 1
-                    }
-                }
-            }
-            if row > 0 {
-                let up = idx - width
-                if visited[up] == 0 {
-                    let a = rgbaBytes[up * 4 + 3]
-                    if a < exteriorCornerAlphaThreshold {
-                        visited[up] = 1
-                        stack.append(up)
-                    } else if a < 255 {
-                        visited[up] = 1
-                    }
-                }
-            }
-            if row + 1 < height {
-                let down = idx + width
-                if visited[down] == 0 {
-                    let a = rgbaBytes[down * 4 + 3]
-                    if a < exteriorCornerAlphaThreshold {
-                        visited[down] = 1
-                        stack.append(down)
-                    } else if a < 255 {
-                        visited[down] = 1
-                    }
-                }
-            }
-        }
-
-        return visited
+        return path.isEmpty ? nil : path
     }
 
     private static func makeBakeContext(
-        data: UnsafeMutableRawPointer? = nil,
         width: Int,
         height: Int,
-        bytesPerRow: Int = 0,
         baseImage: CGImage
     ) -> CGContext? {
         let preferredSpace = resolvedOutputRGBColorSpace(for: baseImage)
         if let ctx = CGContext(
-            data: data,
+            data: nil,
             width: width,
             height: height,
             bitsPerComponent: 8,
-            bytesPerRow: bytesPerRow,
+            bytesPerRow: 0,
             space: preferredSpace,
             bitmapInfo: bakeBitmapInfo
         ) {
@@ -541,11 +435,11 @@ public enum AnnotationRenderer {
         }
         let srgbFallback = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
         return CGContext(
-            data: data,
+            data: nil,
             width: width,
             height: height,
             bitsPerComponent: 8,
-            bytesPerRow: bytesPerRow,
+            bytesPerRow: 0,
             space: srgbFallback,
             bitmapInfo: bakeBitmapInfo
         )
