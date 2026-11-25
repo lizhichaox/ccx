@@ -121,6 +121,8 @@ struct MenuBarPopoverActions {
 
 /// Refined Liquid Glass menu bar popover replacing the legacy `NSMenu`.
 struct MenuBarPopoverView: View {
+    static let cornerRadius: CGFloat = 16
+
     @ObservedObject var model: MenuBarPanelModel
     @ObservedObject var updateManager: AppUpdateManager
     let actions: MenuBarPopoverActions
@@ -222,7 +224,7 @@ struct MenuBarPopoverView: View {
         .padding(.bottom, 10)
         .frame(width: 316)
         .fixedSize(horizontal: false, vertical: true)
-        .ccxPopoverSurface(cornerRadius: 16)
+        .ccxPopoverSurface(cornerRadius: Self.cornerRadius)
     }
 }
 
@@ -1263,6 +1265,7 @@ private struct UtilityDockButton: View {
 private extension View {
     @ViewBuilder
     func ccxPopoverSurface(cornerRadius: CGFloat) -> some View {
+        let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
         let topWash = LinearGradient(
             colors: [
                 CCXBadgePalette.blue.topColor.opacity(0.085),
@@ -1274,28 +1277,19 @@ private extension View {
         )
         if #available(macOS 26.0, *) {
             self
-                .background(
-                    topWash,
-                    in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                )
+                .background(topWash, in: shape)
                 .glassEffect(.regular, in: .rect(cornerRadius: cornerRadius))
-                .overlay(
-                    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                        .strokeBorder(Color.primary.opacity(0.12), lineWidth: 1)
-                        .allowsHitTesting(false)
-                )
+                .clipShape(shape)
         } else {
             self
-                .background(
-                    topWash,
-                    in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                )
-                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+                .background(topWash, in: shape)
+                .background(.regularMaterial, in: shape)
                 .overlay(
-                    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    shape
                         .strokeBorder(Color.primary.opacity(0.12), lineWidth: 1)
                         .allowsHitTesting(false)
                 )
+                .clipShape(shape)
         }
     }
 }

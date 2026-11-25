@@ -38,7 +38,7 @@ private final class MenuBarPanel: NSPanel {
     init() {
         super.init(
             contentRect: NSRect(x: 0, y: 0, width: 316, height: 220),
-            styleMask: [.borderless, .nonactivatingPanel, .fullSizeContentView],
+            styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
         )
@@ -497,6 +497,12 @@ final class MenuBarController: NSObject, NSWindowDelegate {
         hostingView.sizingOptions = [.intrinsicContentSize]
         hostingView.wantsLayer = true
         hostingView.layer?.backgroundColor = NSColor.clear.cgColor
+        // Clip the hosting layer to the popover's continuous rounded silhouette so
+        // Liquid Glass backdrop layers cannot leak alpha into the square window
+        // corners and produce rectangular WindowServer shadow edges.
+        hostingView.layer?.cornerRadius = MenuBarPopoverView.cornerRadius
+        hostingView.layer?.cornerCurve = .continuous
+        hostingView.layer?.masksToBounds = true
 
         panel.contentView = hostingView
         self.panel = panel
