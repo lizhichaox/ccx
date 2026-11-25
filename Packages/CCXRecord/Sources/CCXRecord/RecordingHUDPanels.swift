@@ -1260,6 +1260,13 @@ final class RecordingControlPanel: NSPanel, NSWindowDelegate {
             let glass = NSGlassEffectView()
             glass.cornerRadius = cornerRadius
             glass.style = .regular
+            // Clip the glass layer to the panel's continuous rounded silhouette so
+            // Liquid Glass backdrop layers cannot leak alpha into square window
+            // corners and produce rectangular WindowServer shadow edges.
+            glass.wantsLayer = true
+            glass.layer?.cornerRadius = cornerRadius
+            glass.layer?.cornerCurve = .continuous
+            glass.layer?.masksToBounds = true
             contentView.autoresizingMask = [.width, .height]
             glass.contentView = contentView
             return glass
@@ -1270,6 +1277,7 @@ final class RecordingControlPanel: NSPanel, NSWindowDelegate {
         effect.state = .active
         effect.wantsLayer = true
         effect.layer?.cornerRadius = cornerRadius
+        effect.layer?.cornerCurve = .continuous
         effect.layer?.masksToBounds = true
         effect.layer?.borderWidth = 1
         effect.layer?.borderColor = NSColor.white.withAlphaComponent(0.14).cgColor

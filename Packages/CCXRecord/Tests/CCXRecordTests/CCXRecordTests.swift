@@ -1,3 +1,4 @@
+import AppKit
 import AVFoundation
 import CCXCore
 import CoreGraphics
@@ -7,6 +8,7 @@ import Darwin
 import Foundation
 import ImageIO
 import os
+import QuartzCore
 import ScreenCaptureKit
 import Testing
 import UniformTypeIdentifiers
@@ -326,6 +328,28 @@ struct CCXRecordTests {
         panel.update(phase: .completed(fakeResult), settings: latestSettings, elapsedSeconds: 5)
         #expect(panel.isCompletedContainerVisible)
         #expect(panel.summaryText.contains("GIF · 00:05"))
+    }
+
+    @Test @MainActor func controlPanelGlassSurfaceClipsLayerToContinuousRoundedCorners() throws {
+        let panel = RecordingControlPanel(
+            captureRect: CGRect(x: 200, y: 200, width: 400, height: 300),
+            visibleFrame: CGRect(x: 0, y: 0, width: 1440, height: 900),
+            settings: RecordingSettings(format: .mp4)
+        )
+        defer { panel.tearDown() }
+
+        let surface = try #require(panel.contentView)
+        surface.layoutSubtreeIfNeeded()
+        #expect(surface.wantsLayer)
+        let layer = try #require(surface.layer)
+        #expect(layer.masksToBounds)
+        #expect(layer.cornerCurve == .continuous)
+        #expect(layer.cornerRadius == 14)
+
+        if #available(macOS 26.0, *) {
+            let glass = try #require(surface as? NSGlassEffectView)
+            #expect(glass.cornerRadius == 14)
+        }
     }
 
     @Test @MainActor func controlPanelFPSSelectionAndZeroOverflowLayoutAcrossAllPhases() {
