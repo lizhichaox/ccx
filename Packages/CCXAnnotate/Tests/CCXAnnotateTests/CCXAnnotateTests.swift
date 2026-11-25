@@ -741,7 +741,9 @@ struct CCXAnnotateTests {
         }
     }
 
-    private func alphaHistogramAndDigest(of image: NSImage) throws -> (nonZeroPixels: Int, digest: UInt64) {
+    private func alphaHistogramAndDigest(
+        of image: NSImage
+    ) throws -> (nonZeroPixels: Int, midAlphaPixels: Int, opaquePixels: Int, digest: UInt64) {
         let width = 60
         let height = 60
         var rgba = [UInt8](repeating: 0, count: width * height * 4)
@@ -767,31 +769,50 @@ struct CCXAnnotateTests {
         NSGraphicsContext.restoreGraphicsState()
 
         var nonZero = 0
+        var midAlpha = 0
+        var opaque = 0
         var fnv: UInt64 = 14_695_981_039_346_656_037
         for i in stride(from: 3, to: rgba.count, by: 4) {
             let alpha = rgba[i]
             if alpha > 20 { nonZero += 1 }
+            if alpha >= 70 && alpha <= 190 { midAlpha += 1 }
+            if alpha >= 235 { opaque += 1 }
             fnv ^= UInt64(alpha)
             fnv = fnv &* 1_099_511_628_211
         }
-        return (nonZero, fnv)
+        return (nonZero, midAlpha, opaque, fnv)
     }
 
-    @Test func penAndTextIconsAreTemplateNonEmptyAndLocaleIndependentAcrossToolbar() throws {
-        // Brush uses an unmistakable non-localized paintbrush SF Symbol; text avoids localized SF Symbols.
-        #expect(AnnotationTool.pen.symbolName == "paintbrush.pointed")
+    @Test func penHighlighterAndTextIconsAreDistinctTemplateNonEmptyAndLocaleIndependentAcrossToolbar() throws {
+        // Fallback symbol names stay clean and non-localized across `en` and `zh-Hans`.
+        #expect(AnnotationTool.pen.symbolName == "scribble")
+        #expect(AnnotationTool.highlighter.symbolName == "highlighter")
         #expect(AnnotationTool.text.symbolName != "textformat")
         #expect(AnnotationTool.text.symbolName != "text.cursor")
         #expect(AnnotationTool.text.symbolName != "character.cursor.ibeam")
         #expect(AnnotationTool.text.symbolName != "character.textbox")
 
-        for tool in [AnnotationTool.pen, .text] {
+        var renderedByTool: [AnnotationTool: (nonZeroPixels: Int, midAlphaPixels: Int, opaquePixels: Int, digest: UInt64)] = [:]
+        for tool in [AnnotationTool.pen, .highlighter, .text] {
             let icon = tool.toolbarIconImage(accessibilityDescription: tool.displayName)
             #expect(icon.isTemplate)
             #expect(icon.size.width > 0 && icon.size.height > 0)
             let rendered = try alphaHistogramAndDigest(of: icon)
             #expect(rendered.nonZeroPixels > 20)
+            renderedByTool[tool] = rendered
         }
+
+        // Pen (open S-wave), Highlighter (chisel nib + translucent 4.2pt swath), and Text (`T|`)
+        // must have distinct rendered silhouettes, with Highlighter preserving both its translucent
+        // swath and opaque chisel nib ink.
+        let penRendered = try #require(renderedByTool[.pen])
+        let highlighterRendered = try #require(renderedByTool[.highlighter])
+        let textRendered = try #require(renderedByTool[.text])
+        #expect(penRendered.digest != highlighterRendered.digest)
+        #expect(penRendered.digest != textRendered.digest)
+        #expect(highlighterRendered.digest != textRendered.digest)
+        #expect(highlighterRendered.midAlphaPixels > 80)
+        #expect(highlighterRendered.opaquePixels > 40)
 
         // Every button icon in both toolbar presets must render non-empty template ink
         // identically in `en` and `zh-Hans` (no localized Chinese characters in the toolbar).
@@ -805,6 +826,10 @@ struct CCXAnnotateTests {
                 #expect(buttonImage.isTemplate)
                 #expect(buttonImage.size.width > 0 && buttonImage.size.height > 0)
             }
+
+            let penButtonImage = try #require(toolbar.toolButtonImage(for: .pen))
+            let hlButtonImage = try #require(toolbar.toolButtonImage(for: .highlighter))
+            #expect(try alphaHistogramAndDigest(of: penButtonImage).digest != alphaHistogramAndDigest(of: hlButtonImage).digest)
 
             let buttons = toolbar.primaryStack.arrangedSubviews.compactMap { $0 as? NSButton }
             #expect(!buttons.isEmpty)

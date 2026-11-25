@@ -32,7 +32,7 @@ public enum AnnotationTool: String, CaseIterable, Sendable {
         case .rectangle: "rectangle"
         case .ellipse: "circle"
         case .arrow: "arrow.up.right"
-        case .pen: "paintbrush.pointed"
+        case .pen: "scribble"
         case .highlighter: "highlighter"
         case .mosaic: "checkerboard.rectangle"
         case .text: "t.square"
@@ -42,11 +42,19 @@ public enum AnnotationTool: String, CaseIterable, Sendable {
 
     /// Returns the crisp template icon rendered in the floating annotation toolbar.
     ///
-    /// `.text` uses a custom locale-independent vector glyph (`T` + I-beam insertion
-    /// cursor) rather than Apple's `"textformat"` / `"text.cursor"` SF Symbols, which
-    /// localize into Chinese characters under `zh-Hans`.
+    /// `.pen`, `.highlighter`, and `.text` use custom locale-independent vector glyphs:
+    /// - `.pen` renders an open freehand S-wave (matching the draw-output grammar of
+    ///   `rectangle`, `circle`, and `arrow.up.right` with zero diagonal stick).
+    /// - `.highlighter` renders a broad chisel nib over a thick 4.2pt translucent swath,
+    ///   giving an unmistakably different silhouette from `.pen` at 14pt toolbar size.
+    /// - `.text` renders `T` + an I-beam insertion cursor rather than Apple's `"textformat"`
+    ///   / `"text.cursor"` SF Symbols, which localize into Chinese characters under `zh-Hans`.
     public func toolbarIconImage(accessibilityDescription: String? = nil) -> NSImage {
         switch self {
+        case .pen:
+            return Self.makeFreehandPenIcon(accessibilityDescription: accessibilityDescription)
+        case .highlighter:
+            return Self.makeHighlighterIcon(accessibilityDescription: accessibilityDescription)
         case .text:
             return Self.makeTextInputIcon(accessibilityDescription: accessibilityDescription)
         default:
@@ -56,6 +64,87 @@ public enum AnnotationTool: String, CaseIterable, Sendable {
             configured.isTemplate = true
             return configured
         }
+    }
+
+    private static func makeFreehandPenIcon(accessibilityDescription: String?) -> NSImage {
+        let image = NSImage(size: NSSize(width: 18, height: 16), flipped: false) { _ in
+            NSColor.black.setStroke()
+
+            // Smooth horizontal-flowing S-wave matching the ~1.5pt optical weight of neighbor shapes.
+            let wave = NSBezierPath()
+            wave.lineWidth = 1.6
+            wave.lineCapStyle = .round
+            wave.lineJoinStyle = .round
+            wave.move(to: NSPoint(x: 1.9, y: 6.0))
+            wave.curve(
+                to: NSPoint(x: 9.0, y: 8.0),
+                controlPoint1: NSPoint(x: 3.8, y: 12.5),
+                controlPoint2: NSPoint(x: 6.8, y: 12.1)
+            )
+            wave.curve(
+                to: NSPoint(x: 16.1, y: 10.0),
+                controlPoint1: NSPoint(x: 11.2, y: 3.9),
+                controlPoint2: NSPoint(x: 14.2, y: 3.5)
+            )
+            wave.stroke()
+            return true
+        }
+        image.isTemplate = true
+        image.accessibilityDescription = accessibilityDescription
+        return image
+    }
+
+    private static func makeHighlighterIcon(accessibilityDescription: String?) -> NSImage {
+        let image = NSImage(size: NSSize(width: 18, height: 16), flipped: false) { _ in
+            // 1. Thick 4.2pt translucent chisel-cut highlight swath spanning the bottom.
+            let swath = NSBezierPath()
+            swath.move(to: NSPoint(x: 1.5, y: 1.8))
+            swath.line(to: NSPoint(x: 14.7, y: 1.8))
+            swath.line(to: NSPoint(x: 16.5, y: 6.0))
+            swath.line(to: NSPoint(x: 3.3, y: 6.0))
+            swath.close()
+            NSColor.black.withAlphaComponent(0.46).setFill()
+            swath.fill()
+
+            swath.lineWidth = 0.85
+            swath.lineJoinStyle = .round
+            NSColor.black.withAlphaComponent(0.32).setStroke()
+            swath.stroke()
+
+            // 2. Broad 38°-tilted chisel marker barrel with perpendicular collar seam touching y = 6.0.
+            let collarL = NSPoint(x: 8.65, y: 10.35)
+            let collarR = NSPoint(x: 11.80, y: 7.89)
+            let dx: CGFloat = 0.616 * 4.5
+            let dy: CGFloat = 0.788 * 4.5
+            let topL = NSPoint(x: collarL.x + dx, y: collarL.y + dy)
+            let topR = NSPoint(x: collarR.x + dx, y: collarR.y + dy)
+
+            let barrel = NSBezierPath()
+            barrel.move(to: collarL)
+            barrel.line(to: topL)
+            barrel.line(to: topR)
+            barrel.line(to: collarR)
+            barrel.close()
+            barrel.lineWidth = 1.35
+            barrel.lineJoinStyle = .round
+            NSColor.black.setStroke()
+            barrel.stroke()
+
+            // Solid broad 3.4pt flat chisel nib wedge resting squarely on the swath top edge.
+            let nib = NSBezierPath()
+            nib.move(to: collarL)
+            nib.line(to: collarR)
+            nib.line(to: NSPoint(x: 10.65, y: 6.0))
+            nib.line(to: NSPoint(x: 7.25, y: 6.0))
+            nib.close()
+            NSColor.black.setFill()
+            nib.fill()
+
+            return true
+        }
+        image.isTemplate = true
+        image.accessibilityDescription = accessibilityDescription
+        return image
     }
 
     private static func makeTextInputIcon(accessibilityDescription: String?) -> NSImage {
