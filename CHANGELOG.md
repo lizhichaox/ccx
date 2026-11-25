@@ -2,6 +2,11 @@
 
 All notable changes to **CCX (Control · Command · X)** are documented in this file.
 
+## [0.9.1] - 2026-11-25
+
+### Improved
+- **Distinct Pen & Highlighter Toolbar Icons (`CCXAnnotate`)**: Replaced the visually similar diagonal pen and highlighter glyphs with two unmistakable custom monochrome template `NSImage` silhouettes (`isTemplate = true`, `18×16pt`)—a clean open horizontal S-wave for **Pen** (`.pen`, fallback symbol `scribble`) matching the draw-output grammar of neighboring shape tools, and a broad 38° chisel nib over a thick 4.2pt translucent chisel-cut swath for **Highlighter** (`.highlighter`, fallback symbol `highlighter`)—while keeping the locale-independent `T|` **Text** icon intact and adding unit tests asserting distinct bitmaps, uniform `30pt` pill heights, and byte-identical `en`/`zh-Hans` rendering across `.snip` and `.pin` toolbars.
+
 ## [0.9.0] - 2026-11-25
 
 ### Added
