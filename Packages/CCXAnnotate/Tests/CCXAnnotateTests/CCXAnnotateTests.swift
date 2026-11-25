@@ -8,6 +8,11 @@ import Testing
 @MainActor
 struct CCXAnnotateTests {
     private func samplePixel(in image: CGImage, x: Int, y: Int) throws -> (r: UInt8, g: UInt8, b: UInt8) {
+        let rgba = try sampleRGBA(in: image, x: x, y: y)
+        return (rgba.r, rgba.g, rgba.b)
+    }
+
+    private func sampleRGBA(in image: CGImage, x: Int, y: Int) throws -> (r: UInt8, g: UInt8, b: UInt8, a: UInt8) {
         let cropped = try #require(image.cropping(to: CGRect(x: x, y: y, width: 1, height: 1)))
         var rgba = [UInt8](repeating: 0, count: 4)
         let ctx = try #require(CGContext(
@@ -17,10 +22,11 @@ struct CCXAnnotateTests {
             bitsPerComponent: 8,
             bytesPerRow: 4,
             space: CGColorSpace(name: CGColorSpace.sRGB)!,
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue
         ))
+        ctx.setBlendMode(.copy)
         ctx.draw(cropped, in: CGRect(x: 0, y: 0, width: 1, height: 1))
-        return (rgba[0], rgba[1], rgba[2])
+        return (rgba[0], rgba[1], rgba[2], rgba[3])
     }
 
     @Test func documentUndoRedoCounterAndStyleMutations() {
@@ -812,6 +818,391 @@ struct CCXAnnotateTests {
                 #expect(enRendered.nonZeroPixels > 10)
                 #expect(enRendered.digest == zhRendered.digest)
             }
+        }
+    }
+
+    /// Creates an sRGB premultiplied RGBA image with optional rounded corners (specified in top-left image
+    /// orientation so tests can verify vertical orientation explicitly).
+    private func makeRoundedImage(
+        width: Int,
+        height: Int,
+        topLeftRadius: CGFloat,
+        topRightRadius: CGFloat,
+        bottomLeftRadius: CGFloat,
+        bottomRightRadius: CGFloat,
+        drawContent: (CGContext) -> Void
+    ) throws -> CGImage {
+        let ctx = try #require(CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue
+        ))
+        ctx.clear(CGRect(x: 0, y: 0, width: width, height: height))
+
+        // Build per-corner rounded path in CG bottom-left coordinates:
+        // top edge is y = height, bottom edge is y = 0.
+        let w = CGFloat(width)
+        let h = CGFloat(height)
+        let path = CGMutablePath()
+        path.move(to: CGPoint(x: bottomLeftRadius, y: 0))
+        path.addLine(to: CGPoint(x: w - bottomRightRadius, y: 0))
+        if bottomRightRadius > 0 {
+            path.addArc(tangent1End: CGPoint(x: w, y: 0), tangent2End: CGPoint(x: w, y: bottomRightRadius), radius: bottomRightRadius)
+        }
+        path.addLine(to: CGPoint(x: w, y: h - topRightRadius))
+        if topRightRadius > 0 {
+            path.addArc(tangent1End: CGPoint(x: w, y: h), tangent2End: CGPoint(x: w - topRightRadius, y: h), radius: topRightRadius)
+        }
+        path.addLine(to: CGPoint(x: topLeftRadius, y: h))
+        if topLeftRadius > 0 {
+            path.addArc(tangent1End: CGPoint(x: 0, y: h), tangent2End: CGPoint(x: 0, y: h - topLeftRadius), radius: topLeftRadius)
+        }
+        path.addLine(to: CGPoint(x: 0, y: bottomLeftRadius))
+        if bottomLeftRadius > 0 {
+            path.addArc(tangent1End: CGPoint(x: 0, y: 0), tangent2End: CGPoint(x: bottomLeftRadius, y: 0), radius: bottomLeftRadius)
+        }
+        path.closeSubpath()
+
+        ctx.addPath(path)
+        ctx.clip()
+        drawContent(ctx)
+        return try #require(ctx.makeImage())
+    }
+
+    @Test func mosaicCachePreservesTransparentRoundedCornersInBlurAndPixelate() throws {
+        let width = 200
+        let height = 120
+        let radius: CGFloat = 28
+
+        // Striped interior so both blur and pixelate produce measurable interior changes.
+        let rounded = try makeRoundedImage(
+            width: width,
+            height: height,
+            topLeftRadius: radius,
+            topRightRadius: radius,
+            bottomLeftRadius: radius,
+            bottomRightRadius: radius
+        ) { ctx in
+            ctx.setFillColor(red: 0.15, green: 0.25, blue: 0.45, alpha: 1)
+            ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
+            ctx.setFillColor(red: 0.95, green: 0.95, blue: 0.95, alpha: 1)
+            for x in stride(from: 0, to: width, by: 8) {
+                ctx.fill(CGRect(x: x, y: 0, width: 4, height: height))
+            }
+        }
+
+        let exteriorSamples = [
+            (0, 0), (width - 1, 0), (0, height - 1), (width - 1, height - 1),
+            (3, 3), (width - 4, 3), (3, height - 4), (width - 4, height - 4),
+        ]
+        for (x, y) in exteriorSamples {
+            let px = try sampleRGBA(in: rounded, x: x, y: y)
+            #expect(px.a == 0)
+        }
+
+        let cache = MosaicImageCache(baseImage: rounded)
+        let blurred = try #require(cache.filteredImage(mode: .blur, size: .medium, backingScale: 2))
+        let cpuBlurred = try #require(cache.cpuBlurredImage(radius: StrokeSize.medium.blurRadius * 2))
+        let pixelated = try #require(cache.filteredImage(mode: .pixelate, size: .medium, backingScale: 2))
+
+        for filtered in [blurred, cpuBlurred, pixelated] {
+            #expect(filtered.width == width && filtered.height == height)
+            for (x, y) in exteriorSamples {
+                let px = try sampleRGBA(in: filtered, x: x, y: y)
+                #expect(px.a == 0 && px.r == 0 && px.g == 0 && px.b == 0)
+            }
+            // Interior center stays opaque and averages the dark/light stripes cleanly.
+            let center = try sampleRGBA(in: filtered, x: width / 2, y: height / 2)
+            #expect(center.a == 255)
+            #expect(center.r > 60 && center.r < 225)
+            // Interior pixel inside the rounded curve stays fully opaque (no translucent edge bleed).
+            let nearCurve = try sampleRGBA(in: filtered, x: 34, y: 14)
+            #expect(nearCurve.a == 255)
+        }
+
+        // Uniform mid-gray rounded image verifies normalized blur avoids dark halos near transparent corners.
+        let midGrayRounded = try makeRoundedImage(
+            width: width,
+            height: height,
+            topLeftRadius: radius,
+            topRightRadius: radius,
+            bottomLeftRadius: radius,
+            bottomRightRadius: radius
+        ) { ctx in
+            ctx.setFillColor(red: 0.5, green: 0.5, blue: 0.5, alpha: 1)
+            ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        }
+        let grayCache = MosaicImageCache(baseImage: midGrayRounded)
+        // Verify the CoreImage GPU graph itself unpremultiplies blur and masks via `_srcIn` for alpha images.
+        let alphaGraph = try #require(grayCache.gpuBlurCIImage(radius: StrokeSize.medium.blurRadius * 2)).debugDescription
+        #expect(alphaGraph.contains("unpremultiply"))
+        #expect(alphaGraph.contains("swizzle_rgb1"))
+        #expect(alphaGraph.contains("_srcIn"))
+
+        let grayBlur = try #require(grayCache.filteredImage(mode: .blur, size: .medium, backingScale: 2))
+        let grayGPUBlur = grayCache.gpuBlurredImage(radius: StrokeSize.medium.blurRadius * 2)
+        let grayCPUBlur = try #require(grayCache.cpuBlurredImage(radius: StrokeSize.medium.blurRadius * 2))
+        var blurVariants = [grayBlur, grayCPUBlur]
+        if let grayGPUBlur {
+            blurVariants.append(grayGPUBlur)
+        }
+        for img in blurVariants {
+            let corner = try sampleRGBA(in: img, x: 0, y: 0)
+            #expect(corner.a == 0)
+            // 4px inside the top-left rounded arc (circle center at (28, 28), (12, 12) has distance ~22.6 < 28).
+            let nearEdge = try sampleRGBA(in: img, x: 12, y: 12)
+            #expect(nearEdge.a == 255)
+            #expect(nearEdge.r >= 118 && nearEdge.r <= 145)
+        }
+
+        // Asymmetric corner mask (only top-left rounded) verifies zero vertical flip in MosaicImageCache.
+        let asymmetric = try makeRoundedImage(
+            width: 160,
+            height: 120,
+            topLeftRadius: 28,
+            topRightRadius: 0,
+            bottomLeftRadius: 0,
+            bottomRightRadius: 0
+        ) { ctx in
+            ctx.setFillColor(red: 0.3, green: 0.6, blue: 0.8, alpha: 1)
+            ctx.fill(CGRect(x: 0, y: 0, width: 160, height: 120))
+        }
+        let asymCache = MosaicImageCache(baseImage: asymmetric)
+        for img in [
+            try #require(asymCache.filteredImage(mode: .blur, size: .medium, backingScale: 2)),
+            try #require(asymCache.cpuBlurredImage(radius: StrokeSize.medium.blurRadius * 2)),
+            try #require(asymCache.filteredImage(mode: .pixelate, size: .medium, backingScale: 2)),
+        ] {
+            #expect(try sampleRGBA(in: img, x: 0, y: 0).a == 0)
+            #expect(try sampleRGBA(in: img, x: 159, y: 0).a == 255)
+            #expect(try sampleRGBA(in: img, x: 0, y: 119).a == 255)
+            #expect(try sampleRGBA(in: img, x: 159, y: 119).a == 255)
+        }
+    }
+
+    @Test func bakePreservesTransparentRoundedCornersAsymmetricOrientationAndOpaqueImages() throws {
+        let width = 200
+        let height = 120
+        let radius: CGFloat = 28
+
+        // 1. Four transparent rounded corners + a semi-transparent interior patch surrounded by opaque pixels.
+        let rounded = try makeRoundedImage(
+            width: width,
+            height: height,
+            topLeftRadius: radius,
+            topRightRadius: radius,
+            bottomLeftRadius: radius,
+            bottomRightRadius: radius
+        ) { ctx in
+            ctx.setFillColor(red: 0.12, green: 0.22, blue: 0.36, alpha: 1)
+            ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
+            // Translucent interior patch at CG (140..170, 50..70) -> top-down x=140..170, y=50..70.
+            ctx.setBlendMode(.copy)
+            ctx.setFillColor(red: 0.2, green: 0.6, blue: 0.8, alpha: 160.0 / 255.0)
+            ctx.fill(CGRect(x: 140, y: 50, width: 30, height: 20))
+            ctx.setBlendMode(.normal)
+        }
+        #expect(AnnotationRenderer.hasTransparentExteriorCorners(rounded))
+
+        // Capture untouched anti-aliased edge alpha along the top-left curve to confirm zero degradation.
+        var aaSamplePoint: (x: Int, y: Int, alpha: UInt8)?
+        for y in 0..<Int(radius) {
+            for x in 0..<Int(radius) {
+                let px = try sampleRGBA(in: rounded, x: x, y: y)
+                if px.a > 40 && px.a < 210 {
+                    aaSamplePoint = (x, y, px.a)
+                    break
+                }
+            }
+            if aaSamplePoint != nil { break }
+        }
+        let aaSample = try #require(aaSamplePoint)
+
+        let doc = AnnotationDocument()
+        // Edge-to-edge rectangle, corner-to-corner pen strokes, and full-width blur/pixelate mosaics.
+        doc.commit(AnnotationItem(
+            kind: .mosaic(CGRect(x: 0, y: 0, width: 50, height: 60), .blur),
+            style: AnnotationStyle(color: .red, size: .medium, mosaicMode: .blur)
+        ))
+        doc.commit(AnnotationItem(
+            kind: .rectangle(CGRect(x: 0, y: 0, width: 100, height: 60)),
+            style: AnnotationStyle(color: .red, size: .maximum)
+        ))
+        doc.commit(AnnotationItem(
+            kind: .pen([CGPoint(x: 0, y: 0), CGPoint(x: 100, y: 60)]),
+            style: AnnotationStyle(color: .green, size: .large)
+        ))
+        doc.commit(AnnotationItem(
+            kind: .pen([CGPoint(x: 0, y: 60), CGPoint(x: 100, y: 0)]),
+            style: AnnotationStyle(color: .green, size: .large)
+        ))
+
+        let cache = MosaicImageCache(baseImage: rounded)
+        let bakedWithCache = try #require(AnnotationRenderer.bake(
+            baseImage: rounded,
+            localSelectionRect: CGRect(x: 0, y: 0, width: 100, height: 60),
+            pixelCropRect: CGRect(x: 0, y: 0, width: width, height: height),
+            screenSize: CGSize(width: 100, height: 60),
+            document: doc,
+            mosaicCache: cache
+        ))
+        let bakedWithoutCache = try #require(AnnotationRenderer.bake(
+            baseImage: rounded,
+            localSelectionRect: CGRect(x: 0, y: 0, width: 100, height: 60),
+            pixelCropRect: CGRect(x: 0, y: 0, width: width, height: height),
+            screenSize: CGSize(width: 100, height: 60),
+            document: doc,
+            mosaicCache: nil
+        ))
+
+        let exteriorSamples = [
+            (0, 0), (width - 1, 0), (0, height - 1), (width - 1, height - 1),
+            (3, 3), (width - 4, 3), (3, height - 4), (width - 4, height - 4),
+        ]
+        for baked in [bakedWithCache, bakedWithoutCache] {
+            #expect(baked.width == width && baked.height == height)
+            for (x, y) in exteriorSamples {
+                let px = try sampleRGBA(in: baked, x: x, y: y)
+                #expect(px.a == 0 && px.r == 0 && px.g == 0 && px.b == 0)
+            }
+            // Center of diagonal green pen intersection stays opaque green.
+            let center = try sampleRGBA(in: baked, x: 100, y: 60)
+            #expect(center.a == 255 && center.g > 160 && center.r < 90)
+            // Untouched translucent interior patch keeps its original alpha (~160).
+            let translucentInterior = try sampleRGBA(in: baked, x: 155, y: 60)
+            #expect(abs(Int(translucentInterior.a) - 160) <= 1)
+            // Anti-aliased edge preserves exact corner alpha without double-attenuation.
+            let aaAfter = try sampleRGBA(in: baked, x: aaSample.x, y: aaSample.y)
+            #expect(aaAfter.a == aaSample.alpha)
+        }
+
+        // Re-baking a second annotation pass onto an already-baked rounded image must not erode AA corners.
+        let secondDoc = AnnotationDocument()
+        secondDoc.commit(AnnotationItem(
+            kind: .rectangle(CGRect(x: 35, y: 20, width: 30, height: 20)),
+            style: AnnotationStyle(color: .blue, size: .medium)
+        ))
+        let reBaked = try #require(AnnotationRenderer.bake(
+            baseImage: bakedWithCache,
+            localSelectionRect: CGRect(x: 0, y: 0, width: 100, height: 60),
+            pixelCropRect: CGRect(x: 0, y: 0, width: width, height: height),
+            screenSize: CGSize(width: 100, height: 60),
+            document: secondDoc,
+            mosaicCache: nil
+        ))
+        #expect(try sampleRGBA(in: reBaked, x: 0, y: 0).a == 0)
+        #expect(try sampleRGBA(in: reBaked, x: aaSample.x, y: aaSample.y).a == aaSample.alpha)
+
+        // 2. Asymmetric corner mask (ONLY top-left rounded, other 3 square) guarantees zero vertical flip.
+        let asymWidth = 160
+        let asymHeight = 120
+        let asymmetric = try makeRoundedImage(
+            width: asymWidth,
+            height: asymHeight,
+            topLeftRadius: 28,
+            topRightRadius: 0,
+            bottomLeftRadius: 0,
+            bottomRightRadius: 0
+        ) { ctx in
+            ctx.setFillColor(red: 0.1, green: 0.1, blue: 0.1, alpha: 1)
+            ctx.fill(CGRect(x: 0, y: 0, width: asymWidth, height: asymHeight))
+        }
+        #expect(AnnotationRenderer.hasTransparentExteriorCorners(asymmetric))
+
+        let edgeDoc = AnnotationDocument()
+        edgeDoc.commit(AnnotationItem(
+            kind: .rectangle(CGRect(x: 0, y: 0, width: 80, height: 60)),
+            style: AnnotationStyle(color: .red, size: .maximum)
+        ))
+        let asymBaked = try #require(AnnotationRenderer.bake(
+            baseImage: asymmetric,
+            localSelectionRect: CGRect(x: 0, y: 0, width: 80, height: 60),
+            pixelCropRect: CGRect(x: 0, y: 0, width: asymWidth, height: asymHeight),
+            screenSize: CGSize(width: 80, height: 60),
+            document: edgeDoc,
+            mosaicCache: nil
+        ))
+
+        let tl = try sampleRGBA(in: asymBaked, x: 0, y: 0)
+        let tlInner = try sampleRGBA(in: asymBaked, x: 3, y: 3)
+        let tr = try sampleRGBA(in: asymBaked, x: asymWidth - 1, y: 0)
+        let bl = try sampleRGBA(in: asymBaked, x: 0, y: asymHeight - 1)
+        let br = try sampleRGBA(in: asymBaked, x: asymWidth - 1, y: asymHeight - 1)
+
+        #expect(tl.a == 0 && tl.r == 0 && tl.g == 0 && tl.b == 0)
+        #expect(tlInner.a == 0 && tlInner.r == 0 && tlInner.g == 0 && tlInner.b == 0)
+        #expect(tr.a == 255 && tr.r > 200 && tr.g < 80)
+        #expect(bl.a == 255 && bl.r > 200 && bl.g < 80)
+        #expect(br.a == 255 && br.r > 200 && br.g < 80)
+
+        // 3. Standard opaque rectangular images (both RGBX noneSkipLast and opaque RGBA) behave identically.
+        let rgbxCtx = try #require(CGContext(
+            data: nil,
+            width: 120,
+            height: 80,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
+        ))
+        rgbxCtx.setFillColor(red: 0.2, green: 0.3, blue: 0.4, alpha: 1)
+        rgbxCtx.fill(CGRect(x: 0, y: 0, width: 120, height: 80))
+        let opaqueRGBX = try #require(rgbxCtx.makeImage())
+        #expect(!AnnotationRenderer.hasTransparentExteriorCorners(opaqueRGBX))
+
+        // Opaque RGBX images take the fast CoreImage blur path without unpremultiply or `_srcIn` overhead.
+        let opaqueCache = MosaicImageCache(baseImage: opaqueRGBX)
+        let opaqueGraph = try #require(opaqueCache.gpuBlurCIImage(radius: StrokeSize.medium.blurRadius * 2)).debugDescription
+        #expect(!opaqueGraph.contains("unpremultiply"))
+        #expect(!opaqueGraph.contains("_srcIn"))
+
+        let opaqueDoc = AnnotationDocument()
+        opaqueDoc.commit(AnnotationItem(
+            kind: .rectangle(CGRect(x: 0, y: 0, width: 60, height: 40)),
+            style: AnnotationStyle(color: .red, size: .maximum)
+        ))
+        let opaqueBaked = try #require(AnnotationRenderer.bake(
+            baseImage: opaqueRGBX,
+            localSelectionRect: CGRect(x: 0, y: 0, width: 60, height: 40),
+            pixelCropRect: CGRect(x: 0, y: 0, width: 120, height: 80),
+            screenSize: CGSize(width: 60, height: 40),
+            document: opaqueDoc,
+            mosaicCache: opaqueCache
+        ))
+        for (x, y) in [(0, 0), (119, 0), (0, 79), (119, 79)] {
+            let px = try sampleRGBA(in: opaqueBaked, x: x, y: y)
+            #expect(px.a == 255 && px.r > 200)
+        }
+
+        // Standard opaque RGBA (premultipliedLast with all alpha == 255) also skips corner masking cleanly.
+        let opaqueRGBACtx = try #require(CGContext(
+            data: nil,
+            width: 120,
+            height: 80,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue
+        ))
+        opaqueRGBACtx.setFillColor(red: 0.2, green: 0.3, blue: 0.4, alpha: 1)
+        opaqueRGBACtx.fill(CGRect(x: 0, y: 0, width: 120, height: 80))
+        let opaqueRGBA = try #require(opaqueRGBACtx.makeImage())
+        #expect(!AnnotationRenderer.hasTransparentExteriorCorners(opaqueRGBA))
+        let opaqueRGBABaked = try #require(AnnotationRenderer.bake(
+            baseImage: opaqueRGBA,
+            localSelectionRect: CGRect(x: 0, y: 0, width: 60, height: 40),
+            pixelCropRect: CGRect(x: 0, y: 0, width: 120, height: 80),
+            screenSize: CGSize(width: 60, height: 40),
+            document: opaqueDoc,
+            mosaicCache: MosaicImageCache(baseImage: opaqueRGBA)
+        ))
+        for (x, y) in [(0, 0), (119, 0), (0, 79), (119, 79)] {
+            let px = try sampleRGBA(in: opaqueRGBABaked, x: x, y: y)
+            #expect(px.a == 255 && px.r > 200)
         }
     }
 }

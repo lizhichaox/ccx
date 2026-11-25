@@ -35,6 +35,7 @@ public final class MosaicImageCache {
     private lazy var ciSource = CIImage(cgImage: baseImage)
     private lazy var rgbColorSpace: CGColorSpace = Self.resolvedRGBColorSpace(for: baseImage)
     private var cachedBaseRGBA: [UInt8]?
+    private var cachedHasTransparency: Bool?
     internal private(set) var baseRasterizationCount = 0
     internal var cachedVariantCount: Int { cache.count }
     internal var cachedByteCount: Int { totalCachedBytes }
@@ -203,6 +204,53 @@ public final class MosaicImageCache {
         return rendered
     }
 
+    private static func mayHaveTransparency(_ image: CGImage) -> Bool {
+        switch image.alphaInfo {
+        case .none, .noneSkipFirst, .noneSkipLast:
+            return false
+        case .premultipliedFirst, .premultipliedLast, .first, .last, .alphaOnly:
+            return true
+        @unknown default:
+            return true
+        }
+    }
+
+    private func bufferHasTransparency(_ rgbaBytes: [UInt8]) -> Bool {
+        if let cachedHasTransparency {
+            return cachedHasTransparency
+        }
+        guard Self.mayHaveTransparency(baseImage) else {
+            cachedHasTransparency = false
+            return false
+        }
+        let width = baseImage.width
+        let height = baseImage.height
+        let bytesPerRow = width * 4
+        let cornerOffsets = [
+            3,
+            (width - 1) * 4 + 3,
+            (height - 1) * bytesPerRow + 3,
+            (height - 1) * bytesPerRow + (width - 1) * 4 + 3,
+        ]
+        for offset in cornerOffsets where offset < rgbaBytes.count {
+            if rgbaBytes[offset] < 255 {
+                cachedHasTransparency = true
+                return true
+            }
+        }
+        var found = false
+        var idx = 3
+        while idx < rgbaBytes.count {
+            if rgbaBytes[idx] < 255 {
+                found = true
+                break
+            }
+            idx += 4
+        }
+        cachedHasTransparency = found
+        return found
+    }
+
     private func pixelatedImage(blockPixels: Int) -> CGImage? {
         let width = baseImage.width
         let height = baseImage.height
@@ -212,6 +260,7 @@ public final class MosaicImageCache {
             return nil
         }
         let srcBytesPerRow = srcDims.bytesPerRow
+        let preserveAlpha = bufferHasTransparency(srcBytes)
 
         let gridWidth = max(1, Int(ceil(Double(width) / Double(blockPixels))))
         let gridHeight = max(1, Int(ceil(Double(height) / Double(blockPixels))))
@@ -273,9 +322,16 @@ public final class MosaicImageCache {
                 g = min(max(g + shift, 0.0), 1.0)
                 b = min(max(b + shift, 0.0), 1.0)
 
-                gridBytes[offset] = UInt8((r * alpha * 255.0).rounded())
-                gridBytes[offset + 1] = UInt8((g * alpha * 255.0).rounded())
-                gridBytes[offset + 2] = UInt8((b * alpha * 255.0).rounded())
+                // When masking by `baseImage`'s alpha below, emit opaque normalized tile colors so
+                // blocks straddling transparent rounded corners never bleed unredacted interior pixels
+                // or double-attenuate semi-transparent regions.
+                let outAlpha: Float = preserveAlpha ? 1.0 : alpha
+                gridBytes[offset] = UInt8((r * outAlpha * 255.0).rounded())
+                gridBytes[offset + 1] = UInt8((g * outAlpha * 255.0).rounded())
+                gridBytes[offset + 2] = UInt8((b * outAlpha * 255.0).rounded())
+                if preserveAlpha {
+                    gridBytes[offset + 3] = 255
+                }
             }
         }
 
@@ -314,6 +370,10 @@ public final class MosaicImageCache {
             height: scaledHeight
         )
         outContext.draw(gridCGImage, in: targetRect)
+        if preserveAlpha {
+            outContext.setBlendMode(.destinationIn)
+            outContext.draw(baseImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+        }
         return outContext.makeImage()
     }
 
@@ -324,20 +384,28 @@ public final class MosaicImageCache {
         return cpuBlurredImage(radius: radius)
     }
 
-    private func gpuBlurredImage(radius: CGFloat) -> CGImage? {
+    internal func gpuBlurCIImage(radius: CGFloat) -> CIImage? {
         let extent = ciSource.extent
+        let preserveAlpha = Self.mayHaveTransparency(baseImage)
         guard let blur = CIFilter(name: "CIGaussianBlur") else { return nil }
         blur.setValue(ciSource.clampedToExtent(), forKey: kCIInputImageKey)
         blur.setValue(radius, forKey: kCIInputRadiusKey)
         guard let blurred = blur.outputImage?.cropped(to: extent) else { return nil }
 
+        // Normalize premultiplied blur alpha before saturation and frosted veil so interior pixels
+        // near transparent rounded corners retain full opacity and avoid dark halos; final output
+        // is masked strictly back to `ciSource`'s alpha via `CISourceInCompositing`.
+        let normalizedBlur: CIImage = preserveAlpha
+            ? blurred.unpremultiplyingAlpha().settingAlphaOne(in: extent)
+            : blurred
+
         let saturated: CIImage
         if let colorControls = CIFilter(name: "CIColorControls") {
-            colorControls.setValue(blurred, forKey: kCIInputImageKey)
+            colorControls.setValue(normalizedBlur, forKey: kCIInputImageKey)
             colorControls.setValue(1.12, forKey: kCIInputSaturationKey)
-            saturated = colorControls.outputImage?.cropped(to: extent) ?? blurred
+            saturated = colorControls.outputImage?.cropped(to: extent) ?? normalizedBlur
         } else {
-            saturated = blurred
+            saturated = normalizedBlur
         }
 
         let composited: CIImage
@@ -350,11 +418,22 @@ public final class MosaicImageCache {
             composited = saturated
         }
 
-        return Self.sharedCIContext.createCGImage(composited, from: extent, format: .RGBA8, colorSpace: rgbColorSpace)
-            ?? Self.sharedCIContext.createCGImage(composited, from: extent)
+        if preserveAlpha, let sourceIn = CIFilter(name: "CISourceInCompositing") {
+            sourceIn.setValue(composited, forKey: kCIInputImageKey)
+            sourceIn.setValue(ciSource, forKey: kCIInputBackgroundImageKey)
+            return sourceIn.outputImage?.cropped(to: extent) ?? composited
+        }
+        return composited
     }
 
-    private func cpuBlurredImage(radius: CGFloat) -> CGImage? {
+    internal func gpuBlurredImage(radius: CGFloat) -> CGImage? {
+        guard let masked = gpuBlurCIImage(radius: radius) else { return nil }
+        let extent = ciSource.extent
+        return Self.sharedCIContext.createCGImage(masked, from: extent, format: .RGBA8, colorSpace: rgbColorSpace)
+            ?? Self.sharedCIContext.createCGImage(masked, from: extent)
+    }
+
+    internal func cpuBlurredImage(radius: CGFloat) -> CGImage? {
         let width = baseImage.width
         let height = baseImage.height
         guard let dims = Self.checkedRGBA8Dimensions(width: width, height: height),
@@ -363,6 +442,7 @@ public final class MosaicImageCache {
             return nil
         }
         let bytesPerRow = dims.bytesPerRow
+        let preserveAlpha = bufferHasTransparency(srcBytes)
 
         var dstBytes = [UInt8](repeating: 0, count: dims.byteCount)
         let minDim = min(width, height)
@@ -403,6 +483,27 @@ public final class MosaicImageCache {
         }
         guard convolveError == kvImageNoError else { return nil }
 
+        if preserveAlpha {
+            for offset in stride(from: 0, to: dims.byteCount, by: 4) {
+                let srcA = srcBytes[offset + 3]
+                guard srcA > 0 else {
+                    dstBytes[offset] = 0
+                    dstBytes[offset + 1] = 0
+                    dstBytes[offset + 2] = 0
+                    dstBytes[offset + 3] = 0
+                    continue
+                }
+                let dstA = dstBytes[offset + 3]
+                if dstA > 0 && dstA < 255 {
+                    let inv = 255.0 / Float(dstA)
+                    dstBytes[offset] = UInt8(min(255, Int((Float(dstBytes[offset]) * inv).rounded())))
+                    dstBytes[offset + 1] = UInt8(min(255, Int((Float(dstBytes[offset + 1]) * inv).rounded())))
+                    dstBytes[offset + 2] = UInt8(min(255, Int((Float(dstBytes[offset + 2]) * inv).rounded())))
+                    dstBytes[offset + 3] = 255
+                }
+            }
+        }
+
         return dstBytes.withUnsafeMutableBytes { dstRaw in
             guard let dstBase = dstRaw.baseAddress,
                   let outContext = makeRGBA8Context(
@@ -417,6 +518,10 @@ public final class MosaicImageCache {
             let veilCG = CGColor(srgbRed: 0.557, green: 0.600, blue: 0.659, alpha: 0.08)
             outContext.setFillColor(veilCG)
             outContext.fill(CGRect(x: 0, y: 0, width: width, height: height))
+            if preserveAlpha {
+                outContext.setBlendMode(.destinationIn)
+                outContext.draw(baseImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+            }
             return outContext.makeImage()
         }
     }
