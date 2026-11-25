@@ -2,6 +2,15 @@
 
 All notable changes to **CCX (Control · Command · X)** are documented in this file.
 
+## [0.9.0] - 2026-11-25
+
+### Added
+- **Adaptive Smart Window-Corner Capture (`CCXCapture`)**: Automatically preserves true macOS window and Notification Center overlay card rounded corners on capture (while keeping square windows, sub-elements, and custom drag selections cleanly square) by extracting an exterior-only ScreenCaptureKit window alpha silhouette (`WindowCornerMaskExtractor`) and masking the frozen WYSIWYG display snapshot. Includes per-corner alignment, Z-order corner-occlusion checks so foreground overlapping windows are never clipped, lazy per-window silhouette prefetching with a 120ms commit timeout fallback, and live adaptive rounded selection previews in `SnipOverlayView`.
+
+### Improved
+- **Transparent-Corner Preservation in Mosaic & Annotation Baking (`CCXAnnotate`)**: Updated `MosaicImageCache` (CoreImage GPU blur, CPU blur fallback, and pixelate) to mask blurred/pixelated surfaces strictly back to the base image's alpha channel without frosted-veil corner bleed, and updated `AnnotationRenderer.bake` to preserve transparent exterior corners and anti-aliased edge curves across repeated re-bakes while keeping opaque images on the fast single-context path.
+- **Borderless Rounded-Corner Floating Pin Rendering & Shadows (`CCXPin`)**: Added transparent-corner detection and corner-radius estimation across all 90° rotations and horizontal/vertical flips (`PinLayout`), suppressed the resting 1pt square border on transparent-corner image pins so WindowServer casts clean rounded shadows, aligned click-through and annotation outlines to zoom-scaled continuous corner radii, and refreshed pin shadows across transforms and toolbar toggles.
+
 ## [0.8.3] - 2026-11-25
 
 ### Fixed
