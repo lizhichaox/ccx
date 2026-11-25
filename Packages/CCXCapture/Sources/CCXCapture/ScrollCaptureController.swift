@@ -871,6 +871,13 @@ internal final class ScrollCaptureHUDPanel: NSPanel, NSWindowDelegate {
             glass.cornerRadius = cornerRadius
             glass.style = .regular
             glass.contentView = contentView
+            // Clip the backing layer to a continuous rounded rect so Liquid Glass backdrop/SDF
+            // layers cannot leak alpha into square corners and cause rectangular WindowServer
+            // shadow artifacts on this borderless panel.
+            glass.wantsLayer = true
+            glass.layer?.cornerRadius = cornerRadius
+            glass.layer?.cornerCurve = .continuous
+            glass.layer?.masksToBounds = true
             return glass
         }
         let effect = NSVisualEffectView()
@@ -879,6 +886,7 @@ internal final class ScrollCaptureHUDPanel: NSPanel, NSWindowDelegate {
         effect.state = .active
         effect.wantsLayer = true
         effect.layer?.cornerRadius = cornerRadius
+        effect.layer?.cornerCurve = .continuous
         effect.layer?.masksToBounds = true
         effect.layer?.borderWidth = 1
         effect.layer?.borderColor = NSColor.white.withAlphaComponent(0.14).cgColor

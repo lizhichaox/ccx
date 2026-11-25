@@ -2,6 +2,7 @@ import AppKit
 import CoreGraphics
 import CCXAnnotate
 import CCXCore
+import QuartzCore
 import Testing
 @testable import CCXCapture
 
@@ -1597,5 +1598,21 @@ struct SnipOverlayViewTests {
             screens: [leftScreen, rightScreen]
         )
         #expect(resolved == rightScreen.visibleFrame)
+    }
+
+    @Test func scrollCaptureHUDPanelClipsGlassSurfaceToContinuousRoundedCorners() throws {
+        let hud = ScrollCaptureHUDPanel(
+            captureRect: CGRect(x: 220, y: 260, width: 520, height: 500),
+            visibleFrame: CGRect(x: 0, y: 0, width: 1440, height: 900)
+        )
+        let surface = try #require(hud.contentView)
+        #expect(surface.wantsLayer)
+        let layer = try #require(surface.layer)
+        #expect(layer.masksToBounds)
+        #expect(layer.cornerCurve == .continuous)
+        #expect(layer.cornerRadius == 14)
+        if #available(macOS 26.0, *) {
+            #expect(surface is NSGlassEffectView)
+        }
     }
 }
