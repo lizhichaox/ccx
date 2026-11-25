@@ -143,7 +143,11 @@ public enum WindowCornerMaskExtractor {
 
         let scaleX = CGFloat(windowImage.width) / windowFrame.width
         let scaleY = CGFloat(windowImage.height) / windowFrame.height
-        guard scaleX.isFinite, scaleY.isFinite, scaleX > 0, scaleY > 0 else { return nil }
+        let outScaleX = CGFloat(outW) / selectionRect.width
+        let outScaleY = CGFloat(outH) / selectionRect.height
+        guard scaleX.isFinite, scaleY.isFinite, scaleX > 0, scaleY > 0,
+              outScaleX.isFinite, outScaleY.isFinite, outScaleX > 0, outScaleY > 0
+        else { return nil }
 
         // Map AppKit global `selectionRect` (bottom-left origin) into `windowImage` pixel coordinates
         // (top-left origin: row 0 = visual top of `windowFrame`).
@@ -161,12 +165,43 @@ public enum WindowCornerMaskExtractor {
               selectionInWindowPx.height >= 8
         else { return nil }
 
-        // Cap patch size to half of output dimensions so the 4 corner patches never overlap.
-        let maxPatchX = max(4, Int((maxCornerPatchPoints * scaleX).rounded()))
-        let maxPatchY = max(4, Int((maxCornerPatchPoints * scaleY).rounded()))
-        let patchW = min(maxPatchX, outW / 2, Int(selectionInWindowPx.width) / 2)
-        let patchH = min(maxPatchY, outH / 2, Int(selectionInWindowPx.height) / 2)
-        guard patchW >= 4, patchH >= 4 else { return nil }
+        // Cap patch size to half of source and output dimensions so the 4 corner patches never overlap.
+        // When source silhouette DPI differs from output display DPI (e.g. a window straddling 2x/1x
+        // monitors), compute source and destination patch sizes from the same point span and resample.
+        let needsResample = abs(scaleX - outScaleX) > 0.02 || abs(scaleY - outScaleY) > 0.02
+        let srcPatchW: Int
+        let srcPatchH: Int
+        let dstPatchW: Int
+        let dstPatchH: Int
+        if needsResample {
+            let patchPointsX = min(
+                maxCornerPatchPoints,
+                selectionRect.width * 0.5,
+                selectionInWindowPx.width / (2 * scaleX),
+                CGFloat(outW / 2) / outScaleX
+            )
+            let patchPointsY = min(
+                maxCornerPatchPoints,
+                selectionRect.height * 0.5,
+                selectionInWindowPx.height / (2 * scaleY),
+                CGFloat(outH / 2) / outScaleY
+            )
+            guard patchPointsX.isFinite, patchPointsY.isFinite, patchPointsX > 0, patchPointsY > 0 else {
+                return nil
+            }
+            srcPatchW = min(max(4, Int((patchPointsX * scaleX).rounded())), Int(selectionInWindowPx.width) / 2)
+            srcPatchH = min(max(4, Int((patchPointsY * scaleY).rounded())), Int(selectionInWindowPx.height) / 2)
+            dstPatchW = min(max(4, Int((patchPointsX * outScaleX).rounded())), outW / 2)
+            dstPatchH = min(max(4, Int((patchPointsY * outScaleY).rounded())), outH / 2)
+        } else {
+            let maxPatchX = max(4, Int((maxCornerPatchPoints * scaleX).rounded()))
+            let maxPatchY = max(4, Int((maxCornerPatchPoints * scaleY).rounded()))
+            srcPatchW = min(maxPatchX, outW / 2, Int(selectionInWindowPx.width) / 2)
+            srcPatchH = min(maxPatchY, outH / 2, Int(selectionInWindowPx.height) / 2)
+            dstPatchW = srcPatchW
+            dstPatchH = srcPatchH
+        }
+        guard srcPatchW >= 4, srcPatchH >= 4, dstPatchW >= 4, dstPatchH >= 4 else { return nil }
 
         var patches: [Corner: CornerPatchResult] = [:]
         var maskedCorners: WindowCornerSet = []
@@ -176,27 +211,46 @@ public enum WindowCornerMaskExtractor {
             let sourcePatchRect = cornerRect(
                 for: corner,
                 inside: selectionInWindowPx,
-                patchWidth: patchW,
-                patchHeight: patchH
+                patchWidth: srcPatchW,
+                patchHeight: srcPatchH
             )
-            guard let alphaBuffer = rasterizeAlphaPatch(from: windowImage, cropRect: sourcePatchRect, width: patchW, height: patchH),
+            guard let alphaBuffer = rasterizeAlphaPatch(from: windowImage, cropRect: sourcePatchRect, width: srcPatchW, height: srcPatchH),
                   let extracted = extractExteriorCornerMask(
                       alphaBytes: alphaBuffer,
-                      width: patchW,
-                      height: patchH,
+                      width: srcPatchW,
+                      height: srcPatchH,
                       corner: corner,
                       scaleX: scaleX,
                       scaleY: scaleY
                   )
             else { continue }
 
-            patches[corner] = extracted
+            let finalPatch: CornerPatchResult
+            if needsResample && (extracted.width != dstPatchW || extracted.height != dstPatchH) {
+                guard let resampledBytes = resampleGrayscalePatch(
+                    extracted.maskValues,
+                    sourceWidth: extracted.width,
+                    sourceHeight: extracted.height,
+                    targetWidth: dstPatchW,
+                    targetHeight: dstPatchH
+                ) else { continue }
+                finalPatch = CornerPatchResult(
+                    maskValues: resampledBytes,
+                    width: dstPatchW,
+                    height: dstPatchH,
+                    measuredRadiusPoints: extracted.measuredRadiusPoints
+                )
+            } else {
+                finalPatch = extracted
+            }
+
+            patches[corner] = finalPatch
             maskedCorners.insert(corner.flag)
             switch corner {
-            case .topLeft: radii.topLeft = extracted.measuredRadiusPoints
-            case .topRight: radii.topRight = extracted.measuredRadiusPoints
-            case .bottomLeft: radii.bottomLeft = extracted.measuredRadiusPoints
-            case .bottomRight: radii.bottomRight = extracted.measuredRadiusPoints
+            case .topLeft: radii.topLeft = finalPatch.measuredRadiusPoints
+            case .topRight: radii.topRight = finalPatch.measuredRadiusPoints
+            case .bottomLeft: radii.bottomLeft = finalPatch.measuredRadiusPoints
+            case .bottomRight: radii.bottomRight = finalPatch.measuredRadiusPoints
             }
         }
 
@@ -594,8 +648,6 @@ public enum WindowCornerMaskExtractor {
         let interiorMedian = interiorSamples[interiorSamples.count / 2]
         guard interiorFloor >= 16, interiorMedian >= 16 else { return nil }
 
-        let innerIndex = innerY * width + innerX
-
         // Helper performing 4-connected BFS from `startIndex` over pixels with `alpha <= maxAlpha`.
         func floodFill(maxAlpha: UInt8) -> [Bool] {
             var visited = [Bool](repeating: false, count: count)
@@ -643,11 +695,25 @@ public enum WindowCornerMaskExtractor {
             return visited
         }
 
+        // Returns `true` if a flood-fill reached either inner patch boundary (`x == innerX` or `y == innerY`),
+        // which signals either flooding into a translucent titlebar/sidebar next to an opaque body or an
+        // exterior transparent strip (e.g. NSPopover chevron / letterbox bar) that would create a 72pt seam.
+        func touchesInnerBoundary(_ visited: [Bool]) -> Bool {
+            let innerRowOffset = innerY * width
+            for x in 0..<width where visited[innerRowOffset + x] {
+                return true
+            }
+            for y in 0..<height where visited[y * width + innerX] {
+                return true
+            }
+            return false
+        }
+
         var maskValues = [UInt8](repeating: 255, count: count)
         let primaryCeiling = UInt8(max(Int(exteriorCornerAlphaThreshold) - 1, Int(interiorFloor) - 6))
         let primaryVisited = floodFill(maxAlpha: primaryCeiling)
 
-        if !primaryVisited[innerIndex] {
+        if !touchesInnerBoundary(primaryVisited) {
             // Primary BFS cleanly isolated the exterior + full anti-aliased curve tangent.
             let denom = Double(interiorMedian)
             for idx in 0..<count where primaryVisited[idx] {
@@ -660,10 +726,11 @@ public enum WindowCornerMaskExtractor {
                 }
             }
         } else {
-            // Fallback for highly variable translucent interiors: strict exterior BFS (`< 8`)
-            // plus a 1px 8-connected anti-aliased ring.
+            // Fallback for translucent titlebars/sidebars or uneven interiors: strict exterior BFS (`< 8`)
+            // plus a 1px 8-connected anti-aliased ring. If even strict exterior reaches an inner patch
+            // boundary (e.g. NSPopover chevron strip or letterboxed frame), skip masking this corner.
             let strictVisited = floodFill(maxAlpha: exteriorCornerAlphaThreshold - 1)
-            guard !strictVisited[innerIndex] else { return nil }
+            guard !touchesInnerBoundary(strictVisited) else { return nil }
 
             let denom = Double(interiorMedian)
             for idx in 0..<count {
@@ -724,6 +791,46 @@ public enum WindowCornerMaskExtractor {
             height: height,
             measuredRadiusPoints: measuredRadius
         )
+    }
+
+    private nonisolated static func resampleGrayscalePatch(
+        _ sourceBytes: [UInt8],
+        sourceWidth: Int,
+        sourceHeight: Int,
+        targetWidth: Int,
+        targetHeight: Int
+    ) -> [UInt8]? {
+        guard sourceWidth > 0, sourceHeight > 0,
+              targetWidth > 0, targetHeight > 0,
+              sourceBytes.count == sourceWidth * sourceHeight
+        else { return nil }
+        var mutableSource = sourceBytes
+        guard let sourceImage = makeGrayscaleMaskImage(
+            bytes: &mutableSource,
+            width: sourceWidth,
+            height: sourceHeight
+        ) else {
+            return nil
+        }
+        var targetBytes = [UInt8](repeating: 255, count: targetWidth * targetHeight)
+        let ok = targetBytes.withUnsafeMutableBytes { rawBuffer -> Bool in
+            guard let base = rawBuffer.baseAddress,
+                  let ctx = CGContext(
+                      data: base,
+                      width: targetWidth,
+                      height: targetHeight,
+                      bitsPerComponent: 8,
+                      bytesPerRow: targetWidth,
+                      space: grayColorSpace,
+                      bitmapInfo: CGImageAlphaInfo.none.rawValue
+                  )
+            else { return false }
+            ctx.setBlendMode(.copy)
+            ctx.interpolationQuality = .high
+            ctx.draw(sourceImage, in: CGRect(x: 0, y: 0, width: targetWidth, height: targetHeight))
+            return true
+        }
+        return ok ? targetBytes : nil
     }
 
     private nonisolated static func makeGrayscaleMaskImage(

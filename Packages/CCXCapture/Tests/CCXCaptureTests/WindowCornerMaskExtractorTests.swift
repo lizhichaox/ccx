@@ -717,4 +717,306 @@ struct WindowCornerMaskExtractorTests {
         let fallbackRGBA = try rasterizeRGBA(fallbackResult.image)
         #expect(pixel(fallbackRGBA, x: 0, y: 0).a == 255)
     }
+
+    // MARK: - Hardening Regression Tests (P1 #1, P1 #2, P1 #3 & Cancellation)
+
+    @Test func translucentTitlebarAndSidebarAdjacentToOpaqueBodyLeaveNo72ptSeam() throws {
+        let frame = CGRect(x: 0, y: 0, width: 320, height: 220)
+        let scale: CGFloat = 2
+        let w = Int(frame.width * scale)   // 640
+        let h = Int(frame.height * scale)  // 440
+        let cs = CGColorSpace(name: CGColorSpace.sRGB)!
+        let ctx = try #require(CGContext(
+            data: nil,
+            width: w,
+            height: h,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: cs,
+            bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue
+        ))
+        let fullRect = CGRect(x: 0, y: 0, width: w, height: h)
+        ctx.clear(fullRect)
+        ctx.setShouldAntialias(true)
+
+        // Clip to a real 16pt-rounded window silhouette, then paint an opaque body (alpha = 255)
+        // plus a 40pt translucent titlebar (top) and 44pt translucent sidebar (left) at alpha = 200.
+        let r = 16 * scale
+        let windowPath = WindowCornerMaskExtractor.makeRoundedRectPath(
+            rect: fullRect,
+            radii: AdaptiveCornerRadii(topLeft: r, topRight: r, bottomLeft: r, bottomRight: r)
+        )
+        ctx.addPath(windowPath)
+        ctx.clip()
+
+        ctx.setBlendMode(.copy)
+        ctx.setFillColor(CGColor(colorSpace: cs, components: [0.15, 0.16, 0.18, 1.0])!)
+        ctx.fill(fullRect)
+
+        let chromeAlpha: CGFloat = 200.0 / 255.0
+        ctx.setFillColor(CGColor(colorSpace: cs, components: [0.22, 0.24, 0.28, chromeAlpha])!)
+        // CGContext origin is bottom-left: top 40pt titlebar is y = [h - 80, h].
+        ctx.fill(CGRect(x: 0, y: CGFloat(h) - 40 * scale, width: CGFloat(w), height: 40 * scale))
+        // Left 44pt translucent sidebar is x = [0, 88].
+        ctx.fill(CGRect(x: 0, y: 0, width: 44 * scale, height: CGFloat(h)))
+
+        let windowImg = try #require(ctx.makeImage())
+        let extracted = try #require(WindowCornerMaskExtractor.extractMask(
+            windowImage: windowImg,
+            windowFrame: frame,
+            selectionRect: frame,
+            eligibleCorners: .all,
+            outputPixelSize: (width: w, height: h),
+            displayScale: scale
+        ))
+        #expect(extracted.maskedCorners == .all)
+        #expect(abs(extracted.cornerRadii.topLeft - 16) <= 2.0)
+
+        let frozen = try makeSolidOpaqueImage(pixelWidth: w, pixelHeight: h, rgb: (0.4, 0.6, 0.9))
+        let masked = WindowCornerMaskExtractor.applyMask(extracted.maskImage, to: frozen)
+        let rgba = try rasterizeRGBA(masked)
+
+        // Outer corners are cleanly transparent.
+        #expect(pixel(rgba, x: 0, y: 0).a == 0)
+        #expect(pixel(rgba, x: w - 1, y: 0).a == 0)
+        #expect(pixel(rgba, x: 0, y: h - 1).a == 0)
+        #expect(pixel(rgba, x: w - 1, y: h - 1).a == 0)
+
+        // Translucent titlebar stays 100% opaque (255) across the 72pt (144px) patch boundary and interior.
+        for x in [60, 100, 143, 144, 145, w - 144, w - 100] {
+            #expect(pixel(rgba, x: x, y: 20).a == 255)
+            #expect(pixel(rgba, x: x, y: 60).a == 255)
+        }
+        // Translucent left sidebar stays 100% opaque (255) across the 72pt (144px) vertical patch boundary.
+        for y in [60, 100, 143, 144, 145, h - 144, h - 100] {
+            #expect(pixel(rgba, x: 20, y: y).a == 255)
+            #expect(pixel(rgba, x: 60, y: y).a == 255)
+        }
+
+        // NSPopover-like transparent top 12pt chevron strip must NOT stamp a 72pt top seam, while
+        // preserving normal rounded bottom corners.
+        let popCtx = try #require(CGContext(
+            data: nil,
+            width: w,
+            height: h,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: cs,
+            bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue
+        ))
+        popCtx.clear(fullRect)
+        let popoverBodyRect = CGRect(x: 0, y: 0, width: w, height: h - Int(12 * scale))
+        popCtx.addPath(WindowCornerMaskExtractor.makeRoundedRectPath(
+            rect: popoverBodyRect,
+            radii: AdaptiveCornerRadii(topLeft: r, topRight: r, bottomLeft: r, bottomRight: r)
+        ))
+        popCtx.setFillColor(CGColor(colorSpace: cs, components: [0.3, 0.3, 0.35, 1.0])!)
+        popCtx.fillPath()
+        let popoverImg = try #require(popCtx.makeImage())
+
+        let popExtracted = try #require(WindowCornerMaskExtractor.extractMask(
+            windowImage: popoverImg,
+            windowFrame: frame,
+            selectionRect: frame,
+            eligibleCorners: .all,
+            outputPixelSize: (width: w, height: h),
+            displayScale: scale
+        ))
+        #expect(popExtracted.maskedCorners == [.bottomLeft, .bottomRight])
+        #expect(popExtracted.cornerRadii.topLeft == 0)
+        #expect(popExtracted.cornerRadii.topRight == 0)
+    }
+
+    @Test func mixedDPISilhouetteAndOutputProducesExact20ptCornerCutout() throws {
+        let frame = CGRect(x: 0, y: 0, width: 300, height: 200)
+        let radii = AdaptiveCornerRadii(topLeft: 20, topRight: 20, bottomLeft: 20, bottomRight: 0)
+
+        // 1. 2x silhouette (600x400) -> 1x output (300x200): 20pt corner = 20px radius, diag crossing ~5.86px.
+        let win2x = try makeWindowImage(
+            widthPoints: frame.width,
+            heightPoints: frame.height,
+            scale: 2,
+            radii: radii
+        )
+        let extracted2to1 = try #require(WindowCornerMaskExtractor.extractMask(
+            windowImage: win2x,
+            windowFrame: frame,
+            selectionRect: frame,
+            eligibleCorners: .all,
+            outputPixelSize: (width: 300, height: 200),
+            displayScale: 2
+        ))
+        #expect(extracted2to1.maskedCorners == [.topLeft, .topRight, .bottomLeft])
+        #expect(abs(extracted2to1.cornerRadii.topLeft - 20) <= 1.5)
+
+        let out1x = try makeSolidOpaqueImage(pixelWidth: 300, pixelHeight: 200)
+        let masked1x = WindowCornerMaskExtractor.applyMask(extracted2to1.maskImage, to: out1x)
+        let rgba1x = try rasterizeRGBA(masked1x)
+        // Outside 20pt arc (d=3 < 5.86) is transparent; inside 20pt arc (d=8 > 5.86, would be transparent if 2x unscaled!) is opaque.
+        #expect(pixel(rgba1x, x: 0, y: 0).a == 0)
+        #expect(pixel(rgba1x, x: 3, y: 3).a == 0)
+        #expect(pixel(rgba1x, x: 8, y: 8).a == 255)
+        #expect(pixel(rgba1x, x: 12, y: 12).a == 255)
+        // Top-right & bottom-left rounded; bottom-right stays square (verifies non-flipped resampling).
+        #expect(pixel(rgba1x, x: 299, y: 0).a == 0)
+        #expect(pixel(rgba1x, x: 291, y: 8).a == 255)
+        #expect(pixel(rgba1x, x: 0, y: 199).a == 0)
+        #expect(pixel(rgba1x, x: 8, y: 191).a == 255)
+        #expect(pixel(rgba1x, x: 299, y: 199).a == 255)
+
+        // 2. 1x silhouette (300x200) -> 2x output (600x400): 20pt corner = 40px radius, diag crossing ~11.72px.
+        let win1x = try makeWindowImage(
+            widthPoints: frame.width,
+            heightPoints: frame.height,
+            scale: 1,
+            radii: radii
+        )
+        let extracted1to2 = try #require(WindowCornerMaskExtractor.extractMask(
+            windowImage: win1x,
+            windowFrame: frame,
+            selectionRect: frame,
+            eligibleCorners: .all,
+            outputPixelSize: (width: 600, height: 400),
+            displayScale: 1
+        ))
+        #expect(extracted1to2.maskedCorners == [.topLeft, .topRight, .bottomLeft])
+        #expect(abs(extracted1to2.cornerRadii.topLeft - 20) <= 2.0)
+
+        let out2x = try makeSolidOpaqueImage(pixelWidth: 600, pixelHeight: 400)
+        let masked2x = WindowCornerMaskExtractor.applyMask(extracted1to2.maskImage, to: out2x)
+        let rgba2x = try rasterizeRGBA(masked2x)
+        // Outside 20pt arc (d=8 < 11.72, would be opaque if 1x unscaled!) is transparent; inside (d=15 > 11.72) is opaque.
+        #expect(pixel(rgba2x, x: 0, y: 0).a == 0)
+        #expect(pixel(rgba2x, x: 8, y: 8).a == 0)
+        #expect(pixel(rgba2x, x: 15, y: 15).a == 255)
+        #expect(pixel(rgba2x, x: 599, y: 0).a == 0)
+        #expect(pixel(rgba2x, x: 591, y: 8).a == 0)
+        #expect(pixel(rgba2x, x: 584, y: 15).a == 255)
+        #expect(pixel(rgba2x, x: 0, y: 399).a == 0)
+        #expect(pixel(rgba2x, x: 8, y: 391).a == 0)
+        #expect(pixel(rgba2x, x: 15, y: 384).a == 255)
+        #expect(pixel(rgba2x, x: 599, y: 399).a == 255)
+    }
+
+    @Test func liveWindowBoundsValidationRejectsMidSnipResizeMoveOrDisappearance() {
+        let expected = CGRect(x: 100, y: 200, width: 400, height: 300)
+
+        // Matching within 1pt tolerance passes.
+        #expect(ScreenSnapshotEngine.validateWindowSilhouetteBounds(
+            expectedFrame: expected,
+            contentSize: CGSize(width: 400, height: 300),
+            liveBoundsBefore: expected,
+            liveBoundsAfter: CGRect(x: 100.5, y: 199.5, width: 400.5, height: 299.5)
+        ))
+
+        // Window disappeared before or after capture.
+        #expect(!ScreenSnapshotEngine.validateWindowSilhouetteBounds(
+            expectedFrame: expected,
+            contentSize: expected.size,
+            liveBoundsBefore: nil,
+            liveBoundsAfter: expected
+        ))
+        #expect(!ScreenSnapshotEngine.validateWindowSilhouetteBounds(
+            expectedFrame: expected,
+            contentSize: expected.size,
+            liveBoundsBefore: expected,
+            liveBoundsAfter: nil
+        ))
+
+        // Programmatic resize mid-snip (400x300 -> 400x350) rejected even when stale SCWindow contentSize is still 400x300.
+        let resized = CGRect(x: 100, y: 200, width: 400, height: 350)
+        #expect(!ScreenSnapshotEngine.validateWindowSilhouetteBounds(
+            expectedFrame: expected,
+            contentSize: expected.size,
+            liveBoundsBefore: resized,
+            liveBoundsAfter: resized
+        ))
+        #expect(!ScreenSnapshotEngine.validateWindowSilhouetteBounds(
+            expectedFrame: expected,
+            contentSize: expected.size,
+            liveBoundsBefore: expected,
+            liveBoundsAfter: resized
+        ))
+
+        // Origin drift > 1pt rejected.
+        let moved = CGRect(x: 105, y: 200, width: 400, height: 300)
+        #expect(!ScreenSnapshotEngine.validateWindowSilhouetteBounds(
+            expectedFrame: expected,
+            contentSize: expected.size,
+            liveBoundsBefore: moved,
+            liveBoundsAfter: moved
+        ))
+    }
+
+    @Test func cancellingFinishTaskDuringAwaitSilhouetteWakesPromptly() async throws {
+        // Measure cancellation wake latency off @MainActor so parallel @MainActor tests cannot skew elapsed time.
+        let (result, elapsed) = await Task.detached(priority: .userInitiated) {
+            let slowSilhouetteTask = Task<CapturedWindowSilhouette?, Never> {
+                try? await Task.sleep(for: .seconds(5))
+                return nil
+            }
+            defer { slowSilhouetteTask.cancel() }
+
+            let waiter = Task<CapturedWindowSilhouette?, Never> {
+                await SnipOverlayController.awaitSilhouette(
+                    slowSilhouetteTask,
+                    timeoutNanoseconds: 5_000_000_000
+                )
+            }
+
+            try? await Task.sleep(for: .milliseconds(15))
+            let cancelStart = ContinuousClock.now
+            waiter.cancel()
+            let value = await waiter.value
+            return (value, ContinuousClock.now - cancelStart)
+        }.value
+
+        #expect(result == nil)
+        #expect(elapsed < .milliseconds(500))
+
+        // Also verify closing a controller during an active finishTask suppresses completion cleanly.
+        let size = CGSize(width: 400, height: 300)
+        let displayImage = try makeSolidOpaqueImage(pixelWidth: 800, pixelHeight: 600, rgb: (0.2, 0.5, 0.8))
+        let snapshot = DisplaySnapshot(
+            displayID: 1,
+            screenFrame: CGRect(origin: .zero, size: size),
+            backingScaleFactor: 2,
+            image: displayImage
+        )
+        let winRect = CGRect(x: 40, y: 40, width: 260, height: 180)
+        let win = DetectedWindow(windowID: 99, ownerPID: 10, ownerName: "App", layer: 0, frame: winRect)
+        let detector = SmartElementDetector(enableAccessibility: false)
+        detector.setDetectedStateForTesting(regularWindows: [win], windows: [win], fallbackOverlayWindows: [])
+
+        var finished = false
+        let controller = SnipOverlayController(
+            snapshots: [snapshot],
+            detector: detector,
+            silhouetteProvider: { _, _ in
+                try? await Task.sleep(for: .seconds(2))
+                return nil
+            },
+            onFinish: { _ in finished = true }
+        )
+        let view = SnipOverlayView(snapshot: snapshot, topInset: 0)
+        controller.attachViewForTesting(view)
+        let down = try #require(NSEvent.mouseEvent(
+            with: .leftMouseDown, location: CGPoint(x: 100, y: 100), modifierFlags: [],
+            timestamp: 0, windowNumber: 0, context: nil, eventNumber: 0, clickCount: 1, pressure: 1
+        ))
+        let up = try #require(NSEvent.mouseEvent(
+            with: .leftMouseUp, location: CGPoint(x: 100, y: 100), modifierFlags: [],
+            timestamp: 0, windowNumber: 0, context: nil, eventNumber: 0, clickCount: 1, pressure: 0
+        ))
+        let cmdC = try #require(NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: [.command], timestamp: 0,
+            windowNumber: 0, context: nil, characters: "c", charactersIgnoringModifiers: "c", isARepeat: false, keyCode: 8
+        ))
+        view.mouseDown(with: down)
+        view.mouseUp(with: up)
+        #expect(view.performKeyEquivalent(with: cmdC))
+        controller.close()
+        try await Task.sleep(for: .milliseconds(30))
+        #expect(!finished)
+    }
 }

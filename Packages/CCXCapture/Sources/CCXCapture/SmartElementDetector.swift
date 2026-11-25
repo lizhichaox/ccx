@@ -212,7 +212,7 @@ public final class SmartElementDetector {
     private let excludedWindowIDs: Set<CGWindowID>
     private let ownPID: pid_t = ProcessInfo.processInfo.processIdentifier
     private let axWorker: AXQueryWorker?
-    private var cachedPrimaryScreenHeight: CGFloat = 0
+    private(set) var cachedPrimaryScreenHeight: CGFloat = 0
     private var snapshotGeneration: UInt64 = 0
 
     /// - Parameters:

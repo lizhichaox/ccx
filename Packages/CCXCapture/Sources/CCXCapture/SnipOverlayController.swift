@@ -18,6 +18,7 @@ final class SnipOverlayPanel: NSPanel {
 @MainActor
 final class SnipOverlayController {
     private static let silhouetteCommitTimeoutNanoseconds: UInt64 = 120_000_000
+    private static let maxCachedSilhouettes = 8
 
     private let snapshots: [DisplaySnapshot]
     private let detector: SmartElementDetector
@@ -35,6 +36,7 @@ final class SnipOverlayController {
     private var screenParametersObserver: NSObjectProtocol?
     private var silhouetteTasks: [CGWindowID: Task<CapturedWindowSilhouette?, Never>] = [:]
     private var resolvedSilhouettes: [CGWindowID: CapturedWindowSilhouette?] = [:]
+    private var resolvedSilhouetteOrder: [CGWindowID] = []
     private var previewUpdateTasks: [ObjectIdentifier: Task<Void, Never>] = [:]
     private var finishTask: Task<Void, Never>?
     private var isFinishing = false
@@ -237,6 +239,7 @@ final class SnipOverlayController {
         for task in silhouetteTasks.values { task.cancel() }
         silhouetteTasks.removeAll()
         resolvedSilhouettes.removeAll()
+        resolvedSilhouetteOrder.removeAll()
 
         if let screenParametersObserver {
             NotificationCenter.default.removeObserver(screenParametersObserver)
@@ -277,8 +280,32 @@ final class SnipOverlayController {
             || silhouetteProvider != nil
     }
 
+    private struct SilhouetteWaitState: Sendable {
+        var continuation: CheckedContinuation<CapturedWindowSilhouette?, Never>?
+        var timerTask: Task<Void, Never>?
+        var waitTask: Task<Void, Never>?
+        var isResolved = false
+    }
+
+    private func cacheResolvedSilhouette(_ silhouette: CapturedWindowSilhouette?, for windowID: CGWindowID) {
+        resolvedSilhouettes[windowID] = silhouette
+        resolvedSilhouetteOrder.removeAll { $0 == windowID }
+        resolvedSilhouetteOrder.append(windowID)
+        while resolvedSilhouetteOrder.count > Self.maxCachedSilhouettes {
+            let evicted = resolvedSilhouetteOrder.removeFirst()
+            resolvedSilhouettes.removeValue(forKey: evicted)
+        }
+    }
+
+    private func expectedQuartzFrame(for appKitFrame: CGRect) -> CGRect? {
+        let primaryHeight = detector.cachedPrimaryScreenHeight
+        guard primaryHeight > 0 else { return nil }
+        return CoordinateConverter.appKitToQuartz(appKitFrame, primaryScreenHeight: primaryHeight)
+    }
+
     private func ensureSilhouetteTask(
         for windowID: CGWindowID,
+        expectedAppKitFrame: CGRect,
         scale: CGFloat
     ) -> Task<CapturedWindowSilhouette?, Never>? {
         if let existing = silhouetteTasks[windowID] {
@@ -287,6 +314,7 @@ final class SnipOverlayController {
         let provider = silhouetteProvider
         let windowBox = shareableWindows[windowID]
         guard provider != nil || windowBox != nil else { return nil }
+        let expectedQuartz = expectedQuartzFrame(for: expectedAppKitFrame)
 
         let task = Task<CapturedWindowSilhouette?, Never>(priority: .userInitiated) {
             let result: CapturedWindowSilhouette?
@@ -295,7 +323,8 @@ final class SnipOverlayController {
             } else if let windowBox {
                 result = await ScreenSnapshotEngine.captureWindowSilhouetteWithMetadata(
                     window: windowBox.value,
-                    scale: scale
+                    scale: scale,
+                    expectedQuartzFrame: expectedQuartz
                 )
             } else {
                 result = nil
@@ -305,8 +334,9 @@ final class SnipOverlayController {
         silhouetteTasks[windowID] = task
         Task { @MainActor [weak self] in
             let silhouette = await task.value
-            guard let self, !self.isClosed else { return }
-            self.resolvedSilhouettes[windowID] = silhouette
+            guard let self, !self.isClosed, self.silhouetteTasks[windowID] == task else { return }
+            self.silhouetteTasks.removeValue(forKey: windowID)
+            self.cacheResolvedSilhouette(silhouette, for: windowID)
         }
         return task
     }
@@ -332,6 +362,8 @@ final class SnipOverlayController {
 
         // Fast synchronous path when this window's silhouette is already cached in the session.
         if let cached = resolvedSilhouettes[windowID] {
+            resolvedSilhouetteOrder.removeAll { $0 == windowID }
+            resolvedSilhouetteOrder.append(windowID)
             if let silhouette = cached,
                Self.silhouetteMatchesTarget(silhouette, target: target) {
                 let radii = WindowCornerMaskExtractor.extractCornerRadii(
@@ -346,13 +378,16 @@ final class SnipOverlayController {
             return
         }
 
-        guard let task = ensureSilhouetteTask(for: windowID, scale: view.snapshot.backingScaleFactor) else {
+        guard let task = ensureSilhouetteTask(
+            for: windowID,
+            expectedAppKitFrame: target.backingWindowFrame,
+            scale: view.snapshot.backingScaleFactor
+        ) else {
             return
         }
         previewUpdateTasks[viewKey] = Task { @MainActor [weak self, weak view] in
             let silhouette = await task.value
             guard let self, let view, !self.isClosed, !self.isFinishing, !Task.isCancelled else { return }
-            self.resolvedSilhouettes[windowID] = silhouette
             guard let silhouette,
                   Self.silhouetteMatchesTarget(silhouette, target: target)
             else { return }
@@ -378,35 +413,103 @@ final class SnipOverlayController {
             && abs(silhouette.contentSize.height - target.backingWindowFrame.height) <= WindowCornerMaskExtractor.windowSizeMatchTolerance
     }
 
-    /// Awaits an unstructured silhouette fetch with a hard wall-clock timeout so a stalled
-    /// ScreenCaptureKit call can never delay commit (falls back to square after `timeoutNanoseconds`).
-    private nonisolated static func awaitSilhouette(
+    /// Awaits an unstructured silhouette fetch with a hard wall-clock timeout and cancellation support
+    /// so a stalled ScreenCaptureKit call never delays commit and closing cancels immediately.
+    internal nonisolated static func awaitSilhouette(
         _ task: Task<CapturedWindowSilhouette?, Never>,
         timeoutNanoseconds: UInt64
     ) async -> CapturedWindowSilhouette? {
-        await withCheckedContinuation { continuation in
-            let resumed = OSAllocatedUnfairLock(initialState: false)
-            @Sendable func resumeOnce(_ value: CapturedWindowSilhouette?) {
-                let shouldResume = resumed.withLock { already -> Bool in
-                    guard !already else { return false }
-                    already = true
-                    return true
-                }
-                if shouldResume {
-                    continuation.resume(returning: value)
-                }
-            }
+        if Task.isCancelled { return nil }
+        let state = OSAllocatedUnfairLock(initialState: SilhouetteWaitState())
 
-            let timerTask = Task {
-                try? await Task.sleep(nanoseconds: timeoutNanoseconds)
-                resumeOnce(nil)
+        @Sendable func resolve(_ value: CapturedWindowSilhouette?) {
+            let pending = state.withLock { s -> (CheckedContinuation<CapturedWindowSilhouette?, Never>?, Task<Void, Never>?, Task<Void, Never>?) in
+                guard !s.isResolved else { return (nil, nil, nil) }
+                s.isResolved = true
+                let cont = s.continuation
+                let timer = s.timerTask
+                let wait = s.waitTask
+                s.continuation = nil
+                s.timerTask = nil
+                s.waitTask = nil
+                return (cont, timer, wait)
             }
-            Task {
-                let value = await task.value
-                timerTask.cancel()
-                resumeOnce(value)
-            }
+            pending.1?.cancel()
+            pending.2?.cancel()
+            pending.0?.resume(returning: value)
         }
+
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                let shouldResumeImmediately = state.withLock { s -> Bool in
+                    guard !s.isResolved else { return true }
+                    s.continuation = continuation
+                    return false
+                }
+                if shouldResumeImmediately {
+                    continuation.resume(returning: nil)
+                    return
+                }
+
+                let timerTask = Task {
+                    try? await Task.sleep(nanoseconds: timeoutNanoseconds)
+                    resolve(nil)
+                }
+                let waitTask = Task {
+                    let value = await task.value
+                    resolve(value)
+                }
+                let tasksToCancel = state.withLock { s -> (Task<Void, Never>?, Task<Void, Never>?) in
+                    if s.isResolved {
+                        return (timerTask, waitTask)
+                    }
+                    s.timerTask = timerTask
+                    s.waitTask = waitTask
+                    return (nil, nil)
+                }
+                tasksToCancel.0?.cancel()
+                tasksToCancel.1?.cancel()
+            }
+        } onCancel: {
+            resolve(nil)
+        }
+    }
+
+    private func completeImageExport(
+        rect: CGRect,
+        from view: SnipOverlayView,
+        cornerTarget: WindowCornerTarget?,
+        silhouette: CapturedWindowSilhouette?,
+        renderError: String,
+        buildOutcome: @MainActor (SnipResult) -> SnipOutcome
+    ) {
+        // The window may have changed after the preview cached a valid silhouette.
+        let currentSilhouette: CapturedWindowSilhouette?
+        if let silhouette, let cornerTarget, silhouetteProvider == nil {
+            if let expected = expectedQuartzFrame(for: cornerTarget.backingWindowFrame),
+               let live = ScreenSnapshotEngine.liveQuartzWindowBounds(for: cornerTarget.window.windowID),
+               ScreenSnapshotEngine.windowBoundsMatch(live, expected) {
+                currentSilhouette = silhouette
+            } else {
+                currentSilhouette = nil
+            }
+        } else {
+            currentSilhouette = silhouette
+        }
+        let result = Self.makeResult(
+            localRect: rect,
+            snapshot: view.snapshot,
+            document: view.annotations,
+            mosaicCache: view.mosaicCache,
+            cornerTarget: cornerTarget,
+            windowSilhouette: currentSilhouette
+        )
+        if result != nil {
+            onSelectionCommitted?(view.snapshot.displayID, rect)
+        }
+        let outcome = result.map(buildOutcome) ?? .failed(renderError)
+        close()
+        onFinish(outcome)
     }
 
     private func finish(_ action: OverlayAction, from view: SnipOverlayView) {
@@ -421,53 +524,65 @@ final class SnipOverlayController {
             )
             let cornerTarget = detector.matchingWindowCornerTarget(for: globalRect)
 
-            func completeSync(with silhouette: CapturedWindowSilhouette?) {
-                let result = Self.makeResult(
-                    localRect: rect,
-                    snapshot: view.snapshot,
-                    document: view.annotations,
-                    mosaicCache: view.mosaicCache,
-                    cornerTarget: cornerTarget,
-                    windowSilhouette: silhouette
-                )
-                if result != nil {
-                    onSelectionCommitted?(view.snapshot.displayID, rect)
-                }
-                let outcome = result.map(buildOutcome) ?? .failed(renderError)
-                close()
-                onFinish(outcome)
-            }
-
             guard let cornerTarget, hasSilhouetteSource(for: cornerTarget.window.windowID) else {
-                completeSync(with: nil)
+                completeImageExport(
+                    rect: rect,
+                    from: view,
+                    cornerTarget: cornerTarget,
+                    silhouette: nil,
+                    renderError: renderError,
+                    buildOutcome: buildOutcome
+                )
                 return
             }
 
             let windowID = cornerTarget.window.windowID
             if let cached = resolvedSilhouettes[windowID] {
-                completeSync(with: cached)
+                completeImageExport(
+                    rect: rect,
+                    from: view,
+                    cornerTarget: cornerTarget,
+                    silhouette: cached,
+                    renderError: renderError,
+                    buildOutcome: buildOutcome
+                )
                 return
             }
 
-            guard let task = ensureSilhouetteTask(for: windowID, scale: view.snapshot.backingScaleFactor) else {
-                completeSync(with: nil)
+            guard let task = ensureSilhouetteTask(
+                for: windowID,
+                expectedAppKitFrame: cornerTarget.backingWindowFrame,
+                scale: view.snapshot.backingScaleFactor
+            ) else {
+                completeImageExport(
+                    rect: rect,
+                    from: view,
+                    cornerTarget: cornerTarget,
+                    silhouette: nil,
+                    renderError: renderError,
+                    buildOutcome: buildOutcome
+                )
                 return
             }
 
             // Hide overlay panels immediately while awaiting the in-flight silhouette (bounded by 120ms).
             isFinishing = true
             for panel in panels { panel.orderOut(nil) }
-            finishTask = Task { @MainActor [weak self] in
+            finishTask = Task { @MainActor [weak self, weak view] in
                 let silhouette = await Self.awaitSilhouette(
                     task,
                     timeoutNanoseconds: Self.silhouetteCommitTimeoutNanoseconds
                 )
-                guard let self, !self.isClosed else { return }
+                guard let self, let view, !self.isClosed, !Task.isCancelled else { return }
                 self.finishTask = nil
-                if let silhouette {
-                    self.resolvedSilhouettes[windowID] = silhouette
-                }
-                completeSync(with: silhouette)
+                self.completeImageExport(
+                    rect: rect,
+                    from: view,
+                    cornerTarget: cornerTarget,
+                    silhouette: silhouette,
+                    renderError: renderError,
+                    buildOutcome: buildOutcome
+                )
             }
         }
 

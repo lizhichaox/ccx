@@ -180,6 +180,70 @@ public enum ScreenSnapshotEngine {
         throw ScreenSnapshotError.captureFailed
     }
 
+    /// Reads the live Quartz bounds of a single on-screen window from WindowServer (`nil` if closed/offscreen).
+    nonisolated static func liveQuartzWindowBounds(for windowID: CGWindowID) -> CGRect? {
+        guard let list = CGWindowListCopyWindowInfo(.optionIncludingWindow, windowID) as? [[String: Any]],
+              let info = list.first,
+              (info[kCGWindowIsOnscreen as String] as? NSNumber)?.boolValue == true,
+              let boundsDict = info[kCGWindowBounds as String] as? NSDictionary,
+              let bounds = CGRect(dictionaryRepresentation: boundsDict as CFDictionary),
+              isFinitePositiveRect(bounds, minimumSide: 2)
+        else {
+            return nil
+        }
+        if let alpha = (info[kCGWindowAlpha as String] as? NSNumber)?.doubleValue, alpha <= 0.01 {
+            return nil
+        }
+        return bounds
+    }
+
+    nonisolated static func windowBoundsMatch(
+        _ lhs: CGRect,
+        _ rhs: CGRect,
+        tolerance: CGFloat = WindowCornerMaskExtractor.windowSizeMatchTolerance
+    ) -> Bool {
+        guard isFinitePositiveRect(lhs, minimumSide: 2),
+              isFinitePositiveRect(rhs, minimumSide: 2),
+              tolerance.isFinite,
+              tolerance >= 0
+        else {
+            return false
+        }
+        return abs(lhs.minX - rhs.minX) <= tolerance
+            && abs(lhs.minY - rhs.minY) <= tolerance
+            && abs(lhs.width - rhs.width) <= tolerance
+            && abs(lhs.height - rhs.height) <= tolerance
+    }
+
+    nonisolated static func validateWindowSilhouetteBounds(
+        expectedFrame: CGRect,
+        contentSize: CGSize,
+        liveBoundsBefore: CGRect?,
+        liveBoundsAfter: CGRect?,
+        tolerance: CGFloat = WindowCornerMaskExtractor.windowSizeMatchTolerance
+    ) -> Bool {
+        guard isFinitePositiveRect(expectedFrame, minimumSide: 2),
+              contentSize.width.isFinite, contentSize.height.isFinite,
+              abs(contentSize.width - expectedFrame.width) <= tolerance,
+              abs(contentSize.height - expectedFrame.height) <= tolerance,
+              let liveBoundsBefore,
+              let liveBoundsAfter,
+              windowBoundsMatch(liveBoundsBefore, expectedFrame, tolerance: tolerance),
+              windowBoundsMatch(liveBoundsAfter, expectedFrame, tolerance: tolerance),
+              windowBoundsMatch(liveBoundsBefore, liveBoundsAfter, tolerance: tolerance)
+        else {
+            return false
+        }
+        return true
+    }
+
+    private nonisolated static func isFinitePositiveRect(_ rect: CGRect, minimumSide: CGFloat) -> Bool {
+        !rect.isNull && !rect.isInfinite
+            && rect.origin.x.isFinite && rect.origin.y.isFinite
+            && rect.size.width.isFinite && rect.size.height.isFinite
+            && rect.size.width >= minimumSide && rect.size.height >= minimumSide
+    }
+
     /// Captures a single isolated window with shadow framing stripped and transparent exterior
     /// corners preserved so `WindowCornerMaskExtractor` can read its real corner geometry.
     nonisolated static func captureWindowSilhouette(
@@ -191,8 +255,15 @@ public enum ScreenSnapshotEngine {
 
     nonisolated static func captureWindowSilhouetteWithMetadata(
         window: SCWindow,
-        scale: CGFloat
+        scale: CGFloat,
+        expectedQuartzFrame: CGRect? = nil
     ) async -> CapturedWindowSilhouette? {
+        let referenceFrame = expectedQuartzFrame ?? window.frame
+        guard isFinitePositiveRect(referenceFrame, minimumSide: 2) else { return nil }
+        if let expectedQuartzFrame, !windowBoundsMatch(window.frame, expectedQuartzFrame) {
+            return nil
+        }
+
         let filter = SCContentFilter(desktopIndependentWindow: window)
         let contentRect = filter.contentRect
         let effectiveScale = filter.pointPixelScale > 0
@@ -205,7 +276,14 @@ public enum ScreenSnapshotEngine {
               contentRect.width >= 2,
               contentRect.height >= 2,
               effectiveScale.isFinite,
-              effectiveScale > 0
+              effectiveScale > 0,
+              abs(contentRect.width - referenceFrame.width) <= WindowCornerMaskExtractor.windowSizeMatchTolerance,
+              abs(contentRect.height - referenceFrame.height) <= WindowCornerMaskExtractor.windowSizeMatchTolerance
+        else { return nil }
+
+        // Guard before capture: reject stale SCWindow if the live window disappeared, moved, or resized.
+        guard let preBounds = liveQuartzWindowBounds(for: window.windowID),
+              windowBoundsMatch(preBounds, referenceFrame)
         else { return nil }
 
         let rawWidth = (contentRect.width * effectiveScale).rounded()
@@ -234,6 +312,16 @@ public enum ScreenSnapshotEngine {
                 contentFilter: filter,
                 configuration: configuration
             )
+            // Guard after capture: discard letterboxed frames if the window changed mid-capture.
+            let postBounds = liveQuartzWindowBounds(for: window.windowID)
+            guard validateWindowSilhouetteBounds(
+                expectedFrame: referenceFrame,
+                contentSize: contentRect.size,
+                liveBoundsBefore: preBounds,
+                liveBoundsAfter: postBounds
+            ) else {
+                return nil
+            }
             return CapturedWindowSilhouette(
                 image: image,
                 contentSize: contentRect.size,

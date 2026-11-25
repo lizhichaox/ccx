@@ -703,6 +703,7 @@ internal final class ScrollCaptureHUDPanel: NSPanel, NSWindowDelegate {
         guard targetFrame != frame else { return }
         isProgrammaticFrameUpdate = true
         setFrame(targetFrame, display: true)
+        invalidateShadow()
         isProgrammaticFrameUpdate = false
         contentView?.frame = CGRect(origin: .zero, size: targetSize)
         innerContainer.frame = CGRect(origin: .zero, size: targetSize)
