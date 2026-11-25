@@ -14,6 +14,12 @@ public struct DetectedWindow: Sendable, Equatable {
     public let frame: CGRect
     /// Whether Tier 2 Accessibility sub-element refinement may run inside this window.
     public let allowsTier2Refinement: Bool
+    /// Full backing `SCWindow` frame in AppKit global coordinates when this entry is an extracted card
+    /// inside a larger transparent composite overlay (`nil` when `frame` is the full window frame).
+    public let containerWindowFrame: CGRect?
+
+    /// The backing `SCWindow` bounds corresponding to `windowID`.
+    public var backingWindowFrame: CGRect { containerWindowFrame ?? frame }
 
     public init(
         windowID: CGWindowID,
@@ -21,7 +27,8 @@ public struct DetectedWindow: Sendable, Equatable {
         ownerName: String?,
         layer: Int,
         frame: CGRect,
-        allowsTier2Refinement: Bool = true
+        allowsTier2Refinement: Bool = true,
+        containerWindowFrame: CGRect? = nil
     ) {
         self.windowID = windowID
         self.ownerPID = ownerPID
@@ -29,7 +36,19 @@ public struct DetectedWindow: Sendable, Equatable {
         self.layer = layer
         self.frame = frame
         self.allowsTier2Refinement = allowsTier2Refinement
+        self.containerWindowFrame = containerWindowFrame
     }
+}
+
+/// Resolved Z-order match linking a selection rectangle to a detected window's unoccluded corners.
+public struct WindowCornerTarget: Equatable, Sendable {
+    public let window: DetectedWindow
+    /// Full backing `SCWindow` frame in AppKit global coordinates.
+    public let backingWindowFrame: CGRect
+    /// Selection corners aligned with `window.frame` (`<= 1pt`) and unobstructed by higher-Z windows.
+    public let eligibleCorners: WindowCornerSet
+    /// `true` when `window` is an extracted card inside a larger transparent composite overlay.
+    public let isCompositeOverlayCard: Bool
 }
 
 /// Composite system overlay (such as Notification Center) tracked alongside its insertion slot
@@ -321,6 +340,134 @@ public final class SmartElementDetector {
     /// The front-most window or card containing `globalPoint` (AppKit global coordinates).
     public func windowRect(at globalPoint: CGPoint) -> CGRect? {
         Self.hitTest(windows, at: globalPoint)?.frame
+    }
+
+    /// The front-most `DetectedWindow` (with Z-order metadata) containing `globalPoint`.
+    public func window(at globalPoint: CGPoint) -> DetectedWindow? {
+        Self.hitTest(windows, at: globalPoint)
+    }
+
+    /// Resolves the front-most detected window whose outer edges align with at least one corner of
+    /// `globalSelectionRect` (`<= edgeTolerance` points), excluding any corners occluded by a higher-Z window.
+    public func matchingWindowCornerTarget(
+        for globalSelectionRect: CGRect,
+        edgeTolerance: CGFloat = 1.0,
+        occlusionPatchSize: CGFloat = 24
+    ) -> WindowCornerTarget? {
+        Self.matchingWindowCornerTarget(
+            for: globalSelectionRect,
+            in: windows,
+            edgeTolerance: edgeTolerance,
+            occlusionPatchSize: occlusionPatchSize
+        )
+    }
+
+    /// Pure Z-order window-corner matcher and occlusion checker (front-to-back order in `windows`).
+    public nonisolated static func matchingWindowCornerTarget(
+        for globalSelectionRect: CGRect,
+        in windows: [DetectedWindow],
+        edgeTolerance: CGFloat = 1.0,
+        occlusionPatchSize: CGFloat = 24
+    ) -> WindowCornerTarget? {
+        guard !globalSelectionRect.isNull,
+              !globalSelectionRect.isInfinite,
+              globalSelectionRect.origin.x.isFinite,
+              globalSelectionRect.origin.y.isFinite,
+              globalSelectionRect.size.width.isFinite,
+              globalSelectionRect.size.height.isFinite,
+              globalSelectionRect.width >= 8,
+              globalSelectionRect.height >= 8
+        else { return nil }
+
+        let rect = globalSelectionRect.standardized
+        let tol = max(0, edgeTolerance.isFinite ? edgeTolerance : 1.0)
+
+        for (index, candidate) in windows.enumerated() {
+            let expanded = candidate.frame.insetBy(dx: -tol, dy: -tol)
+            guard expanded.contains(rect) else { continue }
+
+            let matchesLeft = abs(rect.minX - candidate.frame.minX) <= tol
+            let matchesRight = abs(rect.maxX - candidate.frame.maxX) <= tol
+            let matchesBottom = abs(rect.minY - candidate.frame.minY) <= tol
+            let matchesTop = abs(rect.maxY - candidate.frame.maxY) <= tol
+
+            var alignedCorners: WindowCornerSet = []
+            if matchesLeft && matchesTop { alignedCorners.insert(.topLeft) }
+            if matchesRight && matchesTop { alignedCorners.insert(.topRight) }
+            if matchesLeft && matchesBottom { alignedCorners.insert(.bottomLeft) }
+            if matchesRight && matchesBottom { alignedCorners.insert(.bottomRight) }
+
+            guard !alignedCorners.isEmpty else {
+                // `candidate` fully covers `rect` interior without matching any outer corner, so any
+                // lower-Z window behind it is occluded across the entire selection.
+                return nil
+            }
+
+            let eligible = unoccludedCorners(
+                for: rect,
+                alignedCorners: alignedCorners,
+                targetIndex: index,
+                in: windows,
+                occlusionPatchSize: occlusionPatchSize
+            )
+            guard !eligible.isEmpty else { return nil }
+
+            return WindowCornerTarget(
+                window: candidate,
+                backingWindowFrame: candidate.backingWindowFrame,
+                eligibleCorners: eligible,
+                isCompositeOverlayCard: !candidate.allowsTier2Refinement && candidate.containerWindowFrame != nil
+            )
+        }
+        return nil
+    }
+
+    /// Removes any corner in `alignedCorners` whose corner patch is overlapped by a higher-Z window
+    /// (`windows[0..<targetIndex]`), preventing corner cutouts from punching through foreground windows.
+    public nonisolated static func unoccludedCorners(
+        for globalSelectionRect: CGRect,
+        alignedCorners: WindowCornerSet,
+        targetIndex: Int,
+        in windows: [DetectedWindow],
+        occlusionPatchSize: CGFloat = 24
+    ) -> WindowCornerSet {
+        guard !alignedCorners.isEmpty, targetIndex > 0 else { return alignedCorners }
+        let rect = globalSelectionRect.standardized
+        let safePatch = occlusionPatchSize.isFinite && occlusionPatchSize > 0 ? occlusionPatchSize : 24
+        let patchW = min(safePatch, rect.width * 0.5)
+        let patchH = min(safePatch, rect.height * 0.5)
+        guard patchW > 0, patchH > 0 else { return alignedCorners }
+
+        let higherWindows = windows[0..<min(targetIndex, windows.count)]
+
+        func isOccluded(_ patch: CGRect) -> Bool {
+            for higher in higherWindows {
+                let overlap = higher.frame.intersection(patch)
+                if !overlap.isNull, overlap.width > 0.5, overlap.height > 0.5 {
+                    return true
+                }
+            }
+            return false
+        }
+
+        var remaining = alignedCorners
+        if remaining.contains(.topLeft) {
+            let patch = CGRect(x: rect.minX, y: rect.maxY - patchH, width: patchW, height: patchH)
+            if isOccluded(patch) { remaining.remove(.topLeft) }
+        }
+        if remaining.contains(.topRight) {
+            let patch = CGRect(x: rect.maxX - patchW, y: rect.maxY - patchH, width: patchW, height: patchH)
+            if isOccluded(patch) { remaining.remove(.topRight) }
+        }
+        if remaining.contains(.bottomLeft) {
+            let patch = CGRect(x: rect.minX, y: rect.minY, width: patchW, height: patchH)
+            if isOccluded(patch) { remaining.remove(.bottomLeft) }
+        }
+        if remaining.contains(.bottomRight) {
+            let patch = CGRect(x: rect.maxX - patchW, y: rect.minY, width: patchW, height: patchH)
+            if isOccluded(patch) { remaining.remove(.bottomRight) }
+        }
+        return remaining
     }
 
     /// Returns whether Tier 2 AX element refinement should run at `globalPoint`.
@@ -956,7 +1103,8 @@ public final class SmartElementDetector {
                                 ownerName: entry.window.ownerName,
                                 layer: entry.window.layer,
                                 frame: cardFrame,
-                                allowsTier2Refinement: false
+                                allowsTier2Refinement: false,
+                                containerWindowFrame: entry.window.frame
                             ))
                         }
                     } else if confirmedEmptyWindowIDs.contains(entry.window.windowID) {

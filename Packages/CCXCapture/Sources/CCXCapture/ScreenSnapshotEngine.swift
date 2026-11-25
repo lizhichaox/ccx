@@ -35,7 +35,17 @@ public enum ScreenSnapshotEngine {
         let scale: CGFloat
     }
 
+    /// Frozen display snapshots together with the on-screen `SCWindow` catalog captured during
+    /// the same `SCShareableContent` call (zero extra startup latency for adaptive corner masking).
+    struct DisplayCaptureSession: Sendable {
+        let snapshots: [DisplaySnapshot]
+        let shareableWindows: [CGWindowID: UncheckedSendableBox<SCWindow>]
+    }
+
     private static let logger = Logger(subsystem: "com.lizhichaox.ccx", category: "ScreenSnapshotEngine")
+    /// Strongly retained transparent `CGColor` because `SCStreamConfiguration.backgroundColor`
+    /// is an Objective-C `assign` (`unowned(unsafe)`) property.
+    private nonisolated static let clearCGColor = CGColor(gray: 0, alpha: 0)
 
     /// Returns `true` when ScreenCaptureKit reported that the user declined or lacks
     /// Screen Recording permission (`SCStreamError.userDeclined`, `-3801`).
@@ -103,10 +113,22 @@ public enum ScreenSnapshotEngine {
         geometries: [CGDirectDisplayID: ScreenGeometry],
         excludingWindowIDs: Set<CGWindowID> = []
     ) async throws -> [DisplaySnapshot] {
+        try await captureSession(geometries: geometries, excludingWindowIDs: excludingWindowIDs).snapshots
+    }
+
+    nonisolated static func captureSession(
+        geometries: [CGDirectDisplayID: ScreenGeometry],
+        excludingWindowIDs: Set<CGWindowID> = []
+    ) async throws -> DisplayCaptureSession {
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
         let excludedWindows = excludingWindowIDs.isEmpty
             ? []
             : content.windows.filter { excludingWindowIDs.contains($0.windowID) }
+        var shareableWindows: [CGWindowID: UncheckedSendableBox<SCWindow>] = [:]
+        shareableWindows.reserveCapacity(content.windows.count)
+        for window in content.windows where !excludingWindowIDs.contains(window.windowID) {
+            shareableWindows[window.windowID] = UncheckedSendableBox(window)
+        }
 
         var jobs: [(UncheckedSendableBox<SCContentFilter>, ScreenGeometry)] = []
         for display in content.displays {
@@ -147,7 +169,7 @@ public enum ScreenSnapshotEngine {
         }
 
         if !snapshots.isEmpty {
-            return snapshots
+            return DisplayCaptureSession(snapshots: snapshots, shareableWindows: shareableWindows)
         }
         if let permissionError = errors.first(where: { isPermissionDeniedError($0) }) {
             throw permissionError
@@ -156,6 +178,71 @@ public enum ScreenSnapshotEngine {
             throw firstError
         }
         throw ScreenSnapshotError.captureFailed
+    }
+
+    /// Captures a single isolated window with shadow framing stripped and transparent exterior
+    /// corners preserved so `WindowCornerMaskExtractor` can read its real corner geometry.
+    nonisolated static func captureWindowSilhouette(
+        window: SCWindow,
+        scale: CGFloat
+    ) async -> CGImage? {
+        await captureWindowSilhouetteWithMetadata(window: window, scale: scale)?.image
+    }
+
+    nonisolated static func captureWindowSilhouetteWithMetadata(
+        window: SCWindow,
+        scale: CGFloat
+    ) async -> CapturedWindowSilhouette? {
+        let filter = SCContentFilter(desktopIndependentWindow: window)
+        let contentRect = filter.contentRect
+        let effectiveScale = filter.pointPixelScale > 0
+            ? CGFloat(filter.pointPixelScale)
+            : (scale.isFinite && scale > 0 ? scale : 1)
+        guard !contentRect.isNull,
+              !contentRect.isInfinite,
+              contentRect.width.isFinite,
+              contentRect.height.isFinite,
+              contentRect.width >= 2,
+              contentRect.height >= 2,
+              effectiveScale.isFinite,
+              effectiveScale > 0
+        else { return nil }
+
+        let rawWidth = (contentRect.width * effectiveScale).rounded()
+        let rawHeight = (contentRect.height * effectiveScale).rounded()
+        guard rawWidth.isFinite, rawHeight.isFinite, rawWidth >= 2, rawHeight >= 2 else {
+            return nil
+        }
+        let pixelWidth = min(max(2, Int(rawWidth)), 16_384)
+        let pixelHeight = min(max(2, Int(rawHeight)), 16_384)
+
+        let configuration = SCStreamConfiguration()
+        configuration.width = pixelWidth
+        configuration.height = pixelHeight
+        configuration.ignoreShadowsSingleWindow = true
+        configuration.ignoreGlobalClipSingleWindow = true
+        configuration.shouldBeOpaque = false
+        configuration.backgroundColor = clearCGColor
+        configuration.includeChildWindows = false
+        configuration.showsCursor = false
+        configuration.pixelFormat = kCVPixelFormatType_32BGRA
+        configuration.captureResolution = .best
+        configuration.scalesToFit = false
+
+        do {
+            let image = try await SCScreenshotManager.captureImage(
+                contentFilter: filter,
+                configuration: configuration
+            )
+            return CapturedWindowSilhouette(
+                image: image,
+                contentSize: contentRect.size,
+                pointPixelScale: effectiveScale
+            )
+        } catch {
+            logger.debug("Window silhouette capture failed for window \(window.windowID): \(error.localizedDescription)")
+            return nil
+        }
     }
 
     nonisolated private static func captureImage(filter: SCContentFilter, geometry: ScreenGeometry) async throws -> CGImage {

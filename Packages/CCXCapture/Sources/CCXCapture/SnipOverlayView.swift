@@ -47,6 +47,8 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
     var shouldBecomeKeyOnHover: (() -> Bool)?
     /// Called once when the user finishes the session from this view.
     var onFinish: ((OverlayAction) -> Void)?
+    /// Called whenever the locked `.selected` rectangle changes or clears (never fires while hovering).
+    var onSelectionChanged: ((CGRect?) -> Void)?
     /// Called whenever the active annotation style changes so the next session restores it.
     var onStyleUpdated: ((AnnotationStyle) -> Void)?
 
@@ -100,9 +102,13 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
     private var renderedHighlightValid = false
     private var renderedHighlightRect: CGRect?
     private var renderedIsHovering = true
+    private var renderedCornerRadii: AdaptiveCornerRadii = .zero
     private var renderedHandlesRect: CGRect?
     private var hasRenderedAnnotations = false
     private var lastCursorKind: CursorKind?
+    private(set) var adaptiveCornerRadii: AdaptiveCornerRadii = .zero
+    private var lastNotifiedSelectedRect: CGRect?
+    private var isRefreshing = false
 
     private let pixelSampler = SnapshotPixelSampler()
     private let imageLayer = CALayer()
@@ -124,6 +130,7 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
     var sizeHUDText: String { sizeHUD.displayText }
     var sizeHUDFrame: CGRect { sizeHUD.frame }
     var borderLayerPath: CGPath? { borderLayer.path }
+    var dimLayerPath: CGPath? { dimLayer.path }
     var isEditingTextForTesting: Bool { isEditingText }
     var inlineEditorFrameForTesting: CGRect? { inlineEditor?.frame }
     var inlineEditorFieldForTesting: NSTextField? { inlineEditor }
@@ -295,6 +302,9 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
         toolbar.onDragMoved = nil
         toolbar.onDragStateChanged = nil
         toolbar.onResetPosition = nil
+        onSelectionChanged = nil
+        adaptiveCornerRadii = .zero
+        lastNotifiedSelectedRect = nil
         bumpAXEpoch(cancelPending: true)
         annotations.clear()
         mosaicCache.clear()
@@ -336,8 +346,20 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
         lastCursorKind = nil
         isSpaceDown = false
         lastSizeLabelText = nil
+        adaptiveCornerRadii = .zero
         machine.reset()
         refresh()
+    }
+
+    /// Updates live adaptive corner preview radii for the current `.selected` rect,
+    /// dropping stale async responses whose `expectedRect` no longer matches.
+    func setAdaptiveCornerRadii(_ radii: AdaptiveCornerRadii, forLocalRect expectedRect: CGRect) {
+        guard let current = selectedRect, rectsNearlyEqual(current, expectedRect) else { return }
+        guard adaptiveCornerRadii != radii else { return }
+        adaptiveCornerRadii = radii
+        if !isRefreshing {
+            refresh()
+        }
     }
 
     /// Clears hover highlights, magnifier, and AX state when the cursor leaves this display.
@@ -1668,29 +1690,55 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
     }
 
     private func refresh() {
+        let currentSelected = selectedRect
+        if !rectsNearlyEqual(currentSelected, lastNotifiedSelectedRect) {
+            lastNotifiedSelectedRect = currentSelected
+            adaptiveCornerRadii = .zero
+            let wasRefreshing = isRefreshing
+            isRefreshing = true
+            onSelectionChanged?(currentSelected)
+            isRefreshing = wasRefreshing
+        }
+
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         defer { CATransaction.commit() }
 
         let highlight = machine.highlightedRect
         let isHovering = machine.isHovering
+        let previewRadii = (!isHovering && currentSelected != nil) ? adaptiveCornerRadii : .zero
         if !renderedHighlightValid ||
            !rectsNearlyEqual(highlight, renderedHighlightRect) ||
-           isHovering != renderedIsHovering {
+           isHovering != renderedIsHovering ||
+           previewRadii != renderedCornerRadii {
             renderedHighlightValid = true
             renderedHighlightRect = highlight
             renderedIsHovering = isHovering
+            renderedCornerRadii = previewRadii
 
             let dimPath = CGMutablePath()
             dimPath.addRect(bounds)
-            if let highlight { dimPath.addRect(highlight) }
+            if let highlight {
+                if previewRadii.isAllZero {
+                    dimPath.addRect(highlight)
+                } else {
+                    dimPath.addPath(WindowCornerMaskExtractor.makeRoundedRectPath(rect: highlight, radii: previewRadii))
+                }
+            }
             dimLayer.path = dimPath
 
             if let highlight {
                 let insetX = min(0.75, highlight.width / 2)
                 let insetY = min(0.75, highlight.height / 2)
                 let borderRect = highlight.insetBy(dx: insetX, dy: insetY)
-                borderLayer.path = borderRect.isNull ? nil : CGPath(rect: borderRect, transform: nil)
+                if borderRect.isNull {
+                    borderLayer.path = nil
+                } else if previewRadii.isAllZero {
+                    borderLayer.path = CGPath(rect: borderRect, transform: nil)
+                } else {
+                    let insetRadii = previewRadii.inset(by: max(insetX, insetY))
+                    borderLayer.path = WindowCornerMaskExtractor.makeRoundedRectPath(rect: borderRect, radii: insetRadii)
+                }
                 borderLayer.strokeColor = (isHovering ? NSColor.systemCyan : NSColor.systemBlue).cgColor
             } else {
                 borderLayer.path = nil

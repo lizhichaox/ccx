@@ -1,6 +1,8 @@
 import AppKit
 import CCXAnnotate
 import CCXCore
+import os
+import ScreenCaptureKit
 
 /// Borderless, non-activating overlay panel that can still become key for keyboard shortcuts.
 final class SnipOverlayPanel: NSPanel {
@@ -15,8 +17,12 @@ final class SnipOverlayPanel: NSPanel {
 /// Owns one `SnipOverlayPanel` per display for the duration of a snip session.
 @MainActor
 final class SnipOverlayController {
+    private static let silhouetteCommitTimeoutNanoseconds: UInt64 = 120_000_000
+
     private let snapshots: [DisplaySnapshot]
     private let detector: SmartElementDetector
+    private let shareableWindows: [CGWindowID: UncheckedSendableBox<SCWindow>]
+    private let silhouetteProvider: (@Sendable (CGWindowID, CGFloat) async -> CapturedWindowSilhouette?)?
     private let selectionMode: SnipSelectionMode
     private let initialStyle: AnnotationStyle
     private let previousSelections: [CGDirectDisplayID: CGRect]
@@ -27,11 +33,18 @@ final class SnipOverlayController {
     private var panels: [SnipOverlayPanel] = []
     private var views: [SnipOverlayView] = []
     private var screenParametersObserver: NSObjectProtocol?
-    private var isFinished = false
+    private var silhouetteTasks: [CGWindowID: Task<CapturedWindowSilhouette?, Never>] = [:]
+    private var resolvedSilhouettes: [CGWindowID: CapturedWindowSilhouette?] = [:]
+    private var previewUpdateTasks: [ObjectIdentifier: Task<Void, Never>] = [:]
+    private var finishTask: Task<Void, Never>?
+    private var isFinishing = false
+    private var isClosed = false
 
     init(
         snapshots: [DisplaySnapshot],
         detector: SmartElementDetector,
+        shareableWindows: [CGWindowID: UncheckedSendableBox<SCWindow>] = [:],
+        silhouetteProvider: (@Sendable (CGWindowID, CGFloat) async -> CapturedWindowSilhouette?)? = nil,
         selectionMode: SnipSelectionMode = .snip,
         initialStyle: AnnotationStyle = AnnotationStyle(),
         previousSelections: [CGDirectDisplayID: CGRect] = [:],
@@ -42,6 +55,8 @@ final class SnipOverlayController {
     ) {
         self.snapshots = snapshots
         self.detector = detector
+        self.shareableWindows = shareableWindows
+        self.silhouetteProvider = silhouetteProvider
         self.selectionMode = selectionMode
         self.initialStyle = initialStyle
         self.previousSelections = previousSelections
@@ -123,6 +138,10 @@ final class SnipOverlayController {
                 guard let self else { return true }
                 return !self.views.contains { !$0.machine.isHovering }
             }
+            view.onSelectionChanged = { [weak self, weak view] localRect in
+                guard let self, let view else { return }
+                self.handleSelectionChanged(localRect, on: view)
+            }
             view.onFinish = { [weak self, weak view] action in
                 guard let self, let view else { return }
                 self.finish(action, from: view)
@@ -158,7 +177,7 @@ final class SnipOverlayController {
     }
 
     private func handleScreenParametersChanged() {
-        guard !isFinished else { return }
+        guard !isClosed, !isFinishing else { return }
         close()
         onFinish(.cancelled)
     }
@@ -193,9 +212,32 @@ final class SnipOverlayController {
         panel.setFrame(frame, display: false)
     }
 
+    /// Wires a view directly to this controller without ordering screen-covering panels on screen.
+    internal func attachViewForTesting(_ view: SnipOverlayView) {
+        view.hoverRectProvider = { [weak self] global in self?.detector.windowRect(at: global) }
+        view.onSelectionChanged = { [weak self, weak view] localRect in
+            guard let self, let view else { return }
+            self.handleSelectionChanged(localRect, on: view)
+        }
+        view.onFinish = { [weak self, weak view] action in
+            guard let self, let view else { return }
+            self.finish(action, from: view)
+        }
+        views.append(view)
+    }
+
     /// Tears down all panels without reporting an outcome.
     func close() {
-        isFinished = true
+        isClosed = true
+        isFinishing = true
+        finishTask?.cancel()
+        finishTask = nil
+        for task in previewUpdateTasks.values { task.cancel() }
+        previewUpdateTasks.removeAll()
+        for task in silhouetteTasks.values { task.cancel() }
+        silhouetteTasks.removeAll()
+        resolvedSilhouettes.removeAll()
+
         if let screenParametersObserver {
             NotificationCenter.default.removeObserver(screenParametersObserver)
             self.screenParametersObserver = nil
@@ -205,6 +247,7 @@ final class SnipOverlayController {
         for view in views {
             view.tearDown()
             view.onFinish = nil
+            view.onSelectionChanged = nil
             view.onBeginInteraction = nil
             view.onHoverActive = nil
             view.hasSiblingSelection = nil
@@ -225,31 +268,222 @@ final class SnipOverlayController {
         views.removeAll()
     }
 
-    private func finish(_ action: OverlayAction, from view: SnipOverlayView) {
-        guard !isFinished else { return }
-        func renderResult(for rect: CGRect) -> SnipResult? {
-            let result = Self.makeResult(
-                localRect: rect,
-                snapshot: view.snapshot,
-                document: view.annotations,
-                mosaicCache: view.mosaicCache
-            )
-            if result != nil {
-                onSelectionCommitted?(view.snapshot.displayID, rect)
+    // MARK: - Adaptive Window-Corner Silhouette Prefetch
+
+    private func hasSilhouetteSource(for windowID: CGWindowID) -> Bool {
+        resolvedSilhouettes.keys.contains(windowID)
+            || silhouetteTasks[windowID] != nil
+            || shareableWindows[windowID] != nil
+            || silhouetteProvider != nil
+    }
+
+    private func ensureSilhouetteTask(
+        for windowID: CGWindowID,
+        scale: CGFloat
+    ) -> Task<CapturedWindowSilhouette?, Never>? {
+        if let existing = silhouetteTasks[windowID] {
+            return existing
+        }
+        let provider = silhouetteProvider
+        let windowBox = shareableWindows[windowID]
+        guard provider != nil || windowBox != nil else { return nil }
+
+        let task = Task<CapturedWindowSilhouette?, Never>(priority: .userInitiated) {
+            let result: CapturedWindowSilhouette?
+            if let provider {
+                result = await provider(windowID, scale)
+            } else if let windowBox {
+                result = await ScreenSnapshotEngine.captureWindowSilhouetteWithMetadata(
+                    window: windowBox.value,
+                    scale: scale
+                )
+            } else {
+                result = nil
             }
             return result
         }
+        silhouetteTasks[windowID] = task
+        Task { @MainActor [weak self] in
+            let silhouette = await task.value
+            guard let self, !self.isClosed else { return }
+            self.resolvedSilhouettes[windowID] = silhouette
+        }
+        return task
+    }
+
+    private func handleSelectionChanged(_ localRect: CGRect?, on view: SnipOverlayView) {
+        let viewKey = ObjectIdentifier(view)
+        previewUpdateTasks[viewKey]?.cancel()
+        previewUpdateTasks[viewKey] = nil
+
+        guard selectionMode == .snip,
+              !isClosed,
+              !isFinishing,
+              let localRect
+        else { return }
+
+        let globalRect = localRect.offsetBy(
+            dx: view.snapshot.screenFrame.minX,
+            dy: view.snapshot.screenFrame.minY
+        )
+        guard let target = detector.matchingWindowCornerTarget(for: globalRect) else { return }
+        let windowID = target.window.windowID
+        guard hasSilhouetteSource(for: windowID) else { return }
+
+        // Fast synchronous path when this window's silhouette is already cached in the session.
+        if let cached = resolvedSilhouettes[windowID] {
+            if let silhouette = cached,
+               Self.silhouetteMatchesTarget(silhouette, target: target) {
+                let radii = WindowCornerMaskExtractor.extractCornerRadii(
+                    windowImage: silhouette.image,
+                    windowFrame: target.backingWindowFrame,
+                    selectionRect: globalRect,
+                    eligibleCorners: target.eligibleCorners,
+                    displayScale: silhouette.pointPixelScale
+                )
+                view.setAdaptiveCornerRadii(radii, forLocalRect: localRect)
+            }
+            return
+        }
+
+        guard let task = ensureSilhouetteTask(for: windowID, scale: view.snapshot.backingScaleFactor) else {
+            return
+        }
+        previewUpdateTasks[viewKey] = Task { @MainActor [weak self, weak view] in
+            let silhouette = await task.value
+            guard let self, let view, !self.isClosed, !self.isFinishing, !Task.isCancelled else { return }
+            self.resolvedSilhouettes[windowID] = silhouette
+            guard let silhouette,
+                  Self.silhouetteMatchesTarget(silhouette, target: target)
+            else { return }
+            let radii = await Task.detached(priority: .userInitiated) {
+                WindowCornerMaskExtractor.extractCornerRadii(
+                    windowImage: silhouette.image,
+                    windowFrame: target.backingWindowFrame,
+                    selectionRect: globalRect,
+                    eligibleCorners: target.eligibleCorners,
+                    displayScale: silhouette.pointPixelScale
+                )
+            }.value
+            guard !self.isClosed, !self.isFinishing, !Task.isCancelled else { return }
+            view.setAdaptiveCornerRadii(radii, forLocalRect: localRect)
+        }
+    }
+
+    private nonisolated static func silhouetteMatchesTarget(
+        _ silhouette: CapturedWindowSilhouette,
+        target: WindowCornerTarget
+    ) -> Bool {
+        abs(silhouette.contentSize.width - target.backingWindowFrame.width) <= WindowCornerMaskExtractor.windowSizeMatchTolerance
+            && abs(silhouette.contentSize.height - target.backingWindowFrame.height) <= WindowCornerMaskExtractor.windowSizeMatchTolerance
+    }
+
+    /// Awaits an unstructured silhouette fetch with a hard wall-clock timeout so a stalled
+    /// ScreenCaptureKit call can never delay commit (falls back to square after `timeoutNanoseconds`).
+    private nonisolated static func awaitSilhouette(
+        _ task: Task<CapturedWindowSilhouette?, Never>,
+        timeoutNanoseconds: UInt64
+    ) async -> CapturedWindowSilhouette? {
+        await withCheckedContinuation { continuation in
+            let resumed = OSAllocatedUnfairLock(initialState: false)
+            @Sendable func resumeOnce(_ value: CapturedWindowSilhouette?) {
+                let shouldResume = resumed.withLock { already -> Bool in
+                    guard !already else { return false }
+                    already = true
+                    return true
+                }
+                if shouldResume {
+                    continuation.resume(returning: value)
+                }
+            }
+
+            let timerTask = Task {
+                try? await Task.sleep(nanoseconds: timeoutNanoseconds)
+                resumeOnce(nil)
+            }
+            Task {
+                let value = await task.value
+                timerTask.cancel()
+                resumeOnce(value)
+            }
+        }
+    }
+
+    private func finish(_ action: OverlayAction, from view: SnipOverlayView) {
+        guard !isClosed, !isFinishing else { return }
+
         let renderError = CCXL10n.text("Could not render selected region", zh: "无法渲染选区图像")
-        let outcome: SnipOutcome
+
+        func finishImageExport(rect: CGRect, buildOutcome: @escaping @MainActor (SnipResult) -> SnipOutcome) {
+            let globalRect = rect.offsetBy(
+                dx: view.snapshot.screenFrame.minX,
+                dy: view.snapshot.screenFrame.minY
+            )
+            let cornerTarget = detector.matchingWindowCornerTarget(for: globalRect)
+
+            func completeSync(with silhouette: CapturedWindowSilhouette?) {
+                let result = Self.makeResult(
+                    localRect: rect,
+                    snapshot: view.snapshot,
+                    document: view.annotations,
+                    mosaicCache: view.mosaicCache,
+                    cornerTarget: cornerTarget,
+                    windowSilhouette: silhouette
+                )
+                if result != nil {
+                    onSelectionCommitted?(view.snapshot.displayID, rect)
+                }
+                let outcome = result.map(buildOutcome) ?? .failed(renderError)
+                close()
+                onFinish(outcome)
+            }
+
+            guard let cornerTarget, hasSilhouetteSource(for: cornerTarget.window.windowID) else {
+                completeSync(with: nil)
+                return
+            }
+
+            let windowID = cornerTarget.window.windowID
+            if let cached = resolvedSilhouettes[windowID] {
+                completeSync(with: cached)
+                return
+            }
+
+            guard let task = ensureSilhouetteTask(for: windowID, scale: view.snapshot.backingScaleFactor) else {
+                completeSync(with: nil)
+                return
+            }
+
+            // Hide overlay panels immediately while awaiting the in-flight silhouette (bounded by 120ms).
+            isFinishing = true
+            for panel in panels { panel.orderOut(nil) }
+            finishTask = Task { @MainActor [weak self] in
+                let silhouette = await Self.awaitSilhouette(
+                    task,
+                    timeoutNanoseconds: Self.silhouetteCommitTimeoutNanoseconds
+                )
+                guard let self, !self.isClosed else { return }
+                self.finishTask = nil
+                if let silhouette {
+                    self.resolvedSilhouettes[windowID] = silhouette
+                }
+                completeSync(with: silhouette)
+            }
+        }
+
         switch action {
         case let .pin(rect):
-            outcome = renderResult(for: rect).map(SnipOutcome.pin) ?? .failed(renderError)
+            finishImageExport(rect: rect, buildOutcome: SnipOutcome.pin)
+            return
         case let .copy(rect):
-            outcome = renderResult(for: rect).map(SnipOutcome.copy) ?? .failed(renderError)
+            finishImageExport(rect: rect, buildOutcome: SnipOutcome.copy)
+            return
         case let .save(rect):
-            outcome = renderResult(for: rect).map(SnipOutcome.save) ?? .failed(renderError)
+            finishImageExport(rect: rect, buildOutcome: SnipOutcome.save)
+            return
         case let .quickSave(rect):
-            outcome = renderResult(for: rect).map(SnipOutcome.quickSave) ?? .failed(renderError)
+            finishImageExport(rect: rect, buildOutcome: SnipOutcome.quickSave)
+            return
         case let .scroll(rect):
             let initialResult = Self.makeResult(localRect: rect, snapshot: view.snapshot)
             if initialResult != nil {
@@ -271,7 +505,19 @@ final class SnipOverlayController {
             }
             return
         case let .ocr(rect):
-            outcome = renderResult(for: rect).map(SnipOutcome.ocr) ?? .failed(renderError)
+            let result = Self.makeResult(
+                localRect: rect,
+                snapshot: view.snapshot,
+                document: view.annotations,
+                mosaicCache: view.mosaicCache
+            )
+            if result != nil {
+                onSelectionCommitted?(view.snapshot.displayID, rect)
+            }
+            let outcome = result.map(SnipOutcome.ocr) ?? .failed(renderError)
+            close()
+            onFinish(outcome)
+            return
         case let .record(rect):
             let standardized = rect.standardized
             let localBounds = CGRect(origin: .zero, size: view.snapshot.screenFrame.size)
@@ -282,24 +528,34 @@ final class SnipOverlayController {
                 : view.snapshot.backingScaleFactor
             let screenRect = effectiveLocal.offsetBy(dx: view.snapshot.screenFrame.minX, dy: view.snapshot.screenFrame.minY)
             onSelectionCommitted?(view.snapshot.displayID, effectiveLocal)
-            outcome = .record(RecordRegionRequest(
+            close()
+            onFinish(.record(RecordRegionRequest(
                 displayID: view.snapshot.displayID,
                 displayFrame: view.snapshot.screenFrame,
                 localRect: effectiveLocal,
                 screenRect: screenRect,
                 scale: scale
-            ))
+            )))
+            return
         case let .copyColor(sample, format):
-            outcome = .copiedColor(sample, format)
+            close()
+            onFinish(.copiedColor(sample, format))
+            return
         case .cancel:
-            outcome = .cancelled
+            close()
+            onFinish(.cancelled)
+            return
         }
-        close()
-        onFinish(outcome)
     }
 
     /// Crops the exact backing pixels for a view-local AppKit rect from a display snapshot.
-    nonisolated static func makeResult(localRect: CGRect, snapshot: DisplaySnapshot) -> SnipResult? {
+    nonisolated static func makeResult(
+        localRect: CGRect,
+        snapshot: DisplaySnapshot,
+        cornerTarget: WindowCornerTarget? = nil,
+        windowSilhouette: CapturedWindowSilhouette? = nil,
+        cornerMask: CGImage? = nil
+    ) -> SnipResult? {
         let imageSize = CGSize(width: snapshot.image.width, height: snapshot.image.height)
         let pixelRect = CoordinateConverter.appKitLocalRectToImagePixelRect(
             localRect,
@@ -311,18 +567,36 @@ final class SnipOverlayController {
         }
         let scale = snapshot.screenFrame.width > 0 ? imageSize.width / snapshot.screenFrame.width : snapshot.backingScaleFactor
         let screenRect = localRect.offsetBy(dx: snapshot.screenFrame.minX, dy: snapshot.screenFrame.minY)
-        return SnipResult(image: cropped, scale: scale, screenRect: screenRect)
+        let finalImage = applyAdaptiveCornerMaskIfNeeded(
+            to: cropped,
+            globalRect: screenRect,
+            cornerTarget: cornerTarget,
+            windowSilhouette: windowSilhouette,
+            cornerMask: cornerMask
+        )
+        return SnipResult(image: finalImage, scale: scale, screenRect: screenRect)
     }
 
-    /// Crops the exact backing pixels and bakes any committed annotations at full Retina resolution.
+    /// Crops the exact backing pixels, bakes any committed annotations at full Retina resolution,
+    /// and applies any resolved adaptive window-corner mask after baking so annotations crossing
+    /// rounded corners are cleanly clipped too.
     static func makeResult(
         localRect: CGRect,
         snapshot: DisplaySnapshot,
         document: AnnotationDocument?,
-        mosaicCache: MosaicImageCache?
+        mosaicCache: MosaicImageCache?,
+        cornerTarget: WindowCornerTarget? = nil,
+        windowSilhouette: CapturedWindowSilhouette? = nil,
+        cornerMask: CGImage? = nil
     ) -> SnipResult? {
         guard let document, !document.items.isEmpty else {
-            return makeResult(localRect: localRect, snapshot: snapshot)
+            return makeResult(
+                localRect: localRect,
+                snapshot: snapshot,
+                cornerTarget: cornerTarget,
+                windowSilhouette: windowSilhouette,
+                cornerMask: cornerMask
+            )
         }
         let imageSize = CGSize(width: snapshot.image.width, height: snapshot.image.height)
         let pixelRect = CoordinateConverter.appKitLocalRectToImagePixelRect(
@@ -343,6 +617,40 @@ final class SnipOverlayController {
         }
         let scale = snapshot.screenFrame.width > 0 ? imageSize.width / snapshot.screenFrame.width : snapshot.backingScaleFactor
         let screenRect = localRect.offsetBy(dx: snapshot.screenFrame.minX, dy: snapshot.screenFrame.minY)
-        return SnipResult(image: baked, scale: scale, screenRect: screenRect)
+        let finalImage = applyAdaptiveCornerMaskIfNeeded(
+            to: baked,
+            globalRect: screenRect,
+            cornerTarget: cornerTarget,
+            windowSilhouette: windowSilhouette,
+            cornerMask: cornerMask
+        )
+        return SnipResult(image: finalImage, scale: scale, screenRect: screenRect)
+    }
+
+    private nonisolated static func applyAdaptiveCornerMaskIfNeeded(
+        to image: CGImage,
+        globalRect: CGRect,
+        cornerTarget: WindowCornerTarget?,
+        windowSilhouette: CapturedWindowSilhouette?,
+        cornerMask: CGImage?
+    ) -> CGImage {
+        if let cornerMask {
+            return WindowCornerMaskExtractor.applyMask(cornerMask, to: image)
+        }
+        guard let cornerTarget,
+              let windowSilhouette,
+              silhouetteMatchesTarget(windowSilhouette, target: cornerTarget),
+              let extracted = WindowCornerMaskExtractor.extractMask(
+                  windowImage: windowSilhouette.image,
+                  windowFrame: cornerTarget.backingWindowFrame,
+                  selectionRect: globalRect,
+                  eligibleCorners: cornerTarget.eligibleCorners,
+                  outputPixelSize: (width: image.width, height: image.height),
+                  displayScale: windowSilhouette.pointPixelScale
+              )
+        else {
+            return image
+        }
+        return WindowCornerMaskExtractor.applyMask(extracted.maskImage, to: image)
     }
 }

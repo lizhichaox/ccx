@@ -2,6 +2,7 @@ import AppKit
 import CCXAnnotate
 import CCXCore
 import OSLog
+import ScreenCaptureKit
 
 /// Entry point for an interactive snip session (freeze screens -> select -> act).
 @MainActor
@@ -44,7 +45,7 @@ public final class SnipCoordinator {
             }
             defer { overlayPrepTask.cancel() }
             do {
-                let snapshots = try await ScreenSnapshotEngine.capture(geometries: geometries)
+                let session = try await ScreenSnapshotEngine.captureSession(geometries: geometries)
                 // Bound waiting on overlay AX pre-capture so a hung WidgetKit XPC can never stall snip launch.
                 await Self.awaitWithTimeout(nanoseconds: 160_000_000) {
                     await overlayPrepTask.value
@@ -52,7 +53,12 @@ public final class SnipCoordinator {
                 overlayPrepTask.cancel()
                 guard let self, self.isSessionActive, !Task.isCancelled else { return }
                 PermissionManager.setScreenRecordingVerified(true)
-                self.presentOverlay(snapshots: snapshots, detector: detector, selectionMode: mode)
+                self.presentOverlay(
+                    snapshots: session.snapshots,
+                    detector: detector,
+                    shareableWindows: session.shareableWindows,
+                    selectionMode: mode
+                )
             } catch {
                 guard let self, !Task.isCancelled else { return }
                 if ScreenSnapshotEngine.isPermissionDeniedError(error) {
@@ -97,12 +103,14 @@ public final class SnipCoordinator {
     private func presentOverlay(
         snapshots: [DisplaySnapshot],
         detector: SmartElementDetector,
+        shareableWindows: [CGWindowID: UncheckedSendableBox<SCWindow>],
         selectionMode: SnipSelectionMode
     ) {
         captureTask = nil
         let controller = SnipOverlayController(
             snapshots: snapshots,
             detector: detector,
+            shareableWindows: shareableWindows,
             selectionMode: selectionMode,
             initialStyle: lastAnnotationStyle,
             previousSelections: lastSelectionByDisplay,
