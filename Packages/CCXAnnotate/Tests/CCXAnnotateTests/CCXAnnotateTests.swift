@@ -705,4 +705,33 @@ struct CCXAnnotateTests {
             }
         }
     }
+
+    @Test func toolbarGlassSurfacesClipToContinuousRoundedCorners() throws {
+        for preset in [AnnotationToolbarPreset.snip, .pin] {
+            let toolbar = AnnotationActionToolbar(preset: preset)
+            toolbar.update(
+                activeTool: .pen,
+                style: AnnotationStyle(),
+                showStyleBar: true,
+                canUndo: false,
+                canRedo: false
+            )
+            toolbar.layoutSubtreeIfNeeded()
+
+            let expectedSurfaces: [(surface: NSView, radius: CGFloat)] = [
+                (toolbar.primarySurface, 12),
+                (toolbar.styleSurface, 10),
+            ]
+            for (surface, expectedRadius) in expectedSurfaces {
+                #expect(surface.wantsLayer)
+                let layer = try #require(surface.layer)
+                #expect(layer.masksToBounds)
+                #expect(layer.cornerCurve == .continuous)
+                #expect(layer.cornerRadius == expectedRadius)
+                if #available(macOS 26.0, *), let glass = surface as? NSGlassEffectView {
+                    #expect(glass.cornerRadius == expectedRadius)
+                }
+            }
+        }
+    }
 }

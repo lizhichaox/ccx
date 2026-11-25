@@ -66,8 +66,8 @@ public final class AnnotationActionToolbar: NSView {
     private var dragInitialTopLeft: CGPoint = .zero
     private var lastRenderedState: RenderedState?
 
-    private let primarySurface: NSView
-    private let styleSurface: NSView
+    internal let primarySurface: NSView
+    internal let styleSurface: NSView
     internal let primaryStack = NSStackView()
 
     private let dragHandle = ToolbarDragHandleView()
@@ -560,6 +560,13 @@ public final class AnnotationActionToolbar: NSView {
             glass.cornerRadius = cornerRadius
             glass.style = .regular
             glass.contentView = contentView
+            // Clip the glass layer to a continuous rounded silhouette so Liquid Glass
+            // backdrop layers cannot leak alpha into square corners and produce
+            // rectangular WindowServer shadow/edge artifacts on floating panels.
+            glass.wantsLayer = true
+            glass.layer?.cornerRadius = cornerRadius
+            glass.layer?.cornerCurve = .continuous
+            glass.layer?.masksToBounds = true
             return glass
         }
         let effect = NSVisualEffectView()
@@ -568,6 +575,7 @@ public final class AnnotationActionToolbar: NSView {
         effect.state = .active
         effect.wantsLayer = true
         effect.layer?.cornerRadius = cornerRadius
+        effect.layer?.cornerCurve = .continuous
         effect.layer?.masksToBounds = true
         effect.layer?.borderWidth = 1
         effect.layer?.borderColor = NSColor.white.withAlphaComponent(0.14).cgColor
