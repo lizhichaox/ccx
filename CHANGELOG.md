@@ -2,6 +2,13 @@
 
 All notable changes to **CCX (Control · Command · X)** are documented in this file.
 
+## [0.9.2] - 2026-11-25
+
+### Fixed
+- Rounded window snips preserve translucent titlebars and sidebars, match the selected display's pixel scale, and discard stale corner masks when a window moves, resizes, or closes before export.
+- Pins retain annotations drawn over transparent image backgrounds and translucent window content while preserving rounded window edges. Exported blur and pixelation replace the underlying colors and retain their original alpha.
+- The scroll capture HUD refreshes its shadow after resizing.
+
 ## [0.9.1] - 2026-11-25
 
 ### Improved
