@@ -23,6 +23,35 @@ private func makePinTestImage(width: Int, height: Int, pixel: (Int, Int) -> (UIn
     )!
 }
 
+private func makeRoundedPinTestImage(
+    width: Int,
+    height: Int,
+    cornerRadiusPixels: CGFloat,
+    topOnly: Bool = false
+) throws -> CGImage {
+    let context = try XCTUnwrap(PinLayout.makeRGBContext(
+        width: width,
+        height: height,
+        preferredColorSpace: CGColorSpace(name: CGColorSpace.sRGB)
+    ))
+    let rect = CGRect(x: 0, y: 0, width: width, height: height)
+    context.clear(rect)
+    let path = CGPath(
+        roundedRect: rect,
+        cornerWidth: cornerRadiusPixels,
+        cornerHeight: cornerRadiusPixels,
+        transform: nil
+    )
+    context.setFillColor(CGColor(srgbRed: 0.15, green: 0.45, blue: 0.85, alpha: 1.0))
+    context.addPath(path)
+    context.fillPath()
+    if topOnly {
+        // CoreGraphics Y-up origin: y = 0 is the bottom edge of the produced CGImage.
+        context.fill(CGRect(x: 0, y: 0, width: CGFloat(width), height: cornerRadiusPixels))
+    }
+    return try XCTUnwrap(context.makeImage())
+}
+
 final class PinStateTests: XCTestCase {
     func testDefaultsAndClampingOnInit() {
         let defaults = PinState()
@@ -195,6 +224,109 @@ final class PinLayoutTests: XCTestCase {
 
         let textImg = PinRenderer.exportImage(for: .text("Pinned note"), rotationDegrees: 90, scale: 1)
         XCTAssertNotNil(textImg)
+    }
+
+    func testTransparentCornerDetectionRadiusEstimationAndTransforms() throws {
+        // 24-bit RGB without alpha channel (.none) and 32-bit RGBX (.noneSkipLast) -> always false.
+        let rgbBytes = [UInt8](repeating: 180, count: 16 * 16 * 3)
+        let rgbImage = try XCTUnwrap(CGImage(
+            width: 16, height: 16, bitsPerComponent: 8, bitsPerPixel: 24, bytesPerRow: 16 * 3,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
+            provider: CGDataProvider(data: Data(rgbBytes) as CFData)!,
+            decode: nil, shouldInterpolate: false, intent: .defaultIntent
+        ))
+        XCTAssertFalse(PinLayout.hasTransparentCorners(rgbImage))
+        XCTAssertEqual(PinLayout.analyzeCorners(of: rgbImage), .square)
+
+        let rgbxBytes = [UInt8](repeating: 0, count: 16 * 16 * 4)
+        let rgbxImage = try XCTUnwrap(CGImage(
+            width: 16, height: 16, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: 16 * 4,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue),
+            provider: CGDataProvider(data: Data(rgbxBytes) as CFData)!,
+            decode: nil, shouldInterpolate: false, intent: .defaultIntent
+        ))
+        XCTAssertFalse(PinLayout.hasTransparentCorners(rgbxImage))
+
+        // Opaque RGBA (alpha == 255 and threshold boundary alpha == 250) -> false.
+        let opaqueRGBA = makePinTestImage(width: 24, height: 24) { _, _ in (40, 80, 120, 255) }
+        XCTAssertFalse(PinLayout.hasTransparentCorners(opaqueRGBA))
+        let boundaryOpaque = makePinTestImage(width: 24, height: 24) { _, _ in (40, 80, 120, 250) }
+        XCTAssertFalse(PinLayout.hasTransparentCorners(boundaryOpaque))
+
+        // Single corner pixel below threshold (alpha == 249) -> true.
+        let boundaryTransparent = makePinTestImage(width: 24, height: 24) { x, y in
+            (x == 23 && y == 23) ? (40, 80, 120, 249) : (40, 80, 120, 255)
+        }
+        XCTAssertTrue(PinLayout.hasTransparentCorners(boundaryTransparent))
+        XCTAssertEqual(PinLayout.transparentCornerMask(of: boundaryTransparent), [.bottomRight])
+
+        // Symmetric rounded-corner RGBA image (240x160px @ 2x, 16pt = 32px radius).
+        let rounded = try makeRoundedPinTestImage(width: 240, height: 160, cornerRadiusPixels: 32)
+        XCTAssertTrue(PinLayout.hasTransparentCorners(rounded))
+        let roundedAnalysis = PinLayout.analyzeCorners(of: rounded)
+        XCTAssertEqual(roundedAnalysis.transparentCorners, .all)
+        let estimatedPx = try XCTUnwrap(roundedAnalysis.estimatedCornerRadiusPixels)
+        XCTAssertEqual(estimatedPx, 32, accuracy: 6)
+
+        // Edge cases: 1x1 transparent image and fully transparent image remain safe and finite.
+        let oneByOneClear = makePinTestImage(width: 1, height: 1) { _, _ in (0, 0, 0, 0) }
+        let oneByOneAnalysis = PinLayout.analyzeCorners(of: oneByOneClear)
+        XCTAssertTrue(oneByOneAnalysis.hasTransparentCorners)
+        XCTAssertEqual(oneByOneAnalysis.estimatedCornerRadiusPixels, 0)
+
+        let fullyTransparent = makePinTestImage(width: 40, height: 40) { _, _ in (0, 0, 0, 0) }
+        let clearAnalysis = PinLayout.analyzeCorners(of: fullyTransparent)
+        XCTAssertTrue(clearAnalysis.hasTransparentCorners)
+        XCTAssertNil(clearAnalysis.estimatedCornerRadiusPixels)
+
+        // Asymmetric top-only rounded RGBA image (TL/TR transparent, BL/BR opaque).
+        let asymmetric = try makeRoundedPinTestImage(width: 200, height: 120, cornerRadiusPixels: 32, topOnly: true)
+        XCTAssertEqual(CCXColorSample.samplePixel(from: asymmetric, pixelX: 0, pixelY: 0)?.alpha, 0)
+        XCTAssertEqual(CCXColorSample.samplePixel(from: asymmetric, pixelX: 199, pixelY: 0)?.alpha, 0)
+        XCTAssertEqual(CCXColorSample.samplePixel(from: asymmetric, pixelX: 0, pixelY: 119)?.alpha, 255)
+        XCTAssertEqual(CCXColorSample.samplePixel(from: asymmetric, pixelX: 199, pixelY: 119)?.alpha, 255)
+
+        XCTAssertTrue(PinLayout.hasTransparentCorners(asymmetric))
+        let asymMask = PinLayout.transparentCornerMask(of: asymmetric)
+        XCTAssertEqual(asymMask, [.topLeft, .topRight])
+        XCTAssertEqual(asymMask.caCornerMask, [.layerMinXMaxYCorner, .layerMaxXMaxYCorner])
+
+        // Verify CornerAlphaMask.transformed matches PinLayout.transformedImage pixel placement across rotations/flips.
+        let cases: [(Int, Bool, Bool)] = [
+            (90, false, false),
+            (180, false, false),
+            (270, false, false),
+            (0, true, false),
+            (0, false, true),
+            (90, true, false),
+            (90, false, true),
+            (270, true, true),
+        ]
+        for (degrees, flipH, flipV) in cases {
+            let transformed = try XCTUnwrap(PinLayout.transformedImage(
+                asymmetric,
+                clockwiseDegrees: degrees,
+                flipHorizontal: flipH,
+                flipVertical: flipV
+            ))
+            XCTAssertTrue(PinLayout.hasTransparentCorners(transformed))
+            XCTAssertEqual(
+                PinLayout.transparentCornerMask(of: transformed),
+                asymMask.transformed(clockwiseDegrees: degrees, flipHorizontal: flipH, flipVertical: flipV),
+                "Corner mask mismatch for degrees=\(degrees), flipH=\(flipH), flipV=\(flipV)"
+            )
+        }
+
+        // Transforming an opaque square image must keep hasTransparentCorners == false.
+        let rotatedOpaque = try XCTUnwrap(PinLayout.transformedImage(
+            opaqueRGBA,
+            clockwiseDegrees: 90,
+            flipHorizontal: true,
+            flipVertical: false
+        ))
+        XCTAssertFalse(PinLayout.hasTransparentCorners(rotatedOpaque))
     }
 }
 
@@ -1940,5 +2072,195 @@ final class PinPanelAndManagerTests: XCTestCase {
         colorPanel.keyDown(with: tKey)
         XCTAssertFalse(colorPanel.isToolbarVisible)
         XCTAssertEqual(ocrCount, 1)
+    }
+
+    func testRoundedTransparentCornerPinSuppressesRestingBorderAndMatchesActiveOutline() throws {
+        // 1. Opaque square image keeps the existing 1pt square resting border.
+        let squareImg = makePinTestImage(width: 240, height: 160) { _, _ in (120, 140, 160, 255) }
+        let squarePanel = PinPanel(
+            content: .image(squareImg, scale: 2),
+            frame: CGRect(x: 100, y: 100, width: 120, height: 80)
+        )
+        defer { squarePanel.close() }
+
+        XCTAssertFalse(squarePanel.hasTransparentCornersForTesting)
+        XCTAssertEqual(squarePanel.borderLayerForTesting.borderWidth, 1)
+        XCTAssertNotNil(squarePanel.borderLayerForTesting.borderColor)
+        XCTAssertFalse(squarePanel.borderLayerForTesting.isHidden)
+        XCTAssertEqual(squarePanel.borderLayerForTesting.cornerRadius, 0)
+
+        // Text and color pins also retain their 1pt resting border.
+        let textPanel = PinPanel(content: .text("Bordered card"), frame: CGRect(x: 260, y: 100, width: 120, height: 48))
+        defer { textPanel.close() }
+        XCTAssertEqual(textPanel.borderLayerForTesting.borderWidth, 1)
+
+        let colorPanel = PinPanel(
+            content: .color(CCXColorSample(red: 30, green: 144, blue: 255)),
+            frame: CGRect(x: 400, y: 100, width: 236, height: 88)
+        )
+        defer { colorPanel.close() }
+        XCTAssertEqual(colorPanel.borderLayerForTesting.borderWidth, 1)
+
+        // 2. Rounded transparent-corner image suppresses the resting square 1pt border.
+        let roundedImg = try makeRoundedPinTestImage(width: 240, height: 160, cornerRadiusPixels: 32)
+        let roundedPanel = PinPanel(
+            content: .image(roundedImg, scale: 2),
+            frame: CGRect(x: 120, y: 220, width: 120, height: 80)
+        )
+        defer { roundedPanel.close() }
+
+        XCTAssertTrue(roundedPanel.hasTransparentCornersForTesting)
+        XCTAssertGreaterThanOrEqual(roundedPanel.shadowInvalidationCountForTesting, 1)
+        XCTAssertEqual(roundedPanel.borderLayerForTesting.borderWidth, 0)
+        XCTAssertNil(roundedPanel.borderLayerForTesting.borderColor)
+        XCTAssertTrue(roundedPanel.borderLayerForTesting.isHidden)
+
+        // Verify live view rendering keeps the exterior corner transparent (no square border bleed).
+        let view = try XCTUnwrap(roundedPanel.contentView)
+        view.layoutSubtreeIfNeeded()
+        let rep = try XCTUnwrap(view.bitmapImageRepForCachingDisplay(in: view.bounds))
+        view.cacheDisplay(in: view.bounds, to: rep)
+        let rendered = try XCTUnwrap(rep.cgImage)
+        XCTAssertEqual(CCXColorSample.samplePixel(from: rendered, pixelX: 0, pixelY: 0)?.alpha, 0)
+        XCTAssertEqual(
+            CCXColorSample.samplePixel(from: rendered, pixelX: rendered.width / 2, pixelY: rendered.height / 2)?.alpha,
+            255
+        )
+
+        // 3. Click-through border follows the continuous rounded corner curve and invalidates shadow.
+        let shadowsBeforeClickThrough = roundedPanel.shadowInvalidationCountForTesting
+        roundedPanel.setClickThrough(true)
+        XCTAssertGreaterThan(roundedPanel.shadowInvalidationCountForTesting, shadowsBeforeClickThrough)
+        XCTAssertEqual(roundedPanel.borderLayerForTesting.borderWidth, 3)
+        XCTAssertFalse(roundedPanel.borderLayerForTesting.isHidden)
+        XCTAssertEqual(roundedPanel.borderLayerForTesting.cornerCurve, .continuous)
+        XCTAssertEqual(roundedPanel.borderLayerForTesting.cornerRadius, 16, accuracy: 3.5)
+
+        // Scaling zoom proportionally scales the continuous border radius.
+        roundedPanel.setZoom(2.0)
+        XCTAssertEqual(roundedPanel.borderLayerForTesting.cornerRadius, 32, accuracy: 6.0)
+        roundedPanel.setZoom(1.0)
+
+        roundedPanel.setClickThrough(false)
+        XCTAssertEqual(roundedPanel.borderLayerForTesting.borderWidth, 0)
+        XCTAssertNil(roundedPanel.borderLayerForTesting.borderColor)
+        XCTAssertTrue(roundedPanel.borderLayerForTesting.isHidden)
+
+        // 4. Inline annotation mode uses a matching continuous rounded blue border and transparent aligned overlay.
+        let shadowsBeforeAnnotate = roundedPanel.shadowInvalidationCountForTesting
+        roundedPanel.showAnnotationToolbar()
+        XCTAssertTrue(roundedPanel.isToolbarVisible)
+        XCTAssertGreaterThan(roundedPanel.shadowInvalidationCountForTesting, shadowsBeforeAnnotate)
+        XCTAssertEqual(roundedPanel.borderLayerForTesting.borderWidth, 1.5)
+        XCTAssertFalse(roundedPanel.borderLayerForTesting.isHidden)
+        XCTAssertEqual(roundedPanel.borderLayerForTesting.cornerCurve, .continuous)
+        XCTAssertEqual(roundedPanel.borderLayerForTesting.cornerRadius, 16, accuracy: 3.5)
+
+        let overlay = roundedPanel.annotationOverlayViewForTesting
+        XCTAssertFalse(overlay.isHidden)
+        XCTAssertFalse(overlay.isOpaque)
+        XCTAssertEqual(overlay.frame, view.bounds)
+        XCTAssertEqual(overlay.layer?.backgroundColor?.alpha ?? 0, 0, accuracy: 0.001)
+
+        let shadowsBeforeClose = roundedPanel.shadowInvalidationCountForTesting
+        roundedPanel.closeToolbar(commit: false)
+        XCTAssertGreaterThan(roundedPanel.shadowInvalidationCountForTesting, shadowsBeforeClose)
+        XCTAssertEqual(roundedPanel.borderLayerForTesting.borderWidth, 0)
+        XCTAssertNil(roundedPanel.borderLayerForTesting.borderColor)
+        XCTAssertTrue(roundedPanel.borderLayerForTesting.isHidden)
+    }
+
+    func testRoundedCornerPinRotationFlipAsymmetricMaskAndThumbnailToggle() throws {
+        let asymImg = try makeRoundedPinTestImage(width: 240, height: 140, cornerRadiusPixels: 32, topOnly: true)
+        let panel = PinPanel(
+            content: .image(asymImg, scale: 2),
+            frame: CGRect(x: 140, y: 180, width: 120, height: 70)
+        )
+        defer { panel.close() }
+
+        XCTAssertTrue(panel.hasTransparentCornersForTesting)
+        XCTAssertEqual(panel.borderLayerForTesting.borderWidth, 0)
+        XCTAssertEqual(panel.borderLayerForTesting.maskedCorners, [.layerMinXMaxYCorner, .layerMaxXMaxYCorner])
+
+        // Direct 180° rotation (keeps isQuarterTurned == false) still moves rounded corners to bottom and invalidates shadow.
+        var shadowCount = panel.shadowInvalidationCountForTesting
+        var flipped180 = panel.state
+        flipped180.rotationDegrees = 180
+        panel.updateState(flipped180)
+        XCTAssertGreaterThan(panel.shadowInvalidationCountForTesting, shadowCount)
+        XCTAssertEqual(panel.borderLayerForTesting.borderWidth, 0)
+        XCTAssertEqual(panel.borderLayerForTesting.maskedCorners, [.layerMinXMinYCorner, .layerMaxXMinYCorner])
+        panel.resetAllTransforms()
+
+        // Rotating 90° CW updates maskedCorners to right-edge corners and invalidates shadow.
+        shadowCount = panel.shadowInvalidationCountForTesting
+        panel.rotateClockwise()
+        XCTAssertGreaterThan(panel.shadowInvalidationCountForTesting, shadowCount)
+        XCTAssertEqual(panel.borderLayerForTesting.borderWidth, 0)
+        XCTAssertEqual(panel.borderLayerForTesting.maskedCorners, [.layerMaxXMaxYCorner, .layerMaxXMinYCorner])
+
+        // Flipping horizontally moves the right-edge rounded corners to the left edge and invalidates shadow.
+        shadowCount = panel.shadowInvalidationCountForTesting
+        panel.toggleFlipHorizontal()
+        XCTAssertGreaterThan(panel.shadowInvalidationCountForTesting, shadowCount)
+        XCTAssertEqual(panel.borderLayerForTesting.borderWidth, 0)
+        XCTAssertEqual(panel.borderLayerForTesting.maskedCorners, [.layerMinXMaxYCorner, .layerMinXMinYCorner])
+
+        // Flipping vertically invalidates shadow cleanly too.
+        shadowCount = panel.shadowInvalidationCountForTesting
+        panel.toggleFlipVertical()
+        XCTAssertGreaterThan(panel.shadowInvalidationCountForTesting, shadowCount)
+        XCTAssertEqual(panel.borderLayerForTesting.borderWidth, 0)
+
+        // Opening annotation toolbar flattens the rotated/flipped rounded image while keeping transparent corners,
+        // and committing a centered annotation keeps resting border suppressed and invalidates shadow.
+        panel.showAnnotationToolbar()
+        XCTAssertTrue(panel.isToolbarVisible)
+        XCTAssertEqual(panel.state.rotationDegrees, 0)
+        XCTAssertTrue(panel.hasTransparentCornersForTesting)
+        XCTAssertEqual(panel.borderLayerForTesting.borderWidth, 1.5)
+        XCTAssertGreaterThan(panel.borderLayerForTesting.cornerRadius, 10)
+        XCTAssertEqual(panel.borderLayerForTesting.maskedCorners, [.layerMinXMaxYCorner, .layerMinXMinYCorner])
+
+        let key8 = try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: 0,
+            context: nil, characters: "8", charactersIgnoringModifiers: "8", isARepeat: false, keyCode: 28
+        ))
+        panel.keyDown(with: key8)
+        let centerClick = try XCTUnwrap(NSEvent.mouseEvent(
+            with: .leftMouseDown, location: CGPoint(x: panel.frame.width / 2, y: panel.frame.height / 2),
+            modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil, eventNumber: 1, clickCount: 1, pressure: 1
+        ))
+        panel.contentView?.mouseDown(with: centerClick)
+        shadowCount = panel.shadowInvalidationCountForTesting
+        panel.closeToolbar(commit: true)
+        XCTAssertGreaterThan(panel.shadowInvalidationCountForTesting, shadowCount)
+        XCTAssertTrue(panel.hasTransparentCornersForTesting)
+        XCTAssertEqual(panel.borderLayerForTesting.borderWidth, 0)
+        XCTAssertTrue(panel.borderLayerForTesting.isHidden)
+
+        // Toggling thumbnail mode restores rounded thumbnail clipping + 1pt border and invalidates shadow.
+        shadowCount = panel.shadowInvalidationCountForTesting
+        panel.toggleThumbnail()
+        XCTAssertTrue(panel.state.isThumbnail)
+        XCTAssertGreaterThan(panel.shadowInvalidationCountForTesting, shadowCount)
+        XCTAssertEqual(panel.borderLayerForTesting.cornerRadius, PinLayout.thumbnailCornerRadius)
+        XCTAssertEqual(panel.borderLayerForTesting.maskedCorners, PinLayout.CornerAlphaMask.all.caCornerMask)
+        XCTAssertEqual(panel.borderLayerForTesting.borderWidth, 1)
+        XCTAssertFalse(panel.borderLayerForTesting.isHidden)
+
+        // Rendering in thumbnail mode works without crash.
+        let view = try XCTUnwrap(panel.contentView)
+        if let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) {
+            view.cacheDisplay(in: view.bounds, to: rep)
+        }
+
+        // Restoring from thumbnail suppresses resting border again and invalidates shadow.
+        shadowCount = panel.shadowInvalidationCountForTesting
+        panel.toggleThumbnail()
+        XCTAssertFalse(panel.state.isThumbnail)
+        XCTAssertGreaterThan(panel.shadowInvalidationCountForTesting, shadowCount)
+        XCTAssertEqual(panel.borderLayerForTesting.borderWidth, 0)
+        XCTAssertTrue(panel.borderLayerForTesting.isHidden)
     }
 }

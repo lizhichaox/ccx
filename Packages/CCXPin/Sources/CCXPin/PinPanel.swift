@@ -51,6 +51,15 @@ public final class PinPanel: NSPanel, NSWindowDelegate {
     internal var hasAnnotationControllerForTesting: Bool { annotationController != nil }
     internal var activeAnnotationToolForTesting: AnnotationTool? { annotationController?.activeTool }
     internal var hoverToolbarButtonForTesting: NSButton? { pinView.hoverToolbarButton }
+    internal var borderLayerForTesting: CALayer { pinView.borderLayerForTesting }
+    internal var annotationOverlayViewForTesting: NSView { pinView.annotationOverlayViewForTesting }
+    internal var hasTransparentCornersForTesting: Bool { pinView.hasTransparentCornersForTesting }
+    internal private(set) var shadowInvalidationCountForTesting = 0
+
+    override public func invalidateShadow() {
+        shadowInvalidationCountForTesting += 1
+        super.invalidateShadow()
+    }
 
     private let pinView: PinContentView
     private var annotationController: PinAnnotationController?
@@ -187,8 +196,13 @@ public final class PinPanel: NSPanel, NSWindowDelegate {
 
         let needsShadowInvalidation = previous == nil
             || previous?.showsShadow != state.showsShadow
+            || previous?.showsBorder != state.showsBorder
             || previous?.isThumbnail != state.isThumbnail
-            || previous?.isQuarterTurned != state.isQuarterTurned
+            || previous?.isClickThrough != state.isClickThrough
+            || previous?.rotationDegrees != state.rotationDegrees
+            || previous?.isFlippedHorizontally != state.isFlippedHorizontally
+            || previous?.isFlippedVertically != state.isFlippedVertically
+            || previous?.zoom != state.zoom
         if needsShadowInvalidation {
             invalidateShadow()
         }
@@ -280,7 +294,6 @@ public final class PinPanel: NSPanel, NSWindowDelegate {
             state.rotationDegrees = 0
             state.isFlippedHorizontally = false
             state.isFlippedVertically = false
-            invalidateShadow()
             annotationController?.replaceBaseImage(flattened)
         }
 
@@ -323,6 +336,7 @@ public final class PinPanel: NSPanel, NSWindowDelegate {
         pinView.updateTrackingAreas()
         pinView.syncVisualState()
         pinView.invalidateAnnotations()
+        invalidateShadow()
     }
 
     /// Closes the annotation toolbar, either baking committed annotations or rolling back session edits.
@@ -342,6 +356,7 @@ public final class PinPanel: NSPanel, NSWindowDelegate {
         pinView.updateTrackingAreas()
         pinView.syncVisualState()
         pinView.invalidateAnnotations()
+        invalidateShadow()
     }
 
     public func setZoom(_ zoom: CGFloat, around anchor: CGPoint? = nil) {
@@ -882,6 +897,9 @@ final class PinContentView: NSView {
     weak var panel: PinPanel?
     var mouseLocationProvider: () -> CGPoint = { NSEvent.mouseLocation }
     var hoverToolbarButton: NSButton { hoverToolbarControl }
+    var borderLayerForTesting: CALayer { borderLayer }
+    var annotationOverlayViewForTesting: NSView { annotationOverlayView }
+    var hasTransparentCornersForTesting: Bool { cachedCornerAnalysis.hasTransparentCorners }
 
     private let imageContainerLayer = CALayer()
     private let imageLayer = CALayer()
@@ -904,6 +922,8 @@ final class PinContentView: NSView {
     private var lastDoubleClickActionTimestamp: TimeInterval = 0
     private var cachedTextKey: String?
     private var cachedAttributedText: NSAttributedString?
+    private var cachedCornerAnalysisImage: CGImage?
+    private var cachedCornerAnalysis: PinLayout.CornerAnalysis = .square
     private(set) var lastHUDText: String?
 
     var usesDirectDrawing: Bool {
@@ -998,16 +1018,33 @@ final class PinContentView: NSView {
         }
     }
 
+    private func cornerAnalysis(for image: CGImage?) -> PinLayout.CornerAnalysis {
+        guard let image else {
+            cachedCornerAnalysisImage = nil
+            cachedCornerAnalysis = .square
+            return .square
+        }
+        if let cached = cachedCornerAnalysisImage, cached === image {
+            return cachedCornerAnalysis
+        }
+        let analyzed = PinLayout.analyzeCorners(of: image)
+        cachedCornerAnalysisImage = image
+        cachedCornerAnalysis = analyzed
+        return analyzed
+    }
+
     func syncVisualState() {
         guard let panel else { return }
         let state = panel.state
         let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
+        let isAnnotating = panel.activeAnnotationController != nil
 
         CATransaction.begin()
         CATransaction.setDisableActions(true)
 
         imageContainerLayer.frame = bounds
         imageContainerLayer.cornerRadius = state.isThumbnail ? PinLayout.thumbnailCornerRadius : 0
+        imageContainerLayer.cornerCurve = .continuous
         imageContainerLayer.masksToBounds = true
 
         let displayImage: CGImage? = if let controller = panel.activeAnnotationController {
@@ -1017,6 +1054,9 @@ final class PinContentView: NSView {
         } else {
             nil
         }
+
+        let corners = cornerAnalysis(for: displayImage)
+        let hasTransparentCorners = corners.hasTransparentCorners
 
         if let cgImage = displayImage {
             imageContainerLayer.isHidden = false
@@ -1060,15 +1100,47 @@ final class PinContentView: NSView {
         }
 
         borderLayer.frame = bounds
-        borderLayer.cornerRadius = state.isThumbnail ? PinLayout.thumbnailCornerRadius : 0
+        borderLayer.cornerCurve = .continuous
+        if state.isThumbnail {
+            borderLayer.cornerRadius = PinLayout.thumbnailCornerRadius
+            borderLayer.maskedCorners = PinLayout.CornerAlphaMask.all.caCornerMask
+        } else if hasTransparentCorners, let cgImage = displayImage {
+            // Follow the image's transparent exterior corners so click-through and annotation outlines
+            // never paint a harsh square box around rounded captures.
+            let transformedCorners = corners.transparentCorners.transformed(
+                clockwiseDegrees: state.rotationDegrees,
+                flipHorizontal: state.isFlippedHorizontally,
+                flipVertical: state.isFlippedVertically
+            )
+            let maxRadius = min(bounds.width, bounds.height) / 2
+            let resolvedRadius: CGFloat
+            if let radiusPixels = corners.estimatedCornerRadiusPixels {
+                let displayedPixelW = state.isQuarterTurned ? CGFloat(cgImage.height) : CGFloat(cgImage.width)
+                let displayedPixelH = state.isQuarterTurned ? CGFloat(cgImage.width) : CGFloat(cgImage.height)
+                let pointsPerPixel = (displayedPixelW > 0 && displayedPixelH > 0)
+                    ? min(bounds.width / displayedPixelW, bounds.height / displayedPixelH)
+                    : 0
+                resolvedRadius = min(max(0, radiusPixels * pointsPerPixel), maxRadius)
+            } else {
+                resolvedRadius = min(PinLayout.thumbnailCornerRadius, maxRadius)
+            }
+            borderLayer.cornerRadius = resolvedRadius
+            borderLayer.maskedCorners = transformedCorners.caCornerMask
+        } else {
+            borderLayer.cornerRadius = 0
+            borderLayer.maskedCorners = PinLayout.CornerAlphaMask.all.caCornerMask
+        }
+
         effectiveAppearance.performAsCurrentDrawingAppearance {
             if state.isClickThrough {
                 borderLayer.borderWidth = 3
                 borderLayer.borderColor = NSColor.systemCyan.withAlphaComponent(0.9).cgColor
-            } else if panel.activeAnnotationController != nil {
+            } else if isAnnotating {
                 borderLayer.borderWidth = 1.5
                 borderLayer.borderColor = NSColor.systemBlue.withAlphaComponent(0.92).cgColor
-            } else if state.showsBorder {
+            } else if state.showsBorder && (state.isThumbnail || !hasTransparentCorners) {
+                // Suppress the resting 1pt rectangular border on transparent-corner images so
+                // WindowServer casts a crisp shadow matching the true rounded alpha silhouette.
                 borderLayer.borderWidth = 1
                 borderLayer.borderColor = NSColor(white: 0.5, alpha: 0.55).cgColor
             } else {
@@ -1076,9 +1148,10 @@ final class PinContentView: NSView {
                 borderLayer.borderColor = nil
             }
         }
+        borderLayer.isHidden = borderLayer.borderWidth <= 0
 
         annotationOverlayView.panel = panel
-        annotationOverlayView.isHidden = (panel.activeAnnotationController == nil)
+        annotationOverlayView.isHidden = !isAnnotating
 
         CATransaction.commit()
         hoverToolbarControl.updateLocalization()
@@ -1182,6 +1255,8 @@ final class PinContentView: NSView {
         lastDoubleClickActionTimestamp = 0
         isPointerInside = false
         hoverToolbarControl.isHidden = true
+        cachedCornerAnalysisImage = nil
+        cachedCornerAnalysis = .square
     }
 
     private var canShowHoverToolbarButton: Bool {

@@ -24,6 +24,172 @@ enum PinLayout {
     static let maxDisplayTextLength: Int = 4_096
     /// Minimum visible edge margin kept inside active screen bounds when clamping/rescuing pins.
     static let minVisibleMargin: CGFloat = 40
+    /// Corner pixels with alpha below this threshold classify an image as having transparent corners.
+    static let transparentCornerAlphaThreshold: UInt8 = 250
+    /// Approximate diagonal distance ratio (`d / R`) where a macOS continuous corner curve crosses 50% alpha.
+    private static let diagonalCornerRadiusFactor: CGFloat = 0.305
+    /// Caps diagonal probing so corner radius estimation remains O(1) even on large images.
+    private static let maxCornerDiagonalScanSteps: Int = 64
+
+    /// Identifies which exterior image corners have transparent pixels.
+    struct CornerAlphaMask: OptionSet, Equatable, Sendable {
+        let rawValue: UInt8
+
+        static let topLeft = CornerAlphaMask(rawValue: 1 << 0)
+        static let topRight = CornerAlphaMask(rawValue: 1 << 1)
+        static let bottomLeft = CornerAlphaMask(rawValue: 1 << 2)
+        static let bottomRight = CornerAlphaMask(rawValue: 1 << 3)
+        static let all: CornerAlphaMask = [.topLeft, .topRight, .bottomLeft, .bottomRight]
+
+        /// Maps image-space corner flags through clockwise rotation (multiples of 90°)
+        /// followed by screen-space horizontal/vertical mirroring, matching `PinLayout.transformedImage`
+        /// and `PinContentView`'s GPU layer transform.
+        func transformed(
+            clockwiseDegrees: Int,
+            flipHorizontal: Bool,
+            flipVertical: Bool
+        ) -> CornerAlphaMask {
+            let normalized = ((clockwiseDegrees % 360) + 360) % 360
+            let steps = (normalized / 90) % 4
+            var current = self
+            for _ in 0..<steps {
+                var rotated: CornerAlphaMask = []
+                if current.contains(.topLeft) { rotated.insert(.topRight) }
+                if current.contains(.topRight) { rotated.insert(.bottomRight) }
+                if current.contains(.bottomRight) { rotated.insert(.bottomLeft) }
+                if current.contains(.bottomLeft) { rotated.insert(.topLeft) }
+                current = rotated
+            }
+            if flipHorizontal {
+                var flipped: CornerAlphaMask = []
+                if current.contains(.topLeft) { flipped.insert(.topRight) }
+                if current.contains(.topRight) { flipped.insert(.topLeft) }
+                if current.contains(.bottomLeft) { flipped.insert(.bottomRight) }
+                if current.contains(.bottomRight) { flipped.insert(.bottomLeft) }
+                current = flipped
+            }
+            if flipVertical {
+                var flipped: CornerAlphaMask = []
+                if current.contains(.topLeft) { flipped.insert(.bottomLeft) }
+                if current.contains(.bottomLeft) { flipped.insert(.topLeft) }
+                if current.contains(.topRight) { flipped.insert(.bottomRight) }
+                if current.contains(.bottomRight) { flipped.insert(.topRight) }
+                current = flipped
+            }
+            return current
+        }
+
+        /// Converts visual corner flags to non-flipped AppKit `CACornerMask` (Y-up coordinates).
+        var caCornerMask: CACornerMask {
+            var mask: CACornerMask = []
+            if contains(.topLeft) { mask.insert(.layerMinXMaxYCorner) }
+            if contains(.topRight) { mask.insert(.layerMaxXMaxYCorner) }
+            if contains(.bottomLeft) { mask.insert(.layerMinXMinYCorner) }
+            if contains(.bottomRight) { mask.insert(.layerMaxXMinYCorner) }
+            return mask
+        }
+    }
+
+    /// Cached result of inspecting an image's exterior corners for transparency and corner radius.
+    struct CornerAnalysis: Equatable, Sendable {
+        static let square = CornerAnalysis(transparentCorners: [], estimatedCornerRadiusPixels: nil)
+
+        let transparentCorners: CornerAlphaMask
+        /// Estimated exterior corner radius in image pixels (`nil` when transparent margins extend
+        /// past the diagonal probe budget; `0` when the corner pixel itself is >= 50% opaque).
+        let estimatedCornerRadiusPixels: CGFloat?
+
+        var hasTransparentCorners: Bool { !transparentCorners.isEmpty }
+    }
+
+    /// Returns `true` when `image` has an alpha channel and at least one of its four corner pixels
+    /// `(0, 0)`, `(w-1, 0)`, `(0, h-1)`, `(w-1, h-1)` has alpha `< 250`.
+    static func hasTransparentCorners(_ image: CGImage) -> Bool {
+        !transparentCornerMask(of: image).isEmpty
+    }
+
+    /// Inspects the four corner pixels of `image` and estimates the pixel corner radius along the
+    /// corner diagonal when transparent corners are present.
+    static func analyzeCorners(of image: CGImage) -> CornerAnalysis {
+        let mask = transparentCornerMask(of: image)
+        guard !mask.isEmpty else { return .square }
+        let radiusPixels = estimateCornerRadiusPixels(of: image, transparentCorners: mask)
+        return CornerAnalysis(transparentCorners: mask, estimatedCornerRadiusPixels: radiusPixels)
+    }
+
+    static func transparentCornerMask(of image: CGImage) -> CornerAlphaMask {
+        let width = image.width
+        let height = image.height
+        guard width > 0, height > 0 else { return [] }
+        switch image.alphaInfo {
+        case .none, .noneSkipFirst, .noneSkipLast:
+            return []
+        default:
+            break
+        }
+
+        let maxX = width - 1
+        let maxY = height - 1
+        var mask: CornerAlphaMask = []
+        if let tl = CCXColorSample.samplePixel(from: image, pixelX: 0, pixelY: 0),
+           tl.alpha < transparentCornerAlphaThreshold {
+            mask.insert(.topLeft)
+        }
+        if let tr = CCXColorSample.samplePixel(from: image, pixelX: maxX, pixelY: 0),
+           tr.alpha < transparentCornerAlphaThreshold {
+            mask.insert(.topRight)
+        }
+        if let bl = CCXColorSample.samplePixel(from: image, pixelX: 0, pixelY: maxY),
+           bl.alpha < transparentCornerAlphaThreshold {
+            mask.insert(.bottomLeft)
+        }
+        if let br = CCXColorSample.samplePixel(from: image, pixelX: maxX, pixelY: maxY),
+           br.alpha < transparentCornerAlphaThreshold {
+            mask.insert(.bottomRight)
+        }
+        return mask
+    }
+
+    private static func estimateCornerRadiusPixels(
+        of image: CGImage,
+        transparentCorners: CornerAlphaMask
+    ) -> CGFloat? {
+        let width = image.width
+        let height = image.height
+        let maxSteps = min(min(width, height) / 2, maxCornerDiagonalScanSteps)
+        guard maxSteps > 0 else { return 0 }
+
+        let probe: (startX: Int, startY: Int, stepX: Int, stepY: Int)
+        if transparentCorners.contains(.topLeft) {
+            probe = (0, 0, 1, 1)
+        } else if transparentCorners.contains(.topRight) {
+            probe = (width - 1, 0, -1, 1)
+        } else if transparentCorners.contains(.bottomLeft) {
+            probe = (0, height - 1, 1, -1)
+        } else if transparentCorners.contains(.bottomRight) {
+            probe = (width - 1, height - 1, -1, -1)
+        } else {
+            return 0
+        }
+
+        var previousAlpha: UInt8 = 0
+        for step in 0..<maxSteps {
+            let x = probe.startX + step * probe.stepX
+            let y = probe.startY + step * probe.stepY
+            guard let sample = CCXColorSample.samplePixel(from: image, pixelX: x, pixelY: y) else {
+                break
+            }
+            if sample.alpha >= 128 {
+                guard step > 0 else { return 0 }
+                let span = max(1, Int(sample.alpha) - Int(previousAlpha))
+                let fraction = CGFloat(128 - Int(previousAlpha)) / CGFloat(span)
+                let diagonalCrossing = (CGFloat(step) - 0.5) + fraction
+                return max(0, diagonalCrossing / diagonalCornerRadiusFactor)
+            }
+            previousAlpha = sample.alpha
+        }
+        return nil
+    }
 
     static func sanitizedScale(_ scale: CGFloat) -> CGFloat {
         guard scale.isFinite, scale > 0 else { return 1 }
