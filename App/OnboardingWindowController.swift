@@ -747,12 +747,14 @@ private struct PermissionRow: View {
                     .buttonStyle(.borderedProminent)
                     .controlSize(.small)
                     .disabled(isDisabled)
+                    .accessibilityLabel(CCXL10n.text("Allow \(title)", zh: "授权\(title)"))
                     .fixedSize()
             } else {
                 Button(CCXL10n.text("Allow", zh: "授权"), action: onAllow)
                     .buttonStyle(.bordered)
                     .controlSize(.small)
                     .disabled(isDisabled)
+                    .accessibilityLabel(CCXL10n.text("Allow \(title)", zh: "授权\(title)"))
                     .fixedSize()
             }
         }
@@ -762,10 +764,13 @@ private struct PermissionRow: View {
 }
 
 private struct PermissionGrantedPill: View {
+    @Environment(\.colorScheme) private var colorScheme
+
     var body: some View {
+        let green = CCXBadgePalette.green.labelColor(for: colorScheme)
         Label(CCXL10n.text("Granted", zh: "已授权"), systemImage: "checkmark.circle.fill")
             .font(.system(size: 11, weight: .semibold))
-            .foregroundStyle(CCXBadgePalette.green.accentColor)
+            .foregroundStyle(green)
             .padding(.horizontal, 8)
             .padding(.vertical, 3.5)
             .background(CCXBadgePalette.green.accentColor.opacity(0.14), in: Capsule())
@@ -877,8 +882,8 @@ private struct ReadyStepView: View {
                 GuideActionRow(
                     symbol: "text.viewfinder",
                     palette: .teal,
-                    title: CCXL10n.text("Annotate, OCR & Record", zh: "标注、OCR 与录屏"),
-                    trailing: { InteractionPillView(text: "1–8 · T · R") }
+                    title: CCXL10n.text("Annotate, OCR & Scroll", zh: "标注、OCR 与长截屏"),
+                    trailing: { InteractionPillView(text: "1–8 · T · L") }
                 )
             }
             .ccxCardSurface(cornerRadius: 12)
@@ -1037,8 +1042,13 @@ private struct OnboardingFooterBar: View {
                 }
             }
 
-            HStack(spacing: 7) {
+            HStack(spacing: 5) {
                 ForEach(OnboardingStep.allCases, id: \.self) { step in
+                    let stepTitle: String = switch step {
+                    case .welcome: CCXL10n.text("Overview", zh: "功能概览")
+                    case .permissions: CCXL10n.text("Permissions", zh: "权限设置")
+                    case .ready: CCXL10n.text("Shortcuts", zh: "快捷操作")
+                    }
                     Button {
                         withAnimation(OnboardingFlowState.springAnimation) {
                             flow.step = step
@@ -1047,9 +1057,17 @@ private struct OnboardingFooterBar: View {
                         Capsule()
                             .fill(flow.step == step ? CCXBadgePalette.blue.accentColor : Color.primary.opacity(0.2))
                             .frame(width: flow.step == step ? 20 : 7, height: 7)
+                            .padding(.vertical, 6)
+                            .padding(.horizontal, 2)
+                            .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
-                    .accessibilityLabel(CCXL10n.text("Step \(step.rawValue + 1)", zh: "第 \(step.rawValue + 1) 步"))
+                    .help(stepTitle)
+                    .accessibilityLabel(CCXL10n.text(
+                        "Step \(step.rawValue + 1): \(stepTitle)",
+                        zh: "第 \(step.rawValue + 1) 步：\(stepTitle)"
+                    ))
+                    .accessibilityAddTraits(flow.step == step ? .isSelected : [])
                 }
             }
         }
@@ -1061,20 +1079,25 @@ private struct OnboardingFooterBar: View {
 private extension View {
     @ViewBuilder
     func ccxCardSurface(cornerRadius: CGFloat = 14, borderColor: Color = Color.primary.opacity(0.08)) -> some View {
+        let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
         if #available(macOS 26.0, *) {
             self
-                .glassEffect(.regular, in: .rect(cornerRadius: cornerRadius))
+                .glassEffect(.regular, in: shape)
                 .overlay(
-                    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    shape
                         .strokeBorder(borderColor, lineWidth: 1)
+                        .allowsHitTesting(false)
                 )
+                .clipShape(shape)
         } else {
             self
-                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+                .background(.regularMaterial, in: shape)
                 .overlay(
-                    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    shape
                         .strokeBorder(borderColor, lineWidth: 1)
+                        .allowsHitTesting(false)
                 )
+                .clipShape(shape)
         }
     }
 }
@@ -1194,6 +1217,7 @@ struct CCXIconBadge: View {
 /// Green check / orange warning label for a permission state (shared with Settings).
 struct PermissionBadge: View {
     let granted: Bool
+    @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         Label(
@@ -1202,7 +1226,11 @@ struct PermissionBadge: View {
         )
         .labelStyle(.titleAndIcon)
         .font(.caption.weight(.medium))
-        .foregroundStyle(granted ? CCXBadgePalette.green.accentColor : CCXBadgePalette.orange.accentColor)
+        .foregroundStyle(
+            granted
+                ? CCXBadgePalette.green.labelColor(for: colorScheme)
+                : CCXBadgePalette.orange.labelColor(for: colorScheme)
+        )
         .fixedSize()
     }
 }

@@ -207,6 +207,13 @@ public enum AppUpdateURLPolicy {
 
     /// Returns `true` only for credential-free `https://` URLs targeting exact official GitHub release hosts.
     public static func isAllowedDownloadURL(_ url: URL) -> Bool {
+        let rawString = url.absoluteString
+        guard !rawString.contains("\\"),
+              !rawString.unicodeScalars.contains(where: { $0.value < 0x20 || $0.value == 0x7F })
+        else {
+            return false
+        }
+
         guard let components = URLComponents(url: url, resolvingAgainstBaseURL: true),
               components.scheme?.lowercased() == "https",
               components.user == nil,
@@ -221,11 +228,39 @@ public enum AppUpdateURLPolicy {
             return false
         }
 
+        let lowerEncodedPath = components.percentEncodedPath.lowercased()
+        guard !lowerEncodedPath.contains("%2f"),
+              !lowerEncodedPath.contains("%5c")
+        else {
+            return false
+        }
+
         guard let rawHost = components.host, !rawHost.isEmpty else {
             return false
         }
         let host = rawHost.lowercased()
         return allowedExactHosts.contains(host)
+    }
+
+    /// Returns `true` only when `url` passes `isAllowedDownloadURL`, scopes `github.com` paths strictly
+    /// under `/lizhichaox/ccx/releases/`, and excludes `api.github.com` for release pages and asset downloads.
+    public static func isAllowedRepoReleaseURL(_ url: URL, requireGitHubHost: Bool) -> Bool {
+        guard isAllowedDownloadURL(url),
+              let host = url.host?.lowercased()
+        else {
+            return false
+        }
+        if host == "github.com" {
+            let lowerPath = url.path.lowercased()
+            let lowerStandardizedPath = url.standardized.path.lowercased()
+            return lowerPath.hasPrefix("/lizhichaox/ccx/releases/")
+                && lowerStandardizedPath.hasPrefix("/lizhichaox/ccx/releases/")
+                && !url.path.split(separator: "/").contains("..")
+        }
+        if requireGitHubHost || host == "api.github.com" {
+            return false
+        }
+        return true
     }
 }
 
@@ -325,7 +360,7 @@ public enum GitHubReleaseParser {
         guard zipAsset.size <= maxArchiveBytes else {
             throw AppUpdateError.responseTooLarge
         }
-        if checksumsAsset.size < 0 {
+        if checksumsAsset.size <= 0 {
             throw AppUpdateError.invalidResponse
         }
         if checksumsAsset.size > Int64(maxMetadataBytes) {
@@ -369,22 +404,7 @@ public enum GitHubReleaseParser {
     }
 
     private static func isAllowedRepoReleaseURL(_ url: URL, requireGitHubHost: Bool) -> Bool {
-        guard AppUpdateURLPolicy.isAllowedDownloadURL(url),
-              let host = url.host?.lowercased()
-        else {
-            return false
-        }
-        if host == "github.com" {
-            let lowerPath = url.path.lowercased()
-            let lowerStandardizedPath = url.standardized.path.lowercased()
-            return lowerPath.hasPrefix("/lizhichaox/ccx/releases/")
-                && lowerStandardizedPath.hasPrefix("/lizhichaox/ccx/releases/")
-                && !url.path.split(separator: "/").contains("..")
-        }
-        if requireGitHubHost || host == "api.github.com" {
-            return false
-        }
-        return true
+        AppUpdateURLPolicy.isAllowedRepoReleaseURL(url, requireGitHubHost: requireGitHubHost)
     }
 
     private static func parseISO8601Date(_ raw: String) -> Date? {
@@ -415,10 +435,12 @@ public enum AppUpdateChecksumVerifier {
     }
 
     /// Extracts the expected lowercase 64-character SHA-256 hex digest for `assetName`
-    /// from a `shasum -a 256` formatted checksum file.
+    /// from a `shasum -a 256` formatted checksum file. Fails closed (`nil`) if the
+    /// manifest contains conflicting digests for the same asset name.
     public static func parseExpectedSHA256(forAssetName assetName: String, from checksumsText: String) -> String? {
         guard !assetName.isEmpty else { return nil }
 
+        var matchedDigest: String?
         for rawLine in checksumsText.split(whereSeparator: \.isNewline) {
             let line = rawLine.trimmingCharacters(in: .whitespaces)
             guard !line.isEmpty, !line.hasPrefix("#") else { continue }
@@ -437,10 +459,14 @@ public enum AppUpdateChecksumVerifier {
                 remainder.removeFirst(2)
             }
             if remainder == assetName {
-                return hashToken.lowercased()
+                let normalized = hashToken.lowercased()
+                if let existing = matchedDigest, existing != normalized {
+                    return nil
+                }
+                matchedDigest = normalized
             }
         }
-        return nil
+        return matchedDigest
     }
 
     /// Computes the lowercase SHA-256 hex digest of a regular, non-symlink file in 64 KB chunks.
@@ -882,6 +908,8 @@ public enum AppUpdateArchiveValidator {
         var cursor = 0
         var totalUncompressedBytes: UInt64 = 0
         var hasCCXAppEntry = false
+        var seenNormalizedPaths: Set<String> = []
+        seenNormalizedPaths.reserveCapacity(Int(totalEntries))
 
         for _ in 0..<Int(totalEntries) {
             guard cdBytes.count - cursor >= centralDirHeaderMinSize else {
@@ -924,6 +952,11 @@ public enum AppUpdateArchiveValidator {
             }
             totalUncompressedBytes = nextTotal
 
+            // Stored (uncompressed) entries must declare matching compressed and uncompressed byte lengths.
+            if compressionMethod == 0 && compressedSize != uncompressedSize {
+                throw AppUpdateError.extractionFailed
+            }
+
             guard nameLen > 0 else {
                 throw AppUpdateError.extractionFailed
             }
@@ -963,6 +996,13 @@ public enum AppUpdateArchiveValidator {
             }
             if entryName.hasPrefix("CCX.app/") {
                 hasCCXAppEntry = true
+            }
+
+            // Reject duplicate or case-colliding paths (macOS APFS is case-insensitive by default)
+            // to prevent ZIP entry shadowing / parser-differential overwrites.
+            let normalizedEntryKey = normalizedPath(entryName).lowercased()
+            guard seenNormalizedPaths.insert(normalizedEntryKey).inserted else {
+                throw AppUpdateError.extractionFailed
             }
 
             let hostOS = versionMadeBy >> 8
@@ -1313,10 +1353,21 @@ public enum AppUpdateInstaller {
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
 
+        let exitSemaphore = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in
+            exitSemaphore.signal()
+        }
+
         do {
             try process.run()
-            process.waitUntilExit()
         } catch {
+            process.terminationHandler = nil
+            throw AppUpdateError.extractionFailed
+        }
+
+        if exitSemaphore.wait(timeout: .now() + .seconds(60)) == .timedOut {
+            process.terminate()
+            _ = exitSemaphore.wait(timeout: .now() + .seconds(2))
             throw AppUpdateError.extractionFailed
         }
 
@@ -1779,11 +1830,14 @@ public final class URLSessionAppUpdateTransport: AppUpdateTransport {
 }
 
 private final class StreamingUpdateSessionDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    private static let maxRedirects = 5
+
     private struct State {
         var buffer = Data()
         var receivedBytes: Int64 = 0
         var expectedBytes: Int64 = -1
         var lastReportedProgress: Double = -1
+        var redirectCount: Int = 0
         var overrideError: AppUpdateError?
         var continuation: CheckedContinuation<Data, Error>?
     }
@@ -1827,7 +1881,34 @@ private final class StreamingUpdateSessionDelegate: NSObject, URLSessionDataDele
         newRequest request: URLRequest,
         completionHandler: @escaping (URLRequest?) -> Void
     ) {
-        guard let targetURL = request.url, AppUpdateURLPolicy.isAllowedDownloadURL(targetURL) else {
+        let withinRedirectBudget: Bool = state.withLock { state in
+            state.redirectCount += 1
+            if state.redirectCount > Self.maxRedirects {
+                state.overrideError = .untrustedURL
+                return false
+            }
+            return true
+        }
+        guard withinRedirectBudget else {
+            task.cancel()
+            completionHandler(nil)
+            return
+        }
+
+        let targetAllowed: Bool
+        if let targetURL = request.url {
+            if destinationURL != nil {
+                targetAllowed = AppUpdateURLPolicy.isAllowedRepoReleaseURL(targetURL, requireGitHubHost: false)
+            } else if targetURL.host?.lowercased() == "github.com" {
+                targetAllowed = AppUpdateURLPolicy.isAllowedRepoReleaseURL(targetURL, requireGitHubHost: true)
+            } else {
+                targetAllowed = AppUpdateURLPolicy.isAllowedDownloadURL(targetURL)
+            }
+        } else {
+            targetAllowed = false
+        }
+
+        guard targetAllowed else {
             state.withLock { $0.overrideError = .untrustedURL }
             task.cancel()
             completionHandler(nil)
@@ -1835,6 +1916,8 @@ private final class StreamingUpdateSessionDelegate: NSObject, URLSessionDataDele
         }
         var sanitizedRequest = request
         sanitizedRequest.httpShouldHandleCookies = false
+        sanitizedRequest.setValue(nil, forHTTPHeaderField: "Authorization")
+        sanitizedRequest.setValue(nil, forHTTPHeaderField: "Cookie")
         completionHandler(sanitizedRequest)
     }
 
@@ -1874,6 +1957,10 @@ private final class StreamingUpdateSessionDelegate: NSObject, URLSessionDataDele
         let expectedLength = http.expectedContentLength
         if expectedLength > maxBytes {
             fail(task: dataTask, error: .responseTooLarge, completionHandler: completionHandler)
+            return
+        }
+        if destinationURL != nil && expectedLength == 0 {
+            fail(task: dataTask, error: .invalidResponse, completionHandler: completionHandler)
             return
         }
 
@@ -1948,7 +2035,12 @@ private final class StreamingUpdateSessionDelegate: NSObject, URLSessionDataDele
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        let hasFailure = error != nil || state.withLock { $0.overrideError != nil }
+        let hasFailure = error != nil || state.withLock { state in
+            if state.overrideError == nil && error == nil && destinationURL != nil && state.receivedBytes <= 0 {
+                state.overrideError = .invalidResponse
+            }
+            return state.overrideError != nil
+        }
         let closeFailed: Bool
         if hasFailure {
             closeAndCleanupOnFailure()
@@ -2337,6 +2429,11 @@ public final class AppUpdateManager: ObservableObject {
     /// to prevent TOCTOU tampering, and relaunches immediately.
     public func installAvailableUpdate() {
         guard !isBusy, let release = availableRelease else { return }
+        guard release.version > currentVersion else {
+            clearPreparedUpdate()
+            state = .upToDate(checkedAt: Date())
+            return
+        }
 
         guard canTerminateNow() else {
             onBlockedByActiveSession()
@@ -2469,6 +2566,7 @@ public final class AppUpdateManager: ObservableObject {
     public func applyPreparedUpdateOnQuitIfReady(relaunch: Bool = false) -> Bool {
         guard automaticallyChecksForUpdates,
               case .readyToInstall(let release) = state,
+              release.version > currentVersion,
               let prepared = preparedUpdate,
               prepared.release.version == release.version
         else {
@@ -2647,6 +2745,11 @@ public final class AppUpdateManager: ObservableObject {
 
     private func performSilentIdleInstall(prepared: PreparedUpdate, timerID: UUID) async {
         let release = prepared.release
+        guard release.version > currentVersion else {
+            clearPreparedUpdate()
+            state = .upToDate(checkedAt: Date())
+            return
+        }
         let versionString = release.version.description
 
         let targetAppURL: URL
@@ -2750,6 +2853,11 @@ public final class AppUpdateManager: ObservableObject {
         silentFailure: Bool
     ) async {
         guard !Task.isCancelled, activeTaskID == taskID else { return }
+        guard release.version > currentVersion else {
+            clearPreparedUpdate()
+            state = .upToDate(checkedAt: Date())
+            return
+        }
         state = .downloading(release, progress: 0)
 
         let transport = self.transport
@@ -2964,7 +3072,12 @@ public final class AppUpdateManager: ObservableObject {
                         self.userDefaults.removeObject(forKey: Self.dismissedBannerVersionKey)
                     }
 
-                    if let prepared = self.preparedUpdate, prepared.release.version == release.version {
+                    if let prepared = self.preparedUpdate,
+                       prepared.release.version == release.version,
+                       prepared.release.zipDownloadURL == release.zipDownloadURL,
+                       prepared.release.checksumsDownloadURL == release.checksumsDownloadURL,
+                       FileManager.default.fileExists(atPath: prepared.verifiedAppURL.path)
+                    {
                         self.preparedUpdate = PreparedUpdate(
                             release: release,
                             verifiedAppURL: prepared.verifiedAppURL,

@@ -110,6 +110,9 @@ struct MenuBarPopoverActions {
     let onPastePin: () -> Void
     let onClearClipboard: () -> Void
     let onPinHistory: (SnipHistoryEntry) -> Void
+    let onCopyHistory: (SnipHistoryEntry) -> Void
+    let onSaveHistory: (SnipHistoryEntry) -> Void
+    let onOCRHistory: (SnipHistoryEntry) -> Void
     let onClearHistory: () -> Void
     let onToggleAllPins: () -> Void
     let onUnlockClickThrough: () -> Void
@@ -162,6 +165,7 @@ struct MenuBarPopoverView: View {
                         isBadgeDimmed: model.isPinBadgeDimmed,
                         symbol: "pin.fill",
                         palette: .indigo,
+                        tooltip: CCXL10n.text("Pin from clipboard (⌘V)", zh: "从剪贴板贴图 (⌘V)"),
                         accessorySymbol: "xmark.circle.fill",
                         accessoryTooltip: CCXL10n.text("Clear clipboard", zh: "清空剪贴板"),
                         accessoryPalette: .red,
@@ -188,6 +192,9 @@ struct MenuBarPopoverView: View {
                     entries: model.recentSnips,
                     pinnedHistoryIDs: model.pinnedHistoryIDs,
                     onPinHistory: actions.onPinHistory,
+                    onCopyHistory: actions.onCopyHistory,
+                    onSaveHistory: actions.onSaveHistory,
+                    onOCRHistory: actions.onOCRHistory,
                     onClearHistory: actions.onClearHistory
                 )
             }
@@ -228,12 +235,16 @@ private struct ActiveRecordingBanner: View {
     let onStop: () -> Void
     let onDiscard: () -> Void
 
+    @Environment(\.colorScheme) private var colorScheme
+
     var body: some View {
-        let tint: Color = status.isPaused ? CCXBadgePalette.orange.accentColor : CCXBadgePalette.red.accentColor
+        let palette: CCXBadgePalette = status.isPaused ? .orange : .red
+        let tint = palette.accentColor
+        let labelTint = palette.labelColor(for: colorScheme)
         VStack(spacing: 8) {
             HStack(spacing: 8) {
                 Circle()
-                    .fill(tint)
+                    .fill(labelTint)
                     .frame(width: 8, height: 8)
                 Text(
                     status.isPaused
@@ -244,21 +255,21 @@ private struct ActiveRecordingBanner: View {
                 Spacer()
                 Text(status.formattedElapsed)
                     .font(.system(size: 12.5, weight: .bold).monospacedDigit())
-                    .foregroundStyle(tint)
+                    .foregroundStyle(labelTint)
             }
 
             HStack(spacing: 6) {
                 PinControlPill(
                     title: status.isPaused ? CCXL10n.text("Resume", zh: "继续") : CCXL10n.text("Pause", zh: "暂停"),
                     symbol: status.isPaused ? "play.fill" : "pause.fill",
-                    tint: status.isPaused ? CCXBadgePalette.teal.accentColor : CCXBadgePalette.orange.accentColor,
+                    tint: (status.isPaused ? CCXBadgePalette.teal : CCXBadgePalette.orange).labelColor(for: colorScheme),
                     isActive: status.isPaused,
                     action: onTogglePause
                 )
                 PinControlPill(
                     title: CCXL10n.text("Stop", zh: "停止"),
                     symbol: "stop.fill",
-                    tint: CCXBadgePalette.red.accentColor,
+                    tint: CCXBadgePalette.red.labelColor(for: colorScheme),
                     isActive: true,
                     action: onStop
                 )
@@ -302,6 +313,7 @@ private struct QuickActionTile: View {
     let action: () -> Void
 
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isHovering = false
     @State private var isAccessoryHovering = false
 
@@ -343,9 +355,13 @@ private struct QuickActionTile: View {
                         lineWidth: 1
                     )
             )
+            .animation(reduceMotion ? nil : .easeOut(duration: 0.12), value: isHovering)
         }
         .buttonStyle(.plain)
         .help(tooltip ?? title)
+        .accessibilityLabel("\(title), \(badge)")
+        .accessibilityHint(tooltip ?? title)
+        .modifier(OptionalAccessibilityActionModifier(name: accessoryTooltip, action: onAccessory))
         .overlay(alignment: .topTrailing) {
             if let onAccessory, let accessorySymbol, isHovering {
                 Button(action: onAccessory) {
@@ -401,6 +417,20 @@ private struct QuickActionTile: View {
             if !hovering {
                 isAccessoryHovering = false
             }
+        }
+    }
+}
+
+private struct OptionalAccessibilityActionModifier: ViewModifier {
+    let name: String
+    let action: (() -> Void)?
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if let action, !name.isEmpty {
+            content.accessibilityAction(named: Text(name), action)
+        } else {
+            content
         }
     }
 }
@@ -465,6 +495,9 @@ private struct RecentSnipsSection: View {
     let entries: [SnipHistoryEntry]
     let pinnedHistoryIDs: Set<UUID>
     let onPinHistory: (SnipHistoryEntry) -> Void
+    let onCopyHistory: (SnipHistoryEntry) -> Void
+    let onSaveHistory: (SnipHistoryEntry) -> Void
+    let onOCRHistory: (SnipHistoryEntry) -> Void
     let onClearHistory: () -> Void
 
     @Environment(\.colorScheme) private var colorScheme
@@ -507,9 +540,14 @@ private struct RecentSnipsSection: View {
             if entries.count <= 4 {
                 HStack(spacing: 6) {
                     ForEach(entries) { entry in
-                        RecentSnipThumbnail(entry: entry, isPinned: pinnedHistoryIDs.contains(entry.id)) {
-                            onPinHistory(entry)
-                        }
+                        RecentSnipThumbnail(
+                            entry: entry,
+                            isPinned: pinnedHistoryIDs.contains(entry.id),
+                            onPin: { onPinHistory(entry) },
+                            onCopy: { onCopyHistory(entry) },
+                            onSave: { onSaveHistory(entry) },
+                            onOCR: { onOCRHistory(entry) }
+                        )
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .center)
@@ -518,7 +556,10 @@ private struct RecentSnipsSection: View {
                 ScrollableRecentSnipsStrip(
                     entries: entries,
                     pinnedHistoryIDs: pinnedHistoryIDs,
-                    onPinHistory: onPinHistory
+                    onPinHistory: onPinHistory,
+                    onCopyHistory: onCopyHistory,
+                    onSaveHistory: onSaveHistory,
+                    onOCRHistory: onOCRHistory
                 )
             }
         }
@@ -538,6 +579,9 @@ private struct ScrollableRecentSnipsStrip: View {
     let entries: [SnipHistoryEntry]
     let pinnedHistoryIDs: Set<UUID>
     let onPinHistory: (SnipHistoryEntry) -> Void
+    let onCopyHistory: (SnipHistoryEntry) -> Void
+    let onSaveHistory: (SnipHistoryEntry) -> Void
+    let onOCRHistory: (SnipHistoryEntry) -> Void
 
     @State private var scrollPosition = ScrollPosition(x: 0)
     @State private var scrollEdgeFlags = ScrollEdgeFlags.initialOverflow
@@ -548,9 +592,14 @@ private struct ScrollableRecentSnipsStrip: View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: Self.thumbnailSpacing) {
                 ForEach(entries) { entry in
-                    RecentSnipThumbnail(entry: entry, isPinned: pinnedHistoryIDs.contains(entry.id)) {
-                        onPinHistory(entry)
-                    }
+                    RecentSnipThumbnail(
+                        entry: entry,
+                        isPinned: pinnedHistoryIDs.contains(entry.id),
+                        onPin: { onPinHistory(entry) },
+                        onCopy: { onCopyHistory(entry) },
+                        onSave: { onSaveHistory(entry) },
+                        onOCR: { onOCRHistory(entry) }
+                    )
                 }
             }
             .padding(.horizontal, Self.horizontalInset)
@@ -727,12 +776,17 @@ private struct RecentClearButton: View {
 private struct RecentSnipThumbnail: View {
     let entry: SnipHistoryEntry
     let isPinned: Bool
-    let action: () -> Void
+    let onPin: () -> Void
+    let onCopy: () -> Void
+    let onSave: () -> Void
+    let onOCR: () -> Void
 
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isHovering = false
 
     var body: some View {
-        Button(action: action) {
+        let ageLabel = CCXL10n.relativeAge(from: entry.timestamp)
+        Button(action: onPin) {
             Color.clear
                 .frame(width: 60.5, height: 38)
                 .overlay {
@@ -750,31 +804,64 @@ private struct RecentSnipThumbnail: View {
                             .overlay(Circle().strokeBorder(.white, lineWidth: 1))
                             .padding(3)
                             .allowsHitTesting(false)
+                    } else if isHovering {
+                        Image(systemName: "pin.fill")
+                            .font(.system(size: 7.5, weight: .bold))
+                            .foregroundStyle(.white)
+                            .frame(width: 14, height: 14)
+                            .background(CCXBadgePalette.blue.accentColor.opacity(0.92), in: Circle())
+                            .shadow(color: .black.opacity(0.25), radius: 1.5, y: 0.5)
+                            .padding(2.5)
+                            .allowsHitTesting(false)
                     }
                 }
                 .overlay(
                     RoundedRectangle(cornerRadius: 6, style: .continuous)
                         .strokeBorder(
                             isPinned
-                                ? CCXBadgePalette.indigo.accentColor.opacity(0.80)
-                                : (isHovering ? CCXBadgePalette.blue.accentColor.opacity(0.88) : Color.primary.opacity(0.15)),
+                                ? CCXBadgePalette.indigo.accentColor.opacity(0.82)
+                                : (isHovering ? CCXBadgePalette.blue.accentColor.opacity(0.90) : Color.primary.opacity(0.15)),
                             lineWidth: isHovering ? 1.5 : 1
                         )
                         .allowsHitTesting(false)
                 )
+                .animation(reduceMotion ? nil : .easeOut(duration: 0.12), value: isHovering)
                 .contentShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
         }
         .buttonStyle(.plain)
         .frame(width: 60.5, height: 38)
         .contentShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
         .help(CCXL10n.text(
-            "\(entry.image.width) × \(entry.image.height) · \(isPinned ? "Already pinned" : "Click to pin")",
-            zh: "\(entry.image.width) × \(entry.image.height) · \(isPinned ? "已贴图" : "点击贴图")"
+            "\(entry.image.width) × \(entry.image.height) · \(ageLabel) · \(isPinned ? "Already pinned" : "Click to pin · Right-click for more")",
+            zh: "\(entry.image.width) × \(entry.image.height) · \(ageLabel) · \(isPinned ? "已贴图" : "点击贴图 · 右键更多操作")"
         ))
         .accessibilityLabel(CCXL10n.text(
-            "Recent snip \(entry.image.width) by \(entry.image.height), \(isPinned ? "already pinned" : "click to pin")",
-            zh: "最近截屏 \(entry.image.width) × \(entry.image.height)，\(isPinned ? "已贴图" : "点击贴图")"
+            "Recent snip \(entry.image.width) by \(entry.image.height), \(ageLabel), \(isPinned ? "already pinned" : "not pinned")",
+            zh: "最近截屏 \(entry.image.width) × \(entry.image.height)，\(ageLabel)，\(isPinned ? "已贴图" : "未贴图")"
         ))
+        .accessibilityHint(CCXL10n.text(
+            "Activate to pin to screen. Open context menu to copy, recognize text, or save PNG.",
+            zh: "点击可悬浮贴图，打开右键菜单可拷贝、识别文字或保存为 PNG"
+        ))
+        .accessibilityAction(named: Text(CCXL10n.text("Copy Image", zh: "拷贝图片")), onCopy)
+        .accessibilityAction(named: Text(CCXL10n.text("Recognize Text (OCR)", zh: "识别文字 (OCR)")), onOCR)
+        .accessibilityAction(named: Text(CCXL10n.text("Save as PNG…", zh: "保存为 PNG…")), onSave)
+        .contextMenu {
+            Button(
+                isPinned
+                    ? CCXL10n.text("Already Pinned", zh: "已贴图")
+                    : CCXL10n.text("Pin to Screen", zh: "悬浮贴图"),
+                action: onPin
+            )
+            .disabled(isPinned)
+
+            Button(CCXL10n.text("Copy Image", zh: "拷贝图片"), action: onCopy)
+            Button(CCXL10n.text("Recognize Text (OCR)", zh: "识别文字 (OCR)"), action: onOCR)
+
+            Divider()
+
+            Button(CCXL10n.text("Save as PNG…", zh: "保存为 PNG…"), action: onSave)
+        }
         .onHover { isHovering = $0 }
     }
 }
@@ -795,24 +882,34 @@ private struct FloatingPinsSection: View {
         VStack(alignment: .center, spacing: 6) {
             Divider().opacity(0.45)
 
+            let badgePalette: CCXBadgePalette = arePinsHidden ? .orange : .indigo
+            let statusText = arePinsHidden
+                ? CCXL10n.text("\(pinCount) hidden", zh: "\(pinCount) 个已隐藏")
+                : CCXL10n.text("\(pinCount) active", zh: "\(pinCount) 个显示")
+
             HStack(spacing: 6) {
                 Text(CCXL10n.text("FLOATING PINS", zh: "悬浮贴图"))
                     .font(.system(size: 9.5, weight: .semibold))
                     .foregroundStyle(Color.primary.opacity(0.74))
                     .tracking(0.6)
 
-                Text(CCXL10n.text("\(pinCount) active", zh: "\(pinCount) 个显示"))
+                Text(statusText)
                     .font(.system(size: 9.5, weight: .bold).monospacedDigit())
-                    .foregroundStyle(CCXBadgePalette.indigo.labelColor(for: colorScheme))
+                    .foregroundStyle(badgePalette.labelColor(for: colorScheme))
                     .padding(.horizontal, 6)
                     .padding(.vertical, 2)
-                    .background(CCXBadgePalette.indigo.accentColor.opacity(0.14), in: Capsule())
+                    .background(badgePalette.accentColor.opacity(0.14), in: Capsule())
                     .overlay(
                         Capsule()
-                            .strokeBorder(CCXBadgePalette.indigo.accentColor.opacity(0.24), lineWidth: 0.75)
+                            .strokeBorder(badgePalette.accentColor.opacity(0.24), lineWidth: 0.75)
                     )
             }
             .frame(maxWidth: .infinity, alignment: .center)
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(CCXL10n.text(
+                "Floating pins, \(statusText)",
+                zh: "悬浮贴图，\(statusText)"
+            ))
 
             VStack(spacing: 6) {
                 HStack(spacing: 8) {
@@ -856,6 +953,7 @@ private struct PinControlPill: View {
     let action: () -> Void
 
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isHovering = false
 
     var body: some View {
@@ -879,6 +977,7 @@ private struct PinControlPill: View {
                 RoundedRectangle(cornerRadius: 9, style: .continuous)
                     .strokeBorder(borderColor, lineWidth: 1)
             )
+            .animation(reduceMotion ? nil : .easeOut(duration: 0.12), value: isHovering)
         }
         .buttonStyle(.plain)
         .onHover { isHovering = $0 }
@@ -948,22 +1047,26 @@ private struct PopoverUtilityFooterSlot: View {
 
 private struct UpdateAvailableBanner: View {
     @ObservedObject var updateManager: AppUpdateManager
+    @Environment(\.colorScheme) private var colorScheme
 
-    private var tint: Color {
+    private var palette: CCXBadgePalette {
         switch updateManager.state {
         case .available, .readyToInstall:
-            return CCXBadgePalette.green.accentColor
+            return .green
         case .failed:
-            return CCXBadgePalette.orange.accentColor
+            return .orange
         case .downloading, .verifying, .installing:
-            return CCXBadgePalette.blue.accentColor
+            return .blue
         case .idle, .checking, .upToDate:
-            return CCXBadgePalette.green.accentColor
+            return .green
         }
     }
 
     var body: some View {
-        let tint = self.tint
+        let tint = palette.accentColor
+        let greenLabel = CCXBadgePalette.green.labelColor(for: colorScheme)
+        let blueLabel = CCXBadgePalette.blue.labelColor(for: colorScheme)
+        let orangeLabel = CCXBadgePalette.orange.labelColor(for: colorScheme)
 
         Group {
             switch updateManager.state {
@@ -971,7 +1074,7 @@ private struct UpdateAvailableBanner: View {
                 HStack(spacing: 8) {
                     Image(systemName: "arrow.down.circle.fill")
                         .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(CCXBadgePalette.green.accentColor)
+                        .foregroundStyle(greenLabel)
 
                     Text(CCXL10n.text(
                         "Update v\(release.version.description)",
@@ -1015,7 +1118,7 @@ private struct UpdateAvailableBanner: View {
                 HStack(spacing: 8) {
                     Image(systemName: "arrow.down.circle.fill")
                         .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(CCXBadgePalette.blue.accentColor)
+                        .foregroundStyle(blueLabel)
 
                     Text(CCXL10n.text("Downloading \(pct)%", zh: "下载中 \(pct)%"))
                         .font(.system(size: 11, weight: .medium).monospacedDigit())
@@ -1056,7 +1159,7 @@ private struct UpdateAvailableBanner: View {
                 HStack(spacing: 8) {
                     Image(systemName: "arrow.down.circle.fill")
                         .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(CCXBadgePalette.green.accentColor)
+                        .foregroundStyle(greenLabel)
 
                     Text(CCXL10n.text(
                         "v\(release.version.description) Ready",
@@ -1110,7 +1213,7 @@ private struct UpdateAvailableBanner: View {
                     HStack(spacing: 6) {
                         Image(systemName: "exclamationmark.triangle.fill")
                             .font(.system(size: 12, weight: .semibold))
-                            .foregroundStyle(CCXBadgePalette.orange.accentColor)
+                            .foregroundStyle(orangeLabel)
 
                         Text(CCXL10n.text("Update Failed", zh: "更新失败"))
                             .font(.system(size: 11.5, weight: .semibold))
@@ -1137,7 +1240,7 @@ private struct UpdateAvailableBanner: View {
                         } label: {
                             Text("GitHub")
                                 .font(.system(size: 10.5, weight: .medium))
-                                .foregroundStyle(CCXBadgePalette.blue.accentColor)
+                                .foregroundStyle(blueLabel)
                         }
                         .buttonStyle(.plain)
                         .pointerStyle(.link)
@@ -1249,6 +1352,7 @@ private struct UtilityDockButton: View {
     let action: () -> Void
 
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isHovering = false
 
     var body: some View {
@@ -1281,9 +1385,11 @@ private struct UtilityDockButton: View {
                 RoundedRectangle(cornerRadius: 10, style: .continuous)
                     .strokeBorder(hoverBorder, lineWidth: 1)
             )
+            .animation(reduceMotion ? nil : .easeOut(duration: 0.12), value: isHovering)
         }
         .buttonStyle(.plain)
         .help(tooltip)
+        .accessibilityLabel(tooltip)
         .onHover { isHovering = $0 }
     }
 
@@ -1330,7 +1436,7 @@ private extension View {
         if #available(macOS 26.0, *) {
             self
                 .background(topWash, in: shape)
-                .glassEffect(.regular, in: .rect(cornerRadius: cornerRadius))
+                .glassEffect(.regular, in: shape)
                 .clipShape(shape)
         } else {
             self

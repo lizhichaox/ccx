@@ -86,6 +86,8 @@ final class SnipHistoryDiskStore: Sendable {
 
             let indexURL = directoryURL.appendingPathComponent("index.json")
             guard Self.entryExists(at: indexURL) else {
+                // Clean up any orphaned cached PNGs or temp files left without a manifest.
+                Self.pruneUnreferencedFiles(in: directoryURL, keepingPNGNames: [])
                 completion([])
                 return
             }
@@ -131,20 +133,24 @@ final class SnipHistoryDiskStore: Sendable {
 
                     let sanitizedScale = Self.sanitizeScale(record.scale)
                     let sanitizedRect = Self.sanitizeRect(record.screenRect)
-                    if sanitizedScale != record.scale || sanitizedRect != record.screenRect {
+                    let sanitizedTimestamp = Self.sanitizeTimestamp(record.timestamp)
+                    if sanitizedScale != record.scale
+                        || sanitizedRect != record.screenRect
+                        || sanitizedTimestamp != record.timestamp
+                    {
                         needsCleanup = true
                     }
 
                     entries.append(SnipHistoryEntry(
                         id: record.id,
-                        timestamp: record.timestamp,
+                        timestamp: sanitizedTimestamp,
                         image: image,
                         scale: sanitizedScale,
                         screenRect: sanitizedRect
                     ))
                     validRecords.append(SnipHistoryManifestRecord(
                         id: record.id,
-                        timestamp: record.timestamp,
+                        timestamp: sanitizedTimestamp,
                         scale: sanitizedScale,
                         screenRect: sanitizedRect
                     ))
@@ -179,6 +185,10 @@ final class SnipHistoryDiskStore: Sendable {
 
     // MARK: - Private Security Helpers
 
+    private static let maxPlausibleCoordinate: CGFloat = 1_000_000
+    private static let minPlausibleTimestamp = Date(timeIntervalSince1970: 946_684_800) // 2000-01-01
+    private static let maxFutureSkewSeconds: TimeInterval = 86_400
+
     private static func sanitizeScale(_ scale: CGFloat) -> CGFloat {
         guard scale.isFinite, scale > 0 else { return 1 }
         return min(max(scale, 0.5), 8)
@@ -188,9 +198,24 @@ final class SnipHistoryDiskStore: Sendable {
         guard !rect.isNull, !rect.isInfinite,
               rect.origin.x.isFinite, rect.origin.y.isFinite,
               rect.size.width.isFinite, rect.size.height.isFinite,
-              rect.size.width >= 0, rect.size.height >= 0
+              rect.size.width >= 0, rect.size.height >= 0,
+              abs(rect.origin.x) <= maxPlausibleCoordinate,
+              abs(rect.origin.y) <= maxPlausibleCoordinate,
+              rect.size.width <= maxPlausibleCoordinate,
+              rect.size.height <= maxPlausibleCoordinate
         else { return .zero }
         return rect
+    }
+
+    private static func sanitizeTimestamp(_ timestamp: Date, now: Date = Date()) -> Date {
+        let raw = timestamp.timeIntervalSinceReferenceDate
+        guard raw.isFinite,
+              timestamp >= minPlausibleTimestamp,
+              timestamp <= now.addingTimeInterval(maxFutureSkewSeconds)
+        else {
+            return now
+        }
+        return timestamp
     }
 
     private static func ensureSecureDirectory(at directoryURL: URL) -> Bool {
@@ -342,6 +367,11 @@ final class SnipHistoryDiskStore: Sendable {
               st.st_size <= Int64(maxBytes)
         else { return nil }
 
+        // Self-heal file permissions back to user-only 0600 on the already-open descriptor.
+        if (st.st_mode & 0o777) != 0o600 {
+            _ = Darwin.fchmod(fd, 0o600)
+        }
+
         let expectedSize = Int(st.st_size)
         var data = Data()
         data.reserveCapacity(expectedSize)
@@ -372,13 +402,19 @@ final class SnipHistoryDiskStore: Sendable {
         guard let contents = try? fm.contentsOfDirectory(at: directoryURL, includingPropertiesForKeys: nil) else {
             return
         }
+        let uid = Darwin.getuid()
         for fileURL in contents {
             let name = fileURL.lastPathComponent
             if name == "index.json" || validNames.contains(name) {
                 continue
             }
             if name.hasSuffix(".png") || name.hasPrefix(".tmp-") {
-                _ = Darwin.unlink(fileURL.path)
+                var st = stat()
+                guard Darwin.lstat(fileURL.path, &st) == 0, st.st_uid == uid else { continue }
+                let fileType = st.st_mode & S_IFMT
+                if fileType == S_IFREG || fileType == S_IFLNK {
+                    _ = Darwin.unlink(fileURL.path)
+                }
             }
         }
     }

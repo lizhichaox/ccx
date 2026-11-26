@@ -1059,6 +1059,84 @@ final class ClipboardStoreTests: XCTestCase {
         )
         XCTAssertEqual(pb.stringReadCount - beforeColor, 1)
     }
+
+    func testPersistencePrunesOrphansWithoutIndexHeals0600AndSanitizesExtremeMetadata() async throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ccx-heal-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o755])
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        // 1. Directory with orphaned PNG/tmp files and NO index.json cleans up orphans on load.
+        let orphanPNG = dir.appendingPathComponent("\(UUID().uuidString).png")
+        let orphanTmp = dir.appendingPathComponent(".tmp-abandoned")
+        try Data("orphan".utf8).write(to: orphanPNG)
+        try Data("tmp".utf8).write(to: orphanTmp)
+
+        let store1 = ClipboardStore(maxHistoryCount: 5, pasteboard: InMemoryClipboardPasteboard(), historyDirectoryURL: dir)
+        store1.flushPendingPersistence()
+        try await Task.sleep(for: .milliseconds(30))
+        XCTAssertTrue(store1.history.isEmpty)
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: dir.path).isEmpty)
+
+        // 2. Loosened 0644 file permissions self-heal to 0600 on load; extreme rect & far-future timestamp sanitize cleanly.
+        let entryID = UUID()
+        let img = makeTestImage(width: 6, height: 6) { _, _ in (90, 140, 210, 255) }
+        let pngData = try XCTUnwrap(ClipboardStore.encodePNG(img, scale: 2))
+        let pngURL = dir.appendingPathComponent("\(entryID.uuidString).png")
+        let indexURL = dir.appendingPathComponent("index.json")
+        try pngData.write(to: pngURL)
+        _ = Darwin.chmod(pngURL.path, 0o644)
+
+        let farFuture = Date().addingTimeInterval(365 * 86_400 * 50)
+        let extremeRecord = SnipHistoryManifestRecord(
+            id: entryID,
+            timestamp: farFuture,
+            scale: 2,
+            screenRect: CGRect(x: 9_999_999, y: 0, width: 100, height: 100)
+        )
+        try JSONEncoder().encode([extremeRecord]).write(to: indexURL)
+        _ = Darwin.chmod(indexURL.path, 0o644)
+
+        let store2 = ClipboardStore(maxHistoryCount: 5, pasteboard: InMemoryClipboardPasteboard(), historyDirectoryURL: dir)
+        try await waitUntil { store2.history.count == 1 }
+        store2.flushPendingPersistence()
+
+        XCTAssertEqual(store2.history.first?.screenRect, .zero)
+        XCTAssertLessThan(abs((store2.history.first?.timestamp.timeIntervalSinceNow ?? 999)), 60)
+
+        var pngStat = stat()
+        XCTAssertEqual(Darwin.lstat(pngURL.path, &pngStat), 0)
+        XCTAssertEqual(pngStat.st_mode & 0o777, 0o600)
+
+        var idxStat = stat()
+        XCTAssertEqual(Darwin.lstat(indexURL.path, &idxStat), 0)
+        XCTAssertEqual(idxStat.st_mode & 0o777, 0o600)
+    }
+
+    func testClipboardStoreCapsOversizedPinTextAndRejectsUnsafeQuickSaveStems() throws {
+        let pb = InMemoryClipboardPasteboard()
+        let store = ClipboardStore(pasteboard: pb)
+
+        let hugeText = "   " + String(repeating: "X", count: ClipboardStore.maxPinTextLength + 5_000) + "   "
+        store.copyText(hugeText)
+        guard case let .text(pinText)? = store.readPinPayload() else {
+            return XCTFail("Expected capped .text payload")
+        }
+        XCTAssertEqual(pinText.count, ClipboardStore.maxPinTextLength)
+
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ccx-stem-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let img = makeTestImage(width: 2, height: 2) { _, _ in (1, 2, 3, 255) }
+        let pngData = try XCTUnwrap(ClipboardStore.encodePNG(img, scale: 1))
+        for badStem in ["", ".", "..", "sub/name", "sub\\name", "bad\0name"] {
+            XCTAssertThrowsError(try ClipboardStore.writePNGDataExclusively(pngData, in: dir, stem: badStem)) { error in
+                XCTAssertEqual(error as? ClipboardStoreError, .writeFailed)
+            }
+        }
+    }
 }
 
 final class TextRecognizerTests: XCTestCase {

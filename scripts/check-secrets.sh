@@ -55,7 +55,7 @@ SELF_SCRIPT_PATH = "scripts/check-secrets.sh"
 
 PATTERNS: list[tuple[str, re.Pattern[str], bool]] = [
     ("Private key PEM header", re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----"), False),
-    ("GitHub personal access token", re.compile(r"(?<![A-Za-z0-9_])ghp_[A-Za-z0-9]{20,}"), False),
+    ("GitHub token", re.compile(r"(?<![A-Za-z0-9_])gh[opusr]_[A-Za-z0-9]{20,}"), False),
     ("GitHub fine-grained token", re.compile(r"(?<![A-Za-z0-9_])github_pat_[A-Za-z0-9_]{20,}"), False),
     ("AWS Access Key ID", re.compile(r"(?<![A-Za-z0-9])AKIA[0-9A-Z]{16}(?![A-Za-z0-9])"), False),
     ("Slack token", re.compile(r"(?<![A-Za-z0-9_])xox[baprs]-[A-Za-z0-9-]{10,}"), False),

@@ -757,15 +757,23 @@ if [[ -x "$LSREGISTER" ]]; then
   "$LSREGISTER" -u "$BUILT_APP" >/dev/null 2>&1 || true
 fi
 
+if [[ -L "$OUT_DIR" ]]; then
+  echo "error: output directory must not be a symlink: $OUT_DIR" >&2
+  exit 1
+fi
 mkdir -p -- "$OUT_DIR"
 OUT_DIR_ABS="$(cd -- "$OUT_DIR" && pwd)"
 DIST_APP="$OUT_DIR_ABS/CCX.app"
+if [[ -L "$DIST_APP" ]]; then
+  echo "error: refusing to overwrite symlinked app bundle: $DIST_APP" >&2
+  exit 1
+fi
 
 APP_STAGE_DIR="$(mktemp -d "${OUT_DIR_ABS}/.CCX.app.stage.XXXXXX")"
 CLEANUP_PATHS+=("$APP_STAGE_DIR")
-ditto "$BUILT_APP" "$APP_STAGE_DIR/CCX.app"
-rm -rf "$DIST_APP"
-mv "$APP_STAGE_DIR/CCX.app" "$DIST_APP"
+ditto -- "$BUILT_APP" "$APP_STAGE_DIR/CCX.app"
+rm -rf -- "$DIST_APP"
+mv -- "$APP_STAGE_DIR/CCX.app" "$DIST_APP"
 if [[ -x "$LSREGISTER" ]]; then
   "$LSREGISTER" -u "$DIST_APP" >/dev/null 2>&1 || true
 fi
@@ -780,22 +788,30 @@ DMG_PATH=""
 if [[ "$BUILD_ZIP" -eq 1 ]]; then
   ZIP_NAME="CCX-${VERSION}-macOS-${ARCH_MODE}.zip"
   ZIP_PATH="$OUT_DIR_ABS/$ZIP_NAME"
-  rm -f "$ZIP_PATH"
+  if [[ -L "$ZIP_PATH" ]]; then
+    echo "error: refusing to overwrite symlinked archive: $ZIP_PATH" >&2
+    exit 1
+  fi
+  rm -f -- "$ZIP_PATH"
   echo "==> Creating $ZIP_NAME"
-  ditto -c -k --keepParent "$DIST_APP" "$ZIP_PATH"
+  ditto -c -k --keepParent -- "$DIST_APP" "$ZIP_PATH"
   ARTIFACT_BASENAMES+=("$ZIP_NAME")
 fi
 
 if [[ "$BUILD_DMG" -eq 1 ]]; then
   DMG_NAME="CCX-${VERSION}-macOS-${ARCH_MODE}.dmg"
   DMG_PATH="$OUT_DIR_ABS/$DMG_NAME"
+  if [[ -L "$DMG_PATH" ]]; then
+    echo "error: refusing to overwrite symlinked disk image: $DMG_PATH" >&2
+    exit 1
+  fi
   DMG_STAGE="$(mktemp -d "${TMPDIR:-/tmp}/ccx-dmg-stage.XXXXXX")"
   CLEANUP_PATHS+=("$DMG_STAGE")
 
-  ditto "$DIST_APP" "$DMG_STAGE/CCX.app"
+  ditto -- "$DIST_APP" "$DMG_STAGE/CCX.app"
   ln -s /Applications "$DMG_STAGE/Applications"
 
-  rm -f "$DMG_PATH"
+  rm -f -- "$DMG_PATH"
   echo "==> Creating $DMG_NAME"
   hdiutil create \
     -volname "CCX ${VERSION}" \

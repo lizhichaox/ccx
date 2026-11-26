@@ -2023,4 +2023,145 @@ final class AppUpdaterTests: XCTestCase {
             }
         }
     }
+
+    // MARK: 11. Second-Pass Security Hardening Tests
+
+    func testURLPolicyRejectsEncodedSlashesBackslashAndEnforcesRepoScope() {
+        let rejectedDownloadURLs = [
+            "https://github.com/lizhichaox/ccx/releases/%2f../other/repo",
+            "https://github.com/lizhichaox/ccx/releases/%5cevil.zip",
+            "https://objects.githubusercontent.com/assets/%2Fescape.zip",
+        ]
+        for raw in rejectedDownloadURLs {
+            if let url = URL(string: raw) {
+                XCTAssertFalse(AppUpdateURLPolicy.isAllowedDownloadURL(url), "Expected rejected: \(raw)")
+            }
+        }
+
+        XCTAssertTrue(AppUpdateURLPolicy.isAllowedRepoReleaseURL(
+            URL(string: "https://github.com/lizhichaox/ccx/releases/download/v0.10.0/CCX-0.10.0-macOS-universal.zip")!,
+            requireGitHubHost: true
+        ))
+        XCTAssertTrue(AppUpdateURLPolicy.isAllowedRepoReleaseURL(
+            URL(string: "https://objects.githubusercontent.com/github-production-release-asset/123.zip")!,
+            requireGitHubHost: false
+        ))
+        XCTAssertFalse(AppUpdateURLPolicy.isAllowedRepoReleaseURL(
+            URL(string: "https://objects.githubusercontent.com/github-production-release-asset/123.zip")!,
+            requireGitHubHost: true
+        ))
+        XCTAssertFalse(AppUpdateURLPolicy.isAllowedRepoReleaseURL(
+            URL(string: "https://api.github.com/repos/lizhichaox/ccx/releases/latest")!,
+            requireGitHubHost: false
+        ))
+        XCTAssertFalse(AppUpdateURLPolicy.isAllowedRepoReleaseURL(
+            URL(string: "https://github.com/other/repo/releases/download/v0.10.0/file.zip")!,
+            requireGitHubHost: false
+        ))
+    }
+
+    func testReleaseParserRejectsZeroByteChecksumsAndConflictingChecksumManifest() throws {
+        let current = AppSemanticVersion(major: 0, minor: 9, patch: 4)
+        let zeroByteChecksums = try makeReleaseJSON(
+            tagName: "v0.10.0",
+            htmlURL: "https://github.com/lizhichaox/ccx/releases/tag/v0.10.0",
+            assets: [
+                [
+                    "name": "CCX-0.10.0-macOS-universal.zip",
+                    "browser_download_url": "https://github.com/lizhichaox/ccx/releases/download/v0.10.0/CCX-0.10.0-macOS-universal.zip",
+                    "size": 1024,
+                ],
+                [
+                    "name": "SHA256SUMS.txt",
+                    "browser_download_url": "https://github.com/lizhichaox/ccx/releases/download/v0.10.0/SHA256SUMS.txt",
+                    "size": 0,
+                ],
+            ]
+        )
+        XCTAssertThrowsError(try GitHubReleaseParser.parseLatestRelease(data: zeroByteChecksums, currentVersion: current)) { error in
+            XCTAssertEqual(error as? AppUpdateError, .invalidResponse)
+        }
+
+        let digestA = String(repeating: "a", count: 64)
+        let digestB = String(repeating: "b", count: 64)
+        let identicalDuplicate = "\(digestA)  CCX-0.10.0-macOS-universal.zip\n\(digestA.uppercased())  ./CCX-0.10.0-macOS-universal.zip\n"
+        XCTAssertEqual(
+            AppUpdateChecksumVerifier.parseExpectedSHA256(forAssetName: "CCX-0.10.0-macOS-universal.zip", from: identicalDuplicate),
+            digestA
+        )
+
+        let conflictingDuplicate = "\(digestA)  CCX-0.10.0-macOS-universal.zip\n\(digestB)  CCX-0.10.0-macOS-universal.zip\n"
+        XCTAssertNil(
+            AppUpdateChecksumVerifier.parseExpectedSHA256(forAssetName: "CCX-0.10.0-macOS-universal.zip", from: conflictingDuplicate)
+        )
+    }
+
+    func testArchiveValidatorRejectsStoredSizeMismatchAndCaseCollidingDuplicatePaths() throws {
+        let dir = try makeTempDirectory()
+
+        // Stored (method 0) entry with mismatched compressedSize vs uncompressedSize within 250 MB cap -> .extractionFailed.
+        let storedMismatchZip = dir.appendingPathComponent("stored-mismatch.zip")
+        try makeSyntheticZipData(entries: [
+            SyntheticZipEntry(
+                name: "CCX.app/Contents/Info.plist",
+                payload: Data("abcd".utf8),
+                uncompressedSize: 128,
+                compressedSize: 4
+            ),
+        ]).write(to: storedMismatchZip)
+        XCTAssertThrowsError(try AppUpdateArchiveValidator.validateZipArchive(at: storedMismatchZip)) { error in
+            XCTAssertEqual(error as? AppUpdateError, .extractionFailed)
+        }
+
+        // Case-colliding duplicate entry paths (APFS ZIP entry shadowing) -> .extractionFailed.
+        let caseShadowZip = dir.appendingPathComponent("case-shadow.zip")
+        try makeSyntheticZipData(entries: [
+            SyntheticZipEntry(name: "CCX.app/", unixMode: UInt16(S_IFDIR) | 0o755),
+            SyntheticZipEntry(name: "CCX.app/Contents/Info.plist", payload: Data("legit".utf8)),
+            SyntheticZipEntry(name: "CCX.app/Contents/info.plist", payload: Data("evil".utf8)),
+        ]).write(to: caseShadowZip)
+        XCTAssertThrowsError(try AppUpdateArchiveValidator.validateZipArchive(at: caseShadowZip)) { error in
+            XCTAssertEqual(error as? AppUpdateError, .extractionFailed)
+        }
+    }
+
+    @MainActor
+    func testPreparedUpdateInvalidatesWhenAssetURLChangesOrStagedFileVanishes() async throws {
+        let (fakeInstalledApp, transport) = try makePreDownloadFixtures()
+        let extractedBox = AtomicBox<URL?>(nil)
+
+        let manager = AppUpdateManager(
+            userDefaults: makeTestUserDefaults(),
+            currentVersion: AppSemanticVersion(major: 0, minor: 4, patch: 4),
+            currentBundleID: "com.lizhichaox.ccx",
+            currentBundleURL: fakeInstalledApp,
+            currentTeamIDProvider: { "TESTTEAM01" },
+            transport: transport,
+            extractHandler: { _, destinationDir in
+                let extracted = destinationDir.appendingPathComponent("CCX.app", isDirectory: true)
+                try FileManager.default.createDirectory(at: extracted, withIntermediateDirectories: true)
+                extractedBox.value = extracted
+                return extracted
+            },
+            verifyHandler: { _, _, _, _ in },
+            canInstallSilentlyNow: { false }
+        )
+
+        manager.checkForUpdatesInBackgroundIfDue(now: Date())
+        await manager.waitForActiveTask()
+        XCTAssertEqual(transport.downloadCount, 1)
+
+        // Simulate macOS purging the staged bundle in /tmp; a manual re-check must re-download instead of reusing stale state.
+        let firstExtracted = try XCTUnwrap(extractedBox.value)
+        try FileManager.default.removeItem(at: firstExtracted)
+
+        manager.checkForUpdates(userInitiated: true)
+        await manager.waitForActiveTask()
+        XCTAssertEqual(transport.downloadCount, 2)
+        if case .readyToInstall = manager.state {
+            // expected
+        } else {
+            XCTFail("Expected .readyToInstall after recovering missing staged bundle, got \(manager.state)")
+        }
+    }
 }

@@ -17,6 +17,9 @@ protocol MenuBarControllerDelegate: AnyObject {
     func menuBarRequestedPinFromClipboard()
     func menuBarRequestedClearClipboard()
     func menuBarRequestedPinHistoryEntry(_ entry: SnipHistoryEntry)
+    func menuBarRequestedCopyHistoryEntry(_ entry: SnipHistoryEntry)
+    func menuBarRequestedSaveHistoryEntry(_ entry: SnipHistoryEntry)
+    func menuBarRequestedOCRHistoryEntry(_ entry: SnipHistoryEntry)
     func menuBarRequestedClearHistory()
     func menuBarRequestedToggleAllPins()
     func menuBarRequestedUnlockClickThrough()
@@ -229,6 +232,7 @@ final class MenuBarController: NSObject, NSWindowDelegate {
         guard snipHotKeyCombo != combo || isSnipHotKeyRegistered != isRegistered else { return }
         snipHotKeyCombo = combo
         isSnipHotKeyRegistered = isRegistered
+        updateStatusTooltip()
         if panel?.isVisible == true {
             refresh()
         }
@@ -390,8 +394,21 @@ final class MenuBarController: NSObject, NSWindowDelegate {
         let wasVisible = panel.isVisible
         layoutAndPosition(panel: panel)
         installEventMonitors()
+
+        let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        if !wasVisible && !reduceMotion {
+            panel.alphaValue = 0
+        } else {
+            panel.alphaValue = 1
+        }
         panel.makeKeyAndOrderFront(nil)
         panel.invalidateShadow()
+        if !wasVisible && !reduceMotion {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.10
+                panel.animator().alphaValue = 1
+            }
+        }
         if !wasVisible {
             onPanelVisibilityChanged?(true)
         }
@@ -457,6 +474,18 @@ final class MenuBarController: NSObject, NSWindowDelegate {
                 onPinHistory: { [weak self] entry in
                     self?.hidePanel()
                     self?.delegate?.menuBarRequestedPinHistoryEntry(entry)
+                },
+                onCopyHistory: { [weak self] entry in
+                    self?.hidePanel()
+                    self?.delegate?.menuBarRequestedCopyHistoryEntry(entry)
+                },
+                onSaveHistory: { [weak self] entry in
+                    self?.hidePanel()
+                    self?.delegate?.menuBarRequestedSaveHistoryEntry(entry)
+                },
+                onOCRHistory: { [weak self] entry in
+                    self?.hidePanel()
+                    self?.delegate?.menuBarRequestedOCRHistoryEntry(entry)
                 },
                 onClearHistory: { [weak self] in
                     self?.delegate?.menuBarRequestedClearHistory()
@@ -567,8 +596,16 @@ final class MenuBarController: NSObject, NSWindowDelegate {
                 "CCX — \(pinManager.pinCount) pin(s) hidden (click to show)",
                 zh: "CCX — 已隐藏 \(pinManager.pinCount) 个贴图（点击显示）"
             )
+        } else if !isSnipHotKeyRegistered {
+            nextTooltip = CCXL10n.text(
+                "CCX — Shortcut conflict (\(snipHotKeyCombo.displayString))",
+                zh: "CCX — 快捷键冲突 (\(snipHotKeyCombo.displayString))"
+            )
         } else {
-            nextTooltip = "CCX — Control · Command · X"
+            nextTooltip = CCXL10n.text(
+                "CCX — Smart Snip (\(snipHotKeyCombo.displayString))",
+                zh: "CCX — 智能截屏 (\(snipHotKeyCombo.displayString))"
+            )
         }
         if statusItem.button?.toolTip != nextTooltip {
             statusItem.button?.toolTip = nextTooltip
@@ -677,6 +714,10 @@ final class MenuBarController: NSObject, NSWindowDelegate {
                         self.invokePopoverAction {
                             self.delegate?.menuBarRequestedSettings()
                         }
+                        return true
+                    }
+                    if chars == "v", self.recordingStatus == nil {
+                        self.delegate?.menuBarRequestedPinFromClipboard()
                         return true
                     }
                     if chars == "q" {

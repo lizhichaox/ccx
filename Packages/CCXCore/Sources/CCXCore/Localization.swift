@@ -100,4 +100,29 @@ public enum CCXL10n {
             return english
         }
     }
+
+    /// Formats a compact, localized relative age label (e.g. `"Just now"`, `"3m ago"`, `"2h ago"`),
+    /// evaluated purely on demand without background timers.
+    public static func relativeAge(from date: Date, now: Date = Date()) -> String {
+        let elapsed = now.timeIntervalSince(date)
+        guard elapsed.isFinite else {
+            return text("Just now", zh: "刚刚")
+        }
+        if elapsed < 60 {
+            return text("Just now", zh: "刚刚")
+        }
+        let minutes = Int(elapsed / 60)
+        if minutes < 60 {
+            return text("\(minutes)m ago", zh: "\(minutes) 分钟前")
+        }
+        let hours = Int(elapsed / 3_600)
+        if hours < 24 {
+            return text("\(hours)h ago", zh: "\(hours) 小时前")
+        }
+        let days = Int(elapsed / 86_400)
+        if days == 1 {
+            return text("Yesterday", zh: "昨天")
+        }
+        return text("\(days)d ago", zh: "\(days) 天前")
+    }
 }

@@ -388,6 +388,8 @@ public final class InMemoryClipboardPasteboard: ClipboardPasteboard {
 public final class ClipboardStore {
     /// Default total uncompressed RGBA memory budget for in-memory snip history (160 MB).
     public nonisolated static let defaultMaxHistoryMemoryBytes = 160 * 1024 * 1024
+    /// Upper bound on text characters extracted from the pasteboard for floating text pins.
+    public nonisolated static let maxPinTextLength = 100_000
     nonisolated static let maxDecodeFileBytes = 100 * 1024 * 1024 // 100 MB
     nonisolated static let maxDecodeDimension = 32_768
     nonisolated static let maxDecodePixels = 100_000_000 // 100 MP
@@ -688,10 +690,12 @@ public final class ClipboardStore {
         case let .color(sample):
             return .color(sample)
         case .text:
-            guard let string = pasteboard.string(), !string.allSatisfy(\.isWhitespace) else {
+            guard let string = pasteboard.string(),
+                  let trimmed = Self.trimmedPinText(from: string)
+            else {
                 return nil
             }
-            return .text(string.trimmingCharacters(in: .whitespacesAndNewlines))
+            return .text(trimmed)
         }
     }
 
@@ -757,8 +761,40 @@ public final class ClipboardStore {
         if let color = CCXColorSample.parseHex(string) {
             return .color(color)
         }
-        guard !string.allSatisfy(\.isWhitespace) else { return nil }
-        return .text(string.trimmingCharacters(in: .whitespacesAndNewlines))
+        guard let trimmed = Self.trimmedPinText(from: string) else { return nil }
+        return .text(trimmed)
+    }
+
+    /// Trims leading/trailing whitespace and newlines on a slice and caps length to `maxPinTextLength`
+    /// so multi-MB clipboard text payloads never trigger unbounded allocations or stalls.
+    nonisolated static func trimmedPinText(from string: String, maxLength: Int = maxPinTextLength) -> String? {
+        guard maxLength > 0 else { return nil }
+        var start = string.startIndex
+        let endLimit = string.endIndex
+        while start < endLimit, string[start].isWhitespace || string[start].isNewline {
+            string.formIndex(after: &start)
+        }
+        guard start < endLimit else { return nil }
+
+        // Advance at most `maxLength` characters from the first non-whitespace character so
+        // multi-MB blobs are bounded without ever scanning or copying the entire tail.
+        var cappedEnd = start
+        var count = 0
+        while cappedEnd < endLimit, count < maxLength {
+            string.formIndex(after: &cappedEnd)
+            count += 1
+        }
+        var trimmedEnd = cappedEnd
+        while trimmedEnd > start {
+            let prev = string.index(before: trimmedEnd)
+            if string[prev].isWhitespace || string[prev].isNewline {
+                trimmedEnd = prev
+            } else {
+                break
+            }
+        }
+        guard start < trimmedEnd else { return nil }
+        return String(string[start..<trimmedEnd])
     }
 
     /// Encodes `image` as PNG data off or on the main actor.
@@ -805,7 +841,10 @@ public final class ClipboardStore {
     ) throws -> URL {
         guard directory.isFileURL,
               !stem.isEmpty,
+              stem != ".",
+              stem != "..",
               !stem.contains("/"),
+              !stem.contains("\\"),
               !stem.contains("\0")
         else {
             throw ClipboardStoreError.writeFailed

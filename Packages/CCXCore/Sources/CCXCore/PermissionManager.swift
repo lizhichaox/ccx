@@ -87,6 +87,9 @@ public enum PermissionManager {
         guard !bundleID.isEmpty,
               bundleID.count <= 255,
               !bundleID.hasPrefix("-"),
+              !bundleID.hasPrefix("."),
+              !bundleID.hasSuffix("."),
+              !bundleID.contains(".."),
               bundleID.contains(".")
         else { return false }
         return bundleID.utf8.allSatisfy { byte in

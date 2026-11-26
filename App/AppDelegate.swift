@@ -712,15 +712,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return path
     }
 
+    private var isUsingCustomRecordingsFolder: Bool {
+        guard let savedPath = UserDefaults.standard.string(forKey: Self.recordingsDirectoryKey) else {
+            return false
+        }
+        let normalizedSaved = Self.normalizedDirectoryPath(savedPath)
+        guard Self.isWritableRealDirectory(atPath: normalizedSaved) else {
+            return false
+        }
+        let defaultPath = Self.normalizedDirectoryPath(defaultRecordingsDirectoryURL().path)
+        return normalizedSaved != defaultPath
+    }
+
     private func openRecordingsFolder() {
         let directory = preferredRecordingsDirectoryURL(createIfNeeded: true)
-        settingsController?.updateRecordingsFolder(displayPathForDirectory(directory))
+        settingsController?.updateRecordingsFolder(
+            displayPathForDirectory(directory),
+            isCustom: isUsingCustomRecordingsFolder
+        )
         guard Self.isRealDirectory(atPath: directory.path),
               NSWorkspace.shared.open(directory)
         else {
             toast.show(CCXL10n.text("Couldn't Open Recordings Folder", zh: "无法打开录屏目录"), symbolName: "exclamationmark.triangle")
             return
         }
+    }
+
+    private func resetRecordingsFolder() {
+        UserDefaults.standard.removeObject(forKey: Self.recordingsDirectoryKey)
+        let defaultDirectory = defaultRecordingsDirectoryURL()
+        settingsController?.updateRecordingsFolder(
+            displayPathForDirectory(defaultDirectory),
+            isCustom: false
+        )
+        toast.show(
+            CCXL10n.text("Recordings Folder Reset", zh: "已恢复默认录屏目录"),
+            symbolName: "arrow.counterclockwise"
+        )
+    }
+
+    private func copyRecordingsFolderPath() {
+        let path = displayPathForDirectory(preferredRecordingsDirectoryURL(createIfNeeded: false))
+        clipboardStore.copyText(path)
+        toast.show(CCXL10n.text("Copied Folder Path", zh: "已拷贝目录路径"), symbolName: "doc.on.doc")
+        menuBarController?.refresh()
+    }
+
+    private func copyVersionInfo(_ version: String) {
+        clipboardStore.copyText(version)
+        toast.show(CCXL10n.text("Copied \(version)", zh: "已拷贝 \(version)"), symbolName: "doc.on.doc")
+        menuBarController?.refresh()
     }
 
     private func chooseRecordingsFolder() {
@@ -770,8 +811,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
 
                 let validatedURL = URL(fileURLWithPath: normalizedPath, isDirectory: true)
-                UserDefaults.standard.set(normalizedPath, forKey: Self.recordingsDirectoryKey)
-                self.settingsController?.updateRecordingsFolder(self.displayPathForDirectory(validatedURL))
+                let defaultPath = Self.normalizedDirectoryPath(self.defaultRecordingsDirectoryURL().path)
+                if normalizedPath == defaultPath {
+                    UserDefaults.standard.removeObject(forKey: Self.recordingsDirectoryKey)
+                } else {
+                    UserDefaults.standard.set(normalizedPath, forKey: Self.recordingsDirectoryKey)
+                }
+                self.settingsController?.updateRecordingsFolder(
+                    self.displayPathForDirectory(validatedURL),
+                    isCustom: normalizedPath != defaultPath
+                )
                 self.toast.show(CCXL10n.text("Recordings Folder Updated", zh: "已更新录屏目录"), symbolName: "folder.fill")
             }
         }
@@ -806,7 +855,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             } catch {
                 await MainActor.run { [weak self] in
-                    self?.toast.show(CCXL10n.text("Could Not Save PNG", zh: "无法保存 PNG"), symbolName: "exclamationmark.triangle")
+                    guard let self else { return }
+                    self.toast.show(
+                        CCXL10n.text("Quick Save Failed — Choose Folder", zh: "快速保存失败，请选择文件夹"),
+                        symbolName: "exclamationmark.triangle"
+                    )
+                    self.presentSavePanel(for: image)
                 }
             }
         }
@@ -1025,12 +1079,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         Task.detached(priority: .userInitiated) {
             do {
-                guard Self.isWritableRealDirectory(atPath: directory.path),
-                      let targetURL = Self.nextUniqueURL(in: directory, stem: stem, fileExtension: ext)
-                else {
+                guard Self.isWritableRealDirectory(atPath: directory.path) else {
                     throw CocoaError(.fileWriteNoPermission)
                 }
-                try Self.moveRecordingAtomically(from: result.fileURL, to: targetURL)
+                let targetURL = try Self.moveRecordingExclusively(
+                    from: result.fileURL,
+                    in: directory,
+                    stem: stem,
+                    fileExtension: ext
+                )
                 await MainActor.run { [weak self] in
                     self?.toast.show(
                         CCXL10n.text("Saved \(label) to \(folderName)", zh: "已保存 \(label) 到 \(folderName)"),
@@ -1050,6 +1107,116 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     self.presentSavePanel(for: result)
                 }
             }
+        }
+    }
+
+    /// Atomically moves `sourceURL` into a new unique file inside `directory` without ever overwriting
+    /// existing files or following symlinks, even across concurrent saves or separate volumes.
+    private nonisolated static func moveRecordingExclusively(
+        from sourceURL: URL,
+        in directory: URL,
+        stem: String,
+        fileExtension: String
+    ) throws -> URL {
+        let normalizedSourcePath = normalizedDirectoryPath(sourceURL.path)
+        let normalizedDirPath = normalizedDirectoryPath(directory.path)
+        guard !normalizedSourcePath.isEmpty,
+              !normalizedDirPath.isEmpty,
+              !stem.isEmpty,
+              !stem.contains("/"),
+              !stem.contains("\0"),
+              !fileExtension.isEmpty,
+              !fileExtension.contains("/"),
+              !fileExtension.contains("\0")
+        else {
+            throw CocoaError(.fileWriteNoPermission)
+        }
+
+        var sourceStat = stat()
+        if Darwin.lstat(normalizedSourcePath, &sourceStat) != 0 {
+            throw errno == ENOENT ? CocoaError(.fileNoSuchFile) : CocoaError(.fileWriteNoPermission)
+        }
+        guard (sourceStat.st_mode & S_IFMT) == S_IFREG else {
+            throw CocoaError(.fileWriteNoPermission)
+        }
+
+        let dirURL = URL(fileURLWithPath: normalizedDirPath, isDirectory: true)
+        let fm = FileManager.default
+        var stagedSourceURL = sourceURL
+        var stagedSourcePath = normalizedSourcePath
+        var didCopyToDestVolume = false
+
+        defer {
+            if didCopyToDestVolume {
+                try? fm.removeItem(at: stagedSourceURL)
+            }
+        }
+
+        var suffix = 1
+        var usedUUIDFallback = false
+        while true {
+            let candidateName: String
+            if suffix == 1 {
+                candidateName = "\(stem).\(fileExtension)"
+            } else if suffix <= maxQuickSaveSuffixAttempts {
+                candidateName = "\(stem)-\(suffix).\(fileExtension)"
+            } else if !usedUUIDFallback {
+                usedUUIDFallback = true
+                candidateName = "\(stem)-\(UUID().uuidString.prefix(8)).\(fileExtension)"
+            } else {
+                throw CocoaError(.fileWriteNoPermission)
+            }
+
+            let candidateURL = dirURL.appendingPathComponent(candidateName, isDirectory: false)
+            let candidatePath = candidateURL.path
+
+            if Darwin.renamex_np(stagedSourcePath, candidatePath, UInt32(RENAME_EXCL)) == 0 {
+                if didCopyToDestVolume {
+                    didCopyToDestVolume = false
+                    try? fm.removeItem(at: sourceURL)
+                }
+                return candidateURL
+            }
+
+            let err = errno
+            if err == EEXIST {
+                suffix += 1
+                continue
+            }
+            if err == EXDEV && !didCopyToDestVolume {
+                let siblingTemp = dirURL.appendingPathComponent(".ccx-save-\(UUID().uuidString).tmp", isDirectory: false)
+                try fm.copyItem(at: sourceURL, to: siblingTemp)
+                stagedSourceURL = siblingTemp
+                stagedSourcePath = siblingTemp.path
+                didCopyToDestVolume = true
+                continue
+            }
+            if err == ENOTSUP || err == EOPNOTSUPP || err == EINVAL {
+                if Darwin.link(stagedSourcePath, candidatePath) == 0 {
+                    _ = Darwin.unlink(stagedSourcePath)
+                    if didCopyToDestVolume {
+                        didCopyToDestVolume = false
+                        try? fm.removeItem(at: sourceURL)
+                    }
+                    return candidateURL
+                }
+                if errno == EEXIST {
+                    suffix += 1
+                    continue
+                }
+                // Volumes without hard-link support (e.g. FAT32/exFAT): check lstat and move if vacant.
+                if entryExistsOrSymlink(atPath: candidatePath) {
+                    suffix += 1
+                    continue
+                }
+                try fm.moveItem(at: stagedSourceURL, to: candidateURL)
+                if didCopyToDestVolume {
+                    didCopyToDestVolume = false
+                    try? fm.removeItem(at: sourceURL)
+                }
+                return candidateURL
+            }
+            throw CocoaError(.fileWriteNoPermission)
         }
     }
 
@@ -1344,6 +1511,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         recordingCoordinator.cancelIfInReadyPhase()
         let hasClearable = !clipboardStore.history.isEmpty || clipboardStore.hasPasteboardContent
         let recordingsFolderPath = displayPathForDirectory(preferredRecordingsDirectoryURL(createIfNeeded: false))
+        let isCustomRecordingsFolder = self.isUsingCustomRecordingsFolder
         if settingsController == nil {
             let controller = SettingsWindowController(
                 updateManager: updateManager,
@@ -1351,6 +1519,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 isSnipHotKeyRegistered: hotKeyManager.isRegistered(.snip),
                 hasClearableHistory: hasClearable,
                 recordingsFolderPath: recordingsFolderPath,
+                isCustomRecordingsFolder: isCustomRecordingsFolder,
                 resourceMetricsProvider: { [weak self] in
                     guard let self else { return .empty }
                     return SettingsResourceMetricsInput(
@@ -1383,6 +1552,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 },
                 onChooseRecordingsFolder: { [weak self] in
                     self?.chooseRecordingsFolder()
+                },
+                onResetRecordingsFolder: { [weak self] in
+                    self?.resetRecordingsFolder()
+                },
+                onCopyRecordingsFolderPath: { [weak self] in
+                    self?.copyRecordingsFolderPath()
+                },
+                onCopyVersion: { [weak self] version in
+                    self?.copyVersionInfo(version)
                 },
                 onOpenGuide: { [weak self] settingsFrame in
                     guard let self else { return }
@@ -1419,7 +1597,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 isRegistered: hotKeyManager.isRegistered(.snip)
             )
             settingsController?.updateHasClearableHistory(hasClearable)
-            settingsController?.updateRecordingsFolder(recordingsFolderPath)
+            settingsController?.updateRecordingsFolder(recordingsFolderPath, isCustom: isCustomRecordingsFolder)
         }
         settingsController?.show(anchoredTo: anchorRect)
     }
@@ -1475,6 +1653,23 @@ extension AppDelegate: MenuBarControllerDelegate {
         if !pinManager.pin(content: .image(entry.image, scale: entry.scale), at: nil, contentIdentity: entry.pinIdentity) {
             toast.show(CCXL10n.text("Already Pinned", zh: "已贴图"), symbolName: "pin.fill")
         }
+    }
+
+    func menuBarRequestedCopyHistoryEntry(_ entry: SnipHistoryEntry) {
+        guard clipboardStore.history.contains(where: { $0.id == entry.id }) else { return }
+        clipboardStore.copyImage(entry.image, scale: entry.scale, historyEntryID: entry.id)
+        menuBarController?.refresh()
+        toast.show(CCXL10n.text("Copied to Clipboard", zh: "已拷贝到剪贴板"))
+    }
+
+    func menuBarRequestedSaveHistoryEntry(_ entry: SnipHistoryEntry) {
+        guard clipboardStore.history.contains(where: { $0.id == entry.id }) else { return }
+        presentSavePanel(for: entry.image)
+    }
+
+    func menuBarRequestedOCRHistoryEntry(_ entry: SnipHistoryEntry) {
+        guard clipboardStore.history.contains(where: { $0.id == entry.id }) else { return }
+        recognizeAndCopyText(from: entry.image)
     }
 
     func menuBarRequestedClearHistory() {

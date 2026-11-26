@@ -12,17 +12,20 @@ final class SettingsHotKeyState: ObservableObject {
     @Published var shortcutFeedback: String?
     @Published var hasClearableHistory: Bool
     @Published var recordingsFolderPath: String
+    @Published var isCustomRecordingsFolder: Bool
 
     init(
         snipCombo: HotKeyCombo = .defaultSnip,
         isSnipRegistered: Bool = true,
         hasClearableHistory: Bool = false,
-        recordingsFolderPath: String = "~/Movies/CCX"
+        recordingsFolderPath: String = "~/Movies/CCX",
+        isCustomRecordingsFolder: Bool = false
     ) {
         self.snipCombo = snipCombo
         self.isSnipRegistered = isSnipRegistered
         self.hasClearableHistory = hasClearableHistory
         self.recordingsFolderPath = recordingsFolderPath
+        self.isCustomRecordingsFolder = isCustomRecordingsFolder
     }
 }
 
@@ -106,6 +109,9 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     private let onRetryHotKey: () -> Bool
     private let onOpenRecordingsFolder: () -> Void
     private let onChooseRecordingsFolder: () -> Void
+    private let onResetRecordingsFolder: () -> Void
+    private let onCopyRecordingsFolderPath: () -> Void
+    private let onCopyVersion: (String) -> Void
     private let onOpenGuide: (NSRect?) -> Void
     private let onClearHistory: () -> Void
     private let onRelaunch: () -> Void
@@ -132,6 +138,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         isSnipHotKeyRegistered: Bool = true,
         hasClearableHistory: Bool = false,
         recordingsFolderPath: String = "~/Movies/CCX",
+        isCustomRecordingsFolder: Bool = false,
         resourceMetricsProvider: @escaping () -> SettingsResourceMetricsInput = { .empty },
         onBeginShortcutRecording: @escaping () -> Void = {},
         onEndShortcutRecording: @escaping () -> Void = {},
@@ -140,6 +147,9 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         onRetryHotKey: @escaping () -> Bool = { false },
         onOpenRecordingsFolder: @escaping () -> Void = {},
         onChooseRecordingsFolder: @escaping () -> Void = {},
+        onResetRecordingsFolder: @escaping () -> Void = {},
+        onCopyRecordingsFolderPath: @escaping () -> Void = {},
+        onCopyVersion: @escaping (String) -> Void = { _ in },
         onOpenGuide: @escaping (NSRect?) -> Void = { _ in },
         onClearHistory: @escaping () -> Void = {},
         onRelaunch: @escaping () -> Void = { _ = AppRelauncher.relaunch() },
@@ -150,7 +160,8 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             snipCombo: snipCombo,
             isSnipRegistered: isSnipHotKeyRegistered,
             hasClearableHistory: hasClearableHistory,
-            recordingsFolderPath: recordingsFolderPath
+            recordingsFolderPath: recordingsFolderPath,
+            isCustomRecordingsFolder: isCustomRecordingsFolder
         )
         self.resourceMetricsProvider = resourceMetricsProvider
         self.onBeginShortcutRecording = onBeginShortcutRecording
@@ -160,6 +171,9 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         self.onRetryHotKey = onRetryHotKey
         self.onOpenRecordingsFolder = onOpenRecordingsFolder
         self.onChooseRecordingsFolder = onChooseRecordingsFolder
+        self.onResetRecordingsFolder = onResetRecordingsFolder
+        self.onCopyRecordingsFolderPath = onCopyRecordingsFolderPath
+        self.onCopyVersion = onCopyVersion
         self.onOpenGuide = onOpenGuide
         self.onClearHistory = onClearHistory
         self.onRelaunch = onRelaunch
@@ -213,9 +227,12 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         }
     }
 
-    func updateRecordingsFolder(_ path: String) {
+    func updateRecordingsFolder(_ path: String, isCustom: Bool? = nil) {
         if hotKeyState.recordingsFolderPath != path {
             hotKeyState.recordingsFolderPath = path
+        }
+        if let isCustom, hotKeyState.isCustomRecordingsFolder != isCustom {
+            hotKeyState.isCustomRecordingsFolder = isCustom
         }
     }
 
@@ -475,6 +492,16 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             onChooseRecordingsFolder: { [weak self] in
                 self?.stopRecordingShortcut()
                 self?.onChooseRecordingsFolder()
+            },
+            onResetRecordingsFolder: { [weak self] in
+                self?.stopRecordingShortcut()
+                self?.onResetRecordingsFolder()
+            },
+            onCopyRecordingsFolderPath: { [weak self] in
+                self?.onCopyRecordingsFolderPath()
+            },
+            onCopyVersion: { [weak self] version in
+                self?.onCopyVersion(version)
             },
             onToggleResourceUsage: { [weak self] in
                 self?.toggleResourceUsageExpanded()
@@ -760,12 +787,17 @@ private struct SettingsView: View {
     let onRetryHotKey: () -> Void
     let onOpenRecordingsFolder: () -> Void
     let onChooseRecordingsFolder: () -> Void
+    let onResetRecordingsFolder: () -> Void
+    let onCopyRecordingsFolderPath: () -> Void
+    let onCopyVersion: (String) -> Void
     let onToggleResourceUsage: () -> Void
     let onOpenGuide: () -> Void
     let onClearHistory: () -> Void
     let onRelaunch: () -> Void
     let onPermissionReset: @MainActor (Bool) -> Void
     let onContentHeightChange: () -> Void
+
+    @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         ZStack(alignment: .top) {
@@ -781,7 +813,7 @@ private struct SettingsView: View {
             .ignoresSafeArea()
 
             VStack(alignment: .center, spacing: 12) {
-                SettingsIdentityHeader()
+                SettingsIdentityHeader(onCopyVersion: onCopyVersion)
 
                 VStack(spacing: 10) {
                     // Card 1 — Preferences
@@ -792,8 +824,11 @@ private struct SettingsView: View {
                         Divider().padding(.leading, 42)
                         RecordingsFolderRow(
                             folderPath: hotKeyState.recordingsFolderPath,
+                            isCustom: hotKeyState.isCustomRecordingsFolder,
                             onChoose: onChooseRecordingsFolder,
-                            onOpen: onOpenRecordingsFolder
+                            onOpen: onOpenRecordingsFolder,
+                            onReset: onResetRecordingsFolder,
+                            onCopyPath: onCopyRecordingsFolderPath
                         )
                         Divider().padding(.leading, 42)
                         SnipShortcutRow(
@@ -834,7 +869,7 @@ private struct SettingsView: View {
                         HStack(spacing: 5) {
                             Image(systemName: "book.closed.fill")
                                 .font(.system(size: 11, weight: .semibold))
-                                .foregroundStyle(CCXBadgePalette.blue.accentColor)
+                                .foregroundStyle(CCXBadgePalette.blue.labelColor(for: colorScheme))
                             Text(CCXL10n.text("Setup Guide", zh: "使用指南"))
                                 .font(.system(size: 11.5, weight: .medium))
                                 .lineLimit(1)
@@ -852,7 +887,7 @@ private struct SettingsView: View {
                                 .font(.system(size: 11, weight: .semibold))
                                 .foregroundStyle(
                                     hotKeyState.hasClearableHistory
-                                        ? CCXBadgePalette.red.accentColor
+                                        ? CCXBadgePalette.red.labelColor(for: colorScheme)
                                         : Color.secondary
                                 )
                             Text(CCXL10n.text("Clear Snip History", zh: "清空记录"))
@@ -988,7 +1023,10 @@ private struct SettingsFooter: View {
 // MARK: - Header & Section Building Blocks
 
 private struct SettingsIdentityHeader: View {
+    let onCopyVersion: (String) -> Void
+
     var body: some View {
+        let versionString = "CCX v\(AppVersion.shortDisplay)"
         VStack(spacing: 4) {
             CCXBrandIcon(size: 44)
 
@@ -999,6 +1037,12 @@ private struct SettingsIdentityHeader: View {
                 Text("v\(AppVersion.shortDisplay)")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
+                    .help(CCXL10n.text("Right-click to copy version", zh: "右键拷贝版本号"))
+                    .contextMenu {
+                        Button(CCXL10n.text("Copy Version", zh: "拷贝版本号")) {
+                            onCopyVersion(versionString)
+                        }
+                    }
             }
         }
         .frame(maxWidth: .infinity, alignment: .center)
@@ -1095,6 +1139,10 @@ private struct SnipShortcutRow: View {
                                     .strokeBorder(Color.accentColor.opacity(0.55), lineWidth: 1.25)
                             )
                             .fixedSize()
+                            .accessibilityLabel(CCXL10n.text(
+                                "Recording new shortcut: \(liveRecordingLabel). Press keys or Escape to cancel.",
+                                zh: "正在录制新快捷键：\(liveRecordingLabel)，按下按键或按 Esc 取消"
+                            ))
 
                         Button(action: onCancelRecording) {
                             Image(systemName: "xmark")
@@ -1243,6 +1291,7 @@ private struct LaunchAtLoginRow: View {
                         .labelsHidden()
                         .toggleStyle(.switch)
                         .controlSize(.small)
+                        .accessibilityLabel(CCXL10n.text("Launch at Login", zh: "开机自启"))
                 }
             }
 
@@ -1274,8 +1323,13 @@ private struct LaunchAtLoginRow: View {
 
 private struct RecordingsFolderRow: View {
     let folderPath: String
+    let isCustom: Bool
     let onChoose: () -> Void
     let onOpen: () -> Void
+    let onReset: () -> Void
+    let onCopyPath: () -> Void
+
+    @State private var isHoveringReset = false
 
     var body: some View {
         HStack(spacing: 9) {
@@ -1300,7 +1354,28 @@ private struct RecordingsFolderRow: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
-            HStack(spacing: 6) {
+            HStack(spacing: 5) {
+                if isCustom {
+                    Button(action: onReset) {
+                        Image(systemName: "arrow.counterclockwise")
+                            .font(.system(size: 10.5, weight: .semibold))
+                            .foregroundStyle(isHoveringReset ? Color.primary : Color.secondary)
+                            .frame(width: 22, height: 22)
+                            .background(
+                                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                    .fill(isHoveringReset ? Color.primary.opacity(0.10) : Color.primary.opacity(0.05))
+                            )
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                    .strokeBorder(Color.primary.opacity(isHoveringReset ? 0.18 : 0.10), lineWidth: 0.75)
+                            )
+                            .contentShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    }
+                    .buttonStyle(.plain)
+                    .help(CCXL10n.text("Reset to default (~/Movies/CCX)", zh: "恢复默认录屏目录 (~/Movies/CCX)"))
+                    .accessibilityLabel(CCXL10n.text("Reset recordings folder to default", zh: "恢复默认录屏目录"))
+                    .onHover { isHoveringReset = $0 }
+                }
                 Button(CCXL10n.text("Choose…", zh: "选择…"), action: onChoose)
                     .buttonStyle(.bordered)
                     .controlSize(.small)
@@ -1314,11 +1389,20 @@ private struct RecordingsFolderRow: View {
         .padding(.horizontal, 10)
         .padding(.vertical, 7.5)
         .help(CCXL10n.text("Default recordings folder: \(folderPath)", zh: "默认录屏目录：\(folderPath)"))
+        .contextMenu {
+            Button(CCXL10n.text("Open in Finder", zh: "在访达中打开"), action: onOpen)
+            Button(CCXL10n.text("Copy Folder Path", zh: "拷贝目录路径"), action: onCopyPath)
+            if isCustom {
+                Divider()
+                Button(CCXL10n.text("Reset to Default", zh: "恢复默认目录"), action: onReset)
+            }
+        }
     }
 }
 
 private struct UpdatesSettingRow: View {
     @ObservedObject var updateManager: AppUpdateManager
+    @Environment(\.colorScheme) private var colorScheme
 
     private var iconPalette: CCXBadgePalette {
         switch updateManager.state {
@@ -1364,9 +1448,9 @@ private struct UpdatesSettingRow: View {
     private var subtitleColor: Color {
         switch updateManager.state {
         case .available, .readyToInstall:
-            return CCXBadgePalette.green.accentColor
+            return CCXBadgePalette.green.labelColor(for: colorScheme)
         case .failed:
-            return CCXBadgePalette.red.accentColor
+            return CCXBadgePalette.red.labelColor(for: colorScheme)
         case .idle, .checking, .upToDate, .downloading, .verifying, .installing:
             return .secondary
         }
@@ -1564,6 +1648,7 @@ private struct UpdatesSettingRow: View {
             .labelsHidden()
             .toggleStyle(.switch)
             .controlSize(.small)
+            .accessibilityLabel(CCXL10n.text("Automatic Updates", zh: "自动更新"))
             .help(CCXL10n.text(
                 "Download and install updates automatically when idle",
                 zh: "空闲或退出时自动下载并平滑安装更新"
@@ -1679,6 +1764,7 @@ private struct ResourceUsageCard: View {
     let onToggle: () -> Void
 
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isHoveringHeader = false
 
     var body: some View {
@@ -1724,6 +1810,7 @@ private struct ResourceUsageCard: View {
                             .font(.system(size: 10, weight: .semibold))
                             .foregroundStyle(.secondary)
                             .rotationEffect(.degrees(resourceState.isExpanded ? 90 : 0))
+                            .animation(reduceMotion ? nil : .easeInOut(duration: 0.16), value: resourceState.isExpanded)
                             .frame(width: 12, height: 12)
                     }
                 }
@@ -1813,20 +1900,25 @@ private struct ResourceUsageExpandedDetails: View {
 private extension View {
     @ViewBuilder
     func ccxSettingsCard(cornerRadius: CGFloat = 12) -> some View {
+        let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
         if #available(macOS 26.0, *) {
             self
-                .glassEffect(.regular, in: .rect(cornerRadius: cornerRadius))
+                .glassEffect(.regular, in: shape)
                 .overlay(
-                    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    shape
                         .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
+                        .allowsHitTesting(false)
                 )
+                .clipShape(shape)
         } else {
             self
-                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+                .background(.regularMaterial, in: shape)
                 .overlay(
-                    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    shape
                         .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
+                        .allowsHitTesting(false)
                 )
+                .clipShape(shape)
         }
     }
 }

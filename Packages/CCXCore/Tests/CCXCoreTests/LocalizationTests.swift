@@ -114,10 +114,91 @@ final class LocalizationTests: XCTestCase {
         XCTAssertTrue(PermissionManager.isValidBundleIdentifier("com.example.my-app2"))
         XCTAssertFalse(PermissionManager.isValidBundleIdentifier(""))
         XCTAssertFalse(PermissionManager.isValidBundleIdentifier("-com.lizhichaox.ccx"))
+        XCTAssertFalse(PermissionManager.isValidBundleIdentifier(".com.lizhichaox.ccx"))
+        XCTAssertFalse(PermissionManager.isValidBundleIdentifier("com.lizhichaox.ccx."))
+        XCTAssertFalse(PermissionManager.isValidBundleIdentifier("com..lizhichaox.ccx"))
         XCTAssertFalse(PermissionManager.isValidBundleIdentifier("nodot"))
         XCTAssertFalse(PermissionManager.isValidBundleIdentifier("com.lizhichaox.ccx;rm -rf /"))
         XCTAssertFalse(PermissionManager.isValidBundleIdentifier("com.lizhichaox.ccx/sub"))
         XCTAssertFalse(PermissionManager.isValidBundleIdentifier(String(repeating: "a", count: 256) + ".b"))
+    }
+
+    func testRelativeAgeFormattingInBothLanguages() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+
+        CCXL10n.withLanguageForTesting(.en) {
+            XCTAssertEqual(CCXL10n.relativeAge(from: now.addingTimeInterval(-10), now: now), "Just now")
+            XCTAssertEqual(CCXL10n.relativeAge(from: now.addingTimeInterval(30), now: now), "Just now")
+            XCTAssertEqual(CCXL10n.relativeAge(from: now.addingTimeInterval(-180), now: now), "3m ago")
+            XCTAssertEqual(CCXL10n.relativeAge(from: now.addingTimeInterval(-7_200), now: now), "2h ago")
+            XCTAssertEqual(CCXL10n.relativeAge(from: now.addingTimeInterval(-90_000), now: now), "Yesterday")
+            XCTAssertEqual(CCXL10n.relativeAge(from: now.addingTimeInterval(-3 * 86_400), now: now), "3d ago")
+        }
+
+        CCXL10n.withLanguageForTesting(.zhHans) {
+            XCTAssertEqual(CCXL10n.relativeAge(from: now.addingTimeInterval(-10), now: now), "刚刚")
+            XCTAssertEqual(CCXL10n.relativeAge(from: now.addingTimeInterval(-180), now: now), "3 分钟前")
+            XCTAssertEqual(CCXL10n.relativeAge(from: now.addingTimeInterval(-7_200), now: now), "2 小时前")
+            XCTAssertEqual(CCXL10n.relativeAge(from: now.addingTimeInterval(-90_000), now: now), "昨天")
+            XCTAssertEqual(CCXL10n.relativeAge(from: now.addingTimeInterval(-3 * 86_400), now: now), "3 天前")
+        }
+    }
+
+    @MainActor
+    func testV010PopoverSettingsAndGuideCopyFitWidthBudgetsInBothLanguages() {
+        let settingsTitleFont = NSFont.systemFont(ofSize: 12.5, weight: .medium)
+        let smallButtonFont = NSFont.systemFont(ofSize: 11.0)
+        let popoverSectionFont = NSFont.systemFont(ofSize: 9.5, weight: .semibold)
+        let popoverBadgeFont = NSFont.monospacedDigitSystemFont(ofSize: 9.5, weight: .bold)
+        let guideTitleFont = NSFont.systemFont(ofSize: 12.5, weight: .medium)
+        let guidePillFont = NSFont.systemFont(ofSize: 11.0, weight: .medium)
+
+        // Settings RecordingsFolderRow: 316pt inner width -> 24 icon + 9 gap + title + 9 gap + [22 reset + 5] + Choose + 5 + Open + 36 button chrome.
+        let settingsCardInnerWidth: CGFloat = 316.0
+        // Popover FloatingPinsSection header: 288pt inner width.
+        let popoverInnerWidth: CGFloat = 288.0
+        // Setup Guide ReadyStepView row: 464 - 40 outer - 24 row padding = 400pt inner width (24 icon + 10 gap + title + 10 spacer + pill + 18 pill padding).
+        let guideRowInnerWidth: CGFloat = 400.0
+
+        for language in CCXLanguage.allCases {
+            CCXL10n.withLanguageForTesting(language) {
+                let recTitleW = ceil(NSAttributedString(string: CCXL10n.text("Recordings", zh: "录屏目录"), attributes: [.font: settingsTitleFont]).size().width)
+                let chooseW = ceil(NSAttributedString(string: CCXL10n.text("Choose…", zh: "选择…"), attributes: [.font: smallButtonFont]).size().width)
+                let openW = ceil(NSAttributedString(string: CCXL10n.text("Open", zh: "打开"), attributes: [.font: smallButtonFont]).size().width)
+                let recordingsRowTotal = 24 + 9 + recTitleW + 9 + 22 + 5 + chooseW + 18 + 5 + openW + 18
+                XCTAssertLessThanOrEqual(
+                    recordingsRowTotal,
+                    settingsCardInnerWidth,
+                    "[\(language.rawValue)] RecordingsFolderRow measured \(recordingsRowTotal)pt, exceeding \(settingsCardInnerWidth)pt"
+                )
+
+                let pinsHeaderW = ceil(NSAttributedString(string: CCXL10n.text("FLOATING PINS", zh: "悬浮贴图"), attributes: [.font: popoverSectionFont]).size().width)
+                for status in [
+                    CCXL10n.text("99 active", zh: "99 个显示"),
+                    CCXL10n.text("99 hidden", zh: "99 个已隐藏"),
+                ] {
+                    let badgeW = ceil(NSAttributedString(string: status, attributes: [.font: popoverBadgeFont]).size().width)
+                    let totalW = pinsHeaderW + 6 + badgeW + 12
+                    XCTAssertLessThanOrEqual(
+                        totalW,
+                        popoverInnerWidth,
+                        "[\(language.rawValue)] FloatingPinsSection header '\(status)' measured \(totalW)pt, exceeding \(popoverInnerWidth)pt"
+                    )
+                }
+
+                let readyRowTitleW = ceil(NSAttributedString(
+                    string: CCXL10n.text("Annotate, OCR & Scroll", zh: "标注、OCR 与长截屏"),
+                    attributes: [.font: guideTitleFont]
+                ).size().width)
+                let readyPillW = ceil(NSAttributedString(string: "1–8 · T · L", attributes: [.font: guidePillFont]).size().width)
+                let readyRowTotal = 24 + 10 + readyRowTitleW + 10 + readyPillW + 18
+                XCTAssertLessThanOrEqual(
+                    readyRowTotal,
+                    guideRowInnerWidth,
+                    "[\(language.rawValue)] ReadyStepView row measured \(readyRowTotal)pt, exceeding \(guideRowInnerWidth)pt"
+                )
+            }
+        }
     }
 
     @MainActor
