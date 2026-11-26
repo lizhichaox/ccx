@@ -2,6 +2,32 @@
 
 All notable changes to **CCX (Control · Command · X)** are documented in this file.
 
+## [0.10.0] - 2026-11-26
+
+### Added
+- **Menu Bar, Recent Snips & Accessibility Ergonomics (`App`, `CCXCore`)**:
+  - Added right-click context menus and VoiceOver actions (`Pin to Screen`, `Copy Image`, `Recognize Text (OCR)`, `Save as PNG…`) on every Recent Snip thumbnail with zero-timer on-demand relative age tooltips (`CCXL10n.relativeAge`).
+  - Added `⌘V` inside the open menu bar popover to Pin from Clipboard, accurate `"N hidden"` / `"N 个已隐藏"` pin status labeling, conflict-aware status bar tooltips, `RecordingsFolderRow` inline Reset & context menu (`Open in Finder`, `Copy Folder Path`, `Reset to Default`), `SettingsIdentityHeader` `"Copy Version"` menu, resilient `quickSavePNG` fallback to `NSSavePanel` on write failure, and comprehensive VoiceOver labels/hints across Popover, Settings, and Setup Guide.
+- **Smart Snip, Scroll Capture & Annotation Ergonomics (`CCXCapture`, `CCXAnnotate`)**:
+  - Implemented progressive `Esc` hierarchy in `SnipOverlayView` (inline text → toolbar drag → in-flight annotation draft/move/resize rollback → exit drawing tool / clear selection → cancel snip).
+  - Added live `1:1` (`Shift`), `Move` (`Space`), and red `REC ·` cues on the selection dimension pill (with automatic toolbar-overlap avoidance below the Notch), full inline text editing shortcuts (`⌘A`/`⌘C`/`⌘X`/`⌘V`/`⌘Z`/`⇧⌘Z`/`⌘↩`), live `StrokeSizeHUDView` readout while dragging the slider, subtle `.small`/`.medium`/`.large` slider reference ticks, and bilingual tool/color/mosaic tooltips with shortcuts and modifier hints.
+  - Added `ScrollCaptureGuidance.scrollSlower` (after consecutive misaligned frames) and locked `Height limit` HUD states with detailed bilingual tooltips and disabled Auto-Scroll state.
+- **Floating Pin & Screen Recording Usability (`CCXPin`, `CCXRecord`)**:
+  - Added persistent, non-interactive `PinClickThroughBadgeView` (`Click-Through` / `穿透`, auto-compacting to icon-only on narrow pins), accurate `effectiveZoom` HUD readouts with bound-flash feedback, multi-display seam preservation + notch-safe thumbnail clamping, `[` / `]` inline annotation stroke/font sizing, and native SF Symbol icons + `T` OCR shortcut in the pin context menu.
+  - Upgraded Screen Recording with a live `W × H · fps` pre-record dimension pill, mid-drag `Esc` cancellation of active region drags without aborting the session, automatic `.completed` control panel focus with `⌘R` Save & Reveal shortcut, stranded control-panel recovery on display disconnect, and deeper bilingual error diagnosis (preserving outer `AVError` specificity while unwrapping nested POSIX `ENOSPC`/`EACCES`).
+
+### Improved
+- **Cohesive Liquid Glass & Visual Elegance (`App`, `CCXAnnotate`, `CCXCapture`, `CCXPin`, `CCXRecord`)**:
+  - Unified progressive macOS 26+ `NSGlassEffectView` / `.glassEffect` surfaces and `.continuous` squircle corner clipping across `ToastHUD` (with adaptive 1.15s–2.30s hold duration & multi-display/notch XY clamping), Menu Bar Popover, Settings, Onboarding, `PinHUDView`, `PinHoverToolbarButton`, `AnnotationActionToolbar`, `PixelMagnifierView`, `ScrollCaptureHUDPanel`, and `RecordingHUDPanels`.
+  - Upgraded Dark Mode contrast via `CCXBadgePalette.labelColor(for:)`, synced live `AdaptiveCornerRadii` into `AnnotationCanvasView` for 100% WYSIWYG rounded-window annotation clipping, split the `PixelMagnifierView` crosshair into 4 arms leaving the center pixel 100% un-tinted, wrapped pin transforms in atomic `CATransaction`s for flicker-free updates, and added Reduce-Motion-aware micro-animations and GPU-only recording pulse.
+
+### Security
+- **In-App Updater & Local Storage Defense-in-Depth (`CCXCore`, `App`, `scripts`, `SECURITY.md`)**:
+  - Hardened `AppUpdater` to reject `%2f`/`%5c`/control characters in release URLs, enforce a 5-redirect cap with repo-scoped redirects and `Authorization`/`Cookie` stripping, reject empty `SHA256SUMS.txt`/downloads and conflicting digests, block APFS case-insensitive duplicate ZIP path shadowing and stored-entry size mismatches, bound `/usr/bin/ditto` with a 60s timeout, and enforce anti-downgrade and `preparedUpdate` asset/file revalidation.
+  - Hardened `SnipHistoryPersistence` (orphan cleanup even without `index.json`, `fchmod 0600` self-healing on open descriptors, coordinate/timestamp sanitization, `lstat` ownership checks), `ClipboardStore` (`maxPinTextLength = 100_000` zero-copy cap, safe quick-save stems), `PermissionManager.isValidBundleIdentifier`, and exclusive recording moves (`moveRecordingExclusively` via `renamex_np(RENAME_EXCL)`).
+  - Hardened `RecordingFileSecurity` (hard-link rejection `st_nlink == 1`), `ScreenRecordingEngine.cancel()` incomplete-file cleanup, `RecordingTimeline` stale pre-pause PTS preservation, `DualAudioMixer` monotonic PTS + `softClip`, `GifRecordingEncoder` dimension/finiteness guards, `SmartElementDetector` coordinate magnitude (`1_000_000`) & bounded AX strings (`<= 256 B`), `ScrollImageStitcher` non-finite MAD crash fix + hard height/pixel ceilings, `AnnotationModels`/`Renderer`/`MosaicImageCache` NaN/Inf/overflow bounds, and `PinLayout` UTF-8+grapheme Zalgo double-cap & oversized-frame OOM guard.
+  - Broadened GitHub token detection (`gh[opusr]_`) in `scripts/check-secrets.sh`, added symlink refusal & `--` path guards in `scripts/package-release.sh`, and updated `SECURITY.md` for `0.10.x`.
+
 ## [0.9.4] - 2026-11-26
 
 ### Fixed

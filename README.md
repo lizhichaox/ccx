@@ -33,7 +33,7 @@
 
 ## Installation
 
-1. Download the latest `CCX-0.9.4-macOS-universal.dmg` (or `.zip`).
+1. Download the latest `CCX-0.10.0-macOS-universal.dmg` (or `.zip`).
 2. Open the disk image and drag **CCX.app** into **Applications**.
 3. Launch **CCX** from `/Applications` or Spotlight.
 
@@ -69,6 +69,7 @@ CCX requests only the macOS permissions required for its three core features:
 | --- | --- |
 | `⌃⌘X` | Start Smart Snip (customizable in **Settings → Snip Shortcut** with conflict detection) |
 | Click menu bar icon | Open / close CCX popover (left or right click) |
+| `⌘V` | Pin from clipboard (when popover is open) |
 | `⌘,` | Open Settings (when popover is open) |
 | `Esc` / `⌘W` | Dismiss popover, Settings, or Setup Guide |
 | `⌘Q` | Quit CCX (from popover; confirms if recording is active) |
@@ -108,7 +109,7 @@ CCX requests only the macOS permissions required for its three core features:
 | Shortcut | Action |
 | --- | --- |
 | `E` / `Space` / Double-click | Open inline annotation toolbar on image pins (`E` or Double-click also closes; also via bottom-right hover button or **Show Toolbar** at top of right-click menu) |
-| `1`–`8` | Open inline annotation toolbar directly with that drawing tool |
+| `1`–`8` | Open inline annotation toolbar directly with that drawing tool (`[` / `]` adjusts stroke or font size while annotating) |
 | `T` | Extract and copy text from image pin (OCR) |
 | Scroll wheel / trackpad | Zoom in / out (`⌥` + Scroll adjusts opacity) |
 | `+` / `-` (`⌘+` / `⌘-`) | Zoom in / out |
@@ -128,7 +129,7 @@ CCX requests only the macOS permissions required for its three core features:
 | --- | --- |
 | **Ready** | `Return` or `Space`: Start · `← ↑ → ↓` / `⌥` + Arrows: Nudge / resize · `⌘A`: Full display · `Esc` / `⌘W`: Cancel |
 | **Recording / Paused** | `Space`: Pause / resume · `Return`: Stop & finalize · `Esc` / `⌘W`: Discard (when HUD is focused) |
-| **Completed** | `Return` or `⇧⌘S`: Quick Save · `⌘C`: Copy file · `⌘S`: Save dialog · `Esc` / `⌘W`: Discard |
+| **Completed** | `Return` or `⇧⌘S`: Quick Save · `⌘C`: Copy file · `⌘S`: Save dialog · `⌘R`: Save & Reveal in Finder · `Esc` / `⌘W`: Discard |
 
 ---
 
@@ -139,8 +140,9 @@ CCX requests only the macOS permissions required for its three core features:
 
 ### Local Development Build & Launch
 ```bash
-# Auto-detects your Apple Development signing identity (or copy Config/LocalSigning.xcconfig.example),
-# builds CCX.app, installs to /Applications/CCX.app, and launches via LaunchServices:
+# Auto-detects your Developer ID Application or Apple Development signing identity
+# (or copy Config/LocalSigning.xcconfig.example), builds CCX.app, installs to
+# /Applications/CCX.app, and launches via LaunchServices:
 ./scripts/build-and-run.sh
 
 # Optional flags:
@@ -165,7 +167,7 @@ See [SECURITY.md](SECURITY.md) for details on what the hooks verify and how to r
 ### Public Release Packaging (Universal Binary + Hardened Runtime)
 ```bash
 # Bump version in project.yml when preparing a release:
-./scripts/bump-version.sh 0.9.4
+./scripts/bump-version.sh 0.10.0
 
 # Build signed Universal Binary (arm64 + x86_64), verify dylibs/codesign/entitlements,
 # and emit dist/CCX-<version>-macOS-universal.{dmg,zip} + dist/SHA256SUMS.txt:
