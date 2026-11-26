@@ -1216,6 +1216,71 @@ struct SmartElementDetectorTests {
         let elapsed = ContinuousClock.now - switchStart
         #expect(elapsed < .milliseconds(150))
     }
+
+    @Test @MainActor func sanitizationGuardsNaNInfHugeRectsAndOversizedAXStrings() {
+        // 1. parseWindowList drops NaN/Inf alpha, non-finite screen height, huge magnitudes, and NaN bounds.
+        let validEntry = entry(id: 100, pid: 42, layer: 0, x: 40, y: 60, width: 320, height: 220, alpha: 1.0, owner: "ValidApp")
+        let nanAlphaEntry = entry(id: 101, pid: 42, layer: 0, x: 40, y: 60, width: 320, height: 220, alpha: .nan, owner: "BadAlpha")
+        let infAlphaEntry = entry(id: 102, pid: 42, layer: 0, x: 40, y: 60, width: 320, height: 220, alpha: .infinity, owner: "InfAlpha")
+        let hugeCoordEntry = entry(id: 103, pid: 42, layer: 0, x: 1e12, y: 60, width: 320, height: 220, alpha: 1.0, owner: "HugeX")
+        let hugeSizeEntry = entry(id: 104, pid: 42, layer: 0, x: 40, y: 60, width: 2_000_000, height: 220, alpha: 1.0, owner: "HugeW")
+        let nanBoundEntry = entry(id: 105, pid: 42, layer: 0, x: .nan, y: 60, width: 320, height: 220, alpha: 1.0, owner: "NaNX")
+
+        let parsed = SmartElementDetector.parseWindowList(
+            [validEntry, nanAlphaEntry, infAlphaEntry, hugeCoordEntry, hugeSizeEntry, nanBoundEntry],
+            primaryScreenHeight: 982
+        )
+        #expect(parsed.map(\.windowID) == [100])
+
+        // Non-finite primaryScreenHeight rejects all entries cleanly instead of producing NaN frames.
+        #expect(SmartElementDetector.parseWindowList([validEntry], primaryScreenHeight: .nan).isEmpty)
+        #expect(SmartElementDetector.parseWindowList([validEntry], primaryScreenHeight: .infinity).isEmpty)
+
+        // 2. hitTest / shouldRequestElementRect reject non-finite and out-of-range coordinates.
+        let detector = SmartElementDetector(enableAccessibility: true, forceAccessibilityForTesting: true)
+        let normalWindow = DetectedWindow(windowID: 100, ownerPID: 42, ownerName: "ValidApp", layer: 0, frame: CGRect(x: 40, y: 40, width: 400, height: 300))
+        detector.setDetectedStateForTesting(regularWindows: [normalWindow], windows: [normalWindow], fallbackOverlayWindows: [])
+        #expect(SmartElementDetector.hitTest([normalWindow], at: CGPoint(x: CGFloat.nan, y: 100)) == nil)
+        #expect(SmartElementDetector.hitTest([normalWindow], at: CGPoint(x: CGFloat.infinity, y: 100)) == nil)
+        #expect(SmartElementDetector.hitTest([normalWindow], at: CGPoint(x: 1e12, y: 100)) == nil)
+        #expect(SmartElementDetector.hitTest([normalWindow], at: CGPoint(x: 100, y: 100))?.windowID == 100)
+        #expect(detector.shouldRequestElementRect(at: CGPoint(x: CGFloat.nan, y: 100)) == false)
+        #expect(detector.shouldRequestElementRect(at: CGPoint(x: 1e12, y: 100)) == false)
+
+        // 3. Card & Tier-2 element geometry helpers reject NaN / Inf / > 1e6 rects.
+        let windowFrame = CGRect(x: 0, y: 0, width: 1512, height: 982)
+        let hugeRect = CGRect(x: 0, y: 0, width: 2_000_000, height: 200)
+        let hugeOrigin = CGRect(x: 2_000_000, y: 100, width: 300, height: 120)
+        #expect(!SmartElementDetector.isCardSized(hugeRect, in: windowFrame))
+        #expect(!SmartElementDetector.isCardSized(hugeOrigin, in: windowFrame))
+        #expect(!SmartElementDetector.isPlausibleElementRect(hugeRect, containing: CGPoint(x: 50, y: 50), within: windowFrame))
+        #expect(!SmartElementDetector.isPlausibleElementRect(CGRect(x: 10, y: 10, width: 80, height: 40), containing: CGPoint(x: CGFloat.nan, y: 20), within: windowFrame))
+
+        let badChain = [
+            AXAncestorInfo(pid: 42, role: "AXButton", subrole: nil, identifier: nil, roleDescription: nil, frame: hugeRect),
+            AXAncestorInfo(pid: 42, role: "AXGroup", subrole: nil, identifier: nil, roleDescription: nil, frame: CGRect(x: CGFloat.nan, y: 0, width: 100, height: 50)),
+        ]
+        #expect(SmartElementDetector.selectRefinedElementRect(from: badChain, at: CGPoint(x: 50, y: 50), containerFrame: windowFrame) == nil)
+        #expect(SmartElementDetector.selectRefinedElementRect(from: badChain, at: CGPoint(x: CGFloat.nan, y: 50), containerFrame: windowFrame) == nil)
+
+        let pruned = SmartElementDetector.deduplicateAndPruneCards(
+            [.null, .infinite, hugeRect, CGRect(x: 1142, y: 700, width: 352, height: 84)],
+            in: windowFrame
+        )
+        #expect(pruned == [CGRect(x: 1142, y: 700, width: 352, height: 84)])
+        #expect(SmartElementDetector.deduplicateAndPruneCards([CGRect(x: 100, y: 100, width: 200, height: 100)], in: .infinite).isEmpty)
+
+        // 4. AXElementReader.boundedAXString rejects empty, non-string, and > 256-byte untrusted AX strings.
+        #expect(AXElementReader.boundedAXString("AXButton" as NSString) == "AXButton")
+        #expect(AXElementReader.boundedAXString("" as NSString) == nil)
+        #expect(AXElementReader.boundedAXString(NSNumber(value: 42)) == nil)
+        let exactLimit = String(repeating: "a", count: 256)
+        let overLimit = String(repeating: "a", count: 257)
+        let multibyteOverLimit = String(repeating: "中", count: 90) // 270 UTF-8 bytes > 256
+        #expect(AXElementReader.boundedAXString(exactLimit as NSString) == exactLimit)
+        #expect(AXElementReader.boundedAXString(overLimit as NSString) == nil)
+        #expect(AXElementReader.boundedAXString(multibyteOverLimit as NSString) == nil)
+    }
 }
 
 @Suite("Overlay geometry")

@@ -957,4 +957,60 @@ struct ScrollImageStitcherTests {
             #expect(ptr[lastPx + 2] == UInt8((47 * 5) & 0xFF))
         }
     }
+
+    @Test func appendWithResultClassifiesOutcomesGuardsEstimateShiftMADAndEnforcesHardCeilings() throws {
+        // 1. Hard safety ceilings and non-finite parameter defaults in init.
+        let extreme = ScrollImageStitcher(
+            scale: .nan,
+            maxTotalHeight: 10_000_000,
+            maxAllowedMAD: .infinity,
+            maxTotalPixels: 10_000_000_000
+        )
+        #expect(extreme.scale == 2.0)
+        #expect(extreme.maxTotalHeight == ScrollImageStitcher.hardMaxTotalHeight)
+        #expect(extreme.maxAllowedMAD == 8.5)
+        #expect(extreme.maxTotalPixels == ScrollImageStitcher.hardMaxTotalPixels)
+
+        // 2. appendWithResult returns distinct ScrollAppendResult outcomes cleanly.
+        let width = 320
+        let viewportH = 300
+        let doc = try renderSyntheticDocument(width: width, height: 900)
+        let f0 = try #require(ScrollFrameBuffer(cgImage: try renderViewport(from: doc, scrollY: 0, viewportHeight: viewportH)))
+        let f1 = try #require(ScrollFrameBuffer(cgImage: try renderViewport(from: doc, scrollY: 90, viewportHeight: viewportH)))
+        let fUp = try #require(ScrollFrameBuffer(cgImage: try renderViewport(from: doc, scrollY: 30, viewportHeight: viewportH)))
+        let f2 = try #require(ScrollFrameBuffer(cgImage: try renderViewport(from: doc, scrollY: 190, viewportHeight: viewportH)))
+        let f3 = try #require(ScrollFrameBuffer(cgImage: try renderViewport(from: doc, scrollY: 290, viewportHeight: viewportH)))
+        let differentWidthDoc = try renderSyntheticDocument(width: 240, height: viewportH)
+        let fMismatch = try #require(ScrollFrameBuffer(cgImage: differentWidthDoc))
+
+        let stitcher = ScrollImageStitcher(scale: 2, maxTotalHeight: 450)
+        #expect(stitcher.appendWithResult(f0) == .stitched)
+        #expect(stitcher.appendWithResult(f0) == .unchanged)
+        #expect(stitcher.appendWithResult(f1) == .stitched)
+        #expect(stitcher.appendWithResult(fUp) == .misaligned)
+        #expect(stitcher.appendWithResult(fMismatch) == .dimensionMismatch)
+        #expect(stitcher.appendWithResult(f2) == .stitched) // reaches height cap 450
+        #expect(stitcher.isAtHeightLimit)
+        #expect(stitcher.appendWithResult(f3) == .atHeightLimit)
+
+        // 3. estimateVerticalShift safely rejects non-finite and non-positive maxAllowedMAD without trapping.
+        for badMAD in [Double.nan, .infinity, -.infinity, 0.0, -5.0] {
+            let result = ScrollImageStitcher.estimateVerticalShift(
+                previous: f0,
+                current: f1,
+                dynamicTop: 0,
+                dynamicBottom: viewportH,
+                maxAllowedMAD: badMAD
+            )
+            #expect(result == nil)
+        }
+        let validMatch = ScrollImageStitcher.estimateVerticalShift(
+            previous: f0,
+            current: f1,
+            dynamicTop: 0,
+            dynamicBottom: viewportH,
+            maxAllowedMAD: 8.5
+        )
+        #expect(validMatch?.dy == 90)
+    }
 }

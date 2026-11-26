@@ -439,6 +439,11 @@ public final class MosaicImageCache {
 
     internal func gpuBlurCIImage(radius: CGFloat) -> CIImage? {
         guard radius.isFinite, radius > 0 else { return nil }
+        let width = baseImage.width
+        let height = baseImage.height
+        guard width > 0, height > 0 else { return nil }
+        let (pixelCount, pixelOverflow) = width.multipliedReportingOverflow(by: height)
+        guard !pixelOverflow, pixelCount <= Self.maxPixelCount else { return nil }
         let safeRadius = min(max(radius, 0.5), Self.maxBlurRadiusPixels)
         let ciSource = ensureCISource()
         let extent = ciSource.extent

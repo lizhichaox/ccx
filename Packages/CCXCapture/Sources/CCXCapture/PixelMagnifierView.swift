@@ -41,9 +41,13 @@ final class PixelMagnifierView: NSView {
         let side = gridSide
         let cell = cellSize
         let center = CGFloat(gridPixels / 2) * cell
+        let trailing = side - center - cell
         let path = CGMutablePath()
-        path.addRect(CGRect(x: center, y: 0, width: cell, height: side))
-        path.addRect(CGRect(x: 0, y: center, width: side, height: cell))
+        // Four arms stopping cleanly at the center cell so the inspected pixel stays 100% un-tinted.
+        path.addRect(CGRect(x: 0, y: center, width: center, height: cell))
+        path.addRect(CGRect(x: center + cell, y: center, width: trailing, height: cell))
+        path.addRect(CGRect(x: center, y: 0, width: cell, height: center))
+        path.addRect(CGRect(x: center, y: center + cell, width: cell, height: trailing))
         return path
     }()
 
@@ -53,6 +57,7 @@ final class PixelMagnifierView: NSView {
     private let crosshairLayer = CAShapeLayer()
     private let centerOuterLayer = CAShapeLayer()
     private let centerInnerLayer = CAShapeLayer()
+    private let separatorLayer = CALayer()
     private let swatchLayer = CALayer()
 
     private let positionLabel = MagnifierReadoutLabel(font: infoFont, color: .white)
@@ -97,7 +102,8 @@ final class PixelMagnifierView: NSView {
     private func setUpLayers() {
         guard let root = layer else { return }
         root.backgroundColor = Self.backgroundCGColor
-        root.cornerRadius = 8
+        root.cornerRadius = 10
+        root.cornerCurve = .continuous
         root.masksToBounds = true
         root.borderWidth = 1
         root.borderColor = NSColor.white.withAlphaComponent(0.35).cgColor
@@ -147,9 +153,15 @@ final class PixelMagnifierView: NSView {
         centerInnerLayer.lineWidth = 1
         gridContainerLayer.addSublayer(centerInnerLayer)
 
+        separatorLayer.frame = CGRect(x: 0, y: gridOriginY - 0.5, width: side, height: 0.5)
+        separatorLayer.backgroundColor = NSColor.white.withAlphaComponent(0.18).cgColor
+        root.addSublayer(separatorLayer)
+
         let lineHeight: CGFloat = 16
         let infoTop = gridOriginY - 4
         swatchLayer.frame = CGRect(x: 6, y: infoTop - 3 * lineHeight + 2, width: 12, height: 12)
+        swatchLayer.cornerRadius = 3
+        swatchLayer.cornerCurve = .continuous
         swatchLayer.borderWidth = 1
         swatchLayer.borderColor = Self.swatchBorderCGColor
         swatchLayer.isHidden = true
@@ -184,6 +196,7 @@ final class PixelMagnifierView: NSView {
         crosshairLayer.contentsScale = scale
         centerOuterLayer.contentsScale = scale
         centerInnerLayer.contentsScale = scale
+        separatorLayer.contentsScale = scale
         swatchLayer.contentsScale = scale
     }
 

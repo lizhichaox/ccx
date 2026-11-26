@@ -349,8 +349,7 @@ public final class AnnotationActionToolbar: NSView {
         views.append(dragHandle)
 
         for tool in AnnotationTool.drawingTools {
-            let tip = tool.shortcutHint.map { "\(tool.displayName) (\($0))" } ?? tool.displayName
-            let button = ToolToggleButton(tool: tool, tooltip: tip)
+            let button = ToolToggleButton(tool: tool, tooltip: tool.toolbarTooltip)
             button.target = self
             button.action = #selector(toolPressed(_:))
             toolButtons[tool] = button
@@ -708,8 +707,10 @@ private final class ToolToggleButton: HoverButton {
         bezelStyle = .regularSquare
         imagePosition = .imageOnly
         toolTip = tooltip
+        setAccessibilityLabel(tool.displayName)
         wantsLayer = true
         layer?.cornerRadius = 7
+        layer?.cornerCurve = .continuous
         translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
             widthAnchor.constraint(equalToConstant: 30),
@@ -722,6 +723,7 @@ private final class ToolToggleButton: HoverButton {
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
     override func updateVisuals() {
+        setAccessibilityValue(isSelectedTool ? 1 : 0)
         if isSelectedTool {
             layer?.backgroundColor = NSColor.systemBlue.withAlphaComponent(0.9).cgColor
             contentTintColor = .white
@@ -770,6 +772,7 @@ private final class ToolbarIconButton: HoverButton {
         toolTip = tooltip
         wantsLayer = true
         layer?.cornerRadius = 7
+        layer?.cornerCurve = .continuous
         translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
             widthAnchor.constraint(equalToConstant: width),
@@ -808,8 +811,11 @@ private final class ColorSwatchButton: HoverButton {
         super.init(frame: .zero)
         title = ""
         isBordered = false
-        toolTip = color.hex
-        setAccessibilityLabel(CCXL10n.text("Annotation Color \(color.hex)", zh: "标注颜色 \(color.hex)"))
+        toolTip = "\(color.displayName) (\(color.hex))"
+        setAccessibilityLabel(CCXL10n.text(
+            "Annotation Color \(color.displayName) (\(color.hex))",
+            zh: "标注颜色 \(color.displayName) (\(color.hex))"
+        ))
         translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
             widthAnchor.constraint(equalToConstant: 22),
@@ -1039,6 +1045,14 @@ private final class StrokeSizeSlider: NSView {
             context.restoreGState()
         }
 
+        // Subtle reference tick marks at Small / Medium / Large anchors below the track.
+        let tickColor = NSColor.white.withAlphaComponent(isHovering || isDragging ? 0.34 : 0.18)
+        tickColor.setFill()
+        for preset in StrokeSize.presets {
+            let tickX = leftX + (rightX - leftX) * preset.progress
+            NSBezierPath(ovalIn: CGRect(x: tickX - 0.75, y: midY - 6.5, width: 1.5, height: 1.5)).fill()
+        }
+
         let knobDiameter: CGFloat = isDragging ? 13 : 12
         let knobRect = CGRect(
             x: knobX - knobDiameter / 2,
@@ -1104,8 +1118,11 @@ private final class ModePillButton: HoverButton {
         title = mode.label
         font = Self.pillFont
         isBordered = false
+        toolTip = mode.tooltip
+        setAccessibilityLabel(mode.label)
         wantsLayer = true
         layer?.cornerRadius = 6
+        layer?.cornerCurve = .continuous
         translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
             widthAnchor.constraint(equalToConstant: 56),
@@ -1118,6 +1135,7 @@ private final class ModePillButton: HoverButton {
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
     override func updateVisuals() {
+        setAccessibilityValue(isChosen ? 1 : 0)
         let color: NSColor = isChosen ? .white : NSColor.white.withAlphaComponent(0.75)
         attributedTitle = NSAttributedString(
             string: mosaicMode.label,
@@ -1158,6 +1176,7 @@ private final class ToolbarDragHandleView: NSView {
         super.init(frame: frameRect)
         wantsLayer = true
         layer?.cornerRadius = 6
+        layer?.cornerCurve = .continuous
         toolTip = CCXL10n.text("Drag to move toolbar (double-click to reset)", zh: "拖动移动工具栏（双击重置位置）")
         setAccessibilityLabel(CCXL10n.text("Move Annotation Toolbar", zh: "移动标注工具栏"))
         translatesAutoresizingMaskIntoConstraints = false

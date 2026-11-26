@@ -1654,4 +1654,258 @@ struct SnipOverlayViewTests {
         )
         #expect(hugeHUD.hudContentBounds.height == 44)
     }
+
+    @Test func progressiveEscHierarchyLiveBadgesRecordAccentToolbarAvoidanceAndClipSync() throws {
+        let size = CGSize(width: 600, height: 400)
+        let view = SnipOverlayView(snapshot: try makeSnapshot(size: size), topInset: 32)
+        var actions: [OverlayAction] = []
+        view.onFinish = { actions.append($0) }
+
+        // 1. Progressive ESC hierarchy: in-flight draft -> exit tool -> rollback move -> clear selection -> cancel.
+        let selection = CGRect(x: 80, y: 80, width: 260, height: 180)
+        try selectRect(selection, on: view)
+
+        // Commit one rectangle using Rectangle tool ("1").
+        view.keyDown(with: try makeKeyEvent(characters: "1", modifiers: [], keyCode: 18))
+        #expect(view.activeTool == .rectangle)
+        view.mouseDown(with: try makeMouseEvent(type: .leftMouseDown, at: CGPoint(x: 100, y: 100)))
+        view.mouseDragged(with: try makeMouseEvent(type: .leftMouseDragged, at: CGPoint(x: 180, y: 160)))
+        view.mouseUp(with: try makeMouseEvent(type: .leftMouseUp, at: CGPoint(x: 180, y: 160)))
+        #expect(view.annotations.items.count == 1)
+        let originalBox = try #require(view.annotations.items.first?.boundingBox)
+
+        // Start a second draft without releasing, then press Esc -> aborts draft only, keeps tool & committed item.
+        view.mouseDown(with: try makeMouseEvent(type: .leftMouseDown, at: CGPoint(x: 200, y: 110)))
+        view.mouseDragged(with: try makeMouseEvent(type: .leftMouseDragged, at: CGPoint(x: 260, y: 170)))
+        #expect(view.annotations.draft != nil)
+        view.keyDown(with: try makeKeyEvent(characters: "\u{1B}", modifiers: [], keyCode: 53))
+        #expect(view.annotations.draft == nil)
+        #expect(view.annotations.items.count == 1)
+        #expect(view.activeTool == .rectangle)
+        #expect(actions.isEmpty)
+
+        // Next Esc exits drawing tool back to `.select` and clears selection without cancelling snip.
+        view.keyDown(with: try makeKeyEvent(characters: "\u{1B}", modifiers: [], keyCode: 53))
+        #expect(view.activeTool == .select)
+        #expect(view.annotations.selectedID == nil)
+        #expect(actions.isEmpty)
+
+        // Start moving committed rectangle on its left edge, then press Esc -> rolls back move cleanly.
+        view.mouseDown(with: try makeMouseEvent(type: .leftMouseDown, at: CGPoint(x: 100, y: 130)))
+        view.mouseDragged(with: try makeMouseEvent(type: .leftMouseDragged, at: CGPoint(x: 150, y: 170)))
+        #expect(view.annotations.items.first?.boundingBox != originalBox)
+        view.keyDown(with: try makeKeyEvent(characters: "\u{1B}", modifiers: [], keyCode: 53))
+        #expect(view.annotations.items.first?.boundingBox == originalBox)
+        #expect(view.annotations.selectedID != nil)
+        #expect(actions.isEmpty)
+
+        // Esc clears selected annotation without cancelling snip.
+        view.keyDown(with: try makeKeyEvent(characters: "\u{1B}", modifiers: [], keyCode: 53))
+        #expect(view.annotations.selectedID == nil)
+        #expect(actions.isEmpty)
+
+        // Final Esc on plain `.select` with no selected annotation cancels the snip session.
+        view.keyDown(with: try makeKeyEvent(characters: "\u{1B}", modifiers: [], keyCode: 53))
+        #expect(actions == [.cancel])
+
+        // 2. Adaptive corner radii sync live to AnnotationCanvasView and reset cleanly.
+        let radii = AdaptiveCornerRadii(topLeft: 14, topRight: 14, bottomLeft: 14, bottomRight: 14)
+        view.setAdaptiveCornerRadii(radii, forLocalRect: selection)
+        #expect(view.annotationClipCornerRadiiForTesting == radii)
+        view.resetSelection()
+        #expect(view.annotationClipCornerRadiiForTesting == .zero)
+
+        // 3. Size label avoids overlapping flipped toolbar on bottom-edge selection and stays below Notch topInset.
+        let bottomEdgeSelection = CGRect(x: 80, y: 0, width: 220, height: 120)
+        try selectRect(bottomEdgeSelection, on: view)
+        #expect(view.toolbar.frame.minY >= bottomEdgeSelection.maxY)
+        #expect(!view.isSizeLabelHidden)
+        #expect(!view.sizeLabelFrame.intersects(view.toolbar.frame))
+        #expect(view.sizeLabelFrame.maxY <= size.height - 32)
+
+        // 4. Live Shift 1:1 badge and Spacebar Move badge during selection drag (both `en` and `zh-Hans`).
+        for language in CCXLanguage.allCases {
+            try CCXL10n.withLanguageForTesting(language) {
+                view.resetSelection()
+                view.mouseDown(with: try makeMouseEvent(type: .leftMouseDown, at: CGPoint(x: 100, y: 100)))
+                let shiftDrag = try #require(NSEvent.mouseEvent(
+                    with: .leftMouseDragged,
+                    location: CGPoint(x: 220, y: 160),
+                    modifierFlags: [.shift],
+                    timestamp: 0,
+                    windowNumber: 0,
+                    context: nil,
+                    eventNumber: 0,
+                    clickCount: 1,
+                    pressure: 1
+                ))
+                view.mouseDragged(with: shiftDrag)
+                #expect(view.sizeLabelTextForTesting.contains("1:1"))
+
+                view.keyDown(with: try makeKeyEvent(characters: " ", modifiers: [], keyCode: 49))
+                let moveBadge = language == .zhHans ? "移动" : "Move"
+                #expect(view.sizeLabelTextForTesting.contains(moveBadge))
+
+                let spaceUp = try #require(NSEvent.keyEvent(
+                    with: .keyUp,
+                    location: .zero,
+                    modifierFlags: [],
+                    timestamp: 0,
+                    windowNumber: 0,
+                    context: nil,
+                    characters: " ",
+                    charactersIgnoringModifiers: " ",
+                    isARepeat: false,
+                    keyCode: 49
+                ))
+                view.keyUp(with: spaceUp)
+                view.mouseUp(with: try makeMouseEvent(type: .leftMouseUp, at: CGPoint(x: 220, y: 160)))
+            }
+        }
+
+        // 5. Record mode displays red border accent and bilingual `REC` / `录制` dimension prefix.
+        for language in CCXLanguage.allCases {
+            try CCXL10n.withLanguageForTesting(language) {
+                let recordView = SnipOverlayView(
+                    snapshot: try makeSnapshot(size: CGSize(width: 400, height: 300)),
+                    topInset: 0,
+                    selectionMode: .record
+                )
+                #expect(recordView.borderStrokeColorForTesting == NSColor.systemRed.cgColor)
+                recordView.mouseDown(with: try makeMouseEvent(type: .leftMouseDown, at: CGPoint(x: 40, y: 40)))
+                recordView.mouseDragged(with: try makeMouseEvent(type: .leftMouseDragged, at: CGPoint(x: 200, y: 140)))
+                let expectedPrefix = language == .zhHans ? "录制 · " : "REC · "
+                #expect(recordView.sizeLabelTextForTesting.trimmingCharacters(in: .whitespaces).hasPrefix(expectedPrefix))
+                recordView.mouseUp(with: try makeMouseEvent(type: .leftMouseUp, at: CGPoint(x: 200, y: 140)))
+            }
+        }
+    }
+
+    @Test func pixelMagnifierCenterUnTintedInlineTextClampingCmdReturnAndScrollHUDGuidance() throws {
+        // 1. PixelMagnifierView keeps exact center pixel 100% un-tinted and uses continuous corner curve.
+        let redCtx = try #require(CGContext(
+            data: nil,
+            width: 20,
+            height: 20,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ))
+        redCtx.setFillColor(red: 1, green: 0, blue: 0, alpha: 1)
+        redCtx.fill(CGRect(x: 0, y: 0, width: 20, height: 20))
+        let redImage = try #require(redCtx.makeImage())
+
+        let magnifier = PixelMagnifierView(frame: CGRect(origin: .zero, size: PixelMagnifierView.preferredSize))
+        let rootLayer = try #require(magnifier.layer)
+        #expect(rootLayer.cornerCurve == .continuous)
+        #expect(rootLayer.cornerRadius == 10)
+
+        magnifier.update(
+            image: redImage,
+            pixelX: 10,
+            pixelY: 10,
+            sample: CCXColorSample(red: 255, green: 0, blue: 0),
+            format: .hex,
+            sizeText: "20 × 20"
+        )
+        let renderW = Int(PixelMagnifierView.preferredSize.width)
+        let renderH = Int(PixelMagnifierView.preferredSize.height)
+        let renderCtx = try #require(CGContext(
+            data: nil,
+            width: renderW,
+            height: renderH,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ))
+        rootLayer.render(in: renderCtx)
+        let renderedLoupe = try #require(renderCtx.makeImage())
+        // Exact center of the 154x154 11x11 pixel grid (x = 77, y = 77) must remain pure red with zero cyan wash.
+        let centerSample = try #require(CCXColorSample.samplePixel(from: renderedLoupe, pixelX: 77, pixelY: 77))
+        #expect(centerSample.red > 240 && centerSample.green < 15 && centerSample.blue < 15)
+        magnifier.clear()
+
+        // 2. Inline text clamps inside compact selection, caps pasted length to maxTextLength, and commits on Cmd+Return.
+        let view = SnipOverlayView(snapshot: try makeSnapshot(size: CGSize(width: 400, height: 300)), topInset: 32)
+        let compactSelection = CGRect(x: 100, y: 100, width: 130, height: 70)
+        try selectRect(compactSelection, on: view)
+
+        view.keyDown(with: try makeKeyEvent(characters: "7", modifiers: [], keyCode: 26))
+        view.mouseDown(with: try makeMouseEvent(type: .leftMouseDown, at: CGPoint(x: 222, y: 112)))
+        #expect(view.isEditingTextForTesting)
+        let editorFrame = try #require(view.inlineEditorFrameForTesting)
+        #expect(editorFrame.minX >= compactSelection.minX)
+        #expect(editorFrame.maxX <= compactSelection.maxX)
+        #expect(editorFrame.maxY <= 300 - 32)
+
+        let field = try #require(view.inlineEditorFieldForTesting)
+        field.stringValue = String(repeating: "A", count: AnnotationItem.maxTextLength + 300)
+        view.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification, object: field))
+        #expect(field.stringValue.count == AnnotationItem.maxTextLength)
+
+        #expect(view.performKeyEquivalent(with: try makeKeyEvent(characters: "\r", modifiers: [.command], keyCode: 36)))
+        #expect(!view.isEditingTextForTesting)
+        #expect(view.annotations.items.count == 1)
+        if case let .text(_, content) = view.annotations.items[0].kind {
+            #expect(content.count == AnnotationItem.maxTextLength)
+        } else {
+            Issue.record("Expected committed text annotation")
+        }
+
+        // 3. ScrollCaptureHUDPanel fits new bilingual guidance statuses, shows tooltips, disables Auto at ceiling, and guards NaN bounds.
+        let visibleFrame = CGRect(x: 0, y: 0, width: 1440, height: 900)
+        for language in CCXLanguage.allCases {
+            CCXL10n.withLanguageForTesting(language) {
+                let hud = ScrollCaptureHUDPanel(
+                    captureRect: CGRect(x: 220, y: 260, width: 520, height: 500),
+                    visibleFrame: visibleFrame
+                )
+
+                for (status, accent, expectsTooltip, atLimit) in [
+                    (CCXL10n.text("Stitching", zh: "拼接中"), ScrollCaptureVisualAccent.active, false, false),
+                    (CCXL10n.text("Scroll slower", zh: "请放慢滚动"), ScrollCaptureVisualAccent.warning, true, false),
+                    (CCXL10n.text("Needs Accessibility", zh: "需要辅助功能"), ScrollCaptureVisualAccent.warning, true, false),
+                    (CCXL10n.text("Reached bottom", zh: "已到底部"), ScrollCaptureVisualAccent.warning, true, false),
+                    (CCXL10n.text("Max height", zh: "已达最大高度"), ScrollCaptureVisualAccent.warning, true, true),
+                ] {
+                    hud.updateMetrics(
+                        width: 1440,
+                        height: 18500,
+                        status: status,
+                        accent: accent,
+                        isAutoScrolling: false,
+                        isAtHeightLimit: atLimit
+                    )
+                    let frames = hud.hudControlFrames
+                    #expect(frames.count == 9)
+                    #expect(frames.allSatisfy { hud.hudContentBounds.contains($0) })
+                    for i in 0 ..< frames.count {
+                        for j in (i + 1) ..< frames.count {
+                            #expect(!frames[i].intersects(frames[j]))
+                        }
+                    }
+                    #expect((hud.statusLabelToolTipForTesting != nil) == expectsTooltip)
+                    #expect(hud.isAutoScrollButtonEnabledForTesting == !atLimit)
+                }
+
+                // Re-enables Auto button when height limit clears.
+                hud.updateAutoScroll(
+                    isRunning: false,
+                    status: CCXL10n.text("Ready", zh: "就绪"),
+                    accent: .active,
+                    isAtHeightLimit: false
+                )
+                #expect(hud.isAutoScrollButtonEnabledForTesting)
+            }
+        }
+
+        let nanHUD = ScrollCaptureHUDPanel(
+            captureRect: CGRect(x: CGFloat.nan, y: CGFloat.infinity, width: -10, height: CGFloat.nan),
+            visibleFrame: .infinite
+        )
+        #expect(nanHUD.frame.origin.x.isFinite && nanHUD.frame.origin.y.isFinite)
+        #expect(nanHUD.frame.width > 0 && nanHUD.frame.height == 44)
+    }
 }

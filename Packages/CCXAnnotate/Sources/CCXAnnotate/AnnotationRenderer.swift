@@ -156,7 +156,7 @@ public enum AnnotationRenderer {
         }
 
         let blueCG = NSColor.systemBlue.cgColor
-        if let bounds = boundsToStroke {
+        if let bounds = boundsToStroke, isFiniteRect(bounds), !bounds.isEmpty {
             context.setStrokeColor(CGColor(gray: 1, alpha: 0.65))
             context.setLineWidth(1.75)
             context.stroke(bounds)
@@ -195,6 +195,7 @@ public enum AnnotationRenderer {
     /// Draws a live canvas-only dashed guide around a mosaic/blur box so users can spot and grab
     /// redacted regions on light backgrounds. Never called during final export baking.
     public static func drawMosaicGuide(for rect: CGRect, isDraft: Bool, in context: CGContext) {
+        guard isFiniteRect(rect) else { return }
         let standardized = rect.standardized
         guard standardized.width >= 1, standardized.height >= 1 else { return }
         context.saveGState()
@@ -299,19 +300,22 @@ public enum AnnotationRenderer {
         }
 
         func itemIntersectsProtectedCorners(_ item: AnnotationItem, cornerBounds: [CGRect]) -> Bool {
+            let itemBox = item.boundingBox
+            guard isFiniteRect(itemBox) else { return false }
             let strokePad = max(
                 item.style.size.highlighterWidth,
                 item.style.size.lineWidth * 5,
                 item.style.size.counterDiameter,
                 24
             )
-            let localBox = item.boundingBox.insetBy(dx: -strokePad, dy: -strokePad)
+            let localBox = itemBox.insetBy(dx: -strokePad, dy: -strokePad)
             let pixelBox = CGRect(
                 x: (localBox.minX - cropOriginX) * sx,
                 y: (localBox.minY - cropOriginY) * sy,
                 width: localBox.width * sx,
                 height: localBox.height * sy
             )
+            guard isFiniteRect(pixelBox) else { return false }
             return cornerBounds.contains { $0.intersects(pixelBox) }
         }
 
@@ -652,9 +656,10 @@ public enum AnnotationRenderer {
         let fontFactor: CGFloat = switch numberString.count {
         case ...1: 0.52
         case 2: 0.44
-        default: 0.34
+        case 3: 0.34
+        default: 0.28
         }
-        let font = NSFont.monospacedDigitSystemFont(ofSize: diameter * fontFactor, weight: .bold)
+        let font = NSFont.monospacedDigitSystemFont(ofSize: max(6, diameter * fontFactor), weight: .bold)
         let text = numberString as NSString
         let attrs: [NSAttributedString.Key: Any] = [
             .font: font,

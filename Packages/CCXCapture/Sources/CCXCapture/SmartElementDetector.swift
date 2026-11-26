@@ -201,6 +201,7 @@ public final class SmartElementDetector {
     nonisolated static let minimumCardWidth: CGFloat = 80
     nonisolated static let minimumCardHeight: CGFloat = 40
     nonisolated private static let tinyLeafPromotionThreshold: CGFloat = 18
+    nonisolated static let maxCoordinateMagnitude: CGFloat = 1_000_000
 
     /// Front-to-back visible windows (and extracted overlay cards) for the current session.
     public private(set) var windows: [DetectedWindow] = []
@@ -747,17 +748,20 @@ public final class SmartElementDetector {
         let windowID = CGWindowID(number)
         if let excludingPID, pid == excludingPID { return nil }
         guard !excludingWindowIDs.contains(windowID) else { return nil }
-        if let alpha = (info[kCGWindowAlpha as String] as? NSNumber)?.doubleValue, alpha <= 0.01 { return nil }
-        guard !quartzBounds.isNull,
-              !quartzBounds.isInfinite,
-              quartzBounds.origin.x.isFinite,
-              quartzBounds.origin.y.isFinite,
-              quartzBounds.size.width.isFinite,
-              quartzBounds.size.height.isFinite,
+        if let alpha = (info[kCGWindowAlpha as String] as? NSNumber)?.doubleValue,
+           !alpha.isFinite || alpha <= 0.01 { return nil }
+        guard primaryScreenHeight.isFinite,
+              minimumSize.isFinite,
+              minimumSize >= 0,
+              isValidBoundedFrame(quartzBounds),
               quartzBounds.size.width >= minimumSize,
               quartzBounds.size.height >= minimumSize
         else { return nil }
         let frame = CoordinateConverter.quartzToAppKit(quartzBounds, primaryScreenHeight: primaryScreenHeight)
+        guard isValidBoundedFrame(frame),
+              frame.size.width >= minimumSize,
+              frame.size.height >= minimumSize
+        else { return nil }
         return DetectedWindow(
             windowID: windowID,
             ownerPID: pid,
@@ -844,7 +848,8 @@ public final class SmartElementDetector {
 
     /// Returns the front-most window (first in Z-order) containing `point`.
     public nonisolated static func hitTest(_ windows: [DetectedWindow], at point: CGPoint) -> DetectedWindow? {
-        windows.first { $0.frame.contains(point) }
+        guard point.x.isFinite, point.y.isFinite else { return nil }
+        return windows.first { $0.frame.contains(point) }
     }
 
     // MARK: - Card Extraction & Merging
@@ -854,12 +859,8 @@ public final class SmartElementDetector {
         in windowFrame: CGRect,
         allowExtraLarge: Bool = false
     ) -> Bool {
-        guard !rect.isNull,
-              !rect.isInfinite,
-              rect.origin.x.isFinite,
-              rect.origin.y.isFinite,
-              rect.size.width.isFinite,
-              rect.size.height.isFinite,
+        guard isValidBoundedFrame(rect),
+              isValidBoundedFrame(windowFrame),
               rect.size.width >= minimumCardWidth,
               rect.size.height >= minimumCardHeight
         else { return false }
@@ -1254,8 +1255,10 @@ public final class SmartElementDetector {
     }
 
     nonisolated static func deduplicateAndPruneCards(_ rects: [CGRect], in windowFrame: CGRect) -> [CGRect] {
+        guard isValidBoundedFrame(windowFrame) else { return [] }
         var clamped: [CGRect] = []
         for rect in rects {
+            guard isValidBoundedFrame(rect) else { continue }
             let clipped = rect.standardized.intersection(windowFrame)
             guard !clipped.isNull, clipped.width >= minimumCardWidth, clipped.height >= minimumCardHeight else {
                 continue
@@ -1508,7 +1511,11 @@ public final class SmartElementDetector {
         at globalPoint: CGPoint,
         completion: @escaping @MainActor @Sendable (CGRect?, CGPoint, Bool) -> Void
     ) {
-        guard let axWorker else { return }
+        guard let axWorker,
+              globalPoint.x.isFinite, globalPoint.y.isFinite,
+              abs(globalPoint.x) <= Self.maxCoordinateMagnitude,
+              abs(globalPoint.y) <= Self.maxCoordinateMagnitude
+        else { return }
 
         let (targetWindow, overlayFallback) = resolveTier2Targets(
             at: globalPoint,
@@ -1550,12 +1557,11 @@ public final class SmartElementDetector {
         within container: CGRect?,
         minimumSize: CGFloat = 4
     ) -> Bool {
-        guard !rect.isNull,
-              !rect.isInfinite,
-              rect.origin.x.isFinite,
-              rect.origin.y.isFinite,
-              rect.size.width.isFinite,
-              rect.size.height.isFinite,
+        guard point.x.isFinite,
+              point.y.isFinite,
+              minimumSize.isFinite,
+              minimumSize > 0,
+              isValidBoundedFrame(rect),
               rect.size.width >= minimumSize,
               rect.size.height >= minimumSize,
               rect.insetBy(dx: -1, dy: -1).contains(point)
@@ -1563,6 +1569,7 @@ public final class SmartElementDetector {
             return false
         }
         if let container {
+            guard isValidBoundedFrame(container) else { return false }
             return container.insetBy(dx: -2, dy: -2).contains(rect)
         }
         return true
@@ -1581,10 +1588,9 @@ public final class SmartElementDetector {
         containerFrame: CGRect
     ) -> CGRect? {
         guard !chain.isEmpty,
-              !containerFrame.isNull,
-              !containerFrame.isInfinite,
-              containerFrame.width > 0,
-              containerFrame.height > 0
+              point.x.isFinite,
+              point.y.isFinite,
+              isValidBoundedFrame(containerFrame)
         else { return nil }
 
         // Compute effective clip bounds by intersecting containerFrame with any enclosing AXScrollArea
@@ -1667,6 +1673,10 @@ public final class SmartElementDetector {
     }
 
     private nonisolated static func isValidPositiveFrame(_ rect: CGRect) -> Bool {
+        isValidBoundedFrame(rect)
+    }
+
+    private nonisolated static func isValidBoundedFrame(_ rect: CGRect) -> Bool {
         !rect.isNull &&
             !rect.isInfinite &&
             rect.origin.x.isFinite &&
@@ -1674,7 +1684,13 @@ public final class SmartElementDetector {
             rect.size.width.isFinite &&
             rect.size.height.isFinite &&
             rect.size.width > 0 &&
-            rect.size.height > 0
+            rect.size.height > 0 &&
+            rect.maxX.isFinite &&
+            rect.maxY.isFinite &&
+            abs(rect.origin.x) <= maxCoordinateMagnitude &&
+            abs(rect.origin.y) <= maxCoordinateMagnitude &&
+            rect.size.width <= maxCoordinateMagnitude &&
+            rect.size.height <= maxCoordinateMagnitude
     }
 }
 
@@ -1700,7 +1716,8 @@ enum AXElementReader {
         let timedOut: Bool
     }
 
-    private static let maxCoordinateMagnitude: CGFloat = 1_000_000
+    private static let maxCoordinateMagnitude: CGFloat = SmartElementDetector.maxCoordinateMagnitude
+    private static let maxStringByteCount = 256
     private static let defaultMaxElementArrayCount = 350
 
     private nonisolated(unsafe) static let nodeAttributeKeys: CFArray = [
@@ -1789,6 +1806,13 @@ enum AXElementReader {
         return false
     }
 
+    internal static func boundedAXString(_ raw: AnyObject?) -> String? {
+        guard let str = raw as? String, !str.isEmpty, str.utf8.count <= maxStringByteCount else {
+            return nil
+        }
+        return str
+    }
+
     static func readNodeAttributes(
         _ element: AXUIElement,
         primaryScreenHeight: CGFloat,
@@ -1819,10 +1843,10 @@ enum AXElementReader {
             if containsCannotCompleteError(in: array) {
                 timedOut = true
             }
-            role = array[0] as? String
-            subrole = array[1] as? String
-            identifier = array[2] as? String
-            roleDescription = array[3] as? String
+            role = boundedAXString(array[0])
+            subrole = boundedAXString(array[1])
+            identifier = boundedAXString(array[2])
+            roleDescription = boundedAXString(array[3])
             position = extractPoint(from: array[4])
             size = extractSize(from: array[5])
             if includeParent {
@@ -1884,7 +1908,7 @@ enum AXElementReader {
             if containsCannotCompleteError(in: array) {
                 timedOut = true
             }
-            role = array[0] as? String
+            role = boundedAXString(array[0])
             position = extractPoint(from: array[1])
             size = extractSize(from: array[2])
             parent = extractElement(from: array[3])
@@ -1979,6 +2003,10 @@ enum AXElementReader {
         if let deadline, ProcessInfo.processInfo.systemUptime >= deadline { return nil }
 
         let quartzPoint = CoordinateConverter.appKitToQuartz(globalPoint, primaryScreenHeight: primaryScreenHeight)
+        guard quartzPoint.x.isFinite, quartzPoint.y.isFinite,
+              abs(quartzPoint.x) <= maxCoordinateMagnitude,
+              abs(quartzPoint.y) <= maxCoordinateMagnitude
+        else { return nil }
         var hit: AXUIElement?
         let status = AXUIElementCopyElementAtPosition(appElement, Float(quartzPoint.x), Float(quartzPoint.y), &hit)
         if status == .cannotComplete {
@@ -2082,7 +2110,7 @@ enum AXElementReader {
         let status = AXUIElementCopyAttributeValue(element, attribute as CFString, &raw)
         if status == .cannotComplete { timedOut = true }
         guard status == .success else { return nil }
-        return raw as? String
+        return boundedAXString(raw)
     }
 
     private static func copyPoint(_ element: AXUIElement, attribute: String, timedOut: inout Bool) -> CGPoint? {
@@ -2571,7 +2599,23 @@ final class AXQueryWorker: Sendable {
         self.customQueryHandler = queryHandler
     }
 
+    deinit {
+        let oldItem = state.withLock { s -> UncheckedSendableBox<DispatchWorkItem>? in
+            s.cancelGeneration &+= 1
+            s.pending = nil
+            let existing = s.scheduledWorkItem
+            s.scheduledWorkItem = nil
+            return existing
+        }
+        oldItem?.value.cancel()
+    }
+
     func enqueue(_ request: Request, completion: @escaping @MainActor @Sendable (CGRect?, CGPoint, Bool) -> Void) {
+        guard request.point.x.isFinite,
+              request.point.y.isFinite,
+              abs(request.point.x) <= SmartElementDetector.maxCoordinateMagnitude,
+              abs(request.point.y) <= SmartElementDetector.maxCoordinateMagnitude
+        else { return }
         let scheduled: (item: UncheckedSendableBox<DispatchWorkItem>, delay: TimeInterval, oldItem: UncheckedSendableBox<DispatchWorkItem>?)? = state.withLock { state in
             let nextTargetID = request.targetWindow?.windowID
             let nextOverlayID = request.overlayFallback?.windowID
@@ -2796,6 +2840,10 @@ final class AXQueryWorker: Sendable {
         timedOut: inout Bool
     ) -> CGRect? {
         let quartzPoint = CoordinateConverter.appKitToQuartz(point, primaryScreenHeight: primaryScreenHeight)
+        guard quartzPoint.x.isFinite, quartzPoint.y.isFinite,
+              abs(quartzPoint.x) <= SmartElementDetector.maxCoordinateMagnitude,
+              abs(quartzPoint.y) <= SmartElementDetector.maxCoordinateMagnitude
+        else { return nil }
         // Query the underlying app directly so CCX's own full-screen overlay panel does not shadow it.
         let appElement = AXUIElementCreateApplication(target.pid)
         AXUIElementSetMessagingTimeout(appElement, Self.messagingTimeout)

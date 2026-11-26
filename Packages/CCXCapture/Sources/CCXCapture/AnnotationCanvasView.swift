@@ -7,6 +7,7 @@ final class AnnotationCanvasView: NSView {
     let document: AnnotationDocument
     let mosaicCache: MosaicImageCache
     var clipRect: CGRect?
+    var clipCornerRadii: AdaptiveCornerRadii = .zero
     var backingScale: CGFloat = 1
     var editingTextItemID: UUID?
     private var lastDirtyRect: CGRect?
@@ -70,7 +71,12 @@ final class AnnotationCanvasView: NSView {
 
         context.saveGState()
         if let clipRect {
-            context.clip(to: clipRect)
+            if clipCornerRadii.isAllZero {
+                context.clip(to: clipRect)
+            } else {
+                context.addPath(WindowCornerMaskExtractor.makeRoundedRectPath(rect: clipRect, radii: clipCornerRadii))
+                context.clip()
+            }
         }
         let scale = backingScale
         let cache = mosaicCache

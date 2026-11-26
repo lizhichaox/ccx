@@ -46,9 +46,10 @@ public final class AnnotationDocument {
 
     /// Appends a finished item onto the canvas and selects it.
     public func commit(_ item: AnnotationItem) {
+        let safeItem = item.sanitized()
         beginMutationSnapshot()
-        items.append(item)
-        selectedID = item.id
+        items.append(safeItem)
+        selectedID = safeItem.id
         draft = nil
     }
 
@@ -56,10 +57,11 @@ public final class AnnotationDocument {
     /// Avoids pushing a no-op undo snapshot when `updated` equals the existing item.
     @discardableResult
     public func replaceItem(_ updated: AnnotationItem, recordUndo: Bool) -> Bool {
-        guard let index = items.firstIndex(where: { $0.id == updated.id }) else { return false }
-        guard items[index] != updated else { return true }
+        let safeUpdated = updated.sanitized()
+        guard let index = items.firstIndex(where: { $0.id == safeUpdated.id }) else { return false }
+        guard items[index] != safeUpdated else { return true }
         if recordUndo { beginMutationSnapshot() }
-        items[index] = updated
+        items[index] = safeUpdated
         return true
     }
 

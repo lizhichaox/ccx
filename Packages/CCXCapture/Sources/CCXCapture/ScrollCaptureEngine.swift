@@ -8,6 +8,12 @@ import os
 import OSLog
 import ScreenCaptureKit
 
+/// Non-fatal stitching guidance surfaced to the Scroll Capture HUD when user scrolling cannot align.
+public enum ScrollCaptureGuidance: Equatable, Sendable {
+    case none
+    case scrollSlower
+}
+
 /// Live progress delivered on the main actor during a scrolling screenshot session.
 public struct ScrollCaptureProgress: Sendable {
     public let pixelWidth: Int
@@ -15,6 +21,23 @@ public struct ScrollCaptureProgress: Sendable {
     public let frameCount: Int
     public let previewImage: CGImage?
     public let reachedLimit: Bool
+    public let guidance: ScrollCaptureGuidance
+
+    public init(
+        pixelWidth: Int,
+        pixelHeight: Int,
+        frameCount: Int,
+        previewImage: CGImage?,
+        reachedLimit: Bool,
+        guidance: ScrollCaptureGuidance = .none
+    ) {
+        self.pixelWidth = pixelWidth
+        self.pixelHeight = pixelHeight
+        self.frameCount = frameCount
+        self.previewImage = previewImage
+        self.reachedLimit = reachedLimit
+        self.guidance = guidance
+    }
 }
 
 /// Captures frames from a fixed display rectangle via `SCStream` and incrementally
@@ -206,6 +229,7 @@ private final class ScrollStitchWorker: @unchecked Sendable {
     private let stitcher: ScrollImageStitcher
     private var hasReceivedStreamFrame = false
     private var rejectedFrameCount = 0
+    private var consecutiveMisalignedCount = 0
     private var lastPreviewUptime: TimeInterval = 0
 
     init(scale: CGFloat, generatesPreview: Bool = true) {
@@ -223,6 +247,7 @@ private final class ScrollStitchWorker: @unchecked Sendable {
                 if let self, !self.cancelled(), let frame = ScrollFrameBuffer(cgImage: cgImage) {
                     self.hasReceivedStreamFrame = false
                     self.rejectedFrameCount = 0
+                    self.consecutiveMisalignedCount = 0
                     self.lastPreviewUptime = 0
                     self.stitcher.seed(frame)
                 }
@@ -283,12 +308,25 @@ private final class ScrollStitchWorker: @unchecked Sendable {
                 }
             }
 
-            if self.stitcher.append(frame) {
+            switch self.stitcher.appendWithResult(frame) {
+            case .stitched:
                 self.rejectedFrameCount = 0
+                self.consecutiveMisalignedCount = 0
                 let progress = self.makeProgress(includePreview: true, forcePreview: self.stitcher.isAtHeightLimit)
                 onUpdate(progress)
-            } else {
+            case .unchanged:
+                self.consecutiveMisalignedCount = 0
+            case .atHeightLimit:
+                self.consecutiveMisalignedCount = 0
+                let progress = self.makeProgress(includePreview: false, guidance: .none)
+                onUpdate(progress)
+            case .misaligned, .dimensionMismatch:
                 self.rejectedFrameCount += 1
+                self.consecutiveMisalignedCount += 1
+                if self.consecutiveMisalignedCount == 3 {
+                    let progress = self.makeProgress(includePreview: false, guidance: .scrollSlower)
+                    onUpdate(progress)
+                }
                 if self.rejectedFrameCount == 1 || self.rejectedFrameCount % 20 == 0 {
                     Self.logger.debug(
                         "Rejected scroll frame #\(self.rejectedFrameCount) size=\(frame.width)x\(frame.height) stitcher=\(self.stitcher.width)x\(self.stitcher.totalStitchedHeight)"
@@ -322,7 +360,11 @@ private final class ScrollStitchWorker: @unchecked Sendable {
         gate.withLock { $0.isCancelled }
     }
 
-    private func makeProgress(includePreview: Bool, forcePreview: Bool = false) -> ScrollCaptureProgress {
+    private func makeProgress(
+        includePreview: Bool,
+        forcePreview: Bool = false,
+        guidance: ScrollCaptureGuidance = .none
+    ) -> ScrollCaptureProgress {
         let shouldRenderPreview: Bool
         if includePreview && gate.withLock({ $0.generatesPreview }) {
             let now = ProcessInfo.processInfo.systemUptime
@@ -340,7 +382,8 @@ private final class ScrollStitchWorker: @unchecked Sendable {
             pixelHeight: stitcher.totalStitchedHeight,
             frameCount: stitcher.stitchedFrameCount,
             previewImage: shouldRenderPreview ? stitcher.buildPreviewImage() : nil,
-            reachedLimit: stitcher.isAtHeightLimit
+            reachedLimit: stitcher.isAtHeightLimit,
+            guidance: guidance
         )
     }
 }

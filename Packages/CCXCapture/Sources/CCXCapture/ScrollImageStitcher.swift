@@ -322,10 +322,22 @@ public struct ScrollSidebarBounds: Equatable, Sendable {
     }
 }
 
+/// Detailed outcome of attempting to stitch a new scroll frame.
+public enum ScrollAppendResult: Equatable, Sendable {
+    case stitched
+    case unchanged
+    case misaligned
+    case atHeightLimit
+    case dimensionMismatch
+}
+
 /// Incremental, sticky-bar-aware vertical scroll stitcher storing only newly revealed strip slices.
 public final class ScrollImageStitcher {
     /// Default total pixel-area ceiling (~320 MB uncompressed RGBA) preventing OOM on 5K/6K displays.
     public static let defaultMaxTotalPixels = 80_000_000
+    /// Hard safety ceilings preventing accidental OOM even under extreme caller configuration.
+    public static let hardMaxTotalHeight = 65_536
+    public static let hardMaxTotalPixels = 160_000_000
 
     public let maxTotalHeight: Int
     public let maxTotalPixels: Int
@@ -374,9 +386,9 @@ public final class ScrollImageStitcher {
         maxTotalPixels: Int = ScrollImageStitcher.defaultMaxTotalPixels
     ) {
         self.scale = scale.isFinite ? max(1, scale) : 2.0
-        self.maxTotalHeight = max(128, maxTotalHeight)
+        self.maxTotalHeight = min(max(128, maxTotalHeight), Self.hardMaxTotalHeight)
         self.maxAllowedMAD = maxAllowedMAD.isFinite ? max(0.5, maxAllowedMAD) : 8.5
-        self.maxTotalPixels = max(65_536, maxTotalPixels)
+        self.maxTotalPixels = min(max(65_536, maxTotalPixels), Self.hardMaxTotalPixels)
     }
 
     /// Releases all retained frame buffers and stitched slices to free memory immediately.
@@ -542,6 +554,12 @@ public final class ScrollImageStitcher {
         return (movMinX, movMaxX)
     }
 
+    private enum PairEvaluationResult {
+        case matched(sticky: ScrollStickyBounds, match: ScrollMatchResult, currentProfile: ColumnProfiles)
+        case identical
+        case misaligned
+    }
+
     private static func evaluateFramePair(
         previous: ScrollFrameBuffer,
         current: ScrollFrameBuffer,
@@ -552,8 +570,8 @@ public final class ScrollImageStitcher {
         lockedBottom: Int,
         fallbackBottomCap: Int,
         maxAllowedMAD: Double
-    ) -> (sticky: ScrollStickyBounds, match: ScrollMatchResult, currentProfile: ColumnProfiles)? {
-        func runMatch(in range: (minX: Int, maxX: Int)) -> (sticky: ScrollStickyBounds, match: ScrollMatchResult, currentProfile: ColumnProfiles)? {
+    ) -> PairEvaluationResult {
+        func runMatch(in range: (minX: Int, maxX: Int)) -> PairEvaluationResult {
             let prevProf: ColumnProfiles
             if let cached = cachedPrevProfile, cached.minX == range.minX, cached.maxX == range.maxX {
                 prevProf = cached
@@ -567,7 +585,7 @@ public final class ScrollImageStitcher {
                 currProf: currProf,
                 height: previous.height
             )
-            guard !sticky.isIdenticalFrame else { return nil }
+            guard !sticky.isIdenticalFrame else { return .identical }
 
             let matchTop = max(lockedTop, sticky.stickyTop)
             let effectiveBottomCap = lockedBottom > 0
@@ -585,9 +603,9 @@ public final class ScrollImageStitcher {
                 activeMaxX: range.maxX,
                 maxAllowedMAD: maxAllowedMAD
             ) else {
-                return nil
+                return .misaligned
             }
-            return (sticky, match, currProf)
+            return .matched(sticky: sticky, match: match, currentProfile: currProf)
         }
 
         let baseRange = activeColumnRange(
@@ -602,9 +620,11 @@ public final class ScrollImageStitcher {
                 minX: baseRange.minX,
                 maxX: baseRange.maxX
             )
-            if dynamicRange.minX != baseRange.minX || dynamicRange.maxX != baseRange.maxX,
-               let dynamicResult = runMatch(in: dynamicRange) {
-                return dynamicResult
+            if dynamicRange.minX != baseRange.minX || dynamicRange.maxX != baseRange.maxX {
+                let dynamicResult = runMatch(in: dynamicRange)
+                if case .matched = dynamicResult {
+                    return dynamicResult
+                }
             }
         }
         return runMatch(in: baseRange)
@@ -613,16 +633,22 @@ public final class ScrollImageStitcher {
     /// Processes the next frame in sequence. Returns `true` when new content was appended.
     @discardableResult
     public func append(_ frame: ScrollFrameBuffer) -> Bool {
-        guard !isAtHeightLimit else { return false }
+        appendWithResult(frame) == .stitched
+    }
+
+    /// Processes the next frame in sequence and reports why a frame was accepted or rejected.
+    @discardableResult
+    public func appendWithResult(_ frame: ScrollFrameBuffer) -> ScrollAppendResult {
+        guard !isAtHeightLimit else { return .atHeightLimit }
         guard let frontier = frontierFrame else {
             seed(frame)
-            return true
+            return .stitched
         }
-        guard frame.width == frontier.width, frame.height == frontier.height else { return false }
+        guard frame.width == frontier.width, frame.height == frontier.height else { return .dimensionMismatch }
         let frameHeight = frame.height
 
         if Self.isEssentiallyIdenticalFullFrame(previous: frontier, current: frame) {
-            return false
+            return .unchanged
         }
 
         if committedSlices.isEmpty {
@@ -641,7 +667,9 @@ public final class ScrollImageStitcher {
                 fallbackBottomCap: cornerCap,
                 maxAllowedMAD: maxAllowedMAD
             )
-            if evaluated == nil && (tentativeSidebars.stickyLeft > 0 || tentativeSidebars.stickyRight > 0) {
+            if case .matched = evaluated {
+                // Keep tentative sidebar match.
+            } else if tentativeSidebars.stickyLeft > 0 || tentativeSidebars.stickyRight > 0 {
                 effectiveSidebars = ScrollSidebarBounds(stickyLeft: 0, stickyRight: 0)
                 evaluated = Self.evaluateFramePair(
                     previous: frontier,
@@ -655,7 +683,19 @@ public final class ScrollImageStitcher {
                     maxAllowedMAD: maxAllowedMAD
                 )
             }
-            guard let (sticky, match, currentProfile) = evaluated else { return false }
+            let sticky: ScrollStickyBounds
+            let match: ScrollMatchResult
+            let currentProfile: ColumnProfiles
+            switch evaluated {
+            case let .matched(s, m, prof):
+                sticky = s
+                match = m
+                currentProfile = prof
+            case .identical:
+                return .unchanged
+            case .misaligned:
+                return .misaligned
+            }
 
             detectedStickyTop = sticky.stickyTop
             detectedStickyBottom = sticky.stickyBottom
@@ -694,7 +734,7 @@ public final class ScrollImageStitcher {
             let heightCap = effectiveMaxTotalHeight
             let baseHeight = min(commitBottom, heightCap - lockedBottomCapHeight)
             guard baseHeight > 0, let baseSlice = frontier.cropCGImage(yStart: 0, height: baseHeight) else {
-                return false
+                return .misaligned
             }
             committedSlices.append(baseSlice)
             currentSlicesHeight = baseSlice.height
@@ -721,7 +761,7 @@ public final class ScrollImageStitcher {
             if totalStitchedHeight >= heightCap || allowedDy < match.dy {
                 isAtHeightLimit = true
             }
-            return true
+            return .stitched
         }
 
         // Keep sidebars anchored at the locked column range and handle any sticky top/bottom
@@ -737,7 +777,9 @@ public final class ScrollImageStitcher {
             fallbackBottomCap: lockedBottomCapHeight,
             maxAllowedMAD: maxAllowedMAD
         )
-        if evaluated == nil && (detectedStickyLeft > 0 || detectedStickyRight > 0) {
+        if case .matched = evaluated {
+            // Keep locked-sidebar match.
+        } else if detectedStickyLeft > 0 || detectedStickyRight > 0 {
             evaluated = Self.evaluateFramePair(
                 previous: frontier,
                 current: frame,
@@ -750,7 +792,17 @@ public final class ScrollImageStitcher {
                 maxAllowedMAD: maxAllowedMAD
             )
         }
-        guard let (_, match, currentProfile) = evaluated else { return false }
+        let match: ScrollMatchResult
+        let currentProfile: ColumnProfiles
+        switch evaluated {
+        case let .matched(_, m, prof):
+            match = m
+            currentProfile = prof
+        case .identical:
+            return .unchanged
+        case .misaligned:
+            return .misaligned
+        }
 
         let commitBottom = frameHeight - lockedBottomCapHeight
         let heightCap = effectiveMaxTotalHeight
@@ -758,13 +810,13 @@ public final class ScrollImageStitcher {
         let allowedDy = min(match.dy, remaining)
         guard allowedDy > 0 else {
             isAtHeightLimit = true
-            return false
+            return .atHeightLimit
         }
 
         let sliceStart = max(0, commitBottom - allowedDy)
         let sliceHeight = commitBottom - sliceStart
         guard sliceHeight > 0, let slice = frame.cropCGImage(yStart: sliceStart, height: sliceHeight) else {
-            return false
+            return .misaligned
         }
         committedSlices.append(slice)
         currentSlicesHeight += slice.height
@@ -809,7 +861,7 @@ public final class ScrollImageStitcher {
         if totalStitchedHeight >= heightCap || allowedDy < match.dy {
             isAtHeightLimit = true
         }
-        return true
+        return .stitched
     }
 
     private func resolvedOutputColorSpace() -> CGColorSpace {
@@ -817,6 +869,30 @@ public final class ScrollImageStitcher {
         if let initial = initialFrame { return initial.resolvedColorSpace() }
         if let frontier = frontierFrame { return frontier.resolvedColorSpace() }
         return CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+    }
+
+    private static func makeOutputContext(width: Int, height: Int, colorSpace: CGColorSpace) -> CGContext? {
+        if let ctx = CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: colorSpace,
+            bitmapInfo: ScrollFrameBuffer.canonicalBitmapInfo.rawValue
+        ) {
+            return ctx
+        }
+        let fallback = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+        return CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: fallback,
+            bitmapInfo: ScrollFrameBuffer.canonicalBitmapInfo.rawValue
+        )
     }
 
     /// Composites all committed slices into a single tall `CGImage` preserving full resolution.
@@ -830,14 +906,10 @@ public final class ScrollImageStitcher {
         let (pixelCount, pixelOverflow) = width.multipliedReportingOverflow(by: totalHeight)
         guard !pixelOverflow, pixelCount <= max(maxTotalPixels, width * 128) else { return nil }
 
-        guard let context = CGContext(
-            data: nil,
+        guard let context = Self.makeOutputContext(
             width: width,
             height: totalHeight,
-            bitsPerComponent: 8,
-            bytesPerRow: 0,
-            space: resolvedOutputColorSpace(),
-            bitmapInfo: ScrollFrameBuffer.canonicalBitmapInfo.rawValue
+            colorSpace: resolvedOutputColorSpace()
         ) else { return nil }
         context.interpolationQuality = .none
 
@@ -906,14 +978,10 @@ public final class ScrollImageStitcher {
         let (pixelCount, pixelOverflow) = targetWidth.multipliedReportingOverflow(by: totalHeight)
         guard !pixelOverflow, pixelCount <= max(maxTotalPixels, targetWidth * 128) else { return nil }
 
-        guard let context = CGContext(
-            data: nil,
+        guard let context = Self.makeOutputContext(
             width: targetWidth,
             height: totalHeight,
-            bitsPerComponent: 8,
-            bytesPerRow: 0,
-            space: colorSpace,
-            bitmapInfo: ScrollFrameBuffer.canonicalBitmapInfo.rawValue
+            colorSpace: colorSpace
         ) else { return nil }
         context.interpolationQuality = .none
 
@@ -978,14 +1046,10 @@ public final class ScrollImageStitcher {
             previewHeight = safeMaxHeight
         }
 
-        guard let context = CGContext(
-            data: nil,
+        guard let context = Self.makeOutputContext(
             width: targetWidth,
             height: previewHeight,
-            bitsPerComponent: 8,
-            bytesPerRow: 0,
-            space: resolvedOutputColorSpace(),
-            bitmapInfo: ScrollFrameBuffer.canonicalBitmapInfo.rawValue
+            colorSpace: resolvedOutputColorSpace()
         ) else { return nil }
         context.interpolationQuality = .low
 
@@ -1769,7 +1833,13 @@ public final class ScrollImageStitcher {
     ) -> ScrollMatchResult? {
         let height = previous.height
         let sigW = prevProf.sigW
-        guard height == current.height, previous.width == current.width, sigW > 0, sigW == currProf.sigW else {
+        guard height == current.height,
+              previous.width == current.width,
+              sigW > 0,
+              sigW == currProf.sigW,
+              maxAllowedMAD.isFinite,
+              maxAllowedMAD > 0
+        else {
             return nil
         }
 
@@ -1854,7 +1924,8 @@ public final class ScrollImageStitcher {
         let coarseStep = maxShift > 320 ? 4 : 2
         let rowStep = bandHeight >= 32 ? 2 : 1
         let sampledBandRows = (bandHeight + rowStep - 1) / rowStep
-        let earlyExitTotal = Int(Double(sampledBandRows * sigW) * (maxAllowedMAD * 2.5 + 4.0))
+        let rawEarlyExit = Double(sampledBandRows * sigW) * (maxAllowedMAD * 2.5 + 4.0)
+        let earlyExitTotal = rawEarlyExit.isFinite ? Int(min(rawEarlyExit, Double(Int.max / 2))) : (Int.max / 2)
 
         struct Candidate {
             let dy: Int

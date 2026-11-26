@@ -214,6 +214,30 @@ public enum AnnotationTool: String, CaseIterable, Sendable {
         }
     }
 
+    /// Concise single-line localized tooltip combining tool name, shortcut key, and modifier hint.
+    public var toolbarTooltip: String {
+        switch self {
+        case .select:
+            return CCXL10n.text("Select / Move (V)", zh: "选择 / 移动 (V)")
+        case .rectangle:
+            return CCXL10n.text("Rectangle (1) · ⇧ Square", zh: "矩形 (1) · ⇧ 正方形")
+        case .ellipse:
+            return CCXL10n.text("Ellipse (2) · ⇧ Circle", zh: "椭圆 (2) · ⇧ 正圆")
+        case .arrow:
+            return CCXL10n.text("Arrow (3) · ⇧ 15° Snap", zh: "箭头 (3) · ⇧ 15° 对齐")
+        case .pen:
+            return CCXL10n.text("Freehand Pen (4)", zh: "画笔 (4)")
+        case .highlighter:
+            return CCXL10n.text("Highlighter (5)", zh: "荧光笔 (5)")
+        case .mosaic:
+            return CCXL10n.text("Mosaic / Blur (6) · ⇧ Square", zh: "马赛克 / 模糊 (6) · ⇧ 正方形")
+        case .text:
+            return CCXL10n.text("Text (7) · ⇧↩ New Line", zh: "文字 (7) · ⇧↩ 换行")
+        case .counter:
+            return CCXL10n.text("Step Counter (8)", zh: "序号 (8)")
+        }
+    }
+
     public static func forNumberKey(_ character: String) -> AnnotationTool? {
         switch character {
         case "1": .rectangle
@@ -261,9 +285,9 @@ public struct AnnotationColor: Equatable, Hashable, Sendable {
     public let hex: String
 
     public init(r: CGFloat, g: CGFloat, b: CGFloat, hex: String) {
-        self.r = r
-        self.g = g
-        self.b = b
+        self.r = r.isFinite ? min(max(r, 0), 1) : 0
+        self.g = g.isFinite ? min(max(g, 0), 1) : 0
+        self.b = b.isFinite ? min(max(b, 0), 1) : 0
         self.hex = hex
     }
 
@@ -278,6 +302,20 @@ public struct AnnotationColor: Equatable, Hashable, Sendable {
     public static let palette: [AnnotationColor] = [
         .red, .orange, .yellow, .green, .blue, .white, .charcoal,
     ]
+
+    /// Localized human-readable name for curated palette colors, falling back to `hex`.
+    public var displayName: String {
+        switch self {
+        case .red: CCXL10n.text("Red", zh: "红色")
+        case .orange: CCXL10n.text("Orange", zh: "橙色")
+        case .yellow: CCXL10n.text("Yellow", zh: "黄色")
+        case .green: CCXL10n.text("Green", zh: "绿色")
+        case .blue: CCXL10n.text("Blue", zh: "蓝色")
+        case .white: CCXL10n.text("White", zh: "白色")
+        case .charcoal: CCXL10n.text("Charcoal", zh: "炭黑")
+        default: hex
+        }
+    }
 
     public var cgColor: CGColor {
         CGColor(srgbRed: r, green: g, blue: b, alpha: 1)
@@ -376,6 +414,13 @@ public enum MosaicMode: String, CaseIterable, Sendable {
         case .blur: CCXL10n.text("Blur", zh: "模糊")
         }
     }
+
+    public var tooltip: String {
+        switch self {
+        case .pixelate: CCXL10n.text("Pixelate redaction", zh: "马赛克打码")
+        case .blur: CCXL10n.text("Gaussian blur redaction", zh: "高斯模糊打码")
+        }
+    }
 }
 
 /// Visual attributes applied to an annotation item.
@@ -443,17 +488,43 @@ public struct AnnotationItem: Identifiable, Equatable, Sendable {
     public static let maxPolylinePoints = 10_000
     public static let maxTextLength = 4_096
 
+    /// Returns a copy whose text length and polyline point count are bounded within safety caps.
+    /// Fast O(1) no-op when the item is already within limits.
+    public func sanitized() -> AnnotationItem {
+        switch kind {
+        case let .pen(points) where points.count > Self.maxPolylinePoints:
+            var copy = self
+            copy.kind = .pen(Array(points.prefix(Self.maxPolylinePoints)))
+            return copy
+        case let .highlighter(points) where points.count > Self.maxPolylinePoints:
+            var copy = self
+            copy.kind = .highlighter(Array(points.prefix(Self.maxPolylinePoints)))
+            return copy
+        case let .text(origin, content) where content.utf8.count > Self.maxTextLength:
+            let bounded = Self.boundedText(content)
+            guard bounded != content else { return self }
+            var copy = self
+            copy.kind = .text(origin: origin, content: bounded)
+            return copy
+        default:
+            return self
+        }
+    }
+
     public var boundingBox: CGRect {
         switch kind {
         case let .rectangle(rect), let .ellipse(rect), let .mosaic(rect, _):
             return Self.isFiniteRect(rect) ? rect.standardized : .zero
         case let .arrow(start, end):
             guard start.x.isFinite, start.y.isFinite, end.x.isFinite, end.y.isFinite else { return .zero }
+            let width = abs(end.x - start.x)
+            let height = abs(end.y - start.y)
+            guard width.isFinite, height.isFinite else { return .zero }
             return CGRect(
                 x: min(start.x, end.x),
                 y: min(start.y, end.y),
-                width: abs(end.x - start.x),
-                height: abs(end.y - start.y)
+                width: width,
+                height: height
             )
         case let .pen(points), let .highlighter(points):
             return Self.polylineBounds(points)
@@ -475,6 +546,7 @@ public struct AnnotationItem: Identifiable, Equatable, Sendable {
     public var handlePoints: [AnnotationHandle: CGPoint] {
         switch kind {
         case let .rectangle(raw), let .ellipse(raw), let .mosaic(raw, _):
+            guard Self.isFiniteRect(raw) else { return [:] }
             let rect = raw.standardized
             var points: [AnnotationHandle: CGPoint] = [
                 .topLeft: CGPoint(x: rect.minX, y: rect.maxY),
@@ -492,6 +564,7 @@ public struct AnnotationItem: Identifiable, Equatable, Sendable {
             }
             return points
         case let .arrow(start, end):
+            guard start.x.isFinite, start.y.isFinite, end.x.isFinite, end.y.isFinite else { return [:] }
             return [.start: start, .end: end]
         case .pen, .highlighter, .text, .counter:
             return [:]
@@ -514,6 +587,7 @@ public struct AnnotationItem: Identifiable, Equatable, Sendable {
         guard point.x.isFinite, point.y.isFinite, tolerance.isFinite, tolerance >= 0 else { return false }
         switch kind {
         case let .rectangle(raw):
+            guard Self.isFiniteRect(raw) else { return false }
             let rect = raw.standardized
             let pad = tolerance + style.size.lineWidth / 2
             guard rect.insetBy(dx: -pad, dy: -pad).contains(point) else { return false }
@@ -523,11 +597,13 @@ public struct AnnotationItem: Identifiable, Equatable, Sendable {
             return true
 
         case let .ellipse(raw):
+            guard Self.isFiniteRect(raw) else { return false }
             let rect = raw.standardized
             let rx = max(rect.width / 2, 1)
             let ry = max(rect.height / 2, 1)
             let pad = tolerance + style.size.lineWidth / 2
             let d = hypot((point.x - rect.midX) / rx, (point.y - rect.midY) / ry)
+            guard d.isFinite else { return false }
             let band = pad / min(rx, ry)
             if min(rx, ry) <= pad * 1.5 {
                 return d <= 1 + band
@@ -535,30 +611,37 @@ public struct AnnotationItem: Identifiable, Equatable, Sendable {
             return abs(d - 1) <= band
 
         case let .arrow(start, end):
+            guard start.x.isFinite, start.y.isFinite, end.x.isFinite, end.y.isFinite else { return false }
             let pad = tolerance + style.size.lineWidth / 2
             let headPad = max(pad, max(14, style.size.lineWidth * 4.2) * 0.65)
-            guard boundingBox.insetBy(dx: -headPad, dy: -headPad).contains(point) else { return false }
+            let box = boundingBox
+            guard Self.isFiniteRect(box), box.insetBy(dx: -headPad, dy: -headPad).contains(point) else { return false }
             if Self.distanceToSegment(point, start, end) <= pad { return true }
             let headRadius = max(14, style.size.lineWidth * 4.2) * 0.65
             return hypot(point.x - end.x, point.y - end.y) <= headRadius
 
         case let .pen(points):
             let pad = tolerance + style.size.lineWidth / 2
-            guard boundingBox.insetBy(dx: -pad, dy: -pad).contains(point) else { return false }
+            let box = boundingBox
+            guard !points.isEmpty, Self.isFiniteRect(box), box.insetBy(dx: -pad, dy: -pad).contains(point) else { return false }
             return Self.hitTestPolyline(points, point: point, threshold: pad)
 
         case let .highlighter(points):
             let pad = tolerance + style.size.highlighterWidth / 2
-            guard boundingBox.insetBy(dx: -pad, dy: -pad).contains(point) else { return false }
+            let box = boundingBox
+            guard !points.isEmpty, Self.isFiniteRect(box), box.insetBy(dx: -pad, dy: -pad).contains(point) else { return false }
             return Self.hitTestPolyline(points, point: point, threshold: pad)
 
         case let .mosaic(raw, _):
+            guard Self.isFiniteRect(raw) else { return false }
             return raw.standardized.insetBy(dx: -4, dy: -4).contains(point)
 
-        case .text:
+        case let .text(origin, _):
+            guard origin.x.isFinite, origin.y.isFinite else { return false }
             return boundingBox.insetBy(dx: -6, dy: -4).contains(point)
 
         case let .counter(center, _):
+            guard center.x.isFinite, center.y.isFinite else { return false }
             let r = style.size.counterDiameter / 2 + 4
             return hypot(point.x - center.x, point.y - center.y) <= r
         }
@@ -569,30 +652,47 @@ public struct AnnotationItem: Identifiable, Equatable, Sendable {
         var copy = self
         switch kind {
         case let .rectangle(rect):
-            copy.kind = .rectangle(rect.offsetBy(dx: delta.width, dy: delta.height))
+            guard Self.isFiniteRect(rect) else { return self }
+            let moved = rect.offsetBy(dx: delta.width, dy: delta.height)
+            guard Self.isFiniteRect(moved) else { return self }
+            copy.kind = .rectangle(moved)
         case let .ellipse(rect):
-            copy.kind = .ellipse(rect.offsetBy(dx: delta.width, dy: delta.height))
+            guard Self.isFiniteRect(rect) else { return self }
+            let moved = rect.offsetBy(dx: delta.width, dy: delta.height)
+            guard Self.isFiniteRect(moved) else { return self }
+            copy.kind = .ellipse(moved)
         case let .arrow(start, end):
-            copy.kind = .arrow(
-                start: CGPoint(x: start.x + delta.width, y: start.y + delta.height),
-                end: CGPoint(x: end.x + delta.width, y: end.y + delta.height)
-            )
+            let nextStart = CGPoint(x: start.x + delta.width, y: start.y + delta.height)
+            let nextEnd = CGPoint(x: end.x + delta.width, y: end.y + delta.height)
+            guard nextStart.x.isFinite, nextStart.y.isFinite, nextEnd.x.isFinite, nextEnd.y.isFinite else { return self }
+            copy.kind = .arrow(start: nextStart, end: nextEnd)
         case let .pen(points):
-            copy.kind = .pen(points.map { CGPoint(x: $0.x + delta.width, y: $0.y + delta.height) })
+            let moved = points.compactMap { pt -> CGPoint? in
+                let next = CGPoint(x: pt.x + delta.width, y: pt.y + delta.height)
+                return (next.x.isFinite && next.y.isFinite) ? next : nil
+            }
+            guard moved.count == points.count else { return self }
+            copy.kind = .pen(moved)
         case let .highlighter(points):
-            copy.kind = .highlighter(points.map { CGPoint(x: $0.x + delta.width, y: $0.y + delta.height) })
+            let moved = points.compactMap { pt -> CGPoint? in
+                let next = CGPoint(x: pt.x + delta.width, y: pt.y + delta.height)
+                return (next.x.isFinite && next.y.isFinite) ? next : nil
+            }
+            guard moved.count == points.count else { return self }
+            copy.kind = .highlighter(moved)
         case let .mosaic(rect, mode):
-            copy.kind = .mosaic(rect.offsetBy(dx: delta.width, dy: delta.height), mode)
+            guard Self.isFiniteRect(rect) else { return self }
+            let moved = rect.offsetBy(dx: delta.width, dy: delta.height)
+            guard Self.isFiniteRect(moved) else { return self }
+            copy.kind = .mosaic(moved, mode)
         case let .text(origin, content):
-            copy.kind = .text(
-                origin: CGPoint(x: origin.x + delta.width, y: origin.y + delta.height),
-                content: content
-            )
+            let nextOrigin = CGPoint(x: origin.x + delta.width, y: origin.y + delta.height)
+            guard nextOrigin.x.isFinite, nextOrigin.y.isFinite else { return self }
+            copy.kind = .text(origin: nextOrigin, content: content)
         case let .counter(center, number):
-            copy.kind = .counter(
-                center: CGPoint(x: center.x + delta.width, y: center.y + delta.height),
-                number: number
-            )
+            let nextCenter = CGPoint(x: center.x + delta.width, y: center.y + delta.height)
+            guard nextCenter.x.isFinite, nextCenter.y.isFinite else { return self }
+            copy.kind = .counter(center: nextCenter, number: number)
         }
         return copy
     }
@@ -1009,7 +1109,8 @@ public struct AnnotationItem: Identifiable, Equatable, Sendable {
     private static func isFiniteRect(_ rect: CGRect) -> Bool {
         !rect.isNull && !rect.isInfinite &&
             rect.origin.x.isFinite && rect.origin.y.isFinite &&
-            rect.size.width.isFinite && rect.size.height.isFinite
+            rect.size.width.isFinite && rect.size.height.isFinite &&
+            rect.maxX.isFinite && rect.maxY.isFinite
     }
 
     private static func sanitizedBounds(_ bounds: CGRect?) -> CGRect? {
@@ -1050,18 +1151,23 @@ public struct AnnotationItem: Identifiable, Equatable, Sendable {
             if p.y > maxY { maxY = p.y }
         }
         guard foundFinite else { return .zero }
-        return CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
+        let width = maxX - minX
+        let height = maxY - minY
+        guard width.isFinite, height.isFinite else { return .zero }
+        return CGRect(x: minX, y: minY, width: width, height: height)
     }
 
     private static func hitTestPolyline(_ points: [CGPoint], point: CGPoint, threshold: CGFloat) -> Bool {
-        guard let first = points.first else { return false }
-        if points.count == 1 {
-            return hypot(point.x - first.x, point.y - first.y) <= threshold
-        }
-        for i in 0..<(points.count - 1) {
-            if distanceToSegment(point, points[i], points[i + 1]) <= threshold {
+        var previous: CGPoint?
+        for current in points where current.x.isFinite && current.y.isFinite {
+            if let prev = previous {
+                if distanceToSegment(point, prev, current) <= threshold {
+                    return true
+                }
+            } else if hypot(point.x - current.x, point.y - current.y) <= threshold {
                 return true
             }
+            previous = current
         }
         return false
     }

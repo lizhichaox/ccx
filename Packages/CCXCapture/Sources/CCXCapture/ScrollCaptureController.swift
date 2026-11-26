@@ -41,6 +41,8 @@ final class ScrollCaptureController {
 
     private enum ScrollStatus: Equatable {
         case scrollDown
+        case stitching
+        case scrollSlower
         case starting
         case autoScrolling
         case reachedBottom
@@ -50,6 +52,8 @@ final class ScrollCaptureController {
         var displayText: String {
             switch self {
             case .scrollDown: CCXL10n.text("Scroll down", zh: "向下滚动")
+            case .stitching: CCXL10n.text("Stitching", zh: "拼接中")
+            case .scrollSlower: CCXL10n.text("Scroll slower", zh: "请放慢滚动")
             case .starting: CCXL10n.text("Starting...", zh: "正在启动…")
             case .autoScrolling: CCXL10n.text("Auto-scrolling", zh: "滚动中…")
             case .reachedBottom: CCXL10n.text("Reached bottom", zh: "已到底部")
@@ -189,19 +193,22 @@ final class ScrollCaptureController {
             self.autoScroll.notifyHeightAdvanced(progress.pixelHeight)
 
             let accent: ScrollCaptureVisualAccent
-            if progress.reachedLimit {
+            if progress.reachedLimit || self.reachedHeightLimit {
                 self.reachedHeightLimit = true
                 self.pendingAutoScrollStart = false
-                self.autoScroll.stop()
                 self.status = .maxHeight
+                self.autoScroll.stop()
+                accent = .warning
+            } else if progress.guidance == .scrollSlower {
+                self.status = .scrollSlower
                 accent = .warning
             } else if self.autoScroll.isRunning {
                 self.status = .autoScrolling
                 accent = .autoScroll
             } else {
-                // Recover cleanly from prior "Reached bottom" / "Needs Accessibility" warning once manual scroll advances.
+                // Confirm active stitching and recover cleanly from prior warnings once manual scroll advances.
                 if progress.frameCount > 1 {
-                    self.status = .scrollDown
+                    self.status = .stitching
                 }
                 accent = .active
             }
@@ -212,7 +219,8 @@ final class ScrollCaptureController {
                 height: progress.pixelHeight,
                 status: self.status.displayText,
                 accent: accent,
-                isAutoScrolling: self.autoScroll.isRunning
+                isAutoScrolling: self.autoScroll.isRunning,
+                isAtHeightLimit: self.reachedHeightLimit
             )
             if let previewImage = progress.previewImage {
                 let ratio = CGFloat(progress.pixelHeight) / CGFloat(self.initialPixelHeight)
@@ -225,7 +233,7 @@ final class ScrollCaptureController {
         }
 
         autoScroll.onStateChanged = { [weak self] running in
-            guard let self, !self.isClosed else { return }
+            guard let self, !self.isClosed, !self.isFinishing, !self.reachedHeightLimit else { return }
             let accent: ScrollCaptureVisualAccent = running ? .autoScroll : .active
             if running {
                 self.status = .autoScrolling
@@ -233,21 +241,36 @@ final class ScrollCaptureController {
                 self.status = .scrollDown
             }
             self.borderPanel?.setAccent(accent)
-            self.hudPanel?.updateAutoScroll(isRunning: running, status: self.status.displayText, accent: accent)
+            self.hudPanel?.updateAutoScroll(
+                isRunning: running,
+                status: self.status.displayText,
+                accent: accent,
+                isAtHeightLimit: self.reachedHeightLimit
+            )
         }
 
         autoScroll.onReachedBottom = { [weak self] in
-            guard let self, !self.isClosed else { return }
+            guard let self, !self.isClosed, !self.isFinishing, !self.reachedHeightLimit else { return }
             self.status = .reachedBottom
             self.borderPanel?.setAccent(.warning)
-            self.hudPanel?.updateAutoScroll(isRunning: false, status: self.status.displayText, accent: .warning)
+            self.hudPanel?.updateAutoScroll(
+                isRunning: false,
+                status: self.status.displayText,
+                accent: .warning,
+                isAtHeightLimit: self.reachedHeightLimit
+            )
         }
 
         autoScroll.onAccessibilityRequired = { [weak self] in
-            guard let self, !self.isClosed else { return }
+            guard let self, !self.isClosed, !self.isFinishing, !self.reachedHeightLimit else { return }
             self.status = .needsAccessibility
             self.borderPanel?.setAccent(.warning)
-            self.hudPanel?.updateAutoScroll(isRunning: false, status: self.status.displayText, accent: .warning)
+            self.hudPanel?.updateAutoScroll(
+                isRunning: false,
+                status: self.status.displayText,
+                accent: .warning,
+                isAtHeightLimit: self.reachedHeightLimit
+            )
         }
     }
 
@@ -585,15 +608,28 @@ private final class ScrollBorderView: NSView {
         layer?.backgroundColor = nil
         borderLayer.backgroundColor = nil
         borderLayer.borderWidth = 2.5
-        borderLayer.cornerRadius = 5
+        borderLayer.cornerRadius = 6
+        borderLayer.cornerCurve = .continuous
         borderLayer.borderColor = accent.nsColor.cgColor
         layer?.addSublayer(borderLayer)
+        updateLayerContentsScale()
     }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
     override var isOpaque: Bool { false }
+
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        updateLayerContentsScale()
+    }
+
+    private func updateLayerContentsScale() {
+        let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
+        layer?.contentsScale = scale
+        borderLayer.contentsScale = scale
+    }
 
     override func layout() {
         super.layout()
@@ -636,6 +672,7 @@ internal final class ScrollCaptureHUDPanel: NSPanel, NSWindowDelegate {
     private var lastStatusText: String?
     private var lastAccent: ScrollCaptureVisualAccent?
     private var lastIsRunning: Bool?
+    private var lastIsAtHeightLimit: Bool?
     private var lastSizeTextLength = 0
 
     private let innerContainer = NSView()
@@ -651,12 +688,34 @@ internal final class ScrollCaptureHUDPanel: NSPanel, NSWindowDelegate {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
 
+    private static func sanitizedWindowRect(_ rect: CGRect, fallback: CGRect) -> CGRect {
+        let maxCoord: CGFloat = 1_000_000
+        guard !rect.isNull, !rect.isInfinite,
+              rect.origin.x.isFinite, rect.origin.y.isFinite,
+              rect.size.width.isFinite, rect.size.height.isFinite,
+              rect.maxX.isFinite, rect.maxY.isFinite
+        else { return fallback }
+        let normalized = rect.standardized
+        guard normalized.width > 0, normalized.height > 0,
+              abs(normalized.origin.x) <= maxCoord,
+              abs(normalized.origin.y) <= maxCoord,
+              normalized.width <= maxCoord,
+              normalized.height <= maxCoord
+        else { return fallback }
+        return normalized
+    }
+
     init(captureRect: CGRect, visibleFrame: CGRect) {
-        self.captureRect = captureRect
-        self.visibleFrame = visibleFrame
+        let safeVisible = Self.sanitizedWindowRect(
+            visibleFrame,
+            fallback: CGRect(x: 0, y: 0, width: 1440, height: 900)
+        )
+        let safeCapture = Self.sanitizedWindowRect(captureRect, fallback: safeVisible)
+        self.captureRect = safeCapture
+        self.visibleFrame = safeVisible
 
         let initialSize = CGSize(width: 360, height: Self.panelHeight)
-        let initialFrame = CGRect(origin: visibleFrame.origin, size: initialSize)
+        let initialFrame = CGRect(origin: safeVisible.origin, size: initialSize)
         super.init(
             contentRect: initialFrame,
             styleMask: [.borderless, .nonactivatingPanel],
@@ -703,7 +762,8 @@ internal final class ScrollCaptureHUDPanel: NSPanel, NSWindowDelegate {
         height: Int,
         status: String,
         accent: ScrollCaptureVisualAccent,
-        isAutoScrolling: Bool
+        isAutoScrolling: Bool,
+        isAtHeightLimit: Bool = false
     ) {
         lastHeightPixels = height
         let sizeText = "\(width) × \(height)"
@@ -716,6 +776,7 @@ internal final class ScrollCaptureHUDPanel: NSPanel, NSWindowDelegate {
             isRunning: isAutoScrolling,
             status: status,
             accent: accent,
+            isAtHeightLimit: isAtHeightLimit,
             forceLayout: sizeLengthChanged
         )
     }
@@ -724,11 +785,13 @@ internal final class ScrollCaptureHUDPanel: NSPanel, NSWindowDelegate {
         isRunning: Bool,
         status: String,
         accent: ScrollCaptureVisualAccent,
+        isAtHeightLimit: Bool = false,
         forceLayout: Bool = false
     ) {
         let statusChanged = lastStatusText != status
         let accentChanged = lastAccent != accent
         let runningChanged = lastIsRunning != isRunning
+        let limitChanged = lastIsAtHeightLimit != isAtHeightLimit
 
         if accentChanged {
             lastAccent = accent
@@ -745,27 +808,61 @@ internal final class ScrollCaptureHUDPanel: NSPanel, NSWindowDelegate {
         if statusChanged {
             lastStatusText = status
             statusLabel.stringValue = status
-            let needsAXStatus = CCXL10n.text("Needs Accessibility", zh: "需要辅助功能")
-            statusLabel.toolTip = (status == needsAXStatus || status == "Needs Accessibility")
-                ? CCXL10n.text(
-                    "Enable Accessibility for CCX in System Settings to use Auto-Scroll, or scroll manually.",
-                    zh: "请在系统设置中为 CCX 开启辅助功能以使用自动滚动，或手动滚动。"
-                )
-                : nil
+            statusLabel.toolTip = Self.statusTooltip(for: status)
         }
         if runningChanged {
             lastIsRunning = isRunning
             autoButton.setRunning(isRunning)
+        }
+        if limitChanged {
+            lastIsAtHeightLimit = isAtHeightLimit
+            autoButton.setAtHeightLimit(isAtHeightLimit)
         }
         if forceLayout || statusChanged || runningChanged {
             resizeToFit()
         }
     }
 
+    internal var isAutoScrollButtonEnabledForTesting: Bool { autoButton.isEnabled }
+    internal var statusLabelToolTipForTesting: String? { statusLabel.toolTip }
+
+    private static func statusTooltip(for status: String) -> String? {
+        let needsAXStatus = CCXL10n.text("Needs Accessibility", zh: "需要辅助功能")
+        if status == needsAXStatus || status == "Needs Accessibility" {
+            return CCXL10n.text(
+                "Enable Accessibility for CCX in System Settings to use Auto-Scroll, or scroll manually.",
+                zh: "请在系统设置中为 CCX 开启辅助功能以使用自动滚动，或手动滚动。"
+            )
+        }
+        let scrollSlowerStatus = CCXL10n.text("Scroll slower", zh: "请放慢滚动")
+        if status == scrollSlowerStatus || status == "Scroll slower" {
+            return CCXL10n.text(
+                "Scroll downward more slowly so consecutive frames overlap cleanly.",
+                zh: "请放慢向下滚动速度，确保相邻画面有足够重叠以便拼接。"
+            )
+        }
+        let reachedBottomStatus = CCXL10n.text("Reached bottom", zh: "已到底部")
+        if status == reachedBottomStatus || status == "Reached bottom" {
+            return CCXL10n.text(
+                "Auto-Scroll stopped at the bottom. Press Return to Pin, ⌘S to Save, or ⌘C to Copy.",
+                zh: "自动滚动已到达页面底部。按 Return 贴图、⌘S 保存或 ⌘C 拷贝。"
+            )
+        }
+        let maxHeightStatus = CCXL10n.text("Max height", zh: "已达最大高度")
+        if status == maxHeightStatus || status == "Max height" {
+            return CCXL10n.text(
+                "Reached memory-safe capture height ceiling. Pin, Save, or Copy the stitched capture.",
+                zh: "已达到内存安全的最大高度上限，请贴图、保存或拷贝当前结果。"
+            )
+        }
+        return nil
+    }
+
     private func resizeToFit() {
         innerContainer.layoutSubtreeIfNeeded()
         let fitting = rootStack.fittingSize
-        let maxAllowedWidth = max(260, visibleFrame.width - 16)
+        let safeVisibleWidth = visibleFrame.width.isFinite ? visibleFrame.width : 1440
+        let maxAllowedWidth = max(260, safeVisibleWidth - 16)
         let targetWidth = min(maxAllowedWidth, ceil(max(fitting.width, 320)))
         let targetSize = CGSize(width: targetWidth, height: Self.panelHeight)
         let origin = desiredOrigin(for: targetSize)
@@ -782,10 +879,22 @@ internal final class ScrollCaptureHUDPanel: NSPanel, NSWindowDelegate {
     }
 
     private func desiredOrigin(for size: CGSize) -> CGPoint {
-        let minX = visibleFrame.minX + 8
-        let maxX = max(minX, visibleFrame.maxX - size.width - 8)
-        let minY = visibleFrame.minY + 6
-        let maxY = max(minY, visibleFrame.maxY - size.height - 6)
+        let safeVisible = (!visibleFrame.isNull && !visibleFrame.isInfinite
+            && visibleFrame.origin.x.isFinite && visibleFrame.origin.y.isFinite
+            && visibleFrame.size.width.isFinite && visibleFrame.size.height.isFinite)
+            ? visibleFrame.standardized
+            : CGRect(x: 0, y: 0, width: 1440, height: 900)
+        let safeCapture = (!captureRect.isNull && !captureRect.isInfinite
+            && captureRect.origin.x.isFinite && captureRect.origin.y.isFinite
+            && captureRect.size.width.isFinite && captureRect.size.height.isFinite
+            && captureRect.maxX.isFinite && captureRect.maxY.isFinite)
+            ? captureRect.standardized
+            : safeVisible
+
+        let minX = safeVisible.minX + 8
+        let maxX = max(minX, safeVisible.maxX - size.width - 8)
+        let minY = safeVisible.minY + 6
+        let maxY = max(minY, safeVisible.maxY - size.height - 6)
 
         if hasCustomPosition {
             let centeredX = frame.midX - size.width * 0.5
@@ -796,12 +905,12 @@ internal final class ScrollCaptureHUDPanel: NSPanel, NSWindowDelegate {
         }
 
         let gap: CGFloat = 10
-        var y = captureRect.minY - gap - size.height
+        var y = safeCapture.minY - gap - size.height
         if y < minY {
-            let aboveY = captureRect.maxY + gap
-            y = (aboveY + size.height <= visibleFrame.maxY - 6) ? aboveY : (visibleFrame.minY + 14)
+            let aboveY = safeCapture.maxY + gap
+            y = (aboveY + size.height <= safeVisible.maxY - 6) ? aboveY : (safeVisible.minY + 14)
         }
-        let x = captureRect.midX - size.width * 0.5
+        let x = safeCapture.midX - size.width * 0.5
         return CGPoint(
             x: min(max(x, minX), maxX),
             y: min(max(y, minY), maxY)
@@ -982,6 +1091,7 @@ private final class ScrollAutoPillButton: NSButton {
 
     private var isHovered = false
     private var isRunningState = false
+    private var isLimitReached = false
     private var hasConfiguredState = false
 
     override var mouseDownCanMoveWindow: Bool { false }
@@ -994,6 +1104,7 @@ private final class ScrollAutoPillButton: NSButton {
         imageScaling = .scaleNone
         wantsLayer = true
         layer?.cornerRadius = Self.pillHeight * 0.5
+        layer?.cornerCurve = .continuous
         layer?.masksToBounds = true
         setContentHuggingPriority(.required, for: .horizontal)
         setContentCompressionResistancePriority(.required, for: .horizontal)
@@ -1050,9 +1161,11 @@ private final class ScrollAutoPillButton: NSButton {
                 .foregroundColor: running ? NSColor.black : NSColor.white,
             ]
         )
-        toolTip = running
-            ? CCXL10n.text("Pause Auto-Scroll (Space)", zh: "暂停自动滚动 (Space)")
-            : CCXL10n.text("Auto-Scroll Down (Space)", zh: "向下自动滚动 (Space)")
+        toolTip = isLimitReached
+            ? CCXL10n.text("Maximum height reached", zh: "已达最大高度")
+            : (running
+                ? CCXL10n.text("Pause Auto-Scroll (Space)", zh: "暂停自动滚动 (Space)")
+                : CCXL10n.text("Auto-Scroll Down (Space)", zh: "向下自动滚动 (Space)"))
         setAccessibilityLabel(running
             ? CCXL10n.text("Pause Auto-Scroll", zh: "暂停自动滚动")
             : CCXL10n.text("Auto-Scroll Down", zh: "向下自动滚动"))
@@ -1060,14 +1173,29 @@ private final class ScrollAutoPillButton: NSButton {
         invalidateIntrinsicContentSize()
     }
 
+    func setAtHeightLimit(_ reached: Bool) {
+        guard isLimitReached != reached else { return }
+        isLimitReached = reached
+        isEnabled = !reached
+        if reached {
+            toolTip = CCXL10n.text("Maximum height reached", zh: "已达最大高度")
+        } else {
+            toolTip = isRunningState
+                ? CCXL10n.text("Pause Auto-Scroll (Space)", zh: "暂停自动滚动 (Space)")
+                : CCXL10n.text("Auto-Scroll Down (Space)", zh: "向下自动滚动 (Space)")
+        }
+        applyAppearance()
+    }
+
     private func applyAppearance() {
-        if isRunningState {
+        alphaValue = isLimitReached ? 0.42 : 1.0
+        if isRunningState && !isLimitReached {
             contentTintColor = .black
             let alpha: CGFloat = isHovered ? 0.88 : 1.0
             layer?.backgroundColor = NSColor.systemCyan.withAlphaComponent(alpha).cgColor
         } else {
             contentTintColor = .white
-            let alpha: CGFloat = isHovered ? 0.24 : 0.14
+            let alpha: CGFloat = (!isLimitReached && isHovered) ? 0.24 : 0.14
             layer?.backgroundColor = NSColor.white.withAlphaComponent(alpha).cgColor
         }
     }
@@ -1104,6 +1232,7 @@ private final class ScrollHUDIconButton: NSButton {
         self.action = action
         wantsLayer = true
         layer?.cornerRadius = 8
+        layer?.cornerCurve = .continuous
         layer?.masksToBounds = true
         translatesAutoresizingMaskIntoConstraints = false
         setContentHuggingPriority(.required, for: .horizontal)
@@ -1153,28 +1282,48 @@ private final class ScrollCapturePreviewPanel: NSPanel {
         visibleFrame: CGRect,
         scale: CGFloat
     ) -> ScrollCapturePreviewPanel? {
+        let maxCoord: CGFloat = 1_000_000
+        guard !captureRect.isNull, !captureRect.isInfinite,
+              !visibleFrame.isNull, !visibleFrame.isInfinite,
+              captureRect.origin.x.isFinite, captureRect.origin.y.isFinite,
+              captureRect.size.width.isFinite, captureRect.size.height.isFinite,
+              captureRect.maxX.isFinite, captureRect.maxY.isFinite,
+              visibleFrame.origin.x.isFinite, visibleFrame.origin.y.isFinite,
+              visibleFrame.size.width.isFinite, visibleFrame.size.height.isFinite,
+              visibleFrame.maxX.isFinite, visibleFrame.maxY.isFinite
+        else { return nil }
+        let safeCapture = captureRect.standardized
+        let safeVisible = visibleFrame.standardized
+        guard safeCapture.width > 0, safeCapture.height > 0,
+              safeVisible.width > panelWidth + 24, safeVisible.height > 144,
+              abs(safeVisible.minX) <= maxCoord, abs(safeVisible.minY) <= maxCoord,
+              abs(safeCapture.minX) <= maxCoord, abs(safeCapture.minY) <= maxCoord,
+              safeVisible.width <= maxCoord, safeVisible.height <= maxCoord,
+              safeCapture.width <= maxCoord, safeCapture.height <= maxCoord
+        else { return nil }
+
         let gap: CGFloat = 12
         let neededWidth = panelWidth + gap
-        let rightSpace = visibleFrame.maxX - captureRect.maxX
-        let leftSpace = captureRect.minX - visibleFrame.minX
+        let rightSpace = safeVisible.maxX - safeCapture.maxX
+        let leftSpace = safeCapture.minX - safeVisible.minX
 
         let x: CGFloat
         if rightSpace >= neededWidth {
-            x = captureRect.maxX + gap
+            x = safeCapture.maxX + gap
         } else if leftSpace >= neededWidth {
-            x = captureRect.minX - gap - panelWidth
+            x = safeCapture.minX - gap - panelWidth
         } else {
             return nil
         }
 
-        let maxPanelHeight = min(max(captureRect.height, 200), min(420, visibleFrame.height - 24))
-        let initialHeight = min(maxPanelHeight, max(120, captureRect.height))
-        let y = min(max(captureRect.maxY - initialHeight, visibleFrame.minY + 12), visibleFrame.maxY - initialHeight - 12)
+        let maxPanelHeight = min(max(safeCapture.height, 200), min(420, safeVisible.height - 24))
+        let initialHeight = min(maxPanelHeight, max(120, safeCapture.height))
+        let y = min(max(safeCapture.maxY - initialHeight, safeVisible.minY + 12), safeVisible.maxY - initialHeight - 12)
         return ScrollCapturePreviewPanel(
             frame: CGRect(x: x, y: y, width: panelWidth, height: initialHeight),
             maxPanelHeight: maxPanelHeight,
-            anchorMaxY: min(captureRect.maxY, visibleFrame.maxY - 12),
-            minVisibleY: visibleFrame.minY + 12
+            anchorMaxY: min(safeCapture.maxY, safeVisible.maxY - 12),
+            minVisibleY: safeVisible.minY + 12
         )
     }
 
@@ -1212,6 +1361,7 @@ private final class ScrollCapturePreviewPanel: NSPanel {
         container.wantsLayer = true
         container.layer?.backgroundColor = NSColor(white: 0.08, alpha: 0.88).cgColor
         container.layer?.cornerRadius = 10
+        container.layer?.cornerCurve = .continuous
         container.layer?.borderWidth = 1
         container.layer?.borderColor = NSColor.white.withAlphaComponent(0.22).cgColor
         container.layer?.masksToBounds = true
@@ -1228,6 +1378,7 @@ private final class ScrollCapturePreviewPanel: NSPanel {
         badgeLabel.backgroundColor = NSColor.black.withAlphaComponent(0.72)
         badgeLabel.wantsLayer = true
         badgeLabel.layer?.cornerRadius = 5
+        badgeLabel.layer?.cornerCurve = .continuous
         badgeLabel.layer?.masksToBounds = true
         badgeLabel.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(badgeLabel)
@@ -1252,16 +1403,19 @@ private final class ScrollCapturePreviewPanel: NSPanel {
     }
 
     func update(image: CGImage, heightRatio: CGFloat) {
+        guard image.width > 0, image.height > 0 else { return }
+        let safeRatio = heightRatio.isFinite ? max(1.0, heightRatio) : 1.0
         let imgSize = NSSize(width: image.width, height: image.height)
         imageView.image = NSImage(cgImage: image, size: imgSize)
-        badgeLabel.stringValue = String(format: " %.1f× ", max(1.0, heightRatio))
+        badgeLabel.stringValue = String(format: " %.1f× ", safeRatio)
 
         let aspect = CGFloat(image.height) / max(1, CGFloat(image.width))
         let desiredHeight = min(maxPanelHeight, max(120, (Self.panelWidth - 8) * aspect + 8))
         let current = frame
-        if abs(current.height - desiredHeight) >= 2 {
+        if desiredHeight.isFinite, abs(current.height - desiredHeight) >= 2 {
             let newY = max(minVisibleY, anchorMaxY - desiredHeight)
             setFrame(CGRect(x: current.minX, y: newY, width: Self.panelWidth, height: desiredHeight), display: true)
+            invalidateShadow()
         }
     }
 }

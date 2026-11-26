@@ -106,6 +106,8 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
     private var renderedIsHovering = true
     private var renderedCornerRadii: AdaptiveCornerRadii = .zero
     private var renderedHandlesRect: CGRect?
+    private var renderedSizeLabelRect: CGRect?
+    private var renderedSizeLabelToolbarFrame: CGRect?
     private var hasRenderedAnnotations = false
     private var lastCursorKind: CursorKind?
     private(set) var adaptiveCornerRadii: AdaptiveCornerRadii = .zero
@@ -126,13 +128,16 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
     private var trackingArea: NSTrackingArea?
 
     var sizeLabelFrame: CGRect { sizeLabel.frame }
+    var sizeLabelTextForTesting: String { sizeLabel.stringValue }
     var isSizeLabelHidden: Bool { sizeLabel.isHidden }
     var isMagnifierHidden: Bool { magnifier.isHidden }
     var isSizeHUDHidden: Bool { sizeHUD.isHidden }
     var sizeHUDText: String { sizeHUD.displayText }
     var sizeHUDFrame: CGRect { sizeHUD.frame }
     var borderLayerPath: CGPath? { borderLayer.path }
+    var borderStrokeColorForTesting: CGColor? { borderLayer.strokeColor }
     var dimLayerPath: CGPath? { dimLayer.path }
+    var annotationClipCornerRadiiForTesting: AdaptiveCornerRadii { annotationView.clipCornerRadii }
     var isEditingTextForTesting: Bool { isEditingText }
     var inlineEditorFrameForTesting: CGRect? { inlineEditor?.frame }
     var inlineEditorFieldForTesting: NSTextField? { inlineEditor }
@@ -197,7 +202,7 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
         root.addSublayer(dimLayer)
 
         borderLayer.fillColor = nil
-        borderLayer.strokeColor = NSColor.systemBlue.cgColor
+        borderLayer.strokeColor = (selectionMode == .record ? NSColor.systemRed : NSColor.systemBlue).cgColor
         borderLayer.lineWidth = 1.5
         borderLayer.frame = bounds
         borderLayer.zPosition = 2
@@ -205,7 +210,7 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
         root.addSublayer(borderLayer)
 
         handleLayer.fillColor = NSColor.white.cgColor
-        handleLayer.strokeColor = NSColor.systemBlue.cgColor
+        handleLayer.strokeColor = (selectionMode == .record ? NSColor.systemRed : NSColor.systemBlue).cgColor
         handleLayer.lineWidth = 1
         handleLayer.frame = bounds
         handleLayer.zPosition = 3
@@ -239,9 +244,14 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
         sizeLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
         sizeLabel.textColor = .white
         sizeLabel.drawsBackground = true
-        sizeLabel.backgroundColor = NSColor.black.withAlphaComponent(0.72)
+        sizeLabel.backgroundColor = NSColor.black.withAlphaComponent(0.76)
         sizeLabel.wantsLayer = true
-        sizeLabel.layer?.cornerRadius = 4
+        sizeLabel.layer?.cornerRadius = 5
+        sizeLabel.layer?.cornerCurve = .continuous
+        sizeLabel.layer?.borderWidth = 0.5
+        sizeLabel.layer?.borderColor = (selectionMode == .record
+            ? NSColor.systemRed.withAlphaComponent(0.55)
+            : NSColor.white.withAlphaComponent(0.18)).cgColor
         sizeLabel.layer?.masksToBounds = true
         sizeLabel.layer?.zPosition = 10
         sizeLabel.isHidden = true
@@ -360,7 +370,10 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
         lastCursorKind = nil
         isSpaceDown = false
         lastSizeLabelText = nil
+        renderedSizeLabelRect = nil
+        renderedSizeLabelToolbarFrame = nil
         adaptiveCornerRadii = .zero
+        annotationView.clipCornerRadii = .zero
         machine.reset()
         refresh()
     }
@@ -419,6 +432,13 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
         }
 
         if let globalRect {
+            guard !globalRect.isNull,
+                  !globalRect.isInfinite,
+                  globalRect.origin.x.isFinite,
+                  globalRect.origin.y.isFinite,
+                  globalRect.size.width.isFinite,
+                  globalRect.size.height.isFinite
+            else { return }
             let localRect = globalRect.standardized.offsetBy(dx: -snapshot.screenFrame.minX, dy: -snapshot.screenFrame.minY)
             guard localRect.insetBy(dx: -1, dy: -1).contains(current) else { return }
             if isOverlayElement {
@@ -576,13 +596,13 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
         if isSliderEditingSize {
             let targetID = annotations.selectedID
             let shouldRecordUndo = targetID != nil && (!sliderUndoRecorded || sliderUndoItemID != targetID)
-            let mutated = applyStrokeSize(size, recordUndo: shouldRecordUndo, showHUD: false)
+            let mutated = applyStrokeSize(size, recordUndo: shouldRecordUndo, showHUD: true)
             if shouldRecordUndo, mutated {
                 sliderUndoRecorded = true
                 sliderUndoItemID = targetID
             }
         } else {
-            applyStrokeSize(size, recordUndo: true, showHUD: false)
+            applyStrokeSize(size, recordUndo: true, showHUD: true)
         }
     }
 
@@ -681,6 +701,7 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
             window?.makeFirstResponder(self)
         }
         let point = convert(event.locationInWindow, from: nil)
+        guard point.x.isFinite, point.y.isFinite else { return }
         lastMousePoint = point
 
         if inlineEditor != nil {
@@ -799,9 +820,16 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
             invalidateAnnotations(rect: badge.boundingBox)
         case .text:
             activeDrag = .none
+            let fontSize = currentStyle.size.fontSize
+            let minEditorHeight = ceil(fontSize * 1.45)
+            let minEditorWidth = min(88, max(24, selection.width - 8))
+            let minX = selection.minX + 4
+            let maxX = max(minX, selection.maxX - minEditorWidth)
+            let usableTop = min(selection.maxY - 4, max(bounds.minY + minEditorHeight, bounds.maxY - topInset - 4))
+            let minY = min(usableTop, selection.minY + minEditorHeight)
             let startOrigin = CGPoint(
-                x: min(max(point.x, selection.minX + 4), max(selection.minX + 4, selection.maxX - 84)),
-                y: min(max(point.y + currentStyle.size.fontSize * 0.55, selection.minY + currentStyle.size.fontSize * 1.4), selection.maxY - 4)
+                x: min(max(point.x, minX), maxX),
+                y: min(max(point.y + fontSize * 0.55, minY), usableTop)
             )
             beginInlineTextEditor(at: startOrigin, existing: nil, initialText: "", in: selection)
             return
@@ -828,8 +856,10 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
 
     override func mouseDragged(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
+        guard point.x.isFinite, point.y.isFinite else { return }
         lastMousePoint = point
         let constrain = event.modifierFlags.contains(.shift)
+        isShiftDown = constrain
 
         switch activeDrag {
         case .none:
@@ -871,6 +901,12 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
 
     override func mouseUp(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
+        guard point.x.isFinite, point.y.isFinite else {
+            activeDrag = .none
+            isSpaceDown = false
+            refresh()
+            return
+        }
         lastMousePoint = point
 
         switch activeDrag {
@@ -962,6 +998,7 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
         timestamp: TimeInterval = ProcessInfo.processInfo.systemUptime
     ) -> Bool {
         guard selectedRect != nil else { return false }
+        guard deltaY.isFinite, deltaX.isFinite, timestamp.isFinite else { return false }
         guard activeTool.showsStyleBar || annotations.selectedItem != nil || isEditingText else {
             return false
         }
@@ -1015,6 +1052,7 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
     }
 
     private func handleHover(at point: CGPoint) {
+        guard point.x.isFinite, point.y.isFinite else { return }
         lastMousePoint = point
         guard machine.isHovering else {
             updateCursor()
@@ -1209,7 +1247,8 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
         field.placeholderString = CCXL10n.text("Text", zh: "输入文字")
         field.delegate = self
         field.wantsLayer = true
-        field.layer?.cornerRadius = 4
+        field.layer?.cornerRadius = 5
+        field.layer?.cornerCurve = .continuous
         field.layer?.borderWidth = 1
         field.layer?.borderColor = NSColor.systemBlue.withAlphaComponent(0.85).cgColor
         field.layer?.zPosition = 25
@@ -1229,9 +1268,11 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
     }
 
     private func resizeInlineEditor(_ field: NSTextField, clampedTo selectionRect: CGRect? = nil) {
-        guard let origin = editingTextOrigin else { return }
+        guard let origin = editingTextOrigin, origin.x.isFinite, origin.y.isFinite else { return }
         let selection = selectionRect ?? self.selectedRect ?? bounds
-        let liveText = (field.currentEditor() as? NSTextView)?.string ?? field.stringValue
+        let rawText = (field.currentEditor() as? NSTextView)?.string ?? field.stringValue
+        let liveText = AnnotationItem.boundedText(rawText)
+        let usableBoundsMaxY = max(bounds.minY, bounds.maxY - topInset)
         let maxAvailableWidth = max(24, selection.maxX - origin.x)
         let measureWidth = max(24, maxAvailableWidth - 12)
         let box = AnnotationItem.textBoundingBox(
@@ -1240,20 +1281,29 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
             fontSize: currentStyle.size.fontSize,
             maxWidth: measureWidth
         )
-        let desiredMinWidth = min(88, max(24, bounds.maxX - origin.x))
+        let desiredMinWidth = min(88, max(24, min(selection.width, bounds.maxX - origin.x)))
         let maxAllowedWidth = max(desiredMinWidth, min(maxAvailableWidth, bounds.maxX - origin.x))
         let width = min(max(box.width + 12, desiredMinWidth), maxAllowedWidth)
         let minHeight = ceil(currentStyle.size.fontSize * 1.45)
-        let maxHeight = max(minHeight, max(28, origin.y - selection.minY))
+        let availableHeightInSelection = max(minHeight, origin.y - selection.minY)
+        let maxHeight = max(minHeight, min(availableHeightInSelection, max(minHeight, usableBoundsMaxY - bounds.minY)))
         let height = min(max(box.height + 6, minHeight), maxHeight)
-        let frameX = min(max(origin.x, bounds.minX), max(bounds.minX, bounds.maxX - width))
-        let frameY = min(max(origin.y - height, bounds.minY), max(bounds.minY, bounds.maxY - height))
+
+        let clampMinX = selection.width >= width ? selection.minX : bounds.minX
+        let clampMaxX = selection.width >= width ? max(clampMinX, selection.maxX - width) : max(bounds.minX, bounds.maxX - width)
+        let clampMinY = selection.height >= height ? selection.minY : bounds.minY
+        let clampMaxY = selection.height >= height
+            ? max(clampMinY, min(selection.maxY, usableBoundsMaxY) - height)
+            : max(bounds.minY, usableBoundsMaxY - height)
+        let frameX = min(max(origin.x, clampMinX), clampMaxX)
+        let frameY = min(max(origin.y - height, clampMinY), clampMaxY)
         field.frame = CGRect(x: frameX, y: frameY, width: width, height: height)
     }
 
     private func commitInlineTextEditor() {
         guard let field = inlineEditor else { return }
-        let liveText = (field.currentEditor() as? NSTextView)?.string ?? field.stringValue
+        let rawText = (field.currentEditor() as? NSTextView)?.string ?? field.stringValue
+        let liveText = AnnotationItem.boundedText(rawText)
         let trimmed = liveText.trimmingCharacters(in: .whitespacesAndNewlines)
         let origin = editingTextOrigin
         let existing = editingOriginalItem
@@ -1307,6 +1357,18 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
 
     func controlTextDidChange(_ obj: Notification) {
         guard let field = inlineEditor else { return }
+        if let editor = field.currentEditor() as? NSTextView,
+           editor.string.utf8.count > AnnotationItem.maxTextLength {
+            let bounded = AnnotationItem.boundedText(editor.string)
+            if bounded != editor.string {
+                editor.string = bounded
+            }
+        } else if field.stringValue.utf8.count > AnnotationItem.maxTextLength {
+            let bounded = AnnotationItem.boundedText(field.stringValue)
+            if bounded != field.stringValue {
+                field.stringValue = bounded
+            }
+        }
         resizeInlineEditor(field)
     }
 
@@ -1336,13 +1398,58 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
 
     // MARK: - Keyboard
 
-    override func cancelOperation(_ sender: Any?) {
+    /// Progressive ESC handler:
+    /// 1. Cancel active inline text editor.
+    /// 2. Cancel active toolbar drag.
+    /// 3. Abort an in-flight annotation draft/move/resize without losing prior annotations.
+    /// 4. Exit an active drawing tool or clear an annotation selection back to `.select`.
+    /// 5. Otherwise cancel the snip session immediately.
+    private func handleEscapeAction() {
         if isEditingText {
             cancelInlineTextEditor()
             refresh()
             return
         }
+        if toolbar.isDragging {
+            toolbar.cancelDragging()
+            refresh()
+            return
+        }
+        switch activeDrag {
+        case .drawing:
+            let oldBox = annotations.draft?.boundingBox
+            annotations.draft = nil
+            activeDrag = .none
+            invalidateAnnotations(rect: oldBox)
+            refresh()
+            return
+        case let .movingAnnotation(initial, _, didPushUndo),
+             let .resizingAnnotation(initial, _, didPushUndo):
+            let oldBox = annotations.selectedItem?.boundingBox
+            if didPushUndo {
+                _ = annotations.undo()
+            } else {
+                annotations.replaceItem(initial, recordUndo: false)
+            }
+            activeDrag = .none
+            invalidateAnnotations(rect: Self.unionRect(oldBox, initial.boundingBox))
+            refresh()
+            return
+        case .none, .selectionMachine:
+            break
+        }
+        if activeTool.isDrawingTool || annotations.selectedID != nil {
+            resetScrollUndoCoalescing()
+            activeTool = .select
+            setSelectedAnnotationID(nil)
+            refresh()
+            return
+        }
         onFinish?(.cancel)
+    }
+
+    override func cancelOperation(_ sender: Any?) {
+        handleEscapeAction()
     }
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
@@ -1364,6 +1471,41 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
                 cancelInlineTextEditor()
                 onFinish?(.cancel)
                 return true
+            }
+            if flags == .command && (event.keyCode == 36 || event.keyCode == 76) {
+                commitInlineTextEditor()
+                return true
+            }
+            if let field = inlineEditor, let editor = field.currentEditor() as? NSTextView {
+                if flags == [.command, .shift] && char == "z" {
+                    editor.undoManager?.redo()
+                    resizeInlineEditor(field)
+                    return true
+                }
+                if flags == .command {
+                    switch char {
+                    case "a":
+                        editor.selectAll(nil)
+                        return true
+                    case "c":
+                        editor.copy(nil)
+                        return true
+                    case "x":
+                        editor.cut(nil)
+                        resizeInlineEditor(field)
+                        return true
+                    case "v":
+                        editor.paste(nil)
+                        resizeInlineEditor(field)
+                        return true
+                    case "z":
+                        editor.undoManager?.undo()
+                        resizeInlineEditor(field)
+                        return true
+                    default:
+                        break
+                    }
+                }
             }
             return false
         }
@@ -1464,11 +1606,12 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
         let resizeEdges = flags.contains(.option) && selectedRect != nil && annotations.selectedItem == nil
         switch event.keyCode {
         case 53: // Escape
-            onFinish?(.cancel)
+            handleEscapeAction()
             return
         case 49: // Space (moves in-flight selection origin while dragging)
             if case .dragging = machine.state {
                 isSpaceDown = true
+                refresh()
             }
             return
         case 36, 76: // Return, keypad Enter
@@ -1551,7 +1694,9 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
 
     override func keyUp(with event: NSEvent) {
         if event.keyCode == 49 {
+            let wasDown = isSpaceDown
             isSpaceDown = false
+            if wasDown { refresh() }
             return
         }
         super.keyUp(with: event)
@@ -1641,6 +1786,11 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
     }
 
     private static func clampedTranslation(for box: CGRect, desired: CGSize, within boundsRect: CGRect) -> CGSize {
+        guard !box.isNull, !box.isInfinite,
+              box.origin.x.isFinite, box.origin.y.isFinite,
+              box.size.width.isFinite, box.size.height.isFinite,
+              desired.width.isFinite, desired.height.isFinite
+        else { return .zero }
         let dx: CGFloat = if box.width <= boundsRect.width {
             min(max(box.minX + desired.width, boundsRect.minX), boundsRect.maxX - box.width) - box.minX
         } else {
@@ -1748,10 +1898,11 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
         let highlight = machine.highlightedRect
         let isHovering = machine.isHovering
         let previewRadii = (!isHovering && currentSelected != nil) ? adaptiveCornerRadii : .zero
+        let cornerRadiiChanged = previewRadii != renderedCornerRadii
         if !renderedHighlightValid ||
            !rectsNearlyEqual(highlight, renderedHighlightRect) ||
            isHovering != renderedIsHovering ||
-           previewRadii != renderedCornerRadii {
+           cornerRadiiChanged {
             renderedHighlightValid = true
             renderedHighlightRect = highlight
             renderedIsHovering = isHovering
@@ -1784,14 +1935,18 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
                     }
                     borderLayer.isHidden = false
                 }
-                borderLayer.strokeColor = (isHovering ? NSColor.systemCyan : NSColor.systemBlue).cgColor
+                let strokeNSColor: NSColor = if selectionMode == .record {
+                    .systemRed
+                } else {
+                    isHovering ? .systemCyan : .systemBlue
+                }
+                borderLayer.strokeColor = strokeNSColor.cgColor
             } else {
                 borderLayer.path = nil
                 borderLayer.isHidden = true
             }
 
             cachedHighlightSizeText = sizeText(for: highlight)
-            updateSizeLabel(for: highlight, sizeText: cachedHighlightSizeText)
         }
 
         let showsHandles: Bool
@@ -1800,20 +1955,28 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
         case .hovering, .dragging: showsHandles = false
         }
         let handlesRect: CGRect? = showsHandles ? machine.selectionRect : nil
-        if !rectsNearlyEqual(handlesRect, renderedHandlesRect) {
+        let handlesChanged = !rectsNearlyEqual(handlesRect, renderedHandlesRect)
+        if handlesChanged || annotationView.clipCornerRadii != previewRadii {
             renderedHandlesRect = handlesRect
             annotationView.clipRect = machine.selectionRect
-            if let rect = handlesRect {
-                let handles = CGMutablePath()
-                for handle in ResizeHandle.allCases {
-                    let center = SelectionStateMachine.handlePoint(handle, for: rect)
-                    handles.addRect(CGRect(x: center.x - 3, y: center.y - 3, width: 6, height: 6))
+            annotationView.clipCornerRadii = previewRadii
+            if handlesChanged {
+                if let rect = handlesRect {
+                    let handles = CGMutablePath()
+                    for handle in ResizeHandle.allCases {
+                        let center = SelectionStateMachine.handlePoint(handle, for: rect)
+                        handles.addRoundedRect(
+                            in: CGRect(x: center.x - 3, y: center.y - 3, width: 6, height: 6),
+                            cornerWidth: 1.5,
+                            cornerHeight: 1.5
+                        )
+                    }
+                    handleLayer.path = handles
+                    handleLayer.isHidden = false
+                } else {
+                    handleLayer.path = nil
+                    handleLayer.isHidden = true
                 }
-                handleLayer.path = handles
-                handleLayer.isHidden = false
-            } else {
-                handleLayer.path = nil
-                handleLayer.isHidden = true
             }
             invalidateAnnotationCanvas()
         } else {
@@ -1822,6 +1985,7 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
 
         updateMagnifier()
         updateToolbar()
+        updateSizeLabel(for: highlight, sizeText: cachedHighlightSizeText)
         updateCursor()
     }
 
@@ -1843,31 +2007,93 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
         return "\(Int(pixelRect.width)) × \(Int(pixelRect.height))"
     }
 
+    private func formattedSizeLabelText(for sizeText: String) -> String {
+        var display = sizeText
+        if selectionMode == .record {
+            let prefix = CCXL10n.text("REC", zh: "录制")
+            display = "\(prefix) · \(display)"
+        }
+        switch machine.state {
+        case .dragging:
+            if isSpaceDown {
+                let moveHint = CCXL10n.text("Move", zh: "移动")
+                display = "\(display) · \(moveHint)"
+            } else if isShiftDown {
+                display = "\(display) · 1:1"
+            }
+        case let .resizing(_, handle, _):
+            if isShiftDown && handle.isCorner {
+                display = "\(display) · 1:1"
+            }
+        case .hovering, .selected, .moving:
+            break
+        }
+        return " \(display) "
+    }
+
     private func updateSizeLabel(for rect: CGRect?, sizeText: String) {
         guard let rect, !machine.isHovering || rect != bounds else {
             if !sizeLabel.isHidden { sizeLabel.isHidden = true }
+            renderedSizeLabelRect = nil
+            renderedSizeLabelToolbarFrame = nil
             return
         }
-        let formatted = " \(sizeText) "
+        let formatted = formattedSizeLabelText(for: sizeText)
+        let visibleToolbarFrame: CGRect? = toolbar.isHidden ? nil : toolbar.frame
+        if !sizeLabel.isHidden,
+           formatted == lastSizeLabelText,
+           rectsNearlyEqual(rect, renderedSizeLabelRect),
+           rectsNearlyEqual(visibleToolbarFrame, renderedSizeLabelToolbarFrame) {
+            return
+        }
+        renderedSizeLabelRect = rect
+        renderedSizeLabelToolbarFrame = visibleToolbarFrame
+
         if formatted != lastSizeLabelText {
             lastSizeLabelText = formatted
             sizeLabel.stringValue = formatted
             sizeLabel.sizeToFit()
         }
+        let labelSize = sizeLabel.frame.size
         let usableMaxY = max(bounds.minY, bounds.maxY - topInset)
+        let maxOriginX = max(bounds.minX, bounds.maxX - labelSize.width)
+        let maxOriginY = max(bounds.minY, usableMaxY - labelSize.height)
+
+        func clampedOrigin(_ raw: CGPoint) -> CGPoint {
+            CGPoint(
+                x: min(max(raw.x, bounds.minX), maxOriginX),
+                y: min(max(raw.y, bounds.minY), maxOriginY)
+            )
+        }
+
         var origin = CGPoint(x: rect.minX, y: rect.maxY + 4)
-        if origin.y + sizeLabel.frame.height > usableMaxY {
-            let insideTopY = min(rect.maxY, usableMaxY) - sizeLabel.frame.height - 4
+        if origin.y + labelSize.height > usableMaxY {
+            let insideTopY = min(rect.maxY, usableMaxY) - labelSize.height - 4
             if insideTopY >= rect.minY {
                 origin.y = insideTopY
             } else {
-                origin.y = rect.minY - sizeLabel.frame.height - 4
+                origin.y = rect.minY - labelSize.height - 4
             }
         }
-        let maxOriginX = max(bounds.minX, bounds.maxX - sizeLabel.frame.width)
-        let maxOriginY = max(bounds.minY, usableMaxY - sizeLabel.frame.height)
-        origin.x = min(max(origin.x, bounds.minX), maxOriginX)
-        origin.y = min(max(origin.y, bounds.minY), maxOriginY)
+        origin = clampedOrigin(origin)
+
+        // Avoid colliding with the floating toolbar (e.g. when toolbar flips above a bottom-edge selection).
+        if let toolbarFrame = visibleToolbarFrame {
+            let paddedToolbar = toolbarFrame.insetBy(dx: -4, dy: -4)
+            let proposed = CGRect(origin: origin, size: labelSize)
+            if proposed.intersects(paddedToolbar) {
+                let insideTop = clampedOrigin(CGPoint(x: rect.minX + 4, y: min(rect.maxY, usableMaxY) - labelSize.height - 4))
+                let insideBottom = clampedOrigin(CGPoint(x: rect.minX + 4, y: rect.minY + 4))
+                let belowSelection = clampedOrigin(CGPoint(x: rect.minX, y: rect.minY - labelSize.height - 4))
+                let candidates = [insideTop, insideBottom, belowSelection]
+                if let clearOrigin = candidates.first(where: { !CGRect(origin: $0, size: labelSize).intersects(paddedToolbar) }) {
+                    origin = clearOrigin
+                } else {
+                    origin = insideTop
+                }
+            }
+        }
+
         if sizeLabel.frame.origin != origin {
             sizeLabel.setFrameOrigin(origin)
         }
@@ -1933,6 +2159,7 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         toolbar.frame = clamped
+        updateSizeLabel(for: machine.highlightedRect, sizeText: cachedHighlightSizeText)
         CATransaction.commit()
     }
 
@@ -2205,6 +2432,20 @@ private final class StrokeSizeHUDView: NSView {
     private(set) var displayText = ""
     private var hideTask: Task<Void, Never>?
 
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.cornerRadius = 10
+        layer?.cornerCurve = .continuous
+        layer?.masksToBounds = true
+        layer?.backgroundColor = NSColor.black.withAlphaComponent(0.78).cgColor
+        layer?.borderWidth = 1
+        layer?.borderColor = NSColor.white.withAlphaComponent(0.18).cgColor
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
 
     override func viewDidMoveToWindow() {
@@ -2276,15 +2517,6 @@ private final class StrokeSizeHUDView: NSView {
     }
 
     override func draw(_ dirtyRect: NSRect) {
-        let bgRect = bounds.insetBy(dx: 0.5, dy: 0.5)
-        let path = NSBezierPath(roundedRect: bgRect, xRadius: 8, yRadius: 8)
-        NSColor.black.withAlphaComponent(0.76).setFill()
-        path.fill()
-
-        NSColor.white.withAlphaComponent(0.16).setStroke()
-        path.lineWidth = 1
-        path.stroke()
-
         let midY = bounds.midY
         let dotDiameter = 4 + 9 * size.progress
         let dotRect = CGRect(

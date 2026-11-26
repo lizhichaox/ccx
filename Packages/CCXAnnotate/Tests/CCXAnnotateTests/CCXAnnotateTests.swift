@@ -1457,4 +1457,167 @@ struct CCXAnnotateTests {
         #expect(clampedToolbarFrame.origin.x.isFinite && clampedToolbarFrame.origin.y.isFinite)
         #expect(clampedToolbarFrame.width > 0 && clampedToolbarFrame.height > 0)
     }
+
+    @Test func milestoneTooltipsPaletteSanitizationContinuousCornersAndLargeCounters() throws {
+        func allSubviews(of root: NSView) -> [NSView] {
+            root.subviews + root.subviews.flatMap { allSubviews(of: $0) }
+        }
+
+        // 1. Bilingual tool tooltips, palette color display names, mosaic tooltips, accessibility labels, and continuous corners.
+        for language in CCXLanguage.allCases {
+            CCXL10n.withLanguageForTesting(language) {
+                for tool in AnnotationTool.allCases {
+                    let tip = tool.toolbarTooltip
+                    #expect(!tip.isEmpty)
+                    #expect(!tip.contains("\n"))
+                    #expect(tip.contains(tool.displayName))
+                    if let shortcut = tool.shortcutHint {
+                        #expect(tip.contains("(\(shortcut))"))
+                    }
+                }
+                #expect(AnnotationTool.rectangle.toolbarTooltip.contains("⇧"))
+                #expect(AnnotationTool.ellipse.toolbarTooltip.contains("⇧"))
+                #expect(AnnotationTool.arrow.toolbarTooltip.contains("⇧"))
+                #expect(AnnotationTool.mosaic.toolbarTooltip.contains("⇧"))
+                #expect(AnnotationTool.text.toolbarTooltip.contains("⇧↩"))
+
+                for color in AnnotationColor.palette {
+                    #expect(!color.displayName.isEmpty)
+                    #expect(!color.displayName.contains("\n"))
+                }
+                let customColor = AnnotationColor(r: 0.2, g: 0.3, b: 0.4, hex: "#334D66")
+                #expect(customColor.displayName == "#334D66")
+
+                for mode in MosaicMode.allCases {
+                    #expect(!mode.tooltip.isEmpty)
+                    #expect(!mode.tooltip.contains("\n"))
+                }
+
+                for preset in [AnnotationToolbarPreset.snip, .pin] {
+                    let toolbar = AnnotationActionToolbar(preset: preset)
+                    toolbar.update(
+                        activeTool: .rectangle,
+                        style: AnnotationStyle(color: .red, size: .medium, mosaicMode: .pixelate),
+                        showStyleBar: true,
+                        canUndo: true,
+                        canRedo: true
+                    )
+                    toolbar.layoutSubtreeIfNeeded()
+
+                    let primaryButtons = toolbar.primaryStack.arrangedSubviews.compactMap { $0 as? NSButton }
+                    #expect(!primaryButtons.isEmpty)
+                    for button in primaryButtons {
+                        #expect(button.layer?.cornerCurve == .continuous)
+                    }
+                    #expect(toolbar.dragHandleView.layer?.cornerCurve == .continuous)
+
+                    let toolTips = Set(primaryButtons.compactMap(\.toolTip))
+                    for tool in AnnotationTool.drawingTools {
+                        #expect(toolTips.contains(tool.toolbarTooltip))
+                    }
+
+                    let styleButtons = allSubviews(of: toolbar.styleSurface).compactMap { $0 as? NSButton }
+                    let redSwatch = styleButtons.first { $0.toolTip?.contains(AnnotationColor.red.hex) == true }
+                    #expect(redSwatch != nil)
+                    #expect(redSwatch?.toolTip?.contains(AnnotationColor.red.displayName) == true)
+                }
+            }
+        }
+
+        CCXL10n.withLanguageForTesting(.en) {
+            #expect(AnnotationColor.red.displayName == "Red")
+            #expect(AnnotationColor.charcoal.displayName == "Charcoal")
+        }
+        CCXL10n.withLanguageForTesting(.zhHans) {
+            #expect(AnnotationColor.red.displayName == "红色")
+            #expect(AnnotationColor.charcoal.displayName == "炭黑")
+        }
+
+        // 2. AnnotationColor channel clamping & AnnotationDocument boundary sanitization.
+        let clampedColor = AnnotationColor(r: .nan, g: -0.5, b: 2.5, hex: "#BAD")
+        #expect(clampedColor.r == 0 && clampedColor.g == 0 && clampedColor.b == 1)
+
+        let doc = AnnotationDocument()
+        let hugeText = String(repeating: "Z", count: AnnotationItem.maxTextLength + 500)
+        let hugePolyline = (0 ..< (AnnotationItem.maxPolylinePoints + 500)).map { CGPoint(x: CGFloat($0), y: 10) }
+        let textItem = AnnotationItem(kind: .text(origin: CGPoint(x: 10, y: 20), content: hugeText), style: AnnotationStyle())
+        let penItem = AnnotationItem(kind: .pen(hugePolyline), style: AnnotationStyle())
+        doc.commit(textItem)
+        doc.commit(penItem)
+
+        if case let .text(_, storedText) = doc.items[0].kind {
+            #expect(storedText.count == AnnotationItem.maxTextLength)
+        } else {
+            Issue.record("Expected sanitized text item")
+        }
+        if case let .pen(storedPoints) = doc.items[1].kind {
+            #expect(storedPoints.count == AnnotationItem.maxPolylinePoints)
+        } else {
+            Issue.record("Expected sanitized pen item")
+        }
+
+        var replacedText = doc.items[0]
+        replacedText.kind = .text(origin: CGPoint(x: 15, y: 25), content: hugeText)
+        doc.replaceItem(replacedText, recordUndo: false)
+        if case let .text(_, storedReplaced) = doc.items[0].kind {
+            #expect(storedReplaced.count == AnnotationItem.maxTextLength)
+        } else {
+            Issue.record("Expected sanitized replaced text item")
+        }
+
+        // 3. Non-finite & overflow guards on boundingBox, handlePoints, hitTest, and translated.
+        let overflowRectItem = AnnotationItem(
+            kind: .rectangle(CGRect(x: 1e308, y: 0, width: 1e308, height: 10)),
+            style: AnnotationStyle()
+        )
+        #expect(overflowRectItem.boundingBox == .zero)
+        #expect(overflowRectItem.handlePoints.isEmpty)
+        #expect(!overflowRectItem.hitTest(point: CGPoint(x: 10, y: 10)))
+
+        let nanArrow = AnnotationItem(
+            kind: .arrow(start: CGPoint(x: CGFloat.nan, y: 0), end: CGPoint(x: 20, y: 20)),
+            style: AnnotationStyle()
+        )
+        #expect(nanArrow.boundingBox == .zero)
+        #expect(nanArrow.handlePoints.isEmpty)
+        #expect(!nanArrow.hitTest(point: CGPoint(x: 10, y: 10)))
+        let finiteArrow = AnnotationItem(
+            kind: .arrow(start: CGPoint(x: 5, y: 5), end: CGPoint(x: 20, y: 20)),
+            style: AnnotationStyle()
+        )
+        #expect(finiteArrow.translated(by: CGSize(width: CGFloat.nan, height: 5)) == finiteArrow)
+        #expect(finiteArrow.translated(by: CGSize(width: 1e308, height: 1e308)).translated(by: CGSize(width: 1e308, height: 1e308)).boundingBox.origin.x.isFinite)
+
+        let mixedPolyline = AnnotationItem(
+            kind: .pen([CGPoint(x: CGFloat.nan, y: 0), CGPoint(x: 10, y: 10), CGPoint(x: 30, y: 20)]),
+            style: AnnotationStyle()
+        )
+        let polyBounds = mixedPolyline.boundingBox
+        #expect(polyBounds.origin.x.isFinite && polyBounds.origin.y.isFinite && polyBounds.width > 0)
+        #expect(!mixedPolyline.hitTest(point: CGPoint(x: CGFloat.nan, y: 10)))
+
+        // 4. 4-digit counter & non-finite renderer draw guards produce clean output without trapping.
+        let canvasBounds = CGRect(x: 0, y: 0, width: 100, height: 100)
+        let ctx = try #require(CGContext(
+            data: nil,
+            width: 100,
+            height: 100,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue
+        ))
+        let counter4 = AnnotationItem(kind: .counter(center: CGPoint(x: 50, y: 50), number: 1234), style: AnnotationStyle(color: .red, size: .medium))
+        AnnotationRenderer.draw(counter4, in: ctx, screenBounds: canvasBounds, mosaicImage: nil)
+        AnnotationRenderer.draw(overflowRectItem, in: ctx, screenBounds: canvasBounds, mosaicImage: nil)
+        AnnotationRenderer.draw(
+            AnnotationItem(kind: .mosaic(.infinite, .blur), style: AnnotationStyle()),
+            in: ctx,
+            screenBounds: canvasBounds,
+            mosaicImage: nil
+        )
+        let rendered = try #require(ctx.makeImage())
+        let centerPx = try sampleRGBA(in: rendered, x: 50, y: 50)
+        #expect(centerPx.a == 255)
+    }
 }
