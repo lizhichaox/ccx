@@ -2,6 +2,22 @@
 
 All notable changes to **CCX (Control · Command · X)** are documented in this file.
 
+## [0.9.3] - 2026-11-26
+
+### Added
+- **Resource Usage Overview in Settings (`App`, `CCXCore`)**: Added a collapsible **Resource Usage** card in **Settings** displaying live process physical memory (`phys_footprint`), retained snip history & active pin counts, local cache size, and bilingual (`en` / `zh-Hans`) explanations of idle CPU, memory bounds, hardware acceleration, and cache/network behavior—with zero background polling while closed, collapsed, minimized, or occluded.
+
+### Security
+- **In-App Updater & Relaunch Hardening (`CCXCore`, `App`)**: Added Local File Header cross-validation, 4 MB Central Directory cap, encryption/ZIP64-extra rejection, and hostOS-independent Unix symlink/setuid checks before ZIP extraction; enabled `kSecCSCheckNestedCode` with verified `kSecCodeInfoPList` cross-checks and repo-scoped `github.com` asset URL validation; moved streaming download file I/O off `OSAllocatedUnfairLock` onto a serial queue; and deferred relaunch / quit-time update swap helpers into `applicationWillTerminate` to eliminate cancellation and relaunch races.
+- **File-Descriptor Symlink & TOCTOU Defenses (`CCXRecord`, `CCXCore`, `App`, `scripts`)**: Migrated recording staging/cleanup (`RecordingFileSecurity`) and cache sizing (`AppResourceMonitor`) to fd-anchored `open(O_NOFOLLOW | O_CLOEXEC)` / `fstat` / `fchmod` / `fstatat` / `unlinkat` / `(st_dev, st_ino)` checks; added atomic exclusive-create Quick Save PNG (`renamex_np(RENAME_EXCL)`) and quit-time temp recording cleanup; hardened finite/overflow guards and text/polyline bounds across capture, annotation, pin, and recording pipelines; and hardened build/release/secret-audit scripts with `INT`/`TERM` traps, `plutil` XML entitlement verification, and atomic `SHA256SUMS.txt` generation.
+
+### Improved
+- **Lower Idle Memory, GPU VRAM & CPU Usage (`App`, `CCXCore`, `CCXCapture`, `CCXAnnotate`, `CCXPin`, `CCXRecord`)**:
+  - Compacted persisted recent snips in memory to lazy PNG-backed `CGImage`s, eliminated duplicate PNG encoding on Copy, cached resolved system language in `CCXL10n`, and pushed SwiftUI observation to leaf views (eliminating 120Hz scroll strip and closed-window re-renders).
+  - Detached cropped snips from full-display `IOSurface`s, hid empty overlay/annotation backing stores, converted scroll and recording borders to zero-backing `CALayer`s, accelerated adaptive window-corner masking via `.alphaOnly` + corner-only modulation, and optimized scroll stitching with cached `ColumnProfiles`, `SIMD16` row diffs, exact early-exit, and streaming finalization.
+  - Eliminated empty Retina IOSurfaces on `.image` pins (`wantsUpdateLayer`) and collapsed `PinAnnotationOverlayView` on toolbar close, cleared Metal `CIContext` caches in `MosaicImageCache` with unified byte ceilings and zero-copy CPU blur, coalesced zoom shadow invalidations, and used O(1) dirty-rect invalidation during pin annotation drags.
+  - Switched MP4/MOV `SCStream` capture to native `420v` NV12 (62.5% less VRAM/bandwidth), throttled paused streams to 1fps, separated dual-audio PTS watermarks & `AudioSampleNormalizer`s (fixing dual-audio drops and converter thrashing), accelerated GIF encoding via pre-copy locked-buffer fingerprinting + `vImageScale_ARGB8888`, removed the global key monitor after `.ready`, and aligned the recording timer to 1 Hz.
+
 ## [0.9.2] - 2026-11-25
 
 ### Fixed
