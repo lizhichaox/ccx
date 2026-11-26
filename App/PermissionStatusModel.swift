@@ -6,8 +6,12 @@ import Foundation
 /// shared by the onboarding and settings windows.
 @MainActor
 final class PermissionStatusModel: ObservableObject {
+    private static let pendingScreenRecordingRelaunchKey = "CCXPendingScreenRecordingRelaunchCheck"
+
     @Published private(set) var status: CCXPermissionStatus
     @Published private(set) var isCheckingScreenRecording = false
+    @Published private(set) var isResettingScreenRecording = false
+    @Published private(set) var mayHaveStaleScreenRecordingGrant = false
 
     private var isPollingEnabled = false
     nonisolated(unsafe) private var pollTask: Task<Void, Never>?
@@ -15,6 +19,22 @@ final class PermissionStatusModel: ObservableObject {
 
     init() {
         status = PermissionManager.currentStatus()
+    }
+
+    static func markPendingScreenRecordingRelaunch() {
+        UserDefaults.standard.set(true, forKey: pendingScreenRecordingRelaunchKey)
+    }
+
+    static func consumePendingScreenRecordingRelaunch() -> Bool {
+        guard UserDefaults.standard.bool(forKey: pendingScreenRecordingRelaunchKey) else { return false }
+        UserDefaults.standard.removeObject(forKey: pendingScreenRecordingRelaunchKey)
+        return true
+    }
+
+    func markSuspectedStaleScreenRecordingGrant() {
+        if !status.screenRecording {
+            mayHaveStaleScreenRecordingGrant = true
+        }
     }
 
     deinit {
@@ -32,6 +52,9 @@ final class PermissionStatusModel: ObservableObject {
         let latest = PermissionManager.currentStatus()
         if latest != status {
             status = latest
+        }
+        if status.screenRecording && mayHaveStaleScreenRecordingGrant {
+            mayHaveStaleScreenRecordingGrant = false
         }
         if isPollingEnabled {
             if needsPeriodicPolling && pollTask == nil {
@@ -99,19 +122,45 @@ final class PermissionStatusModel: ObservableObject {
 
     /// Probes ScreenCaptureKit directly and refreshes published permission state.
     func verifyScreenRecordingLive() {
-        guard !isCheckingScreenRecording else { return }
+        guard !isCheckingScreenRecording, !isResettingScreenRecording else { return }
         isCheckingScreenRecording = true
         Task { @MainActor [weak self] in
             defer { self?.isCheckingScreenRecording = false }
-            _ = await PermissionManager.verifyScreenRecordingLive()
+            let granted = await PermissionManager.verifyScreenRecordingLive()
             self?.refresh()
+            if !granted {
+                self?.mayHaveStaleScreenRecordingGrant = true
+            }
+        }
+    }
+
+    /// Resets CCX's stale Screen Recording TCC record (plus ungranted Accessibility if needed)
+    /// and re-opens System Settings so macOS writes a fresh signature entry.
+    func resetAndReopenScreenRecording(onComplete: (@MainActor (Bool) -> Void)? = nil) {
+        guard !isResettingScreenRecording, !isCheckingScreenRecording else { return }
+        isResettingScreenRecording = true
+        Task { @MainActor [weak self] in
+            defer { self?.isResettingScreenRecording = false }
+            guard let self else { return }
+            let screenResetOK = await PermissionManager.resetTCCPermission(.screenCapture)
+            if !self.status.accessibility {
+                _ = await PermissionManager.resetTCCPermission(.accessibility)
+            }
+            self.refresh()
+            if screenResetOK {
+                self.mayHaveStaleScreenRecordingGrant = false
+                PermissionManager.requestScreenRecording()
+                try? await Task.sleep(for: .milliseconds(150))
+            }
+            PermissionManager.openScreenRecordingSettings()
+            onComplete?(screenResetOK)
         }
     }
 
     /// Verifies live ScreenCaptureKit access first, then triggers the native prompt
     /// and opens System Settings only if access is still not granted.
     func allowScreenRecording() {
-        guard !isCheckingScreenRecording else { return }
+        guard !isCheckingScreenRecording, !isResettingScreenRecording else { return }
         isCheckingScreenRecording = true
         Task { @MainActor [weak self] in
             defer { self?.isCheckingScreenRecording = false }

@@ -109,6 +109,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     private let onOpenGuide: (NSRect?) -> Void
     private let onClearHistory: () -> Void
     private let onRelaunch: () -> Void
+    private let onPermissionReset: @MainActor (Bool) -> Void
     private var window: NSWindow?
     nonisolated(unsafe) private var shortcutMonitor: Any?
     nonisolated(unsafe) private var didBecomeActiveObserver: NSObjectProtocol?
@@ -141,7 +142,8 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         onChooseRecordingsFolder: @escaping () -> Void = {},
         onOpenGuide: @escaping (NSRect?) -> Void = { _ in },
         onClearHistory: @escaping () -> Void = {},
-        onRelaunch: @escaping () -> Void = { _ = AppRelauncher.relaunch() }
+        onRelaunch: @escaping () -> Void = { _ = AppRelauncher.relaunch() },
+        onPermissionReset: @escaping @MainActor (Bool) -> Void = { _ in }
     ) {
         self.updateManager = updateManager
         self.hotKeyState = SettingsHotKeyState(
@@ -161,6 +163,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         self.onOpenGuide = onOpenGuide
         self.onClearHistory = onClearHistory
         self.onRelaunch = onRelaunch
+        self.onPermissionReset = onPermissionReset
         super.init()
     }
 
@@ -487,6 +490,9 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             onRelaunch: { [weak self] in
                 self?.onRelaunch()
             },
+            onPermissionReset: { [weak self] succeeded in
+                self?.onPermissionReset(succeeded)
+            },
             onContentHeightChange: { [weak self] in
                 DispatchQueue.main.async { [weak self] in
                     self?.syncWindowHeightToFit(preserveTopEdge: true)
@@ -758,6 +764,7 @@ private struct SettingsView: View {
     let onOpenGuide: () -> Void
     let onClearHistory: () -> Void
     let onRelaunch: () -> Void
+    let onPermissionReset: @MainActor (Bool) -> Void
     let onContentHeightChange: () -> Void
 
     var body: some View {
@@ -806,7 +813,8 @@ private struct SettingsView: View {
                     // Card 2 — Permissions
                     PermissionsSettingsCard(
                         permissions: permissions,
-                        onRelaunch: onRelaunch
+                        onRelaunch: onRelaunch,
+                        onPermissionReset: onPermissionReset
                     )
                     .ccxSettingsCard(cornerRadius: 12)
 
@@ -887,6 +895,7 @@ private struct SettingsView: View {
 private struct PermissionsSettingsCard: View {
     @ObservedObject var permissions: PermissionStatusModel
     let onRelaunch: () -> Void
+    let onPermissionReset: @MainActor (Bool) -> Void
     @State private var openedScreenRecordingSettings = false
 
     var body: some View {
@@ -894,10 +903,16 @@ private struct PermissionsSettingsCard: View {
             ScreenRecordingSettingRow(
                 granted: permissions.status.screenRecording,
                 isChecking: permissions.isCheckingScreenRecording,
+                isResetting: permissions.isResettingScreenRecording,
                 showRelaunch: openedScreenRecordingSettings && !permissions.status.screenRecording,
+                showReset: permissions.mayHaveStaleScreenRecordingGrant && !permissions.status.screenRecording,
                 onOpen: {
                     openedScreenRecordingSettings = true
                     permissions.openScreenRecordingSettings()
+                },
+                onReset: {
+                    openedScreenRecordingSettings = true
+                    permissions.resetAndReopenScreenRecording(onComplete: onPermissionReset)
                 },
                 onVerify: {
                     permissions.verifyScreenRecordingLive()
@@ -1559,10 +1574,23 @@ private struct UpdatesSettingRow: View {
 private struct ScreenRecordingSettingRow: View {
     let granted: Bool
     let isChecking: Bool
+    let isResetting: Bool
     let showRelaunch: Bool
+    let showReset: Bool
     let onOpen: () -> Void
+    let onReset: () -> Void
     let onVerify: () -> Void
     let onRelaunch: () -> Void
+
+    private var hintText: String {
+        if showReset {
+            return PermissionManager.ScreenRecordingCopy.settingsHintStale
+        }
+        if showRelaunch {
+            return PermissionManager.ScreenRecordingCopy.settingsHintRelaunch
+        }
+        return PermissionManager.ScreenRecordingCopy.settingsHintDefault
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
@@ -1581,29 +1609,39 @@ private struct ScreenRecordingSettingRow: View {
             }
 
             if !granted {
-                HStack(spacing: 6) {
-                    Text(
-                        showRelaunch
-                            ? CCXL10n.text("Relaunch CCX after enabling.", zh: "授权后请重启 CCX")
-                            : CCXL10n.text("Already enabled?", zh: "已开启权限？")
-                    )
+                HStack(spacing: 5) {
+                    Text(hintText)
                         .font(.system(size: 10.5))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .fixedSize(horizontal: false, vertical: true)
                     Spacer(minLength: 4)
+                    if showReset {
+                        Button(
+                            isResetting
+                                ? PermissionManager.ScreenRecordingCopy.resettingButtonTitle
+                                : PermissionManager.ScreenRecordingCopy.resetButtonTitle,
+                            action: onReset
+                        )
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.mini)
+                            .disabled(isChecking || isResetting)
+                            .help(PermissionManager.ScreenRecordingCopy.resetTooltip)
+                            .fixedSize()
+                    }
                     Button(
                         isChecking ? CCXL10n.text("Checking…", zh: "验证中…") : CCXL10n.text("Verify", zh: "验证"),
                         action: onVerify
                     )
                         .buttonStyle(.bordered)
                         .controlSize(.mini)
-                        .disabled(isChecking)
+                        .disabled(isChecking || isResetting)
                         .fixedSize()
                     if showRelaunch {
                         Button(CCXL10n.text("Relaunch", zh: "重启"), action: onRelaunch)
                             .buttonStyle(.borderedProminent)
                             .controlSize(.mini)
+                            .disabled(isResetting)
                             .fixedSize()
                     }
                 }

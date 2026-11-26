@@ -177,8 +177,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             )
         }
 
+        let returnedFromPermissionRelaunch = PermissionStatusModel.consumePendingScreenRecordingRelaunch()
         if !PermissionManager.currentStatus().screenRecording {
-            showOnboarding(startingAt: .welcome, anchor: .centeredOnActiveScreen)
+            if returnedFromPermissionRelaunch {
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    let liveGranted = await PermissionManager.verifyScreenRecordingLive()
+                    if liveGranted {
+                        self.menuBarController?.refresh()
+                        if !UserDefaults.standard.bool(forKey: Self.hasCompletedOnboardingKey) {
+                            self.showOnboarding(startingAt: .ready, anchor: .centeredOnActiveScreen)
+                        }
+                    } else {
+                        self.showOnboarding(
+                            startingAt: .permissions,
+                            anchor: .centeredOnActiveScreen,
+                            detectedStaleScreenRecording: true
+                        )
+                    }
+                }
+            } else {
+                showOnboarding(startingAt: .welcome, anchor: .centeredOnActiveScreen)
+            }
         } else if !UserDefaults.standard.bool(forKey: Self.hasCompletedOnboardingKey) {
             showOnboarding(startingAt: .ready, anchor: .centeredOnActiveScreen)
         }
@@ -1249,18 +1269,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Windows
 
-    private func relaunchApplication() {
+    private func relaunchApplication(forPermissionRetry: Bool = false) {
         guard AppRelauncher.validatedBundlePath() != nil else {
             NSSound.beep()
             return
+        }
+        if forPermissionRetry {
+            PermissionStatusModel.markPendingScreenRecordingRelaunch()
         }
         isRelaunching = true
         NSApp.terminate(nil)
     }
 
+    private func handlePermissionResetResult(_ succeeded: Bool) {
+        if succeeded {
+            toast.show(
+                CCXL10n.text(
+                    "Old Permission Cleared — Enable CCX & Relaunch",
+                    zh: "已重置旧权限，请重新勾选 CCX 并重启"
+                ),
+                symbolName: "arrow.counterclockwise.circle.fill"
+            )
+        } else {
+            toast.show(
+                CCXL10n.text(
+                    "Remove CCX (−) in Settings, Then Re-add",
+                    zh: "请在系统设置点 − 移除 CCX 后重新添加"
+                ),
+                symbolName: "exclamationmark.triangle"
+            )
+        }
+    }
+
     private func showOnboarding(
         startingAt step: OnboardingStep = .welcome,
-        anchor: OnboardingAnchor = .centeredOnActiveScreen
+        anchor: OnboardingAnchor = .centeredOnActiveScreen,
+        detectedStaleScreenRecording: Bool = false
     ) {
         recordingCoordinator.cancelIfInReadyPhase()
         if onboardingController == nil {
@@ -1276,7 +1320,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     }
                 },
                 onRelaunch: { [weak self] in
-                    self?.relaunchApplication()
+                    self?.relaunchApplication(forPermissionRetry: true)
+                },
+                onPermissionReset: { [weak self] succeeded in
+                    self?.handlePermissionResetResult(succeeded)
                 }
             )
             controller.onWindowVisibilityChanged = { [weak self] _ in
@@ -1286,7 +1333,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             onboardingController?.updateSnipCombo(currentSnipCombo)
         }
-        onboardingController?.show(startingAt: step, anchor: anchor)
+        onboardingController?.show(
+            startingAt: step,
+            anchor: anchor,
+            detectedStaleScreenRecording: detectedStaleScreenRecording
+        )
     }
 
     private func showSettings(anchoredTo anchorRect: NSRect? = nil) {
@@ -1352,7 +1403,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     )
                 },
                 onRelaunch: { [weak self] in
-                    self?.relaunchApplication()
+                    self?.relaunchApplication(forPermissionRetry: true)
+                },
+                onPermissionReset: { [weak self] succeeded in
+                    self?.handlePermissionResetResult(succeeded)
                 }
             )
             controller.onWindowVisibilityChanged = { [weak self] _ in

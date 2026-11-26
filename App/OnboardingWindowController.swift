@@ -54,6 +54,7 @@ final class OnboardingWindowController: NSObject, NSWindowDelegate {
     private let onComplete: () -> Void
     private let onTrySnip: () -> Void
     private let onRelaunch: () -> Void
+    private let onPermissionReset: @MainActor (Bool) -> Void
     private var window: NSWindow?
 
     var onWindowVisibilityChanged: ((Bool) -> Void)?
@@ -70,11 +71,13 @@ final class OnboardingWindowController: NSObject, NSWindowDelegate {
         snipCombo: HotKeyCombo = .defaultSnip,
         onComplete: @escaping () -> Void,
         onTrySnip: @escaping () -> Void,
-        onRelaunch: @escaping () -> Void = { _ = AppRelauncher.relaunch() }
+        onRelaunch: @escaping () -> Void = { _ = AppRelauncher.relaunch() },
+        onPermissionReset: @escaping @MainActor (Bool) -> Void = { _ in }
     ) {
         self.onComplete = onComplete
         self.onTrySnip = onTrySnip
         self.onRelaunch = onRelaunch
+        self.onPermissionReset = onPermissionReset
         super.init()
         self.flow.snipCombo = snipCombo
     }
@@ -98,13 +101,21 @@ final class OnboardingWindowController: NSObject, NSWindowDelegate {
         }
     }
 
-    func show(startingAt step: OnboardingStep = .welcome, anchor: OnboardingAnchor = .centeredOnActiveScreen) {
+    func show(
+        startingAt step: OnboardingStep = .welcome,
+        anchor: OnboardingAnchor = .centeredOnActiveScreen,
+        detectedStaleScreenRecording: Bool = false
+    ) {
         flow.swipeOffset = 0
         flow.step = step
 
         let window = self.window ?? makeWindow()
         self.window = window
         model.refresh()
+        if detectedStaleScreenRecording {
+            flow.requestedScreenRecording = true
+            model.markSuspectedStaleScreenRecordingGrant()
+        }
         model.startPolling()
 
         let targetScreen = Self.targetScreen(for: anchor)
@@ -144,6 +155,9 @@ final class OnboardingWindowController: NSObject, NSWindowDelegate {
             },
             onRelaunch: { [weak self] in
                 self?.onRelaunch()
+            },
+            onPermissionReset: { [weak self] succeeded in
+                self?.onPermissionReset(succeeded)
             }
         )
         let hosting = NSHostingController(rootView: view)
@@ -479,6 +493,7 @@ private struct OnboardingView: View {
     let onDone: () -> Void
     let onTrySnip: () -> Void
     let onRelaunch: () -> Void
+    let onPermissionReset: @MainActor (Bool) -> Void
 
     var body: some View {
         ZStack(alignment: .top) {
@@ -503,7 +518,12 @@ private struct OnboardingView: View {
                             .padding(.bottom, 12)
                             .frame(width: pageWidth, height: proxy.size.height)
 
-                        PermissionsStepView(model: model, flow: flow, onRelaunch: onRelaunch)
+                        PermissionsStepView(
+                            model: model,
+                            flow: flow,
+                            onRelaunch: onRelaunch,
+                            onPermissionReset: onPermissionReset
+                        )
                             .padding(.horizontal, 20)
                             .padding(.top, 28)
                             .padding(.bottom, 12)
@@ -628,6 +648,7 @@ private struct PermissionsStepView: View {
     @ObservedObject var model: PermissionStatusModel
     @ObservedObject var flow: OnboardingFlowState
     let onRelaunch: () -> Void
+    let onPermissionReset: @MainActor (Bool) -> Void
 
     var body: some View {
         VStack(spacing: 12) {
@@ -644,7 +665,7 @@ private struct PermissionsStepView: View {
                     detail: CCXL10n.text("Capture displays & pixels", zh: "用于截屏、取色与录屏"),
                     granted: model.status.screenRecording,
                     prominentAction: true,
-                    isDisabled: model.isCheckingScreenRecording
+                    isDisabled: model.isCheckingScreenRecording || model.isResettingScreenRecording
                 ) {
                     flow.requestedScreenRecording = true
                     model.allowScreenRecording()
@@ -659,7 +680,7 @@ private struct PermissionsStepView: View {
                     detail: CCXL10n.text("Detect UI elements", zh: "自动识别窗口与界面元素"),
                     granted: model.status.accessibility,
                     prominentAction: false,
-                    isDisabled: false
+                    isDisabled: model.isResettingScreenRecording
                 ) {
                     model.allowAccessibility()
                 }
@@ -669,7 +690,13 @@ private struct PermissionsStepView: View {
             if !model.status.screenRecording {
                 ScreenRecordingHintStrip(
                     showRelaunch: flow.requestedScreenRecording,
+                    showReset: model.mayHaveStaleScreenRecordingGrant,
                     isVerifying: model.isCheckingScreenRecording,
+                    isResetting: model.isResettingScreenRecording,
+                    onReset: {
+                        flow.requestedScreenRecording = true
+                        model.resetAndReopenScreenRecording(onComplete: onPermissionReset)
+                    },
                     onVerify: { model.verifyScreenRecordingLive() },
                     onRelaunch: onRelaunch
                 )
@@ -752,22 +779,40 @@ private struct PermissionGrantedPill: View {
 
 private struct ScreenRecordingHintStrip: View {
     let showRelaunch: Bool
+    let showReset: Bool
     let isVerifying: Bool
+    let isResetting: Bool
+    let onReset: () -> Void
     let onVerify: () -> Void
     let onRelaunch: () -> Void
 
     var body: some View {
-        HStack(spacing: 8) {
-            Text(CCXL10n.text(
-                "Enable CCX in Settings, then relaunch.",
-                zh: "请在系统设置中启用 CCX 后重启"
-            ))
+        HStack(spacing: 6) {
+            Text(
+                showReset
+                    ? PermissionManager.ScreenRecordingCopy.guideHintStale
+                    : PermissionManager.ScreenRecordingCopy.guideHintDefault
+            )
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
                 .fixedSize(horizontal: false, vertical: true)
 
-            Spacer(minLength: 6)
+            Spacer(minLength: 4)
+
+            if showReset {
+                Button(
+                    isResetting
+                        ? PermissionManager.ScreenRecordingCopy.resettingButtonTitle
+                        : PermissionManager.ScreenRecordingCopy.resetButtonTitle,
+                    action: onReset
+                )
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .disabled(isVerifying || isResetting)
+                    .help(PermissionManager.ScreenRecordingCopy.resetTooltip)
+                    .fixedSize()
+            }
 
             Button(
                 isVerifying ? CCXL10n.text("Checking…", zh: "验证中…") : CCXL10n.text("Verify", zh: "验证"),
@@ -775,14 +820,15 @@ private struct ScreenRecordingHintStrip: View {
             )
                 .buttonStyle(.bordered)
                 .controlSize(.small)
-                .disabled(isVerifying)
+                .disabled(isVerifying || isResetting)
                 .fixedSize()
 
             if showRelaunch {
                 Button(CCXL10n.text("Relaunch", zh: "重启"), action: onRelaunch)
-                .buttonStyle(.borderedProminent)
-                .controlSize(.small)
-                .fixedSize()
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .disabled(isResetting)
+                    .fixedSize()
             }
         }
         .padding(.horizontal, 10)

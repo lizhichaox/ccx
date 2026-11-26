@@ -81,75 +81,110 @@ fi
 echo "==> Generating CCX.xcodeproj"
 xcodegen generate --spec project.yml --quiet
 
-# Resolve a valid, unexpired Apple Development Team ID when not provided explicitly.
-resolve_valid_apple_dev_team_id() {
-  local valid_hashes hash cert pem_file subject team
-  valid_hashes="$(security find-identity -v -p codesigning 2>/dev/null \
-    | awk '/Apple Development:/ { print $2 }' || true)"
-  [[ -n "$valid_hashes" ]] || return 1
+# Resolve a valid, unexpired signing identity matching $1 ("Developer ID Application" or "Apple Development").
+# Sets RESOLVED_SIGN_HASH, RESOLVED_SIGN_NAME, and RESOLVED_TEAM_ID.
+RESOLVED_SIGN_HASH=""
+RESOLVED_SIGN_NAME=""
+RESOLVED_TEAM_ID=""
 
+resolve_valid_signing_identity() {
+  local query="$1"
+  local required_team="${2:-}"
+  local identities_file pem_file line hash name cert idx cert_hash subject team
+  RESOLVED_SIGN_HASH=""
+  RESOLVED_SIGN_NAME=""
+  RESOLVED_TEAM_ID=""
+
+  identities_file="$(mktemp "${TMPDIR:-/tmp}/ccx-identities.XXXXXX")"
   pem_file="$(mktemp "${TMPDIR:-/tmp}/ccx-certs.XXXXXX")"
-  trap 'rm -f "$pem_file"' RETURN
-  security find-certificate -c "Apple Development" -a -p > "$pem_file" 2>/dev/null || return 1
+  trap 'rm -f -- "$identities_file" "$pem_file"' RETURN
+  security find-identity -v -p codesigning 2>/dev/null > "$identities_file" || return 1
 
-  # Inspect each PEM certificate block and pick the first unexpired one matching a valid signing identity.
-  local idx=0
-  while true; do
-    cert="$(awk -v target="$idx" '
-      /-----BEGIN CERTIFICATE-----/ { in_cert = 1; buf = $0 "\n"; next }
-      in_cert { buf = buf $0 "\n" }
-      /-----END CERTIFICATE-----/ {
-        if (count == target) { printf "%s", buf; exit }
-        count++; in_cert = 0; buf = ""
-      }
-    ' "$pem_file")"
-    [[ -n "$cert" ]] || break
-    idx=$((idx + 1))
+  while IFS= read -r line; do
+    hash="$(printf '%s\n' "$line" | sed -nE 's/^[[:space:]]*[0-9]+\)[[:space:]]+([A-Fa-f0-9]{40})[[:space:]]+"(.*)"$/\1/p')"
+    name="$(printf '%s\n' "$line" | sed -nE 's/^[[:space:]]*[0-9]+\)[[:space:]]+([A-Fa-f0-9]{40})[[:space:]]+"(.*)"$/\2/p')"
+    [[ -n "$hash" && -n "$name" && "$name" == *"$query"* ]] || continue
 
-    if ! printf '%s' "$cert" | openssl x509 -noout -checkend 0 >/dev/null 2>&1; then
-      continue
-    fi
-    hash="$(printf '%s' "$cert" | openssl x509 -noout -fingerprint -sha1 2>/dev/null \
-      | sed -E 's/^.*=//; s/://g' | tr '[:lower:]' '[:upper:]' || true)"
-    [[ -n "$hash" ]] || continue
-    if ! printf '%s\n' "$valid_hashes" | grep -Fxq "$hash"; then
-      continue
-    fi
-    subject="$(printf '%s' "$cert" | openssl x509 -noout -subject 2>/dev/null || true)"
-    team="$(printf '%s\n' "$subject" | grep -Eo 'OU[[:space:]]*=[[:space:]]*[A-Z0-9]{10}' | head -n 1 | grep -Eo '[A-Z0-9]{10}$' || true)"
-    if [[ -n "$team" ]]; then
-      printf '%s\n' "$team"
+    : > "$pem_file"
+    security find-certificate -c "$name" -a -p > "$pem_file" 2>/dev/null || continue
+
+    idx=0
+    while true; do
+      cert="$(awk -v target="$idx" '
+        /-----BEGIN CERTIFICATE-----/ { in_cert = 1; buf = $0 "\n"; next }
+        in_cert { buf = buf $0 "\n" }
+        /-----END CERTIFICATE-----/ {
+          if (count == target) { printf "%s", buf; exit }
+          count++; in_cert = 0; buf = ""
+        }
+      ' "$pem_file")"
+      [[ -n "$cert" ]] || break
+      idx=$((idx + 1))
+
+      if ! printf '%s' "$cert" | openssl x509 -noout -checkend 0 >/dev/null 2>&1; then
+        continue
+      fi
+      cert_hash="$(printf '%s' "$cert" | openssl x509 -noout -fingerprint -sha1 2>/dev/null \
+        | sed -E 's/^.*=//; s/://g' | tr '[:lower:]' '[:upper:]' || true)"
+      [[ "$cert_hash" == "$(printf '%s' "$hash" | tr '[:lower:]' '[:upper:]')" ]] || continue
+
+      subject="$(printf '%s' "$cert" | openssl x509 -noout -subject 2>/dev/null || true)"
+      team="$(printf '%s\n' "$subject" | grep -Eo 'OU[[:space:]]*=[[:space:]]*[A-Z0-9]{10}' | head -n 1 | grep -Eo '[A-Z0-9]{10}$' || true)"
+      [[ -n "$team" ]] || continue
+      if [[ -n "$required_team" && "$team" != "$required_team" ]]; then
+        continue
+      fi
+      RESOLVED_SIGN_HASH="$cert_hash"
+      RESOLVED_SIGN_NAME="$name"
+      RESOLVED_TEAM_ID="$team"
       return 0
-    fi
-  done
+    done
+  done < "$identities_file"
   return 1
 }
 
 # Resolve signing settings.
+# Prefer Developer ID Application when installed so local builds share the exact same
+# Designated Requirement as notarized releases and in-app updates (never invalidating TCC).
 SIGNING_ARGS=("CURRENT_PROJECT_VERSION=$TARGET_BUILD")
 TEAM_ID="${DEVELOPMENT_TEAM:-}"
-if [[ -n "$TEAM_ID" ]]; then
-  echo "==> Signing with DEVELOPMENT_TEAM=$TEAM_ID (environment)"
-  SIGNING_ARGS+=("DEVELOPMENT_TEAM=$TEAM_ID")
-elif [[ -f "$LOCAL_SIGNING_XCCONFIG" ]] && grep -Eq '^[[:space:]]*DEVELOPMENT_TEAM[[:space:]]*=[[:space:]]*[A-Z0-9]{10}' "$LOCAL_SIGNING_XCCONFIG"; then
-  echo "==> Signing with DEVELOPMENT_TEAM from $LOCAL_SIGNING_XCCONFIG"
-else
-  TEAM_ID="$(resolve_valid_apple_dev_team_id || true)"
+if [[ -z "$TEAM_ID" && -f "$LOCAL_SIGNING_XCCONFIG" ]]; then
+  TEAM_ID="$(sed -nE 's/^[[:space:]]*DEVELOPMENT_TEAM[[:space:]]*=[[:space:]]*([A-Z0-9]{10}).*$/\1/p' "$LOCAL_SIGNING_XCCONFIG" | head -n 1 || true)"
+fi
+
+if [[ -n "${CODE_SIGN_IDENTITY:-}" ]]; then
+  echo "==> Signing with explicit CODE_SIGN_IDENTITY=$CODE_SIGN_IDENTITY"
+  SIGNING_ARGS+=("CODE_SIGN_IDENTITY=$CODE_SIGN_IDENTITY")
   if [[ -n "$TEAM_ID" ]]; then
-    echo "==> Signing with Apple Development certificate (Team ID $TEAM_ID)"
     SIGNING_ARGS+=("DEVELOPMENT_TEAM=$TEAM_ID")
-  else
-    echo "warning: no valid \"Apple Development\" signing identity found in the keychain." >&2
-    echo "warning: falling back to ad-hoc signing (CODE_SIGN_IDENTITY=-)." >&2
-    echo "warning: Screen Recording / Accessibility grants will NOT persist across rebuilds." >&2
-    SIGNING_ARGS+=(
-      "CODE_SIGN_IDENTITY=-"
-      "CODE_SIGN_STYLE=Manual"
-      "DEVELOPMENT_TEAM="
-      "ENABLE_HARDENED_RUNTIME=NO"
-      "OTHER_CODE_SIGN_FLAGS="
-    )
   fi
+elif resolve_valid_signing_identity "Developer ID Application:" "$TEAM_ID"; then
+  echo "==> Signing with \"$RESOLVED_SIGN_NAME\" (Team ID $RESOLVED_TEAM_ID; matches release TCC identity)"
+  SIGNING_ARGS+=(
+    "CODE_SIGN_IDENTITY=$RESOLVED_SIGN_HASH"
+    "CODE_SIGN_STYLE=Manual"
+    "DEVELOPMENT_TEAM=$RESOLVED_TEAM_ID"
+    "CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO"
+  )
+elif [[ -n "${DEVELOPMENT_TEAM:-}" ]]; then
+  echo "==> Signing with Apple Development (DEVELOPMENT_TEAM=$TEAM_ID from environment)"
+  SIGNING_ARGS+=("DEVELOPMENT_TEAM=$TEAM_ID")
+elif [[ -n "$TEAM_ID" ]]; then
+  echo "==> Signing with Apple Development (DEVELOPMENT_TEAM=$TEAM_ID from $LOCAL_SIGNING_XCCONFIG)"
+elif resolve_valid_signing_identity "Apple Development:"; then
+  echo "==> Signing with \"$RESOLVED_SIGN_NAME\" (Team ID $RESOLVED_TEAM_ID)"
+  SIGNING_ARGS+=("DEVELOPMENT_TEAM=$RESOLVED_TEAM_ID")
+else
+  echo "warning: no valid Developer ID or Apple Development signing identity found in the keychain." >&2
+  echo "warning: falling back to ad-hoc signing (CODE_SIGN_IDENTITY=-)." >&2
+  echo "warning: Screen Recording / Accessibility grants will NOT persist across rebuilds." >&2
+  SIGNING_ARGS+=(
+    "CODE_SIGN_IDENTITY=-"
+    "CODE_SIGN_STYLE=Manual"
+    "DEVELOPMENT_TEAM="
+    "ENABLE_HARDENED_RUNTIME=NO"
+    "OTHER_CODE_SIGN_FLAGS="
+  )
 fi
 
 echo "==> Building CCX ($CONFIGURATION, $ARCH)"
@@ -189,6 +224,9 @@ fi
 echo "==> Built $APP_PATH"
 
 if [[ "$BUILD_ONLY" -eq 1 ]]; then
+  if [[ -x "$LSREGISTER" ]]; then
+    "$LSREGISTER" -u "$ROOT_DIR/$APP_PATH" >/dev/null 2>&1 || true
+  fi
   exit 0
 fi
 
@@ -264,6 +302,7 @@ if [[ "$INSTALL_APP" -eq 1 ]]; then
   trap - EXIT INT TERM
 
   if [[ -x "$LSREGISTER" ]]; then
+    "$LSREGISTER" -u "$ROOT_DIR/$APP_PATH" >/dev/null 2>&1 || true
     "$LSREGISTER" -f "$INSTALLED_APP" >/dev/null 2>&1 || true
   fi
   LAUNCH_APP="$INSTALLED_APP"

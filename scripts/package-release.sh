@@ -752,6 +752,11 @@ if [[ "$ADHOC" -eq 0 ]]; then
 fi
 
 # Resolve output directory path and copy verified CCX.app cleanly.
+LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Versions/Current/Frameworks/LaunchServices.framework/Versions/Current/Support/lsregister"
+if [[ -x "$LSREGISTER" ]]; then
+  "$LSREGISTER" -u "$BUILT_APP" >/dev/null 2>&1 || true
+fi
+
 mkdir -p -- "$OUT_DIR"
 OUT_DIR_ABS="$(cd -- "$OUT_DIR" && pwd)"
 DIST_APP="$OUT_DIR_ABS/CCX.app"
@@ -761,6 +766,9 @@ CLEANUP_PATHS+=("$APP_STAGE_DIR")
 ditto "$BUILT_APP" "$APP_STAGE_DIR/CCX.app"
 rm -rf "$DIST_APP"
 mv "$APP_STAGE_DIR/CCX.app" "$DIST_APP"
+if [[ -x "$LSREGISTER" ]]; then
+  "$LSREGISTER" -u "$DIST_APP" >/dev/null 2>&1 || true
+fi
 
 if [[ -n "$NOTARIZE_MODE" ]]; then
   notarize_artifact "$DIST_APP"
