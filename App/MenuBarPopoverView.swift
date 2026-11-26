@@ -33,7 +33,7 @@ final class MenuBarPanelModel: ObservableObject {
 
     func syncRecentSnipsOnly(clipboardStore: ClipboardStore) {
         let nextRecent = clipboardStore.history
-        if recentSnips.map(\.id) != nextRecent.map(\.id) {
+        if !recentSnips.elementsEqual(nextRecent, by: { $0.id == $1.id && $0.image === $1.image }) {
             recentSnips = nextRecent
         }
     }
@@ -124,7 +124,7 @@ struct MenuBarPopoverView: View {
     static let cornerRadius: CGFloat = 16
 
     @ObservedObject var model: MenuBarPanelModel
-    @ObservedObject var updateManager: AppUpdateManager
+    let updateManager: AppUpdateManager
     let actions: MenuBarPopoverActions
 
     var body: some View {
@@ -203,17 +203,11 @@ struct MenuBarPopoverView: View {
                 )
             }
 
-            if updateManager.shouldShowPopoverBanner {
-                UpdateAvailableBanner(updateManager: updateManager)
-            }
+            PopoverUpdateBannerSlot(updateManager: updateManager)
 
-            UtilityFooterSection(
+            PopoverUtilityFooterSlot(
                 permissions: model.permissions,
-                hasUpdateBadge: updateManager.availableRelease != nil && !updateManager.shouldShowPopoverBanner,
-                isUpdateReady: {
-                    if case .readyToInstall = updateManager.state { return true }
-                    return false
-                }(),
+                updateManager: updateManager,
                 onOpenPermissions: actions.onOpenPermissions,
                 onOpenSettings: actions.onOpenSettings,
                 onQuit: actions.onQuit
@@ -413,6 +407,20 @@ private struct QuickActionTile: View {
 
 // MARK: - Recent Snips
 
+private struct ScrollEdgeFlags: Equatable, Sendable {
+    let canScrollLeft: Bool
+    let canScrollRight: Bool
+
+    static let initialOverflow = ScrollEdgeFlags(canScrollLeft: false, canScrollRight: true)
+}
+
+@MainActor
+private final class ScrollMetricsBox {
+    var contentOffsetX: CGFloat = 0
+    var visibleWidth: CGFloat = 288
+    var contentWidth: CGFloat = 0
+}
+
 private struct ScrollEdgeState: Equatable, Sendable {
     let canScrollLeft: Bool
     let canScrollRight: Bool
@@ -428,6 +436,10 @@ private struct ScrollEdgeState: Equatable, Sendable {
         visibleWidth: 288,
         contentWidth: 0
     )
+
+    var edgeFlags: ScrollEdgeFlags {
+        ScrollEdgeFlags(canScrollLeft: canScrollLeft, canScrollRight: canScrollRight)
+    }
 
     static func from(_ geometry: ScrollGeometry) -> ScrollEdgeState {
         let visibleWidth = geometry.visibleRect.width
@@ -528,7 +540,8 @@ private struct ScrollableRecentSnipsStrip: View {
     let onPinHistory: (SnipHistoryEntry) -> Void
 
     @State private var scrollPosition = ScrollPosition(x: 0)
-    @State private var scrollEdgeState = ScrollEdgeState.initialOverflow
+    @State private var scrollEdgeFlags = ScrollEdgeFlags.initialOverflow
+    @State private var scrollMetrics = ScrollMetricsBox()
     @State private var isStripHovering = false
 
     var body: some View {
@@ -548,7 +561,13 @@ private struct ScrollableRecentSnipsStrip: View {
         .onScrollGeometryChange(for: ScrollEdgeState.self) { geometry in
             ScrollEdgeState.from(geometry)
         } action: { _, nextState in
-            scrollEdgeState = nextState
+            scrollMetrics.contentOffsetX = nextState.contentOffsetX
+            scrollMetrics.visibleWidth = nextState.visibleWidth
+            scrollMetrics.contentWidth = nextState.contentWidth
+            let nextFlags = nextState.edgeFlags
+            if scrollEdgeFlags != nextFlags {
+                scrollEdgeFlags = nextFlags
+            }
         }
         .frame(height: Self.stripHeight)
         .mask {
@@ -558,21 +577,21 @@ private struct ScrollableRecentSnipsStrip: View {
                 let rightStop = max(1 - Self.trailingFadeWidth / width, 0.75)
                 LinearGradient(
                     stops: [
-                        .init(color: .black.opacity(scrollEdgeState.canScrollLeft ? 0 : 1), location: 0),
+                        .init(color: .black.opacity(scrollEdgeFlags.canScrollLeft ? 0 : 1), location: 0),
                         .init(color: .black, location: leftStop),
                         .init(color: .black, location: rightStop),
-                        .init(color: .black.opacity(scrollEdgeState.canScrollRight ? 0 : 1), location: 1),
+                        .init(color: .black.opacity(scrollEdgeFlags.canScrollRight ? 0 : 1), location: 1),
                     ],
                     startPoint: .leading,
                     endPoint: .trailing
                 )
-                .animation(.easeInOut(duration: 0.16), value: scrollEdgeState.canScrollLeft)
-                .animation(.easeInOut(duration: 0.16), value: scrollEdgeState.canScrollRight)
+                .animation(.easeInOut(duration: 0.16), value: scrollEdgeFlags.canScrollLeft)
+                .animation(.easeInOut(duration: 0.16), value: scrollEdgeFlags.canScrollRight)
             }
         }
         .overlay(alignment: .leading) {
             Group {
-                if isStripHovering && scrollEdgeState.canScrollLeft {
+                if isStripHovering && scrollEdgeFlags.canScrollLeft {
                     ScrollStepButton(
                         symbol: "chevron.left",
                         label: CCXL10n.text("Scroll newer snips", zh: "查看较新截屏"),
@@ -582,11 +601,11 @@ private struct ScrollableRecentSnipsStrip: View {
                     .transition(.opacity)
                 }
             }
-            .animation(.easeInOut(duration: 0.15), value: isStripHovering && scrollEdgeState.canScrollLeft)
+            .animation(.easeInOut(duration: 0.15), value: isStripHovering && scrollEdgeFlags.canScrollLeft)
         }
         .overlay(alignment: .trailing) {
             Group {
-                if isStripHovering && scrollEdgeState.canScrollRight {
+                if isStripHovering && scrollEdgeFlags.canScrollRight {
                     ScrollStepButton(
                         symbol: "chevron.right",
                         label: CCXL10n.text("Scroll older snips", zh: "查看较早截屏"),
@@ -596,7 +615,7 @@ private struct ScrollableRecentSnipsStrip: View {
                     .transition(.opacity)
                 }
             }
-            .animation(.easeInOut(duration: 0.15), value: isStripHovering && scrollEdgeState.canScrollRight)
+            .animation(.easeInOut(duration: 0.15), value: isStripHovering && scrollEdgeFlags.canScrollRight)
         }
         .onAppear {
             scrollPosition.scrollTo(x: 0)
@@ -608,20 +627,20 @@ private struct ScrollableRecentSnipsStrip: View {
     }
 
     private func stepScroll(direction: CGFloat) {
-        let visibleWidth = scrollEdgeState.visibleWidth > 0
-            ? scrollEdgeState.visibleWidth
+        let visibleWidth = scrollMetrics.visibleWidth > 0
+            ? scrollMetrics.visibleWidth
             : Self.fallbackVisibleWidth
         let estimatedContentWidth = CGFloat(entries.count) * Self.thumbnailWidth
             + CGFloat(max(0, entries.count - 1)) * Self.thumbnailSpacing
             + Self.horizontalInset * 2
-        let contentWidth = scrollEdgeState.contentWidth > 0
-            ? scrollEdgeState.contentWidth
+        let contentWidth = scrollMetrics.contentWidth > 0
+            ? scrollMetrics.contentWidth
             : estimatedContentWidth
         let maxOffset = max(0, contentWidth - visibleWidth)
         guard maxOffset > 0 else { return }
 
         let stepWidth = Self.stepThumbnails * (Self.thumbnailWidth + Self.thumbnailSpacing)
-        var targetX = scrollEdgeState.contentOffsetX + direction * stepWidth
+        var targetX = scrollMetrics.contentOffsetX + direction * stepWidth
         if direction > 0, maxOffset - targetX < 20 {
             targetX = maxOffset
         } else if direction < 0, targetX < 20 {
@@ -893,6 +912,39 @@ private struct PinControlPill: View {
 }
 
 // MARK: - In-App Update Banner
+
+private struct PopoverUpdateBannerSlot: View {
+    @ObservedObject var updateManager: AppUpdateManager
+
+    var body: some View {
+        if updateManager.shouldShowPopoverBanner {
+            UpdateAvailableBanner(updateManager: updateManager)
+        }
+    }
+}
+
+private struct PopoverUtilityFooterSlot: View {
+    let permissions: CCXPermissionStatus
+    @ObservedObject var updateManager: AppUpdateManager
+    let onOpenPermissions: () -> Void
+    let onOpenSettings: () -> Void
+    let onQuit: () -> Void
+
+    var body: some View {
+        let isReady: Bool = {
+            if case .readyToInstall = updateManager.state { return true }
+            return false
+        }()
+        UtilityFooterSection(
+            permissions: permissions,
+            hasUpdateBadge: updateManager.availableRelease != nil && !updateManager.shouldShowPopoverBanner,
+            isUpdateReady: isReady,
+            onOpenPermissions: onOpenPermissions,
+            onOpenSettings: onOpenSettings,
+            onQuit: onQuit
+        )
+    }
+}
 
 private struct UpdateAvailableBanner: View {
     @ObservedObject var updateManager: AppUpdateManager

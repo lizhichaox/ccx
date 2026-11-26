@@ -303,11 +303,7 @@ public enum GitHubReleaseParser {
         }
 
         guard let releaseURL = URL(string: payload.htmlURL),
-              AppUpdateURLPolicy.isAllowedDownloadURL(releaseURL),
-              releaseURL.host?.lowercased() == "github.com",
-              releaseURL.path.lowercased().hasPrefix("/lizhichaox/ccx/releases/"),
-              releaseURL.standardized.path.lowercased().hasPrefix("/lizhichaox/ccx/releases/"),
-              !releaseURL.path.split(separator: "/").contains("..")
+              isAllowedRepoReleaseURL(releaseURL, requireGitHubHost: true)
         else {
             throw AppUpdateError.untrustedURL
         }
@@ -337,9 +333,9 @@ public enum GitHubReleaseParser {
         }
 
         guard let zipDownloadURL = URL(string: zipAsset.browserDownloadURL),
-              AppUpdateURLPolicy.isAllowedDownloadURL(zipDownloadURL),
+              isAllowedRepoReleaseURL(zipDownloadURL, requireGitHubHost: false),
               let checksumsDownloadURL = URL(string: checksumsAsset.browserDownloadURL),
-              AppUpdateURLPolicy.isAllowedDownloadURL(checksumsDownloadURL)
+              isAllowedRepoReleaseURL(checksumsDownloadURL, requireGitHubHost: false)
         else {
             throw AppUpdateError.untrustedURL
         }
@@ -347,7 +343,7 @@ public enum GitHubReleaseParser {
         let dmgDownloadURL: URL?
         if let dmgAsset = assets.first(where: { $0.name == expectedDMGName }) {
             guard let url = URL(string: dmgAsset.browserDownloadURL),
-                  AppUpdateURLPolicy.isAllowedDownloadURL(url)
+                  isAllowedRepoReleaseURL(url, requireGitHubHost: false)
             else {
                 throw AppUpdateError.untrustedURL
             }
@@ -370,6 +366,25 @@ public enum GitHubReleaseParser {
             publishedAt: publishedAt
         )
         return .updateAvailable(info)
+    }
+
+    private static func isAllowedRepoReleaseURL(_ url: URL, requireGitHubHost: Bool) -> Bool {
+        guard AppUpdateURLPolicy.isAllowedDownloadURL(url),
+              let host = url.host?.lowercased()
+        else {
+            return false
+        }
+        if host == "github.com" {
+            let lowerPath = url.path.lowercased()
+            let lowerStandardizedPath = url.standardized.path.lowercased()
+            return lowerPath.hasPrefix("/lizhichaox/ccx/releases/")
+                && lowerStandardizedPath.hasPrefix("/lizhichaox/ccx/releases/")
+                && !url.path.split(separator: "/").contains("..")
+        }
+        if requireGitHubHost || host == "api.github.com" {
+            return false
+        }
+        return true
     }
 
     private static func parseISO8601Date(_ raw: String) -> Date? {
@@ -647,7 +662,7 @@ public enum AppCodeSignatureVerifier {
             throw AppUpdateError.signatureVerificationFailed(reqStatus)
         }
 
-        let checkFlags = SecCSFlags(rawValue: kSecCSCheckAllArchitectures | kSecCSStrictValidate)
+        let checkFlags = SecCSFlags(rawValue: kSecCSCheckAllArchitectures | kSecCSStrictValidate | kSecCSCheckNestedCode)
         let validityStatus = SecStaticCodeCheckValidity(staticCode, checkFlags, requirement)
         guard validityStatus == errSecSuccess else {
             throw AppUpdateError.signatureVerificationFailed(validityStatus)
@@ -663,7 +678,11 @@ public enum AppCodeSignatureVerifier {
               let signedTeamID = signingInfo[kSecCodeInfoTeamIdentifier as String] as? String,
               signedTeamID == expectedTeamID,
               let rawFlags = (signingInfo[kSecCodeInfoFlags as String] as? NSNumber)?.uint32Value,
-              (rawFlags & SecCodeSignatureFlags.runtime.rawValue) != 0
+              (rawFlags & SecCodeSignatureFlags.runtime.rawValue) != 0,
+              let sealedPlist = signingInfo[kSecCodeInfoPList as String] as? [String: Any],
+              (sealedPlist["CFBundleIdentifier"] as? String) == expectedBundleID,
+              (sealedPlist["CFBundleShortVersionString"] as? String) == expectedVersion.description,
+              (sealedPlist["CFBundleExecutable"] as? String) == executableName
         else {
             throw AppUpdateError.signatureVerificationFailed(infoStatus == errSecSuccess ? errSecCSReqFailed : infoStatus)
         }
@@ -763,12 +782,16 @@ public enum AppCodeSignatureVerifier {
 public enum AppUpdateArchiveValidator {
     public static let maxZipEntries = 2_000
     public static let maxExtractedBytes: UInt64 = 250 * 1024 * 1024
+    public static let maxCentralDirectoryBytes: UInt64 = 4 * 1024 * 1024
 
     private static let eocdSignature: UInt32 = 0x0605_4B50
     private static let centralDirSignature: UInt32 = 0x0201_4B50
+    private static let localFileHeaderSignature: UInt32 = 0x0403_4B50
     private static let eocdMinSize = 22
     private static let maxEOCDSearchBytes: UInt64 = 65_557 // 22 + 65,535 max comment
     private static let centralDirHeaderMinSize = 46
+    private static let localFileHeaderMinSize = 30
+    private static let zip64ExtraHeaderID: UInt16 = 0x0001
 
     /// Validates the ZIP archive at `zipURL` via `O_NOFOLLOW`, `fstat`, and bounded `pread`
     /// over its End of Central Directory and Central Directory File Headers.
@@ -848,6 +871,7 @@ public enum AppUpdateArchiveValidator {
         let (cdEndOffset, cdOverflow) = cdOffset64.addingReportingOverflow(cdSize64)
         guard !cdOverflow,
               cdSize64 > 0,
+              cdSize64 <= maxCentralDirectoryBytes,
               cdEndOffset <= foundEOCDOffset,
               cdSize64 <= UInt64(Int.max)
         else {
@@ -868,6 +892,8 @@ public enum AppUpdateArchiveValidator {
             }
 
             let versionMadeBy = readUInt16LE(cdBytes, at: cursor + 4)
+            let generalPurposeFlags = readUInt16LE(cdBytes, at: cursor + 8)
+            let compressionMethod = readUInt16LE(cdBytes, at: cursor + 10)
             let compressedSize = readUInt32LE(cdBytes, at: cursor + 20)
             let uncompressedSize = readUInt32LE(cdBytes, at: cursor + 24)
             let nameLen = Int(readUInt16LE(cdBytes, at: cursor + 28))
@@ -878,6 +904,8 @@ public enum AppUpdateArchiveValidator {
             let localHeaderOffset = readUInt32LE(cdBytes, at: cursor + 42)
 
             guard diskNumberStart == 0,
+                  (generalPurposeFlags & 0x0001) == 0,
+                  compressionMethod == 0 || compressionMethod == 8,
                   compressedSize != 0xFFFF_FFFF,
                   uncompressedSize != 0xFFFF_FFFF,
                   localHeaderOffset != 0xFFFF_FFFF
@@ -902,6 +930,11 @@ public enum AppUpdateArchiveValidator {
             let nameStart = cursor + centralDirHeaderMinSize
             let nameEnd = nameStart + nameLen
             let nameSlice = cdBytes[nameStart..<nameEnd]
+            let extraStart = nameEnd
+            let extraEnd = extraStart + extraLen
+            guard !containsZip64ExtraField(cdBytes[extraStart..<extraEnd]) else {
+                throw AppUpdateError.extractionFailed
+            }
             guard !nameSlice.contains(0),
                   let entryName = String(bytes: nameSlice, encoding: .utf8),
                   !entryName.contains("\0"),
@@ -933,8 +966,8 @@ public enum AppUpdateArchiveValidator {
             }
 
             let hostOS = versionMadeBy >> 8
-            if hostOS == 3 || hostOS == 19 {
-                let mode = UInt16((externalAttrs >> 16) & 0xFFFF)
+            let mode = UInt16((externalAttrs >> 16) & 0xFFFF)
+            if hostOS == 3 || hostOS == 19 || mode != 0 {
                 if (mode & 0o6000) != 0 {
                     throw AppUpdateError.extractionFailed
                 }
@@ -947,12 +980,83 @@ public enum AppUpdateArchiveValidator {
                 }
             }
 
+            // Cross-validate the Local File Header to prevent Central Directory / LFH parser differentials.
+            let localOffset64 = UInt64(localHeaderOffset)
+            let (lfhFixedEnd, lfhFixedOverflow) = localOffset64.addingReportingOverflow(UInt64(localFileHeaderMinSize))
+            guard !lfhFixedOverflow, lfhFixedEnd <= cdOffset64 else {
+                throw AppUpdateError.extractionFailed
+            }
+            let lfhBytes = try readExact(from: fd, offset: localOffset64, count: localFileHeaderMinSize)
+            guard readUInt32LE(lfhBytes, at: 0) == localFileHeaderSignature else {
+                throw AppUpdateError.extractionFailed
+            }
+            let lfhFlags = readUInt16LE(lfhBytes, at: 6)
+            let lfhMethod = readUInt16LE(lfhBytes, at: 8)
+            let lfhCompressedSize = readUInt32LE(lfhBytes, at: 18)
+            let lfhUncompressedSize = readUInt32LE(lfhBytes, at: 22)
+            let lfhNameLen = Int(readUInt16LE(lfhBytes, at: 26))
+            let lfhExtraLen = Int(readUInt16LE(lfhBytes, at: 28))
+
+            guard (lfhFlags & 0x0001) == 0,
+                  lfhMethod == compressionMethod,
+                  lfhNameLen == nameLen,
+                  lfhCompressedSize != 0xFFFF_FFFF,
+                  lfhUncompressedSize != 0xFFFF_FFFF
+            else {
+                throw AppUpdateError.extractionFailed
+            }
+
+            let usesDataDescriptor = (lfhFlags & 0x0008) != 0
+            if usesDataDescriptor {
+                let sizesZeroed = (lfhCompressedSize == 0 && lfhUncompressedSize == 0)
+                let sizesMatch = (lfhCompressedSize == compressedSize && lfhUncompressedSize == uncompressedSize)
+                guard sizesZeroed || sizesMatch else {
+                    throw AppUpdateError.extractionFailed
+                }
+            } else {
+                guard lfhCompressedSize == compressedSize, lfhUncompressedSize == uncompressedSize else {
+                    throw AppUpdateError.extractionFailed
+                }
+            }
+
+            let lfhVarLen = lfhNameLen + lfhExtraLen
+            let (lfhVarEnd, lfhVarOverflow) = lfhFixedEnd.addingReportingOverflow(UInt64(lfhVarLen))
+            let (lfhDataEnd, lfhDataOverflow) = lfhVarEnd.addingReportingOverflow(UInt64(compressedSize))
+            guard !lfhVarOverflow, !lfhDataOverflow, lfhDataEnd <= cdOffset64 else {
+                throw AppUpdateError.extractionFailed
+            }
+
+            let lfhVarBytes = try readExact(from: fd, offset: lfhFixedEnd, count: lfhVarLen)
+            let lfhNameSlice = lfhVarBytes[0..<lfhNameLen]
+            let lfhExtraSlice = lfhVarBytes[lfhNameLen..<lfhVarLen]
+            guard lfhNameSlice.elementsEqual(nameSlice),
+                  !containsZip64ExtraField(lfhExtraSlice)
+            else {
+                throw AppUpdateError.extractionFailed
+            }
+
             cursor += entryHeaderTotal
         }
 
         guard cursor == cdBytes.count, hasCCXAppEntry else {
             throw AppUpdateError.extractionFailed
         }
+    }
+
+    private static func containsZip64ExtraField(_ bytes: ArraySlice<UInt8>) -> Bool {
+        var idx = bytes.startIndex
+        while idx < bytes.endIndex {
+            guard bytes.endIndex - idx >= 4 else { return true }
+            let headerID = UInt16(bytes[idx]) | (UInt16(bytes[idx + 1]) << 8)
+            let dataSize = Int(UInt16(bytes[idx + 2]) | (UInt16(bytes[idx + 3]) << 8))
+            if headerID == zip64ExtraHeaderID {
+                return true
+            }
+            let nextIdx = idx + 4 + dataSize
+            guard nextIdx <= bytes.endIndex else { return true }
+            idx = nextIdx
+        }
+        return false
     }
 
     private static func readExact(from fd: Int32, offset: UInt64, count: Int) throws -> [UInt8] {
@@ -1273,6 +1377,9 @@ public enum AppUpdateInstaller {
         currentPID: Int32 = ProcessInfo.processInfo.processIdentifier,
         relaunch: Bool = true
     ) throws {
+        guard currentPID > 1 else {
+            throw AppUpdateError.installFailed(Messages.verifyUpdateBundleFailed)
+        }
         let uid = Darwin.getuid()
         let stagedPath = normalizedPath(stagedSiblingAppURL.path)
         let targetPath = normalizedPath(targetAppURL.path)
@@ -1353,6 +1460,10 @@ public enum AppUpdateInstaller {
           /bin/rm -rf -- "$staged" "$cleanup"
           exit 0
         fi
+        if [ -L "$target" ] || [ ! -d "$target" ] || [ -L "$staged" ] || [ ! -d "$staged" ] || [ -e "$backup" ] || [ -L "$backup" ]; then
+          /bin/rm -rf -- "$staged" "$cleanup"
+          exit 1
+        fi
         if ! /bin/mv -- "$target" "$backup"; then
           /bin/rm -rf -- "$staged" "$cleanup"
           exit 1
@@ -1403,14 +1514,17 @@ public enum AppUpdateInstaller {
             return Darwin.chmod(path, 0o700) == 0
         }
         guard errno == ENOENT else { return false }
-        do {
-            try FileManager.default.createDirectory(
-                at: url,
-                withIntermediateDirectories: true,
-                attributes: [.posixPermissions: 0o700]
-            )
-        } catch {
-            return false
+        if Darwin.mkdir(path, 0o700) != 0 && errno != EEXIST {
+            guard errno == ENOENT else { return false }
+            do {
+                try FileManager.default.createDirectory(
+                    at: url,
+                    withIntermediateDirectories: true,
+                    attributes: [.posixPermissions: 0o700]
+                )
+            } catch {
+                return false
+            }
         }
         guard Darwin.lstat(path, &st) == 0,
               (st.st_mode & S_IFMT) == S_IFDIR,
@@ -1599,6 +1713,11 @@ public final class URLSessionAppUpdateTransport: AppUpdateTransport {
         return request
     }
 
+    private struct CancellationState {
+        var cancelled = false
+        var task: URLSessionDataTask?
+    }
+
     private func runStreamingRequest(
         request: URLRequest,
         destinationURL: URL?,
@@ -1606,8 +1725,7 @@ public final class URLSessionAppUpdateTransport: AppUpdateTransport {
         expectedBytesHint: Int64?,
         onProgress: (@Sendable (Double) -> Void)?
     ) async throws -> Data {
-        let taskBox = OSAllocatedUnfairLock<URLSessionDataTask?>(initialState: nil)
-        let cancelledFlag = OSAllocatedUnfairLock<Bool>(initialState: false)
+        let cancelLock = OSAllocatedUnfairLock<CancellationState>(initialState: CancellationState())
 
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
@@ -1626,21 +1744,35 @@ public final class URLSessionAppUpdateTransport: AppUpdateTransport {
                 config.timeoutIntervalForRequest = requestTimeout
                 config.timeoutIntervalForResource = resourceTimeout
 
-                let session = URLSession(configuration: config, delegate: delegate, delegateQueue: nil)
+                let delegateQueue = OperationQueue()
+                delegateQueue.name = "com.lizhichaox.ccx.updater-session"
+                delegateQueue.maxConcurrentOperationCount = 1
+                delegateQueue.qualityOfService = .utility
+
+                let session = URLSession(configuration: config, delegate: delegate, delegateQueue: delegateQueue)
                 let task = session.dataTask(with: request)
-                let alreadyCancelled = cancelledFlag.withLock { $0 }
+                let alreadyCancelled: Bool = cancelLock.withLock { state in
+                    if state.cancelled {
+                        return true
+                    }
+                    state.task = task
+                    return false
+                }
                 if alreadyCancelled {
                     session.invalidateAndCancel()
                     delegate.finishWithError(AppUpdateError.cancelled)
                     return
                 }
-                taskBox.withLock { $0 = task }
                 task.resume()
                 session.finishTasksAndInvalidate()
             }
         } onCancel: {
-            cancelledFlag.withLock { $0 = true }
-            let task = taskBox.withLock { $0 }
+            let task: URLSessionDataTask? = cancelLock.withLock { state in
+                state.cancelled = true
+                let current = state.task
+                state.task = nil
+                return current
+            }
             task?.cancel()
         }
     }
@@ -1649,7 +1781,6 @@ public final class URLSessionAppUpdateTransport: AppUpdateTransport {
 private final class StreamingUpdateSessionDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
     private struct State {
         var buffer = Data()
-        var fileDescriptor: Int32 = -1
         var receivedBytes: Int64 = 0
         var expectedBytes: Int64 = -1
         var lastReportedProgress: Double = -1
@@ -1662,6 +1793,8 @@ private final class StreamingUpdateSessionDelegate: NSObject, URLSessionDataDele
     private let expectedBytesHint: Int64?
     private let onProgress: (@Sendable (Double) -> Void)?
     private let state: OSAllocatedUnfairLock<State>
+    // Accessed exclusively on the URLSession's serial `delegateQueue` (never under `OSAllocatedUnfairLock`).
+    private var fileDescriptor: Int32 = -1
 
     init(
         destinationURL: URL?,
@@ -1680,7 +1813,6 @@ private final class StreamingUpdateSessionDelegate: NSObject, URLSessionDataDele
 
     func finishWithError(_ error: AppUpdateError) {
         let continuation = state.withLock { state -> CheckedContinuation<Data, Error>? in
-            closeAndCleanupOnFailure(&state)
             let cont = state.continuation
             state.continuation = nil
             return cont
@@ -1754,59 +1886,60 @@ private final class StreamingUpdateSessionDelegate: NSObject, URLSessionDataDele
             effectiveExpectedBytes = -1
         }
 
-        let openSucceeded: Bool = state.withLock { state in
-            state.expectedBytes = effectiveExpectedBytes
-            if let destinationURL {
-                let fd = Darwin.open(destinationURL.path, O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW, 0o600)
-                guard fd >= 0 else {
-                    state.overrideError = .installFailed(AppUpdateInstaller.Messages.createTempDownloadFileFailed)
-                    return false
-                }
-                state.fileDescriptor = fd
+        if let destinationURL {
+            let fd = Darwin.open(destinationURL.path, O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW, 0o600)
+            guard fd >= 0 else {
+                fail(
+                    task: dataTask,
+                    error: .installFailed(AppUpdateInstaller.Messages.createTempDownloadFileFailed),
+                    completionHandler: completionHandler
+                )
+                return
             }
-            return true
+            fileDescriptor = fd
         }
 
-        guard openSucceeded else {
-            completionHandler(.cancel)
-            return
-        }
+        state.withLock { $0.expectedBytes = effectiveExpectedBytes }
         completionHandler(.allow)
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        let preCheck: (proceed: Bool, nextTotal: Int64) = state.withLock { state in
+            guard state.overrideError == nil else { return (false, 0) }
+            let (nextTotal, overflow) = state.receivedBytes.addingReportingOverflow(Int64(data.count))
+            if overflow || nextTotal > maxBytes {
+                state.overrideError = .responseTooLarge
+                return (false, 0)
+            }
+            return (true, nextTotal)
+        }
+
+        guard preCheck.proceed else {
+            dataTask.cancel()
+            return
+        }
+
+        if destinationURL != nil {
+            guard fileDescriptor >= 0, writeAll(data, to: fileDescriptor) else {
+                state.withLock { $0.overrideError = .installFailed(AppUpdateInstaller.Messages.writeDownloadedUpdateFailed) }
+                dataTask.cancel()
+                return
+            }
+        }
+
         let progressToEmit: Double? = state.withLock { state in
             guard state.overrideError == nil else { return nil }
-
-            let nextTotal = state.receivedBytes + Int64(data.count)
-            if nextTotal > maxBytes {
-                state.overrideError = .responseTooLarge
-                return nil
-            }
-
-            if destinationURL != nil {
-                guard state.fileDescriptor >= 0, writeAll(data, to: state.fileDescriptor) else {
-                    state.overrideError = .installFailed(AppUpdateInstaller.Messages.writeDownloadedUpdateFailed)
-                    return nil
-                }
-            } else {
+            if destinationURL == nil {
                 state.buffer.append(data)
             }
-
-            state.receivedBytes = nextTotal
+            state.receivedBytes = preCheck.nextTotal
             guard onProgress != nil, state.expectedBytes > 0 else { return nil }
-            let ratio = min(max(Double(nextTotal) / Double(state.expectedBytes), 0), 1)
+            let ratio = min(max(Double(preCheck.nextTotal) / Double(state.expectedBytes), 0), 1)
             if state.lastReportedProgress < 0 || ratio - state.lastReportedProgress >= 0.01 || ratio >= 1.0 {
                 state.lastReportedProgress = ratio
                 return ratio
             }
             return nil
-        }
-
-        let shouldCancel = state.withLock { $0.overrideError != nil }
-        if shouldCancel {
-            dataTask.cancel()
-            return
         }
 
         if let progressToEmit, let onProgress {
@@ -1815,24 +1948,42 @@ private final class StreamingUpdateSessionDelegate: NSObject, URLSessionDataDele
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        let hasFailure = error != nil || state.withLock { $0.overrideError != nil }
+        let closeFailed: Bool
+        if hasFailure {
+            closeAndCleanupOnFailure()
+            closeFailed = false
+        } else if !closeFileDescriptor() {
+            closeFailed = true
+            if let destinationURL {
+                _ = Darwin.unlink(destinationURL.path)
+            }
+        } else {
+            closeFailed = false
+        }
+
         let outcome: (CheckedContinuation<Data, Error>?, Result<Data, Error>, Bool) = state.withLock { state in
             guard let continuation = state.continuation else {
-                closeFileDescriptor(&state)
                 return (nil, .failure(AppUpdateError.cancelled), false)
             }
             state.continuation = nil
 
             if let overrideError = state.overrideError {
-                closeAndCleanupOnFailure(&state)
                 return (continuation, .failure(overrideError), false)
             }
 
             if let error {
-                closeAndCleanupOnFailure(&state)
                 return (continuation, .failure(Self.mapError(error)), false)
             }
 
-            closeFileDescriptor(&state)
+            if closeFailed {
+                return (
+                    continuation,
+                    .failure(AppUpdateError.installFailed(AppUpdateInstaller.Messages.writeDownloadedUpdateFailed)),
+                    false
+                )
+            }
+
             let emitFinalProgress = onProgress != nil && state.lastReportedProgress < 1.0
             if emitFinalProgress {
                 state.lastReportedProgress = 1.0
@@ -1857,15 +2008,15 @@ private final class StreamingUpdateSessionDelegate: NSObject, URLSessionDataDele
         completionHandler(.cancel)
     }
 
-    private func closeFileDescriptor(_ state: inout State) {
-        if state.fileDescriptor >= 0 {
-            _ = Darwin.close(state.fileDescriptor)
-            state.fileDescriptor = -1
-        }
+    private func closeFileDescriptor() -> Bool {
+        guard fileDescriptor >= 0 else { return true }
+        let fd = fileDescriptor
+        fileDescriptor = -1
+        return Darwin.close(fd) == 0
     }
 
-    private func closeAndCleanupOnFailure(_ state: inout State) {
-        closeFileDescriptor(&state)
+    private func closeAndCleanupOnFailure() {
+        _ = closeFileDescriptor()
         if let destinationURL {
             _ = Darwin.unlink(destinationURL.path)
         }
@@ -2313,9 +2464,9 @@ public final class AppUpdateManager: ObservableObject {
     }
 
     /// Synchronously applies a prepared `.readyToInstall` update during application termination
-    /// without relaunching CCX, so the user starts on the new version on their next launch.
+    /// (without relaunching by default, or with `relaunch: true` when triggered by an explicit app relaunch).
     @discardableResult
-    public func applyPreparedUpdateOnQuitIfReady() -> Bool {
+    public func applyPreparedUpdateOnQuitIfReady(relaunch: Bool = false) -> Bool {
         guard automaticallyChecksForUpdates,
               case .readyToInstall(let release) = state,
               let prepared = preparedUpdate,
@@ -2337,19 +2488,33 @@ public final class AppUpdateManager: ObservableObject {
             return false
         }
 
+        var verified = false
         do {
             let expectedTeamID = currentTeamIDProvider()
             try verifyHandler(prepared.verifiedAppURL, currentBundleID, release.version, expectedTeamID)
-            try installHandler(prepared.verifiedAppURL, targetAppURL, prepared.stagingDirURL, false)
+            verified = true
+            try installHandler(prepared.verifiedAppURL, targetAppURL, prepared.stagingDirURL, relaunch)
             preparedUpdate = nil
             state = .installing(release)
             return true
         } catch {
-            if !FileManager.default.fileExists(atPath: prepared.verifiedAppURL.path) {
+            if !verified || !FileManager.default.fileExists(atPath: prepared.verifiedAppURL.path) {
                 clearPreparedUpdate()
+                state = .available(release)
             }
             return false
         }
+    }
+
+    /// Recovers from `.installing` if `NSApplication` cancels termination after an install helper was launched.
+    public func notifyTerminationCancelled() {
+        guard case .installing(let release) = state else { return }
+        cancelIdleInstallTask()
+        activeTask?.cancel()
+        activeTask = nil
+        activeTaskID = UUID()
+        clearPreparedUpdate()
+        state = .available(release)
     }
 
     /// Cancels any active download, verification, or pending idle-install timer, cleans up

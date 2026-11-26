@@ -370,6 +370,23 @@ final class AppUpdaterTests: XCTestCase {
                 XCTAssertEqual(error as? AppUpdateError, .untrustedURL)
             }
         }
+
+        // Cross-repo asset download URL on github.com must also be rejected.
+        let spoofedAssetRepo = try makeReleaseJSON(assets: [
+            [
+                "name": "CCX-0.5.0-macOS-universal.zip",
+                "browser_download_url": "https://github.com/other/repo/releases/download/v0.5.0/CCX-0.5.0-macOS-universal.zip",
+                "size": 1024,
+            ],
+            [
+                "name": "SHA256SUMS.txt",
+                "browser_download_url": "https://github.com/lizhichaox/ccx/releases/download/v0.5.0/SHA256SUMS.txt",
+                "size": 128,
+            ],
+        ])
+        XCTAssertThrowsError(try GitHubReleaseParser.parseLatestRelease(data: spoofedAssetRepo, currentVersion: current)) { error in
+            XCTAssertEqual(error as? AppUpdateError, .untrustedURL)
+        }
     }
 
     // MARK: 4. AppUpdateChecksumVerifier
@@ -1651,6 +1668,48 @@ final class AppUpdaterTests: XCTestCase {
         XCTAssertThrowsError(try AppUpdateArchiveValidator.validateZipArchive(at: tooManyEntriesZip)) { error in
             XCTAssertEqual(error as? AppUpdateError, .extractionFailed)
         }
+
+        // 8. MS-DOS hostOS=0 carrying Unix symlink or setuid bits in externalAttrs must still be rejected.
+        let msdosSymlinkZip = dir.appendingPathComponent("msdos-symlink.zip")
+        try makeSyntheticZipData(entries: [
+            SyntheticZipEntry(name: "CCX.app/", unixMode: UInt16(S_IFDIR) | 0o755),
+            SyntheticZipEntry(
+                name: "CCX.app/Contents/Link",
+                payload: Data("/etc/passwd".utf8),
+                versionMadeBy: 20, // hostOS = 0 (MS-DOS)
+                unixMode: UInt16(S_IFLNK) | 0o777
+            ),
+        ]).write(to: msdosSymlinkZip)
+        XCTAssertThrowsError(try AppUpdateArchiveValidator.validateZipArchive(at: msdosSymlinkZip)) { error in
+            XCTAssertEqual(error as? AppUpdateError, .extractionFailed)
+        }
+
+        // 9. Local File Header vs Central Directory filename mismatch (parser differential) -> .extractionFailed.
+        var differentialBytes = makeSyntheticZipData(entries: [
+            SyntheticZipEntry(name: "CCX.app/Contents/Info.plist", payload: Data("ok".utf8)),
+        ])
+        // Overwrite the Local File Header filename (starts at offset 30, same length 27 bytes) with traversal path.
+        let evilLFHName = Data("../evil/Contents/Info.plist".utf8)
+        XCTAssertEqual(evilLFHName.count, "CCX.app/Contents/Info.plist".utf8.count)
+        differentialBytes.replaceSubrange(30..<(30 + evilLFHName.count), with: evilLFHName)
+        let differentialZip = dir.appendingPathComponent("lfh-mismatch.zip")
+        try differentialBytes.write(to: differentialZip)
+        XCTAssertThrowsError(try AppUpdateArchiveValidator.validateZipArchive(at: differentialZip)) { error in
+            XCTAssertEqual(error as? AppUpdateError, .extractionFailed)
+        }
+
+        // 10. Encrypted entry (general-purpose bit flag 0x0001) -> .extractionFailed.
+        var encryptedBytes = makeSyntheticZipData(entries: [
+            SyntheticZipEntry(name: "CCX.app/Contents/Info.plist", payload: Data("ok".utf8)),
+        ])
+        // Set bit 0 in both LFH (offset 6) and CD (offset 30 + 27 + 2 + 8 = 67).
+        encryptedBytes[6] |= 0x01
+        encryptedBytes[30 + 27 + 2 + 8] |= 0x01
+        let encryptedZip = dir.appendingPathComponent("encrypted.zip")
+        try encryptedBytes.write(to: encryptedZip)
+        XCTAssertThrowsError(try AppUpdateArchiveValidator.validateZipArchive(at: encryptedZip)) { error in
+            XCTAssertEqual(error as? AppUpdateError, .extractionFailed)
+        }
     }
 
     func testLaunchAtomicReplaceWithoutRelaunchSwapsBundlesCleanly() async throws {
@@ -1786,6 +1845,109 @@ final class AppUpdaterTests: XCTestCase {
             )
         )
         XCTAssertTrue(FileManager.default.fileExists(atPath: sentinel.path))
+
+        // 7. Invalid PID (<= 1) must be rejected before launching /bin/sh.
+        for badPID in [Int32(0), Int32(-1), Int32(1)] {
+            XCTAssertThrowsError(
+                try AppUpdateInstaller.launchAtomicReplaceAndRelaunch(
+                    stagedSiblingAppURL: validStagedApp,
+                    targetAppURL: targetApp,
+                    cleanupDirectoryURL: validCleanupDir,
+                    currentPID: badPID,
+                    relaunch: false
+                )
+            )
+        }
+    }
+
+    @MainActor
+    func testTerminationCancelledRecoversFromInstallingAndQuitVerifyFailureCleansStaging() async throws {
+        let (fakeInstalledApp, transport) = try makePreDownloadFixtures()
+        let verifyCount = AtomicBox<Int>(0)
+        let relaunchFlags = AtomicBox<[Bool]>([])
+
+        let manager = AppUpdateManager(
+            userDefaults: makeTestUserDefaults(),
+            currentVersion: AppSemanticVersion(major: 0, minor: 4, patch: 4),
+            currentBundleID: "com.lizhichaox.ccx",
+            currentBundleURL: fakeInstalledApp,
+            currentTeamIDProvider: { "TESTTEAM01" },
+            transport: transport,
+            extractHandler: { _, destinationDir in
+                let extracted = destinationDir.appendingPathComponent("CCX.app", isDirectory: true)
+                try FileManager.default.createDirectory(at: extracted, withIntermediateDirectories: true)
+                return extracted
+            },
+            verifyHandler: { _, _, _, _ in
+                verifyCount.value += 1
+            },
+            installHandler: { _, _, _, relaunch in
+                relaunchFlags.value.append(relaunch)
+            },
+            canTerminateNow: { true },
+            canInstallSilentlyNow: { false },
+            terminateHandler: {}
+        )
+
+        manager.checkForUpdatesInBackgroundIfDue(now: Date())
+        await manager.waitForActiveTask()
+        XCTAssertTrue(manager.applyPreparedUpdateOnQuitIfReady(relaunch: true))
+        XCTAssertEqual(relaunchFlags.value, [true])
+        if case .installing = manager.state {
+            // expected
+        } else {
+            XCTFail("Expected .installing, got \(manager.state)")
+        }
+
+        // If NSApp cancels termination, manager recovers cleanly from .installing to .available.
+        manager.notifyTerminationCancelled()
+        XCTAssertFalse(manager.isBusy)
+        if case .available(let release) = manager.state {
+            XCTAssertEqual(release.version, AppSemanticVersion(major: 0, minor: 5, patch: 0))
+        } else {
+            XCTFail("Expected .available after notifyTerminationCancelled, got \(manager.state)")
+        }
+
+        // Quit-time verification failure cleans up staged bundle and transitions out of .readyToInstall.
+        let stagingDirBox = AtomicBox<URL?>(nil)
+        let failingVerifyCount = AtomicBox<Int>(0)
+        let manager2 = AppUpdateManager(
+            userDefaults: makeTestUserDefaults(),
+            currentVersion: AppSemanticVersion(major: 0, minor: 4, patch: 4),
+            currentBundleID: "com.lizhichaox.ccx",
+            currentBundleURL: fakeInstalledApp,
+            currentTeamIDProvider: { "TESTTEAM01" },
+            transport: transport,
+            extractHandler: { _, destinationDir in
+                stagingDirBox.value = destinationDir.deletingLastPathComponent()
+                let extracted = destinationDir.appendingPathComponent("CCX.app", isDirectory: true)
+                try FileManager.default.createDirectory(at: extracted, withIntermediateDirectories: true)
+                return extracted
+            },
+            verifyHandler: { _, _, _, _ in
+                failingVerifyCount.value += 1
+                if failingVerifyCount.value == 2 {
+                    throw AppUpdateError.signatureVerificationFailed(-67061)
+                }
+            },
+            installHandler: { _, _, _, _ in
+                XCTFail("Install must not run when quit verification fails")
+            },
+            canInstallSilentlyNow: { false }
+        )
+
+        manager2.checkForUpdatesInBackgroundIfDue(now: Date())
+        await manager2.waitForActiveTask()
+        let stagingDir = try XCTUnwrap(stagingDirBox.value)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: stagingDir.path))
+
+        XCTAssertFalse(manager2.applyPreparedUpdateOnQuitIfReady())
+        XCTAssertFalse(FileManager.default.fileExists(atPath: stagingDir.path))
+        if case .available = manager2.state {
+            // expected
+        } else {
+            XCTFail("Expected .available after quit verify failure, got \(manager2.state)")
+        }
     }
 
     func testRemoveOwnedStagingDirectoryScopesToUpdatesRootAndUnlinksSymlinks() throws {

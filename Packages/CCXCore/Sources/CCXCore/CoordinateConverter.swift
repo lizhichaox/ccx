@@ -124,5 +124,7 @@ public enum CoordinateConverter {
             && rect.origin.y.isFinite
             && rect.size.width.isFinite
             && rect.size.height.isFinite
+            && rect.maxX.isFinite
+            && rect.maxY.isFinite
     }
 }

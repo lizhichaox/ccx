@@ -125,6 +125,15 @@ final class CoordinateConverterTests: XCTestCase {
         XCTAssertTrue(hugeSnapped.width.isFinite && hugeSnapped.height.isFinite)
         XCTAssertEqual(Int(hugeSnapped.width) % 2, 0)
         XCTAssertEqual(Int(hugeSnapped.height) % 2, 0)
+
+        let overflowMaxRect = CGRect(
+            x: CGFloat.greatestFiniteMagnitude,
+            y: CGFloat.greatestFiniteMagnitude,
+            width: CGFloat.greatestFiniteMagnitude,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+        XCTAssertEqual(CoordinateConverter.quartzToAppKit(overflowMaxRect, primaryScreenHeight: 1000), .zero)
+        XCTAssertEqual(CoordinateConverter.appKitToQuartz(overflowMaxRect, primaryScreenHeight: 1000), .zero)
     }
 }
 
@@ -939,6 +948,116 @@ final class ClipboardStoreTests: XCTestCase {
         var st = stat()
         XCTAssertEqual(Darwin.lstat(symlinkURL.path, &st), 0)
         XCTAssertEqual(st.st_mode & S_IFMT, S_IFLNK)
+    }
+
+    func testRecordAndCopyImageEncodesOnceCompactsHistoryAndMatchesIdentity() async throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ccx-record-copy-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let pb = InMemoryClipboardPasteboard()
+        let store = ClipboardStore(maxHistoryCount: 5, pasteboard: pb, historyDirectoryURL: dir)
+        let img = makeTestImage(width: 24, height: 16) { x, _ in
+            x < 12 ? (240, 30, 30, 255) : (30, 180, 240, 255)
+        }
+
+        let entry = try XCTUnwrap(store.recordAndCopyImage(img, scale: 2, screenRect: CGRect(x: 10, y: 20, width: 12, height: 8)))
+        store.flushPendingPersistence()
+
+        XCTAssertEqual(store.history.count, 1)
+        XCTAssertEqual(store.history.first?.id, entry.id)
+        XCTAssertEqual(store.cachedClipboardIdentityIfKnown(), entry.pinIdentity)
+        XCTAssertNotNil(pb.data(forType: .png))
+        XCTAssertEqual(CCXColorSample.samplePixel(from: entry.image, pixelX: 2, pixelY: 2)?.red, 240)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: dir.appendingPathComponent("\(entry.id.uuidString).png").path))
+
+        // Non-copy recordSnip compacts its in-memory entry cleanly after background PNG save and notifies listeners.
+        var changeNotifications = 0
+        store.onHistoryChanged = { changeNotifications += 1 }
+        let img2 = makeTestImage(width: 16, height: 12) { _, _ in (10, 220, 40, 255) }
+        let entry2 = try XCTUnwrap(store.recordSnip(image: img2, scale: 2, screenRect: .zero))
+        XCTAssertEqual(changeNotifications, 1)
+        store.flushPendingPersistence()
+        try await waitUntil { changeNotifications >= 2 }
+        let stored2 = try XCTUnwrap(store.history.first(where: { $0.id == entry2.id }))
+        XCTAssertTrue(stored2.image !== entry2.image, "Expected compacted CGImage instance to replace raw bitmap")
+        XCTAssertEqual(stored2.image.width, 16)
+        XCTAssertEqual(stored2.image.height, 12)
+        XCTAssertEqual(CCXColorSample.samplePixel(from: stored2.image, pixelX: 4, pixelY: 4)?.green, 220)
+    }
+
+    func testWritePNGDataExclusivelyPreventsConcurrentOverwritesAndSymlinkClobber() async throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ccx-exclusive-save-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let img = makeTestImage(width: 4, height: 4) { _, _ in (12, 34, 56, 255) }
+        let pngData = try XCTUnwrap(ClipboardStore.encodePNG(img, scale: 1))
+
+        // Place a symlink at the base filename; exclusive save must never overwrite or follow it.
+        let victimURL = dir.appendingPathComponent("victim.txt")
+        try Data("protected".utf8).write(to: victimURL)
+        let symlinkBase = dir.appendingPathComponent("CCX-20261126-100000.png")
+        try FileManager.default.createSymbolicLink(at: symlinkBase, withDestinationURL: victimURL)
+
+        let savedURLs = try await withThrowingTaskGroup(of: URL.self) { group in
+            for _ in 0..<8 {
+                group.addTask {
+                    try ClipboardStore.writePNGDataExclusively(pngData, in: dir, stem: "CCX-20261126-100000")
+                }
+            }
+            var urls: [URL] = []
+            for try await url in group {
+                urls.append(url)
+            }
+            return urls
+        }
+
+        XCTAssertEqual(Set(savedURLs.map(\.lastPathComponent)).count, 8)
+        XCTAssertFalse(savedURLs.contains(symlinkBase))
+        XCTAssertEqual(try Data(contentsOf: victimURL), Data("protected".utf8))
+        for url in savedURLs {
+            XCTAssertEqual(try Data(contentsOf: url), pngData)
+        }
+    }
+
+    func testCachedClipboardIdentityAvoidsRedundantStringReadsForColorAndEmpty() {
+        @MainActor
+        final class CountingPasteboard: ClipboardPasteboard {
+            var changeCount = 0
+            var stringReadCount = 0
+            private var storedString: String?
+
+            func clearContents() { storedString = nil; changeCount += 1 }
+            func writeData(_ items: [(NSPasteboard.PasteboardType, Data)]) { storedString = nil; changeCount += 1 }
+            func writeString(_ string: String) { storedString = string; changeCount += 1 }
+            func hasImageData() -> Bool { false }
+            func data(forType type: NSPasteboard.PasteboardType) -> Data? { nil }
+            func string() -> String? { stringReadCount += 1; return storedString }
+            func readImageFileURLs() -> [URL] { [] }
+        }
+
+        let pb = CountingPasteboard()
+        let store = ClipboardStore(pasteboard: pb)
+
+        XCTAssertNil(store.cachedClipboardIdentityIfKnown())
+        let readsAfterEmpty = pb.stringReadCount
+        XCTAssertNil(store.cachedClipboardIdentityIfKnown())
+        XCTAssertEqual(pb.stringReadCount, readsAfterEmpty)
+
+        store.copyText("#336699")
+        let beforeColor = pb.stringReadCount
+        XCTAssertEqual(
+            store.cachedClipboardIdentityIfKnown(),
+            .color(CCXColorSample(red: 0x33, green: 0x66, blue: 0x99))
+        )
+        XCTAssertEqual(pb.stringReadCount - beforeColor, 1)
+        XCTAssertEqual(
+            store.cachedClipboardIdentityIfKnown(),
+            .color(CCXColorSample(red: 0x33, green: 0x66, blue: 0x99))
+        )
+        XCTAssertEqual(pb.stringReadCount - beforeColor, 1)
     }
 }
 

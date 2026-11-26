@@ -26,17 +26,79 @@ final class SettingsHotKeyState: ObservableObject {
     }
 }
 
-private struct SendableSettingsMonitorBox: @unchecked Sendable {
-    let monitor: Any
+@MainActor
+final class SettingsResourceState: ObservableObject {
+    @Published var snapshot: ResourceUsageSnapshot
+    @Published var isExpanded = false
+
+    init(snapshot: ResourceUsageSnapshot = ResourceUsageSnapshot()) {
+        self.snapshot = snapshot
+    }
 }
 
-/// Hosts the compact, two-card Settings window: preferences (updates, launch at login,
-/// recordings folder, customizable snip shortcut) and macOS permissions.
+@MainActor
+final class SettingsLaunchAtLoginState: ObservableObject {
+    @Published private(set) var serviceStatus: SMAppService.Status = SMAppService.mainApp.status
+    @Published private(set) var errorMessage: String?
+
+    func syncStatus() {
+        let next = SMAppService.mainApp.status
+        if serviceStatus != next {
+            serviceStatus = next
+        }
+        if (serviceStatus == .enabled || serviceStatus == .notRegistered) && errorMessage != nil {
+            errorMessage = nil
+        }
+    }
+
+    func apply(_ enabled: Bool) {
+        errorMessage = nil
+        do {
+            if enabled {
+                try SMAppService.mainApp.register()
+            } else {
+                try SMAppService.mainApp.unregister()
+            }
+            serviceStatus = SMAppService.mainApp.status
+        } catch {
+            serviceStatus = SMAppService.mainApp.status
+            errorMessage = CCXL10n.text(
+                "Couldn't update Launch at Login.",
+                zh: "无法更新开机自启设置"
+            )
+        }
+    }
+}
+
+struct SettingsResourceMetricsInput: Sendable {
+    let historyCount: Int
+    let maxHistoryCount: Int
+    let activePinCount: Int
+    let cacheDirectories: [URL]
+
+    static let empty = SettingsResourceMetricsInput(
+        historyCount: 0,
+        maxHistoryCount: 20,
+        activePinCount: 0,
+        cacheDirectories: []
+    )
+}
+
+private struct SendableSettingsTeardown: @unchecked Sendable {
+    let monitor: Any?
+    let observers: [NSObjectProtocol]
+}
+
+/// Hosts the compact Settings window: preferences (updates, launch at login, recordings folder,
+/// customizable snip shortcut), macOS permissions, and an expandable resource usage overview.
 @MainActor
 final class SettingsWindowController: NSObject, NSWindowDelegate {
     private let permissions = PermissionStatusModel()
     private let hotKeyState: SettingsHotKeyState
+    private let launchAtLoginState = SettingsLaunchAtLoginState()
+    private let resourceState = SettingsResourceState()
     private let updateManager: AppUpdateManager
+    private let resourceMetricsProvider: () -> SettingsResourceMetricsInput
     private let onBeginShortcutRecording: () -> Void
     private let onEndShortcutRecording: () -> Void
     private let onChangeSnipHotKey: (HotKeyCombo) -> HotKeyConflict?
@@ -46,8 +108,18 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     private let onChooseRecordingsFolder: () -> Void
     private let onOpenGuide: (NSRect?) -> Void
     private let onClearHistory: () -> Void
+    private let onRelaunch: () -> Void
     private var window: NSWindow?
     nonisolated(unsafe) private var shortcutMonitor: Any?
+    nonisolated(unsafe) private var didBecomeActiveObserver: NSObjectProtocol?
+    nonisolated(unsafe) private var occlusionObserver: NSObjectProtocol?
+    nonisolated(unsafe) private var resourcePollTask: Task<Void, Never>?
+    nonisolated(unsafe) private var resourceSampleTask: Task<Void, Never>?
+    nonisolated(unsafe) private var resourceFollowUpTask: Task<Void, Never>?
+    private var resourceSampleGeneration: UInt64 = 0
+    private var resourcePollGeneration: UInt64 = 0
+    private var isWindowMiniaturized = false
+    private var isWindowOccluded = false
 
     var onWindowVisibilityChanged: ((Bool) -> Void)?
     private(set) var isWindowVisible = false
@@ -59,6 +131,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         isSnipHotKeyRegistered: Bool = true,
         hasClearableHistory: Bool = false,
         recordingsFolderPath: String = "~/Movies/CCX",
+        resourceMetricsProvider: @escaping () -> SettingsResourceMetricsInput = { .empty },
         onBeginShortcutRecording: @escaping () -> Void = {},
         onEndShortcutRecording: @escaping () -> Void = {},
         onChangeSnipHotKey: @escaping (HotKeyCombo) -> HotKeyConflict? = { _ in nil },
@@ -67,7 +140,8 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         onOpenRecordingsFolder: @escaping () -> Void = {},
         onChooseRecordingsFolder: @escaping () -> Void = {},
         onOpenGuide: @escaping (NSRect?) -> Void = { _ in },
-        onClearHistory: @escaping () -> Void = {}
+        onClearHistory: @escaping () -> Void = {},
+        onRelaunch: @escaping () -> Void = { _ = AppRelauncher.relaunch() }
     ) {
         self.updateManager = updateManager
         self.hotKeyState = SettingsHotKeyState(
@@ -76,6 +150,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             hasClearableHistory: hasClearableHistory,
             recordingsFolderPath: recordingsFolderPath
         )
+        self.resourceMetricsProvider = resourceMetricsProvider
         self.onBeginShortcutRecording = onBeginShortcutRecording
         self.onEndShortcutRecording = onEndShortcutRecording
         self.onChangeSnipHotKey = onChangeSnipHotKey
@@ -85,19 +160,30 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         self.onChooseRecordingsFolder = onChooseRecordingsFolder
         self.onOpenGuide = onOpenGuide
         self.onClearHistory = onClearHistory
+        self.onRelaunch = onRelaunch
         super.init()
     }
 
     deinit {
-        if let shortcutMonitor {
-            let box = SendableSettingsMonitorBox(monitor: shortcutMonitor)
-            if Thread.isMainThread {
-                NSEvent.removeMonitor(box.monitor)
-            } else {
-                DispatchQueue.main.async {
-                    NSEvent.removeMonitor(box.monitor)
-                }
+        resourcePollTask?.cancel()
+        resourceSampleTask?.cancel()
+        resourceFollowUpTask?.cancel()
+        let teardown = SendableSettingsTeardown(
+            monitor: shortcutMonitor,
+            observers: [didBecomeActiveObserver, occlusionObserver].compactMap { $0 }
+        )
+        let cleanup: @Sendable () -> Void = {
+            if let monitor = teardown.monitor {
+                NSEvent.removeMonitor(monitor)
             }
+            for observer in teardown.observers {
+                NotificationCenter.default.removeObserver(observer)
+            }
+        }
+        if Thread.isMainThread {
+            cleanup()
+        } else {
+            DispatchQueue.main.async(execute: cleanup)
         }
     }
 
@@ -130,12 +216,195 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         }
     }
 
+    func refreshResourceUsage(scheduleFollowUp: Bool = false) {
+        guard isWindowVisible else { return }
+
+        if !resourceState.isExpanded {
+            resourceSampleGeneration &+= 1
+            resourceSampleTask?.cancel()
+            resourceSampleTask = nil
+            resourceFollowUpTask?.cancel()
+            resourceFollowUpTask = nil
+
+            let input = resourceMetricsProvider()
+            let collapsedSnapshot = ResourceUsageSnapshot(
+                physicalMemoryBytes: AppResourceMonitor.currentPhysicalMemoryBytes(),
+                historyCount: input.historyCount,
+                maxHistoryCount: input.maxHistoryCount,
+                activePinCount: input.activePinCount,
+                diskCacheBytes: resourceState.snapshot.diskCacheBytes
+            )
+            applyResourceSnapshotIfDisplayChanged(collapsedSnapshot, isExpanded: false)
+            return
+        }
+
+        let input = resourceMetricsProvider()
+        if resourceState.snapshot.physicalMemoryBytes == nil {
+            let initialSnapshot = ResourceUsageSnapshot(
+                physicalMemoryBytes: AppResourceMonitor.currentPhysicalMemoryBytes(),
+                historyCount: input.historyCount,
+                maxHistoryCount: input.maxHistoryCount,
+                activePinCount: input.activePinCount,
+                diskCacheBytes: resourceState.snapshot.diskCacheBytes
+            )
+            applyResourceSnapshotIfDisplayChanged(initialSnapshot, isExpanded: true)
+        }
+
+        resourceSampleGeneration &+= 1
+        let sampleGeneration = resourceSampleGeneration
+        resourceSampleTask?.cancel()
+        let directories = input.cacheDirectories
+        resourceSampleTask = Task.detached(priority: .utility) { [weak self] in
+            let diskBytes = AppResourceMonitor.totalRegularFilesByteSize(in: directories)
+            guard !Task.isCancelled else { return }
+            await MainActor.run { [weak self] in
+                guard let self,
+                      self.isWindowVisible,
+                      self.resourceState.isExpanded,
+                      self.resourceSampleGeneration == sampleGeneration
+                else { return }
+                let latestInput = self.resourceMetricsProvider()
+                let updated = ResourceUsageSnapshot(
+                    physicalMemoryBytes: AppResourceMonitor.currentPhysicalMemoryBytes(),
+                    historyCount: latestInput.historyCount,
+                    maxHistoryCount: latestInput.maxHistoryCount,
+                    activePinCount: latestInput.activePinCount,
+                    diskCacheBytes: diskBytes
+                )
+                self.applyResourceSnapshotIfDisplayChanged(updated, isExpanded: true)
+            }
+        }
+
+        if scheduleFollowUp {
+            resourceFollowUpTask?.cancel()
+            resourceFollowUpTask = Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .milliseconds(350))
+                guard !Task.isCancelled, let self, self.isWindowVisible, self.resourceState.isExpanded else { return }
+                self.refreshResourceUsage(scheduleFollowUp: false)
+            }
+        }
+    }
+
+    private func applyResourceSnapshotIfDisplayChanged(_ candidate: ResourceUsageSnapshot, isExpanded: Bool) {
+        let current = resourceState.snapshot
+        let displayChanged: Bool
+        if isExpanded {
+            displayChanged = current.formattedMemory != candidate.formattedMemory
+                || current.formattedDiskCache != candidate.formattedDiskCache
+                || current.historyCount != candidate.historyCount
+                || current.maxHistoryCount != candidate.maxHistoryCount
+                || current.activePinCount != candidate.activePinCount
+        } else {
+            displayChanged = current.formattedMemory != candidate.formattedMemory
+        }
+        if displayChanged {
+            resourceState.snapshot = candidate
+        }
+    }
+
+    private func toggleResourceUsageExpanded() {
+        stopRecordingShortcut()
+        resourceState.isExpanded.toggle()
+        if resourceState.isExpanded {
+            refreshResourceUsage()
+        } else {
+            resourceSampleGeneration &+= 1
+            resourceSampleTask?.cancel()
+            resourceSampleTask = nil
+            resourceFollowUpTask?.cancel()
+            resourceFollowUpTask = nil
+        }
+        syncResourcePolling()
+        scheduleWindowHeightSync()
+    }
+
+    private func syncResourcePolling() {
+        let shouldPoll = isWindowVisible
+            && resourceState.isExpanded
+            && !isWindowMiniaturized
+            && !isWindowOccluded
+        guard shouldPoll else {
+            resourcePollGeneration &+= 1
+            resourcePollTask?.cancel()
+            resourcePollTask = nil
+            return
+        }
+        guard resourcePollTask == nil else { return }
+        resourcePollGeneration &+= 1
+        let generation = resourcePollGeneration
+        resourcePollTask = Task { @MainActor [weak self] in
+            defer {
+                if let self, self.resourcePollGeneration == generation {
+                    self.resourcePollTask = nil
+                }
+            }
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(2_500))
+                guard !Task.isCancelled,
+                      let self,
+                      self.resourcePollGeneration == generation,
+                      self.isWindowVisible,
+                      self.resourceState.isExpanded,
+                      !self.isWindowMiniaturized,
+                      !self.isWindowOccluded
+                else {
+                    break
+                }
+                self.refreshResourceUsage()
+            }
+        }
+    }
+
+    private func installWindowObservers(for window: NSWindow) {
+        removeWindowObservers()
+
+        didBecomeActiveObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, self.isWindowVisible else { return }
+                self.launchAtLoginState.syncStatus()
+            }
+        }
+
+        occlusionObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didChangeOcclusionStateNotification,
+            object: window,
+            queue: .main
+        ) { [weak self, weak window] _ in
+            MainActor.assumeIsolated {
+                guard let self, let window, self.isWindowVisible else { return }
+                let isOccluded = !window.occlusionState.contains(.visible)
+                guard self.isWindowOccluded != isOccluded else { return }
+                self.isWindowOccluded = isOccluded
+                self.syncResourcePolling()
+                if !isOccluded {
+                    self.refreshResourceUsage()
+                }
+            }
+        }
+    }
+
+    private func removeWindowObservers() {
+        if let didBecomeActiveObserver {
+            NotificationCenter.default.removeObserver(didBecomeActiveObserver)
+            self.didBecomeActiveObserver = nil
+        }
+        if let occlusionObserver {
+            NotificationCenter.default.removeObserver(occlusionObserver)
+            self.occlusionObserver = nil
+        }
+    }
+
     func show(anchoredTo anchorRect: NSRect? = nil) {
         let window = self.window ?? makeWindow()
         self.window = window
         if !hotKeyState.isRecordingShortcut {
             hotKeyState.shortcutFeedback = nil
         }
+        launchAtLoginState.syncStatus()
         permissions.refresh()
         permissions.startPolling()
 
@@ -159,16 +428,23 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         }
         NSApp.activate()
         window.makeKeyAndOrderFront(nil)
+        isWindowMiniaturized = window.isMiniaturized
+        isWindowOccluded = false
+        installWindowObservers(for: window)
         if !isWindowVisible {
             isWindowVisible = true
             onWindowVisibilityChanged?(true)
         }
+        refreshResourceUsage()
+        syncResourcePolling()
     }
 
     private func makeWindow() -> NSWindow {
         let view = SettingsView(
             permissions: permissions,
             hotKeyState: hotKeyState,
+            launchAtLoginState: launchAtLoginState,
+            resourceState: resourceState,
             updateManager: updateManager,
             onStartRecordingShortcut: { [weak self] in
                 self?.startRecordingShortcut()
@@ -197,6 +473,9 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
                 self?.stopRecordingShortcut()
                 self?.onChooseRecordingsFolder()
             },
+            onToggleResourceUsage: { [weak self] in
+                self?.toggleResourceUsageExpanded()
+            },
             onOpenGuide: { [weak self] in
                 self?.stopRecordingShortcut()
                 self?.onOpenGuide(self?.window?.frame)
@@ -204,6 +483,9 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             onClearHistory: { [weak self] in
                 self?.stopRecordingShortcut()
                 self?.onClearHistory()
+            },
+            onRelaunch: { [weak self] in
+                self?.onRelaunch()
             },
             onContentHeightChange: { [weak self] in
                 DispatchQueue.main.async { [weak self] in
@@ -424,11 +706,35 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         }
     }
 
+    func windowDidMiniaturize(_ notification: Notification) {
+        isWindowMiniaturized = true
+        syncResourcePolling()
+    }
+
+    func windowDidDeminiaturize(_ notification: Notification) {
+        isWindowMiniaturized = false
+        if isWindowVisible {
+            refreshResourceUsage()
+            syncResourcePolling()
+        }
+    }
+
     func windowWillClose(_ notification: Notification) {
         if hotKeyState.isRecordingShortcut {
             stopRecordingShortcut()
         }
+        removeWindowObservers()
         permissions.stopPolling()
+        isWindowMiniaturized = false
+        isWindowOccluded = false
+        resourcePollGeneration &+= 1
+        resourcePollTask?.cancel()
+        resourcePollTask = nil
+        resourceSampleGeneration &+= 1
+        resourceSampleTask?.cancel()
+        resourceSampleTask = nil
+        resourceFollowUpTask?.cancel()
+        resourceFollowUpTask = nil
         if isWindowVisible {
             isWindowVisible = false
             onWindowVisibilityChanged?(false)
@@ -437,19 +743,22 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
 }
 
 private struct SettingsView: View {
-    @ObservedObject var permissions: PermissionStatusModel
+    let permissions: PermissionStatusModel
     @ObservedObject var hotKeyState: SettingsHotKeyState
-    @ObservedObject var updateManager: AppUpdateManager
+    let launchAtLoginState: SettingsLaunchAtLoginState
+    let resourceState: SettingsResourceState
+    let updateManager: AppUpdateManager
     let onStartRecordingShortcut: () -> Void
     let onCancelRecordingShortcut: () -> Void
     let onResetSnipHotKey: () -> Void
     let onRetryHotKey: () -> Void
     let onOpenRecordingsFolder: () -> Void
     let onChooseRecordingsFolder: () -> Void
+    let onToggleResourceUsage: () -> Void
     let onOpenGuide: () -> Void
     let onClearHistory: () -> Void
+    let onRelaunch: () -> Void
     let onContentHeightChange: () -> Void
-    @State private var openedScreenRecordingSettings = false
 
     var body: some View {
         ZStack(alignment: .top) {
@@ -472,7 +781,7 @@ private struct SettingsView: View {
                     VStack(spacing: 0) {
                         UpdatesSettingRow(updateManager: updateManager)
                         Divider().padding(.leading, 42)
-                        LaunchAtLoginRow()
+                        LaunchAtLoginRow(state: launchAtLoginState)
                         Divider().padding(.leading, 42)
                         RecordingsFolderRow(
                             folderPath: hotKeyState.recordingsFolderPath,
@@ -495,39 +804,18 @@ private struct SettingsView: View {
                     .ccxSettingsCard(cornerRadius: 12)
 
                     // Card 2 — Permissions
-                    VStack(spacing: 0) {
-                        ScreenRecordingSettingRow(
-                            granted: permissions.status.screenRecording,
-                            isChecking: permissions.isCheckingScreenRecording,
-                            showRelaunch: openedScreenRecordingSettings && !permissions.status.screenRecording,
-                            onOpen: {
-                                openedScreenRecordingSettings = true
-                                permissions.openScreenRecordingSettings()
-                            },
-                            onVerify: {
-                                permissions.verifyScreenRecordingLive()
-                            },
-                            onRelaunch: {
-                                AppRelauncher.relaunch()
-                            }
-                        )
-                        Divider().padding(.leading, 42)
-                        PermissionSettingRow(
-                            symbol: "accessibility",
-                            palette: .indigo,
-                            title: CCXL10n.text("Accessibility", zh: "辅助功能"),
-                            granted: permissions.status.accessibility,
-                            openAction: permissions.openAccessibilitySettings
-                        )
-                        Divider().padding(.leading, 42)
-                        PermissionSettingRow(
-                            symbol: "mic.fill",
-                            palette: .pink,
-                            title: CCXL10n.text("Microphone", zh: "麦克风"),
-                            granted: permissions.status.microphone,
-                            openAction: permissions.openMicrophoneSettings
-                        )
-                    }
+                    PermissionsSettingsCard(
+                        permissions: permissions,
+                        onRelaunch: onRelaunch
+                    )
+                    .ccxSettingsCard(cornerRadius: 12)
+
+                    // Card 3 — Resource Usage
+                    ResourceUsageCard(
+                        resourceState: resourceState,
+                        updateManager: updateManager,
+                        onToggle: onToggleResourceUsage
+                    )
                     .ccxSettingsCard(cornerRadius: 12)
                 }
 
@@ -593,6 +881,46 @@ private struct SettingsView: View {
         }
         .frame(width: 368)
         .fixedSize(horizontal: false, vertical: true)
+    }
+}
+
+private struct PermissionsSettingsCard: View {
+    @ObservedObject var permissions: PermissionStatusModel
+    let onRelaunch: () -> Void
+    @State private var openedScreenRecordingSettings = false
+
+    var body: some View {
+        VStack(spacing: 0) {
+            ScreenRecordingSettingRow(
+                granted: permissions.status.screenRecording,
+                isChecking: permissions.isCheckingScreenRecording,
+                showRelaunch: openedScreenRecordingSettings && !permissions.status.screenRecording,
+                onOpen: {
+                    openedScreenRecordingSettings = true
+                    permissions.openScreenRecordingSettings()
+                },
+                onVerify: {
+                    permissions.verifyScreenRecordingLive()
+                },
+                onRelaunch: onRelaunch
+            )
+            Divider().padding(.leading, 42)
+            PermissionSettingRow(
+                symbol: "accessibility",
+                palette: .indigo,
+                title: CCXL10n.text("Accessibility", zh: "辅助功能"),
+                granted: permissions.status.accessibility,
+                openAction: permissions.openAccessibilitySettings
+            )
+            Divider().padding(.leading, 42)
+            PermissionSettingRow(
+                symbol: "mic.fill",
+                palette: .pink,
+                title: CCXL10n.text("Microphone", zh: "麦克风"),
+                granted: permissions.status.microphone,
+                openAction: permissions.openMicrophoneSettings
+            )
+        }
     }
 }
 
@@ -873,14 +1201,13 @@ private struct SnipShortcutRow: View {
 }
 
 private struct LaunchAtLoginRow: View {
-    @State private var serviceStatus = SMAppService.mainApp.status
-    @State private var errorMessage: String?
+    @ObservedObject var state: SettingsLaunchAtLoginState
 
     private var toggleBinding: Binding<Bool> {
         Binding(
-            get: { serviceStatus == .enabled },
+            get: { state.serviceStatus == .enabled },
             set: { enabled in
-                apply(enabled)
+                state.apply(enabled)
             }
         )
     }
@@ -889,7 +1216,7 @@ private struct LaunchAtLoginRow: View {
         VStack(alignment: .leading, spacing: 4) {
             SettingsRow(symbol: "power", palette: .teal, title: CCXL10n.text("Launch at Login", zh: "开机自启")) {
                 HStack(spacing: 6) {
-                    if serviceStatus == .requiresApproval {
+                    if state.serviceStatus == .requiresApproval {
                         Button(CCXL10n.text("Approve", zh: "批准")) {
                             SMAppService.openSystemSettingsLoginItems()
                         }
@@ -904,7 +1231,7 @@ private struct LaunchAtLoginRow: View {
                 }
             }
 
-            if serviceStatus == .requiresApproval {
+            if state.serviceStatus == .requiresApproval {
                 Text(CCXL10n.text(
                     "Approve in System Settings → Login Items.",
                     zh: "请在系统设置 → 登录项中批准"
@@ -916,7 +1243,7 @@ private struct LaunchAtLoginRow: View {
                     .padding(.leading, 43)
                     .padding(.trailing, 10)
                     .padding(.bottom, 7)
-            } else if let errorMessage {
+            } else if let errorMessage = state.errorMessage {
                 Text(errorMessage)
                     .font(.system(size: 10.5))
                     .foregroundStyle(.red)
@@ -926,37 +1253,6 @@ private struct LaunchAtLoginRow: View {
                     .padding(.trailing, 10)
                     .padding(.bottom, 7)
             }
-        }
-        .onAppear {
-            syncStatus()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
-            syncStatus()
-        }
-    }
-
-    private func syncStatus() {
-        serviceStatus = SMAppService.mainApp.status
-        if serviceStatus == .enabled || serviceStatus == .notRegistered {
-            errorMessage = nil
-        }
-    }
-
-    private func apply(_ enabled: Bool) {
-        errorMessage = nil
-        do {
-            if enabled {
-                try SMAppService.mainApp.register()
-            } else {
-                try SMAppService.mainApp.unregister()
-            }
-            serviceStatus = SMAppService.mainApp.status
-        } catch {
-            serviceStatus = SMAppService.mainApp.status
-            errorMessage = CCXL10n.text(
-                "Couldn't update Launch at Login.",
-                zh: "无法更新开机自启设置"
-            )
         }
     }
 }
@@ -1336,6 +1632,141 @@ private struct PermissionSettingRow: View {
                     .fixedSize()
             }
         }
+    }
+}
+
+private struct ResourceUsageCard: View {
+    @ObservedObject var resourceState: SettingsResourceState
+    let updateManager: AppUpdateManager
+    let onToggle: () -> Void
+
+    @Environment(\.colorScheme) private var colorScheme
+    @State private var isHoveringHeader = false
+
+    var body: some View {
+        let snapshot = resourceState.snapshot
+        VStack(alignment: .leading, spacing: 0) {
+            Button(action: onToggle) {
+                HStack(spacing: 9) {
+                    CCXIconBadge(
+                        symbol: "cpu.fill",
+                        palette: .teal,
+                        size: 24,
+                        cornerRadius: 6.5,
+                        symbolSize: 12
+                    )
+
+                    VStack(alignment: .leading, spacing: 1.5) {
+                        Text(ResourceUsageSnapshot.headerTitle)
+                            .font(.system(size: 12.5, weight: .medium))
+                            .foregroundStyle(.primary)
+                            .lineLimit(1)
+
+                        Text(ResourceUsageSnapshot.headerSubtitle)
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                    HStack(spacing: 6) {
+                        Text(snapshot.formattedMemory)
+                            .font(.system(size: 10.5, weight: .semibold).monospacedDigit())
+                            .foregroundStyle(CCXBadgePalette.teal.labelColor(for: colorScheme))
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 2.5)
+                            .background(CCXBadgePalette.teal.accentColor.opacity(0.12), in: Capsule())
+                            .overlay(
+                                Capsule()
+                                    .strokeBorder(CCXBadgePalette.teal.accentColor.opacity(0.24), lineWidth: 0.75)
+                            )
+                            .fixedSize()
+
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                            .rotationEffect(.degrees(resourceState.isExpanded ? 90 : 0))
+                            .frame(width: 12, height: 12)
+                    }
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 7.5)
+                .background(isHoveringHeader ? Color.primary.opacity(0.045) : Color.clear)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help(ResourceUsageSnapshot.headerTooltip(isExpanded: resourceState.isExpanded))
+            .accessibilityLabel(CCXL10n.text(
+                "Resource Usage, \(snapshot.formattedMemory)",
+                zh: "资源占用，当前内存 \(snapshot.formattedMemory)"
+            ))
+            .accessibilityValue(
+                resourceState.isExpanded
+                    ? CCXL10n.text("Expanded", zh: "已展开")
+                    : CCXL10n.text("Collapsed", zh: "已收起")
+            )
+            .onHover { isHoveringHeader = $0 }
+
+            if resourceState.isExpanded {
+                Divider().padding(.horizontal, 10)
+                ResourceUsageExpandedDetails(snapshot: snapshot, updateManager: updateManager)
+            }
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+}
+
+private struct ResourceUsageExpandedDetails: View {
+    let snapshot: ResourceUsageSnapshot
+    @ObservedObject var updateManager: AppUpdateManager
+
+    @Environment(\.colorScheme) private var colorScheme
+
+    private func palette(for kind: ResourceUsageGuideItem.Kind) -> CCXBadgePalette {
+        switch kind {
+        case .idle: .green
+        case .memory: .indigo
+        case .capture: .blue
+        case .storage: .orange
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(snapshot.guideItems(automaticallyChecksForUpdates: updateManager.automaticallyChecksForUpdates)) { item in
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Image(systemName: item.symbol)
+                            .font(.system(size: 10.5, weight: .semibold))
+                            .foregroundStyle(palette(for: item.kind).labelColor(for: colorScheme))
+                            .frame(width: 14, alignment: .center)
+
+                        Text(item.title)
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(.primary)
+                            .lineLimit(1)
+
+                        Spacer(minLength: 6)
+
+                        Text(item.badge)
+                            .font(.system(size: 10, weight: .medium).monospacedDigit())
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .fixedSize()
+                    }
+
+                    Text(item.detail)
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.leading, 20)
+                }
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.top, 8)
+        .padding(.bottom, 9)
     }
 }
 

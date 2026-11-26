@@ -398,5 +398,14 @@ final class HotKeyConflictTests: XCTestCase {
         let invalidBareEsc = HotKeyCombo(keyCode: UInt32(kVK_Escape), carbonModifiers: 0)
         defaults.set(try JSONEncoder().encode(invalidBareEsc), forKey: HotKeyPreferences.snipComboKey)
         XCTAssertEqual(HotKeyPreferences.loadCombo(for: .snip, from: defaults), .defaultSnip)
+
+        // Out-of-range keyCode and reserved app shortcuts (e.g. Cmd+Q, Cmd+C) fall back to default.
+        let invalidOutOfRange = HotKeyCombo(keyCode: UInt32(UInt16.max) + 1, carbonModifiers: UInt32(cmdKey))
+        defaults.set(try JSONEncoder().encode(invalidOutOfRange), forKey: HotKeyPreferences.snipComboKey)
+        XCTAssertEqual(HotKeyPreferences.loadCombo(for: .snip, from: defaults), .defaultSnip)
+
+        let reservedCmdQ = HotKeyCombo(keyCode: UInt32(kVK_ANSI_Q), carbonModifiers: UInt32(cmdKey))
+        defaults.set(try JSONEncoder().encode(reservedCmdQ), forKey: HotKeyPreferences.snipComboKey)
+        XCTAssertEqual(HotKeyPreferences.loadCombo(for: .snip, from: defaults), .defaultSnip)
     }
 }

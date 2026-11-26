@@ -57,6 +57,24 @@ public struct SnipHistoryEntry: Identifiable, Sendable {
         self.screenRect = screenRect
     }
 
+    internal init(
+        id: UUID,
+        timestamp: Date,
+        image: CGImage,
+        thumbnail: CGImage,
+        fingerprint: ImageFingerprint,
+        scale: CGFloat,
+        screenRect: CGRect
+    ) {
+        self.id = id
+        self.timestamp = timestamp
+        self.image = image
+        self.thumbnail = thumbnail
+        self.fingerprint = fingerprint
+        self.scale = scale
+        self.screenRect = screenRect
+    }
+
     private static let sRGBColorSpace = CGColorSpace(name: CGColorSpace.sRGB)
 
     private static func makeThumbnail(from image: CGImage, maxPixelDimension: CGFloat) -> CGImage {
@@ -264,6 +282,7 @@ private final class SystemClipboardPasteboard: ClipboardPasteboard {
     }
 
     func readImageFileURLs() -> [URL] {
+        guard pasteboard.availableType(from: [.fileURL]) != nil else { return [] }
         let options: [NSPasteboard.ReadingOptionKey: Any] = [
             .urlReadingFileURLsOnly: true,
             .urlReadingContentsConformToTypes: [UTType.image.identifier],
@@ -440,14 +459,98 @@ public final class ClipboardStore {
 
     @discardableResult
     public func recordSnip(image: CGImage, scale: CGFloat, screenRect: CGRect) -> SnipHistoryEntry? {
+        recordSnipInternal(image: image, scale: scale, screenRect: screenRect, preEncodedPNG: nil)
+    }
+
+    /// Records a snip in history and copies it to the pasteboard while encoding PNG only once
+    /// across both pasteboard writing and background history persistence.
+    @discardableResult
+    public func recordAndCopyImage(_ image: CGImage, scale: CGFloat, screenRect: CGRect) -> SnipHistoryEntry? {
+        let png = Self.encode(image, type: .png, scale: scale)
+        let entry = recordSnipInternal(image: image, scale: scale, screenRect: screenRect, preEncodedPNG: png)
+        if let png {
+            let fingerprint = entry?.fingerprint ?? ImageFingerprint(image: image)
+            cachedBadge = nil
+            pasteboard.writeLazyImage(png: png) {
+                Self.convertImageDataToTIFF(png, scale: scale)
+            }
+            cachedCopiedImageIdentity = (
+                pasteboard.changeCount,
+                .image(fingerprint, historyEntryID: entry?.id)
+            )
+        } else {
+            copyImage(image, scale: scale, historyEntryID: entry?.id)
+        }
+        return entry
+    }
+
+    private func recordSnipInternal(
+        image: CGImage,
+        scale: CGFloat,
+        screenRect: CGRect,
+        preEncodedPNG: Data?
+    ) -> SnipHistoryEntry? {
         latestSnipPasteboardChangeCount = pasteboard.changeCount
         guard maxHistoryCount > 0 else { return nil }
-        let entry = SnipHistoryEntry(image: image, scale: scale, screenRect: screenRect)
+
+        let baseEntry = SnipHistoryEntry(image: image, scale: scale, screenRect: screenRect)
+        let entry: SnipHistoryEntry
+        if let preEncodedPNG, let compactImage = Self.decode(preEncodedPNG)?.0 {
+            entry = SnipHistoryEntry(
+                id: baseEntry.id,
+                timestamp: baseEntry.timestamp,
+                image: compactImage,
+                thumbnail: baseEntry.thumbnail,
+                fingerprint: baseEntry.fingerprint,
+                scale: baseEntry.scale,
+                screenRect: baseEntry.screenRect
+            )
+        } else {
+            entry = baseEntry
+        }
+
         history.insert(entry, at: 0)
         trimHistoryToLimits()
-        diskStore?.save(entry: entry, manifest: currentManifest())
+        let startGeneration = clearGeneration
+        let onEncodedPNG: (@Sendable (UUID, Data) -> Void)?
+        if preEncodedPNG == nil {
+            onEncodedPNG = { [weak self] entryID, pngData in
+                guard let compactImage = Self.decode(pngData)?.0 else { return }
+                Task { @MainActor [weak self] in
+                    self?.compactHistoryEntry(id: entryID, with: compactImage, expectedGeneration: startGeneration)
+                }
+            }
+        } else {
+            onEncodedPNG = nil
+        }
+        diskStore?.save(
+            entry: entry,
+            manifest: currentManifest(),
+            preEncodedPNG: preEncodedPNG,
+            onEncodedPNG: onEncodedPNG
+        )
         onHistoryChanged?()
         return entry
+    }
+
+    private func compactHistoryEntry(id: UUID, with compactImage: CGImage, expectedGeneration: UInt64) {
+        guard clearGeneration == expectedGeneration,
+              let index = history.firstIndex(where: { $0.id == id })
+        else { return }
+        let existing = history[index]
+        guard existing.image.width == compactImage.width,
+              existing.image.height == compactImage.height
+        else { return }
+        history[index] = SnipHistoryEntry(
+            id: existing.id,
+            timestamp: existing.timestamp,
+            image: compactImage,
+            thumbnail: existing.thumbnail,
+            fingerprint: existing.fingerprint,
+            scale: existing.scale,
+            screenRect: existing.screenRect
+        )
+        onHistoryChanged?()
     }
 
     public func clearHistory() {
@@ -467,10 +570,14 @@ public final class ClipboardStore {
             history.removeLast(history.count - maxHistoryCount)
         }
         guard maxHistoryMemoryBytes > 0, history.count > 1 else { return }
-        var totalBytes = history.reduce(0) { $0 + Self.estimatedMemoryBytes(for: $1.image) }
+        var totalBytes = 0
+        for entry in history {
+            let (next, overflow) = totalBytes.addingReportingOverflow(Self.estimatedMemoryBytes(for: entry.image))
+            totalBytes = overflow ? Int.max : next
+        }
         while history.count > 1, totalBytes > maxHistoryMemoryBytes {
             let removed = history.removeLast()
-            totalBytes -= Self.estimatedMemoryBytes(for: removed.image)
+            totalBytes = max(0, totalBytes - Self.estimatedMemoryBytes(for: removed.image))
         }
     }
 
@@ -575,12 +682,17 @@ public final class ClipboardStore {
         if let cached = cachedCopiedImageIdentity, cached.changeCount == changeCount {
             return cached.identity
         }
-        guard peekPinBadge() != .image, let string = pasteboard.string() else { return nil }
-        if let color = CCXColorSample.parseHex(string) {
-            return .color(color)
+        switch peekPinBadge() {
+        case .image, .empty:
+            return nil
+        case let .color(sample):
+            return .color(sample)
+        case .text:
+            guard let string = pasteboard.string(), !string.allSatisfy(\.isWhitespace) else {
+                return nil
+            }
+            return .text(string.trimmingCharacters(in: .whitespacesAndNewlines))
         }
-        guard !string.allSatisfy(\.isWhitespace) else { return nil }
-        return .text(string.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
     /// Computes or reuses the `PinContentIdentity` for a decoded `ClipboardPinPayload`.
@@ -654,8 +766,8 @@ public final class ClipboardStore {
         encode(image, type: .png, scale: scale)
     }
 
-    /// Atomically writes pre-encoded PNG data to `url`, refusing symlink destinations and preserving
-    /// any existing file if writing fails.
+    /// Atomically writes pre-encoded PNG data to `url`, refusing symlinks and non-regular destinations
+    /// while preserving any existing file if writing fails.
     public nonisolated static func writePNGDataAtomically(_ data: Data, to url: URL) throws {
         guard url.isFileURL else {
             throw ClipboardStoreError.writeFailed
@@ -664,14 +776,149 @@ public final class ClipboardStore {
         while path.count > 1 && path.hasSuffix("/") {
             path.removeLast()
         }
-        var st = stat()
-        if Darwin.lstat(path, &st) == 0, (st.st_mode & S_IFMT) == S_IFLNK {
+        guard !path.isEmpty else {
             throw ClipboardStoreError.writeFailed
         }
+        var st = stat()
+        if Darwin.lstat(path, &st) == 0 {
+            guard (st.st_mode & S_IFMT) == S_IFREG else {
+                throw ClipboardStoreError.writeFailed
+            }
+        } else if errno != ENOENT {
+            throw ClipboardStoreError.writeFailed
+        }
+        let normalizedURL = URL(fileURLWithPath: path, isDirectory: false)
         do {
-            try data.write(to: url, options: .atomic)
+            try data.write(to: normalizedURL, options: .atomic)
         } catch {
             throw ClipboardStoreError.writeFailed
+        }
+    }
+
+    /// Atomically creates a new unique `.png` file inside `directory` without ever overwriting
+    /// existing files or following symlinks, even under concurrent quick saves in the same second.
+    public nonisolated static func writePNGDataExclusively(
+        _ data: Data,
+        in directory: URL,
+        stem: String,
+        maxSuffixAttempts: Int = 9_999
+    ) throws -> URL {
+        guard directory.isFileURL,
+              !stem.isEmpty,
+              !stem.contains("/"),
+              !stem.contains("\0")
+        else {
+            throw ClipboardStoreError.writeFailed
+        }
+        var dirPath = directory.path
+        while dirPath.count > 1 && dirPath.hasSuffix("/") {
+            dirPath.removeLast()
+        }
+        guard !dirPath.isEmpty else {
+            throw ClipboardStoreError.writeFailed
+        }
+        var dirStat = stat()
+        guard Darwin.lstat(dirPath, &dirStat) == 0,
+              (dirStat.st_mode & S_IFMT) == S_IFDIR
+        else {
+            throw ClipboardStoreError.writeFailed
+        }
+
+        let dirURL = URL(fileURLWithPath: dirPath, isDirectory: true)
+        let tempURL = dirURL.appendingPathComponent(".ccx-save-\(UUID().uuidString).tmp", isDirectory: false)
+        let tempPath = tempURL.path
+        let fd = Darwin.open(tempPath, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o644)
+        guard fd >= 0 else {
+            throw ClipboardStoreError.writeFailed
+        }
+
+        var movedTemp = false
+        defer {
+            if !movedTemp {
+                _ = Darwin.unlink(tempPath)
+            }
+        }
+
+        let wroteAll = writeAllBytes(data, to: fd)
+        let closedOK = Darwin.close(fd) == 0
+        guard wroteAll, closedOK else {
+            throw ClipboardStoreError.writeFailed
+        }
+
+        var suffix = 1
+        var usedUUIDFallback = false
+        while true {
+            let candidateName: String
+            if suffix == 1 {
+                candidateName = "\(stem).png"
+            } else if suffix <= maxSuffixAttempts {
+                candidateName = "\(stem)-\(suffix).png"
+            } else if !usedUUIDFallback {
+                usedUUIDFallback = true
+                candidateName = "\(stem)-\(UUID().uuidString.prefix(8)).png"
+            } else {
+                throw ClipboardStoreError.writeFailed
+            }
+
+            let candidateURL = dirURL.appendingPathComponent(candidateName, isDirectory: false)
+            let candidatePath = candidateURL.path
+
+            if Darwin.renamex_np(tempPath, candidatePath, UInt32(RENAME_EXCL)) == 0 {
+                movedTemp = true
+                return candidateURL
+            }
+            let err = errno
+            if err == EEXIST {
+                suffix += 1
+                continue
+            }
+            if err == ENOTSUP || err == EOPNOTSUPP || err == EINVAL {
+                if Darwin.link(tempPath, candidatePath) == 0 {
+                    _ = Darwin.unlink(tempPath)
+                    movedTemp = true
+                    return candidateURL
+                }
+                if errno == EEXIST {
+                    suffix += 1
+                    continue
+                }
+                // Volumes without hard-link support (e.g. FAT32/exFAT): exclusive create directly.
+                let directFD = Darwin.open(candidatePath, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o644)
+                if directFD >= 0 {
+                    let directOK = writeAllBytes(data, to: directFD)
+                    let directClosed = Darwin.close(directFD) == 0
+                    if directOK && directClosed {
+                        return candidateURL
+                    }
+                    _ = Darwin.unlink(candidatePath)
+                    throw ClipboardStoreError.writeFailed
+                }
+                if errno == EEXIST {
+                    suffix += 1
+                    continue
+                }
+            }
+            throw ClipboardStoreError.writeFailed
+        }
+    }
+
+    private nonisolated static func writeAllBytes(_ data: Data, to fd: Int32) -> Bool {
+        data.withUnsafeBytes { rawBuffer in
+            guard let base = rawBuffer.baseAddress else { return true }
+            var remaining = rawBuffer.count
+            var offset = 0
+            while remaining > 0 {
+                let written = Darwin.write(fd, base.advanced(by: offset), remaining)
+                if written > 0 {
+                    offset += written
+                    remaining -= written
+                } else if written < 0, errno == EINTR {
+                    continue
+                } else {
+                    return false
+                }
+            }
+            return true
         }
     }
 
@@ -722,7 +969,7 @@ public final class ClipboardStore {
             }
             if bytesRead > 0 {
                 if data.count + bytesRead > maxDecodeFileBytes { return nil }
-                data.append(contentsOf: chunk[0..<bytesRead])
+                data.append(chunk, count: bytesRead)
             } else if bytesRead == 0 {
                 break
             } else if errno == EINTR {
@@ -740,26 +987,28 @@ public final class ClipboardStore {
     }
 
     nonisolated static func encode(_ image: CGImage, type: UTType, scale: CGFloat) -> Data? {
-        guard image.width > 0, image.height > 0 else { return nil }
-        let data = NSMutableData()
-        guard let destination = CGImageDestinationCreateWithData(
-            data as CFMutableData, type.identifier as CFString, 1, nil
-        ) else { return nil }
-        let safeScale = (scale.isFinite && scale > 0) ? max(scale, 0.01) : 1
-        let dpi = 72 * safeScale
-        var properties: [CFString: Any] = [
-            kCGImagePropertyDPIWidth: dpi,
-            kCGImagePropertyDPIHeight: dpi,
-        ]
-        if type == .tiff {
-            // Lossless LZW compression keeps Retina clipboard copies small and fast over IPC.
-            properties[kCGImagePropertyTIFFDictionary] = [
-                kCGImagePropertyTIFFCompression: 5,
+        autoreleasepool {
+            guard image.width > 0, image.height > 0 else { return nil }
+            let data = NSMutableData()
+            guard let destination = CGImageDestinationCreateWithData(
+                data as CFMutableData, type.identifier as CFString, 1, nil
+            ) else { return nil }
+            let safeScale = (scale.isFinite && scale > 0) ? max(scale, 0.01) : 1
+            let dpi = 72 * safeScale
+            var properties: [CFString: Any] = [
+                kCGImagePropertyDPIWidth: dpi,
+                kCGImagePropertyDPIHeight: dpi,
             ]
+            if type == .tiff {
+                // Lossless LZW compression keeps Retina clipboard copies small and fast over IPC.
+                properties[kCGImagePropertyTIFFDictionary] = [
+                    kCGImagePropertyTIFFCompression: 5,
+                ]
+            }
+            CGImageDestinationAddImage(destination, image, properties as CFDictionary)
+            guard CGImageDestinationFinalize(destination) else { return nil }
+            return data as Data
         }
-        CGImageDestinationAddImage(destination, image, properties as CFDictionary)
-        guard CGImageDestinationFinalize(destination) else { return nil }
-        return data as Data
     }
 
     /// Decodes image data with pixel-dimension/decompression-bomb guards and derives the
@@ -771,22 +1020,20 @@ public final class ClipboardStore {
             return nil
         }
 
-        let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any]
-        if let properties {
-            let propWidth = (properties[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue
-            let propHeight = (properties[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue
-            if let propWidth, let propHeight, !isSafeImageSize(width: propWidth, height: propHeight) {
-                return nil
-            }
+        guard let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let propWidth = (properties[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue,
+              let propHeight = (properties[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue,
+              isSafeImageSize(width: propWidth, height: propHeight)
+        else {
+            return nil
         }
 
-        guard let image = CGImageSourceCreateImageAtIndex(source, 0, nil),
+        guard let image = CGImageSourceCreateImageAtIndex(source, 0, sourceOptions),
               isSafeImageSize(width: image.width, height: image.height)
         else { return nil }
 
         var scale: CGFloat = 1
-        if let properties,
-           let dpi = (properties[kCGImagePropertyDPIWidth] as? NSNumber)?.doubleValue,
+        if let dpi = (properties[kCGImagePropertyDPIWidth] as? NSNumber)?.doubleValue,
            dpi.isFinite, dpi > 0 {
             let computed = (CGFloat(dpi) / 72 * 100).rounded() / 100
             if computed.isFinite {

@@ -153,21 +153,20 @@ final class MenuBarController: NSObject, NSWindowDelegate {
             button.sendAction(on: [.leftMouseDown, .rightMouseDown])
         }
 
-        syncModel()
+        updateStatusTooltip()
         observeUpdateState()
     }
 
     private func observeUpdateState() {
         lastUpdateLayoutKey = currentUpdateLayoutKey()
         let handleChange: @MainActor () -> Void = { [weak self] in
+            guard let self, self.panel?.isVisible == true else { return }
             DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
+                guard let self, self.panel?.isVisible == true else { return }
                 let nextKey = self.currentUpdateLayoutKey()
                 guard nextKey != self.lastUpdateLayoutKey else { return }
                 self.lastUpdateLayoutKey = nextKey
-                if self.panel?.isVisible == true {
-                    self.refresh()
-                }
+                self.refresh()
             }
         }
         updateManager.$state
@@ -232,8 +231,6 @@ final class MenuBarController: NSObject, NSWindowDelegate {
         isSnipHotKeyRegistered = isRegistered
         if panel?.isVisible == true {
             refresh()
-        } else {
-            syncModel()
         }
     }
 
@@ -387,6 +384,7 @@ final class MenuBarController: NSObject, NSWindowDelegate {
     }
 
     private func showPanel() {
+        lastUpdateLayoutKey = currentUpdateLayoutKey()
         syncModel()
         let panel = ensurePanel()
         let wasVisible = panel.isVisible

@@ -42,7 +42,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var ocrTaskID = UUID()
     private var isPresentingSavePanel = false
     private weak var activeSavePanel: NSSavePanel?
+    private var activeRecordingSave: RecordingResult?
     private var pendingRecordingSaves: [RecordingResult] = []
+    private var isRelaunching = false
     private var didBecomeActiveObserver: NSObjectProtocol?
 
     override init() {
@@ -72,6 +74,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             self.hadClickThroughPins = hasClickThrough
             self.menuBarController?.refresh()
+            self.settingsController?.refreshResourceUsage()
             self.updateManager.notifyActivityStateChanged()
         }
         pinManager.onRequestSavePNG = { [weak self] image in
@@ -141,6 +144,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self else { return }
             self.menuBarController?.handleHistoryChanged()
             self.settingsController?.updateHasClearableHistory(!self.clipboardStore.history.isEmpty || self.clipboardStore.hasPasteboardContent)
+            self.settingsController?.refreshResourceUsage(scheduleFollowUp: true)
         }
 
         recordingCoordinator.onStatusChanged = { [weak self] status in
@@ -199,6 +203,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         if recordingCoordinator.phase == .finalizing {
+            isRelaunching = false
+            updateManager.notifyTerminationCancelled()
             toast.show(
                 CCXL10n.text("Finishing Recording… Try Again Soon", zh: "正在生成录屏，请稍后再试"),
                 symbolName: "hourglass"
@@ -217,6 +223,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             alert.addButton(withTitle: CCXL10n.text("Keep Recording", zh: "继续录制"))
             alert.addButton(withTitle: CCXL10n.text("Discard & Quit", zh: "丢弃并退出"))
             if alert.runModal() != .alertSecondButtonReturn {
+                isRelaunching = false
+                updateManager.notifyTerminationCancelled()
                 return .terminateCancel
             }
         }
@@ -234,6 +242,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             NotificationCenter.default.removeObserver(didBecomeActiveObserver)
             self.didBecomeActiveObserver = nil
         }
+        if let activeRecordingSave {
+            try? FileManager.default.removeItem(at: activeRecordingSave.fileURL)
+            self.activeRecordingSave = nil
+        }
         for pending in pendingRecordingSaves {
             try? FileManager.default.removeItem(at: pending.fileURL)
         }
@@ -242,7 +254,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         recordingCoordinator.cancelActiveSession()
         hotKeyManager.unregisterAll()
         clipboardStore.flushPendingPersistence()
-        _ = updateManager.applyPreparedUpdateOnQuitIfReady()
+        if isRelaunching {
+            if !updateManager.applyPreparedUpdateOnQuitIfReady(relaunch: true) {
+                _ = AppRelauncher.spawnRelaunchHelper()
+            }
+        } else {
+            _ = updateManager.applyPreparedUpdateOnQuitIfReady()
+        }
     }
 
     func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool {
@@ -456,8 +474,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 toast.show(CCXL10n.text("Already Pinned", zh: "已贴图"), symbolName: "pin.fill")
             }
         case .copy(let result):
-            let entry = record(result)
-            clipboardStore.copyImage(result.image, scale: result.scale, historyEntryID: entry?.id)
+            clipboardStore.recordAndCopyImage(result.image, scale: result.scale, screenRect: result.screenRect)
             toast.show(CCXL10n.text("Copied to Clipboard", zh: "已拷贝到剪贴板"))
         case .save(let result):
             record(result)
@@ -583,16 +600,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
                 Task.detached(priority: .userInitiated) {
                     do {
-                        guard let pngData = ClipboardStore.encodePNG(image, scale: 1) else {
-                            throw ClipboardStoreError.encodingFailed
+                        try autoreleasepool {
+                            guard let pngData = ClipboardStore.encodePNG(image, scale: 1) else {
+                                throw ClipboardStoreError.encodingFailed
+                            }
+                            try ClipboardStore.writePNGDataAtomically(pngData, to: url)
                         }
-                        try ClipboardStore.writePNGDataAtomically(pngData, to: url)
                         await MainActor.run { [weak self] in
                             self?.toast.show(CCXL10n.text("Saved PNG", zh: "已保存 PNG"), symbolName: "square.and.arrow.down")
                         }
                     } catch {
                         let description = Self.userFriendlySaveError(error)
                         await MainActor.run {
+                            NSApp.activate()
                             let alert = NSAlert()
                             alert.alertStyle = .warning
                             alert.messageText = CCXL10n.text("Could Not Save PNG", zh: "无法保存 PNG")
@@ -655,7 +675,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if Darwin.lstat(normalized, &st) != 0, errno == ENOENT {
                 try? FileManager.default.createDirectory(at: defaultURL, withIntermediateDirectories: true)
             }
-            _ = Self.isRealDirectory(atPath: normalized)
         }
         return defaultURL
     }
@@ -743,17 +762,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let stem = Self.defaultFileStem(for: Date())
 
         Task.detached(priority: .userInitiated) {
-            guard let targetURL = Self.nextUniqueURL(in: directory, stem: stem, fileExtension: "png") else {
-                await MainActor.run { [weak self] in
-                    self?.toast.show(CCXL10n.text("Could Not Save PNG", zh: "无法保存 PNG"), symbolName: "exclamationmark.triangle")
-                }
-                return
-            }
             do {
-                guard let pngData = ClipboardStore.encodePNG(image, scale: 1) else {
-                    throw ClipboardStoreError.encodingFailed
+                try autoreleasepool {
+                    guard Self.isWritableRealDirectory(atPath: directory.path) else {
+                        throw ClipboardStoreError.writeFailed
+                    }
+                    guard let pngData = ClipboardStore.encodePNG(image, scale: 1) else {
+                        throw ClipboardStoreError.encodingFailed
+                    }
+                    _ = try ClipboardStore.writePNGDataExclusively(
+                        pngData,
+                        in: directory,
+                        stem: stem,
+                        maxSuffixAttempts: Self.maxQuickSaveSuffixAttempts
+                    )
                 }
-                try ClipboardStore.writePNGDataAtomically(pngData, to: targetURL)
                 let folderName = directory.lastPathComponent
                 await MainActor.run { [weak self] in
                     self?.toast.show(
@@ -864,6 +887,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     guard let self else { return }
                     self.clipboardStore.copyFileURL(destURL)
                     self.menuBarController?.refresh()
+                    self.settingsController?.updateHasClearableHistory(true)
+                    self.settingsController?.refreshResourceUsage(scheduleFollowUp: true)
                     self.toast.show(CCXL10n.text("Copied \(label)", zh: "已拷贝 \(label)"), symbolName: "doc.on.doc")
                 }
             } catch {
@@ -911,6 +936,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         isPresentingSavePanel = true
         activeSavePanel = panel
+        activeRecordingSave = result
         updateManager.notifyActivityStateChanged()
         NSApp.activate()
 
@@ -921,6 +947,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.activeSavePanel = nil
 
                 guard response == .OK, let url = panel.url else {
+                    if self.activeRecordingSave?.fileURL == result.fileURL {
+                        self.activeRecordingSave = nil
+                    }
                     try? FileManager.default.removeItem(at: result.fileURL)
                     self.drainPendingRecordingSavesIfIdle()
                     return
@@ -931,6 +960,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     do {
                         try Self.moveRecordingAtomically(from: result.fileURL, to: url)
                         await MainActor.run { [weak self] in
+                            if self?.activeRecordingSave?.fileURL == result.fileURL {
+                                self?.activeRecordingSave = nil
+                            }
                             self?.toast.show(CCXL10n.text("Saved \(label)", zh: "已保存 \(label)"), symbolName: "square.and.arrow.down")
                             self?.drainPendingRecordingSavesIfIdle()
                         }
@@ -951,6 +983,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                             if alert.runModal() == .alertFirstButtonReturn {
                                 self.presentSavePanel(for: result)
                             } else {
+                                if self.activeRecordingSave?.fileURL == result.fileURL {
+                                    self.activeRecordingSave = nil
+                                }
                                 try? FileManager.default.removeItem(at: result.fileURL)
                                 self.drainPendingRecordingSavesIfIdle()
                             }
@@ -1072,14 +1107,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return Darwin.chmod(url.path, 0o700) == 0
         }
         guard errno == ENOENT else { return false }
-        do {
-            try FileManager.default.createDirectory(
-                at: url,
-                withIntermediateDirectories: true,
-                attributes: [.posixPermissions: 0o700]
-            )
-        } catch {
-            return false
+        if Darwin.mkdir(url.path, 0o700) != 0 && errno != EEXIST {
+            guard errno == ENOENT else { return false }
+            do {
+                try FileManager.default.createDirectory(
+                    at: url,
+                    withIntermediateDirectories: true,
+                    attributes: [.posixPermissions: 0o700]
+                )
+            } catch {
+                return false
+            }
         }
         guard Darwin.lstat(url.path, &st) == 0,
               (st.st_mode & S_IFMT) == S_IFDIR,
@@ -1197,13 +1235,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard !trimmed.isEmpty else {
             return CCXL10n.text("An unexpected error occurred.", zh: "发生意外错误。")
         }
-        if trimmed.contains("Error Domain=") || trimmed.contains("NSCocoaErrorDomain") || trimmed.contains("NSPOSIXErrorDomain") {
+        if trimmed.contains("Error Domain=")
+            || trimmed.contains("NSCocoaErrorDomain")
+            || trimmed.contains("NSPOSIXErrorDomain")
+            || trimmed.contains("NSOSStatusErrorDomain")
+            || trimmed.contains("NSURLErrorDomain")
+            || trimmed.contains("SCStreamErrorDomain")
+        {
             return CCXL10n.text("The operation could not be completed. Please try again.", zh: "操作未能完成，请重试。")
         }
         return trimmed
     }
 
     // MARK: - Windows
+
+    private func relaunchApplication() {
+        guard AppRelauncher.validatedBundlePath() != nil else {
+            NSSound.beep()
+            return
+        }
+        isRelaunching = true
+        NSApp.terminate(nil)
+    }
 
     private func showOnboarding(
         startingAt step: OnboardingStep = .welcome,
@@ -1221,6 +1274,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     self?.scheduleDelayedLaunch(milliseconds: 220) {
                         self?.startSnip()
                     }
+                },
+                onRelaunch: { [weak self] in
+                    self?.relaunchApplication()
                 }
             )
             controller.onWindowVisibilityChanged = { [weak self] _ in
@@ -1244,6 +1300,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 isSnipHotKeyRegistered: hotKeyManager.isRegistered(.snip),
                 hasClearableHistory: hasClearable,
                 recordingsFolderPath: recordingsFolderPath,
+                resourceMetricsProvider: { [weak self] in
+                    guard let self else { return .empty }
+                    return SettingsResourceMetricsInput(
+                        historyCount: self.clipboardStore.history.count,
+                        maxHistoryCount: self.clipboardStore.maxHistoryCount,
+                        activePinCount: self.pinManager.pinCount,
+                        cacheDirectories: [
+                            ClipboardStore.defaultHistoryDirectoryURL(),
+                            Self.pasteboardRecordingsDirectoryURL(),
+                        ]
+                    )
+                },
                 onBeginShortcutRecording: { [weak self] in
                     self?.beginShortcutRecording()
                 },
@@ -1282,6 +1350,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         CCXL10n.text("History & Clipboard Cleared", zh: "已清空记录与剪贴板"),
                         symbolName: "trash"
                     )
+                },
+                onRelaunch: { [weak self] in
+                    self?.relaunchApplication()
                 }
             )
             controller.onWindowVisibilityChanged = { [weak self] _ in
@@ -1342,6 +1413,7 @@ extension AppDelegate: MenuBarControllerDelegate {
         }
         menuBarController?.refresh()
         settingsController?.updateHasClearableHistory(!clipboardStore.history.isEmpty || clipboardStore.hasPasteboardContent)
+        settingsController?.refreshResourceUsage(scheduleFollowUp: true)
     }
 
     func menuBarRequestedPinHistoryEntry(_ entry: SnipHistoryEntry) {
@@ -1362,6 +1434,7 @@ extension AppDelegate: MenuBarControllerDelegate {
         }
         menuBarController?.refresh()
         settingsController?.updateHasClearableHistory(false)
+        settingsController?.refreshResourceUsage(scheduleFollowUp: true)
     }
 
     func menuBarRequestedToggleAllPins() {

@@ -13,25 +13,27 @@ public enum TextRecognizer {
         let cancelBox = CancelableVisionRequestBox()
         return try await withTaskCancellationHandler {
             try await Task.detached(priority: .userInitiated) {
-                try Task.checkCancellation()
+                try autoreleasepool {
+                    try Task.checkCancellation()
 
-                let request = VNRecognizeTextRequest()
-                request.recognitionLevel = .accurate
-                request.usesLanguageCorrection = true
-                request.automaticallyDetectsLanguage = true
-                request.recognitionLanguages = ["zh-Hans", "zh-Hant", "en-US"]
+                    let request = VNRecognizeTextRequest()
+                    request.recognitionLevel = .accurate
+                    request.usesLanguageCorrection = true
+                    request.automaticallyDetectsLanguage = true
+                    request.recognitionLanguages = ["zh-Hans", "zh-Hant", "en-US"]
 
-                guard cancelBox.install(request) else {
-                    throw CancellationError()
+                    guard cancelBox.install(request) else {
+                        throw CancellationError()
+                    }
+                    defer { cancelBox.clear() }
+
+                    let handler = VNImageRequestHandler(cgImage: image, options: [:])
+                    try handler.perform([request])
+                    try Task.checkCancellation()
+
+                    let lines = (request.results ?? []).compactMap { $0.topCandidates(1).first?.string }
+                    return lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
                 }
-                defer { cancelBox.clear() }
-
-                let handler = VNImageRequestHandler(cgImage: image, options: [:])
-                try handler.perform([request])
-                try Task.checkCancellation()
-
-                let lines = (request.results ?? []).compactMap { $0.topCandidates(1).first?.string }
-                return lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
             }.value
         } onCancel: {
             cancelBox.cancel()

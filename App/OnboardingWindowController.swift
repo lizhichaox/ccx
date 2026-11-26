@@ -1,5 +1,6 @@
 import AppKit
 import CCXCore
+import Darwin
 import SwiftUI
 
 enum OnboardingStep: Int, CaseIterable {
@@ -52,6 +53,7 @@ final class OnboardingWindowController: NSObject, NSWindowDelegate {
     private let flow = OnboardingFlowState()
     private let onComplete: () -> Void
     private let onTrySnip: () -> Void
+    private let onRelaunch: () -> Void
     private var window: NSWindow?
 
     var onWindowVisibilityChanged: ((Bool) -> Void)?
@@ -67,10 +69,12 @@ final class OnboardingWindowController: NSObject, NSWindowDelegate {
     init(
         snipCombo: HotKeyCombo = .defaultSnip,
         onComplete: @escaping () -> Void,
-        onTrySnip: @escaping () -> Void
+        onTrySnip: @escaping () -> Void,
+        onRelaunch: @escaping () -> Void = { _ = AppRelauncher.relaunch() }
     ) {
         self.onComplete = onComplete
         self.onTrySnip = onTrySnip
+        self.onRelaunch = onRelaunch
         super.init()
         self.flow.snipCombo = snipCombo
     }
@@ -137,6 +141,9 @@ final class OnboardingWindowController: NSObject, NSWindowDelegate {
                     self.onWindowVisibilityChanged?(false)
                 }
                 self.onTrySnip()
+            },
+            onRelaunch: { [weak self] in
+                self?.onRelaunch()
             }
         )
         let hosting = NSHostingController(rootView: view)
@@ -404,34 +411,63 @@ final class OnboardingWindowController: NSObject, NSWindowDelegate {
 /// Relaunches CCX so macOS applies a freshly granted Screen Recording permission.
 @MainActor
 enum AppRelauncher {
-    static func relaunch() {
-        let bundleURL = Bundle.main.bundleURL
-        guard bundleURL.pathExtension == "app",
-              FileManager.default.fileExists(atPath: bundleURL.path)
-        else {
-            NSSound.beep()
-            return
+    /// Returns the normalized path to the running `.app` bundle when it is a real, non-symlink
+    /// directory and the process has a valid PID.
+    static func validatedBundlePath() -> String? {
+        var path = Bundle.main.bundleURL.path
+        while path.count > 1 && path.hasSuffix("/") {
+            path.removeLast()
         }
+        let normalizedURL = URL(fileURLWithPath: path, isDirectory: true)
+        var st = stat()
+        guard normalizedURL.pathExtension == "app",
+              Darwin.lstat(path, &st) == 0,
+              (st.st_mode & S_IFMT) == S_IFDIR,
+              ProcessInfo.processInfo.processIdentifier > 1
+        else {
+            return nil
+        }
+        return path
+    }
 
-        let pid = String(ProcessInfo.processInfo.processIdentifier)
+    /// Spawns the detached relaunch helper without calling `NSApp.terminate(nil)`.
+    /// Call only once termination is confirmed (e.g. inside `applicationWillTerminate`).
+    @discardableResult
+    static func spawnRelaunchHelper() -> Bool {
+        guard let path = validatedBundlePath() else {
+            return false
+        }
+        let pid = ProcessInfo.processInfo.processIdentifier
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/sh")
         // Wait for this process to exit (bounded to 5s) before reopening via LaunchServices,
-        // avoiding both premature hotkey collisions and blind sleep races.
+        // exiting quietly if the process is still alive.
         process.arguments = [
             "-c",
-            "pid=$1; app=$2; i=0; while kill -0 \"$pid\" 2>/dev/null && [ $i -lt 50 ]; do /bin/sleep 0.1; i=$((i+1)); done; exec /usr/bin/open -- \"$app\"",
+            "pid=$1; app=$2; i=0; while /bin/kill -0 \"$pid\" 2>/dev/null && [ \"$i\" -lt 50 ]; do /bin/sleep 0.1; i=$((i+1)); done; if /bin/kill -0 \"$pid\" 2>/dev/null; then exit 0; fi; exec /usr/bin/open -- \"$app\"",
             "ccx-relaunch",
-            pid,
-            bundleURL.path,
+            String(pid),
+            path,
         ]
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
         do {
             try process.run()
+            return true
         } catch {
+            return false
+        }
+    }
+
+    @discardableResult
+    static func relaunch() -> Bool {
+        guard spawnRelaunchHelper() else {
             NSSound.beep()
-            return
+            return false
         }
         NSApp.terminate(nil)
+        return true
     }
 }
 
@@ -442,6 +478,7 @@ private struct OnboardingView: View {
     @ObservedObject var flow: OnboardingFlowState
     let onDone: () -> Void
     let onTrySnip: () -> Void
+    let onRelaunch: () -> Void
 
     var body: some View {
         ZStack(alignment: .top) {
@@ -466,7 +503,7 @@ private struct OnboardingView: View {
                             .padding(.bottom, 12)
                             .frame(width: pageWidth, height: proxy.size.height)
 
-                        PermissionsStepView(model: model, flow: flow)
+                        PermissionsStepView(model: model, flow: flow, onRelaunch: onRelaunch)
                             .padding(.horizontal, 20)
                             .padding(.top, 28)
                             .padding(.bottom, 12)
@@ -488,7 +525,8 @@ private struct OnboardingView: View {
                     model: model,
                     flow: flow,
                     onDone: onDone,
-                    onTrySnip: onTrySnip
+                    onTrySnip: onTrySnip,
+                    onRelaunch: onRelaunch
                 )
                 .padding(.horizontal, 18)
                 .frame(height: 48)
@@ -589,6 +627,7 @@ private struct FeatureBentoCard: View {
 private struct PermissionsStepView: View {
     @ObservedObject var model: PermissionStatusModel
     @ObservedObject var flow: OnboardingFlowState
+    let onRelaunch: () -> Void
 
     var body: some View {
         VStack(spacing: 12) {
@@ -631,7 +670,8 @@ private struct PermissionsStepView: View {
                 ScreenRecordingHintStrip(
                     showRelaunch: flow.requestedScreenRecording,
                     isVerifying: model.isCheckingScreenRecording,
-                    onVerify: { model.verifyScreenRecordingLive() }
+                    onVerify: { model.verifyScreenRecordingLive() },
+                    onRelaunch: onRelaunch
                 )
             }
 
@@ -714,6 +754,7 @@ private struct ScreenRecordingHintStrip: View {
     let showRelaunch: Bool
     let isVerifying: Bool
     let onVerify: () -> Void
+    let onRelaunch: () -> Void
 
     var body: some View {
         HStack(spacing: 8) {
@@ -738,9 +779,7 @@ private struct ScreenRecordingHintStrip: View {
                 .fixedSize()
 
             if showRelaunch {
-                Button(CCXL10n.text("Relaunch", zh: "重启")) {
-                    AppRelauncher.relaunch()
-                }
+                Button(CCXL10n.text("Relaunch", zh: "重启"), action: onRelaunch)
                 .buttonStyle(.borderedProminent)
                 .controlSize(.small)
                 .fixedSize()
@@ -885,6 +924,7 @@ private struct OnboardingFooterBar: View {
     @ObservedObject var flow: OnboardingFlowState
     let onDone: () -> Void
     let onTrySnip: () -> Void
+    let onRelaunch: () -> Void
 
     var body: some View {
         ZStack {
@@ -916,9 +956,7 @@ private struct OnboardingFooterBar: View {
 
                     case .permissions:
                         if !model.status.screenRecording && flow.requestedScreenRecording {
-                            Button(CCXL10n.text("Relaunch", zh: "重启")) {
-                                AppRelauncher.relaunch()
-                            }
+                            Button(CCXL10n.text("Relaunch", zh: "重启"), action: onRelaunch)
                             .buttonStyle(.borderedProminent)
                             .fixedSize()
                         } else if model.status.screenRecording {

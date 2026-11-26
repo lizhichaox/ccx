@@ -249,6 +249,10 @@ public enum HotKeyConflictDetector {
         reservedAppShortcutLabels.mapValues(\.localized)
     }
 
+    internal static func isReservedAppShortcut(_ combo: HotKeyCombo) -> Bool {
+        reservedAppShortcutLabels[combo.normalized] != nil
+    }
+
     /// Queries Carbon `CopySymbolicHotKeys` for all currently enabled macOS system shortcuts.
     public static func activeSystemSymbolicHotKeys() -> Set<HotKeyCombo> {
         var unmanaged: Unmanaged<CFArray>?
@@ -335,7 +339,10 @@ public enum HotKeyPreferences {
             return action.defaultCombo
         }
         let normalized = decoded.normalized
-        guard HotKeyConflictDetector.validateStructure(normalized) == nil else {
+        guard normalized.keyCode <= UInt32(UInt16.max),
+              HotKeyConflictDetector.validateStructure(normalized) == nil,
+              !HotKeyConflictDetector.isReservedAppShortcut(normalized)
+        else {
             return action.defaultCombo
         }
         return normalized

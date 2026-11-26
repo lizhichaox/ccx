@@ -18,6 +18,7 @@ public enum CCXLanguage: String, CaseIterable, Equatable, Hashable, Sendable {
 /// (including Traditional Chinese).
 public enum CCXL10n {
     private static let languageOverrideLock = OSAllocatedUnfairLock<CCXLanguage?>(initialState: nil)
+    private static let resolvedSystemLanguage: CCXLanguage = resolveLanguage()
 
     /// Resolves the best supported `CCXLanguage` from an ordered list of BCP-47 / macOS
     /// language identifiers (such as `Locale.preferredLanguages`).
@@ -60,12 +61,12 @@ public enum CCXL10n {
     }
 
     /// The active language, honoring any thread-safe test override before falling back to
-    /// automatic system resolution via `resolveLanguage()`.
+    /// the cached system resolution from `resolveLanguage()`.
     public static var currentLanguage: CCXLanguage {
         if let override = languageOverrideLock.withLock({ $0 }) {
             return override
         }
-        return resolveLanguage()
+        return resolvedSystemLanguage
     }
 
     /// Sets or clears a process-wide language override for deterministic unit tests.

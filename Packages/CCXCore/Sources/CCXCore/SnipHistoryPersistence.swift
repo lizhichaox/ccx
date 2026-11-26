@@ -30,23 +30,34 @@ final class SnipHistoryDiskStore: Sendable {
             .appendingPathComponent("RecentSnips", isDirectory: true)
     }
 
-    func save(entry: SnipHistoryEntry, manifest: [SnipHistoryManifestRecord]) {
+    func save(
+        entry: SnipHistoryEntry,
+        manifest: [SnipHistoryManifestRecord],
+        preEncodedPNG: Data? = nil,
+        onEncodedPNG: (@Sendable (UUID, Data) -> Void)? = nil
+    ) {
         ioQueue.async { [directoryURL] in
-            guard Self.ensureSecureDirectory(at: directoryURL) else { return }
+            autoreleasepool {
+                guard Self.ensureSecureDirectory(at: directoryURL) else { return }
 
-            let pngName = "\(entry.id.uuidString).png"
-            let pngURL = directoryURL.appendingPathComponent(pngName)
-            if !Self.isExistingRegularUserFile(at: pngURL),
-               let pngData = ClipboardStore.encode(entry.image, type: .png, scale: entry.scale) {
-                _ = Self.writePrivateFileAtomically(pngData, to: pngURL)
+                let pngName = "\(entry.id.uuidString).png"
+                let pngURL = directoryURL.appendingPathComponent(pngName)
+                if !Self.isExistingRegularUserFile(at: pngURL) {
+                    let pngData = preEncodedPNG ?? ClipboardStore.encode(entry.image, type: .png, scale: entry.scale)
+                    if let pngData {
+                        if Self.writePrivateFileAtomically(pngData, to: pngURL), preEncodedPNG == nil {
+                            onEncodedPNG?(entry.id, pngData)
+                        }
+                    }
+                }
+
+                let indexURL = directoryURL.appendingPathComponent("index.json")
+                if let indexData = try? JSONEncoder().encode(manifest) {
+                    _ = Self.writePrivateFileAtomically(indexData, to: indexURL)
+                }
+
+                Self.pruneUnreferencedFiles(in: directoryURL, keepingPNGNames: Set(manifest.map { "\($0.id.uuidString).png" }))
             }
-
-            let indexURL = directoryURL.appendingPathComponent("index.json")
-            if let indexData = try? JSONEncoder().encode(manifest) {
-                _ = Self.writePrivateFileAtomically(indexData, to: indexURL)
-            }
-
-            Self.pruneUnreferencedFiles(in: directoryURL, keepingPNGNames: Set(manifest.map { "\($0.id.uuidString).png" }))
         }
     }
 
@@ -95,45 +106,53 @@ final class SnipHistoryDiskStore: Sendable {
             var needsCleanup = records.count > maxCount
 
             for record in records.prefix(maxCount) {
-                guard seenIDs.insert(record.id).inserted else {
-                    needsCleanup = true
-                    continue
-                }
+                var reachedBudget = false
+                autoreleasepool {
+                    guard seenIDs.insert(record.id).inserted else {
+                        needsCleanup = true
+                        return
+                    }
 
-                let pngURL = directoryURL.appendingPathComponent("\(record.id.uuidString).png")
-                guard let pngData = Self.readPrivateRegularFile(at: pngURL, maxBytes: ClipboardStore.maxDecodeFileBytes),
-                      let (image, _) = ClipboardStore.decode(pngData)
-                else {
-                    needsCleanup = true
-                    continue
-                }
+                    let pngURL = directoryURL.appendingPathComponent("\(record.id.uuidString).png")
+                    guard let pngData = Self.readPrivateRegularFile(at: pngURL, maxBytes: ClipboardStore.maxDecodeFileBytes),
+                          let (image, _) = ClipboardStore.decode(pngData)
+                    else {
+                        needsCleanup = true
+                        return
+                    }
 
-                let imageBytes = ClipboardStore.estimatedMemoryBytes(for: image)
-                if !entries.isEmpty, maxTotalMemoryBytes > 0, totalMemoryBytes + imageBytes > maxTotalMemoryBytes {
-                    needsCleanup = true
+                    let imageBytes = ClipboardStore.estimatedMemoryBytes(for: image)
+                    let (nextTotalBytes, overflow) = totalMemoryBytes.addingReportingOverflow(imageBytes)
+                    if !entries.isEmpty, maxTotalMemoryBytes > 0, (overflow || nextTotalBytes > maxTotalMemoryBytes) {
+                        needsCleanup = true
+                        reachedBudget = true
+                        return
+                    }
+
+                    let sanitizedScale = Self.sanitizeScale(record.scale)
+                    let sanitizedRect = Self.sanitizeRect(record.screenRect)
+                    if sanitizedScale != record.scale || sanitizedRect != record.screenRect {
+                        needsCleanup = true
+                    }
+
+                    entries.append(SnipHistoryEntry(
+                        id: record.id,
+                        timestamp: record.timestamp,
+                        image: image,
+                        scale: sanitizedScale,
+                        screenRect: sanitizedRect
+                    ))
+                    validRecords.append(SnipHistoryManifestRecord(
+                        id: record.id,
+                        timestamp: record.timestamp,
+                        scale: sanitizedScale,
+                        screenRect: sanitizedRect
+                    ))
+                    totalMemoryBytes = overflow ? Int.max : nextTotalBytes
+                }
+                if reachedBudget {
                     break
                 }
-
-                let sanitizedScale = Self.sanitizeScale(record.scale)
-                let sanitizedRect = Self.sanitizeRect(record.screenRect)
-                if sanitizedScale != record.scale || sanitizedRect != record.screenRect {
-                    needsCleanup = true
-                }
-
-                entries.append(SnipHistoryEntry(
-                    id: record.id,
-                    timestamp: record.timestamp,
-                    image: image,
-                    scale: sanitizedScale,
-                    screenRect: sanitizedRect
-                ))
-                validRecords.append(SnipHistoryManifestRecord(
-                    id: record.id,
-                    timestamp: record.timestamp,
-                    scale: sanitizedScale,
-                    screenRect: sanitizedRect
-                ))
-                totalMemoryBytes += imageBytes
             }
 
             if needsCleanup {
@@ -193,14 +212,17 @@ final class SnipHistoryDiskStore: Sendable {
         }
         guard errno == ENOENT else { return false }
 
-        do {
-            try FileManager.default.createDirectory(
-                at: url,
-                withIntermediateDirectories: true,
-                attributes: [.posixPermissions: 0o700]
-            )
-        } catch {
-            return false
+        if Darwin.mkdir(path, 0o700) != 0 && errno != EEXIST {
+            guard errno == ENOENT else { return false }
+            do {
+                try FileManager.default.createDirectory(
+                    at: url,
+                    withIntermediateDirectories: true,
+                    attributes: [.posixPermissions: 0o700]
+                )
+            } catch {
+                return false
+            }
         }
 
         if Darwin.lstat(path, &st) != 0 { return false }
@@ -333,7 +355,7 @@ final class SnipHistoryDiskStore: Sendable {
                 if data.count + bytesRead > maxBytes {
                     return nil
                 }
-                data.append(contentsOf: chunk[0..<bytesRead])
+                data.append(chunk, count: bytesRead)
             } else if bytesRead == 0 {
                 break
             } else if errno == EINTR {
