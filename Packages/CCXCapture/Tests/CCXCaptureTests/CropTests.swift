@@ -64,4 +64,36 @@ struct CropTests {
         let borderPixel = try #require(CCXColorSample.samplePixel(from: result.image, pixelX: 0, pixelY: 10))
         #expect(borderPixel.green > 150)
     }
+
+    @Test func smallCropDetachesFromFullDisplaySnapshotBufferAndPreservesPixels() throws {
+        let snapshot = try makeSnapshot()
+        let smallResult = try #require(SnipOverlayController.makeResult(
+            localRect: CGRect(x: 10, y: 30, width: 20, height: 10),
+            snapshot: snapshot
+        ))
+        // Detached crop must not share the full display snapshot's underlying CGDataProvider buffer.
+        #expect(smallResult.image.dataProvider !== snapshot.image.dataProvider)
+        #expect(smallResult.image.bytesPerRow < snapshot.image.bytesPerRow)
+        let sampled = try #require(CCXColorSample.samplePixel(from: smallResult.image, pixelX: 5, pixelY: 5))
+        #expect(sampled.red == 255 && sampled.green == 0 && sampled.blue == 0)
+
+        // Forced detach (used for ScrollCaptureRequest.initialImage) detaches even full-screen selections.
+        let fullDetached = try #require(SnipOverlayController.makeResult(
+            localRect: CGRect(x: 0, y: 0, width: 100, height: 50),
+            snapshot: snapshot,
+            detachFromSnapshot: true
+        ))
+        #expect(fullDetached.image.dataProvider !== snapshot.image.dataProvider)
+        #expect(fullDetached.image.width == 200 && fullDetached.image.height == 100)
+        let topPx = try #require(CCXColorSample.samplePixel(from: fullDetached.image, pixelX: 10, pixelY: 10))
+        let bottomPx = try #require(CCXColorSample.samplePixel(from: fullDetached.image, pixelX: 10, pixelY: 90))
+        #expect(topPx.red == 255 && bottomPx.blue == 255)
+
+        // ScreenSnapshotEngine clampedPixelDimension guards huge finite CGFloat values without trapping.
+        #expect(ScreenSnapshotEngine.clampedPixelDimension(1e30, minimum: 1) == 16_384)
+        #expect(ScreenSnapshotEngine.clampedPixelDimension(1e30, minimum: 2) == 16_384)
+        #expect(ScreenSnapshotEngine.clampedPixelDimension(.nan, minimum: 1) == nil)
+        #expect(ScreenSnapshotEngine.clampedPixelDimension(.infinity, minimum: 1) == nil)
+        #expect(ScreenSnapshotEngine.clampedPixelDimension(1, minimum: 2) == nil)
+    }
 }

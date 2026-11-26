@@ -205,7 +205,10 @@ public final class SmartElementDetector {
     /// Front-to-back visible windows (and extracted overlay cards) for the current session.
     public private(set) var windows: [DetectedWindow] = []
     private var regularWindows: [DetectedWindow] = []
+    private var regularWindowIndexByID: [CGWindowID: Int] = [:]
     private var pendingOverlayWindows: [OverlayWindowEntry] = []
+    private var inFlightOverlayWindows: [OverlayWindowEntry] = []
+    private var inFlightOverlayGeneration: UInt64 = 0
     private(set) var fallbackOverlayWindows: [OverlayWindowEntry] = []
 
     private let excludedPID: pid_t?
@@ -267,26 +270,59 @@ public final class SmartElementDetector {
         let raw = (CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]]) ?? []
         let primaryHeight = CoordinateConverter.primaryScreenHeight(screens: screenFrames)
         cachedPrimaryScreenHeight = primaryHeight
+        var runningBundleIDs: [pid_t: String] = [:]
+        for app in NSWorkspace.shared.runningApplications {
+            if let bundleID = app.bundleIdentifier {
+                runningBundleIDs[app.processIdentifier] = bundleID
+            }
+        }
         let parsed = Self.parseWindowSnapshot(
             raw,
             excludingPID: excludedPID,
             excludingWindowIDs: excludedWindowIDs,
             primaryScreenHeight: primaryHeight,
-            screenFrames: screenFrames
+            screenFrames: screenFrames,
+            bundleIdentifierResolver: { pid in
+                runningBundleIDs[pid] ?? Self.defaultBundleIdentifier(for: pid)
+            }
         )
         regularWindows = parsed.windows
+        rebuildRegularWindowIndex()
         windows = parsed.windows
         pendingOverlayWindows = parsed.overlayWindows
+        inFlightOverlayWindows = []
+        inFlightOverlayGeneration = 0
         fallbackOverlayWindows = []
+    }
+
+    private func rebuildRegularWindowIndex() {
+        regularWindowIndexByID.removeAll(keepingCapacity: true)
+        regularWindowIndexByID.reserveCapacity(regularWindows.count)
+        for (index, window) in regularWindows.enumerated() where regularWindowIndexByID[window.windowID] == nil {
+            regularWindowIndexByID[window.windowID] = index
+        }
+    }
+
+    private struct OverlayPrepWaitState: Sendable {
+        var continuation: CheckedContinuation<[CGWindowID: OverlayExtractionResult]?, Never>?
+        var isResolved = false
     }
 
     /// Pre-captures individual cards from composite system overlays (such as Notification Center)
     /// before snip overlays are presented, without blocking normal snips when no overlay is open.
     public func prepareOverlayElements() async {
+        await prepareOverlayElements(customExtractor: nil)
+    }
+
+    internal func prepareOverlayElements(
+        customExtractor: (@Sendable ([OverlayWindowEntry], @Sendable () -> Bool) -> [CGWindowID: OverlayExtractionResult])?
+    ) async {
         guard !pendingOverlayWindows.isEmpty else { return }
         let generation = snapshotGeneration
         let overlays = pendingOverlayWindows
         pendingOverlayWindows = []
+        inFlightOverlayWindows = overlays
+        inFlightOverlayGeneration = generation
 
         let primaryHeight = cachedPrimaryScreenHeight > 0
             ? cachedPrimaryScreenHeight
@@ -294,29 +330,89 @@ public final class SmartElementDetector {
         let isRightToLeft = NSApp?.userInterfaceLayoutDirection == .rightToLeft
 
         let extractionsByWindowID: [CGWindowID: OverlayExtractionResult]
-        if isAccessibilityEnabled {
+        if isAccessibilityEnabled || customExtractor != nil {
             let cancelledFlag = OSAllocatedUnfairLock(initialState: false)
-            extractionsByWindowID = await withTaskCancellationHandler {
-                await withCheckedContinuation { continuation in
-                    DispatchQueue.global(qos: .userInitiated).async {
-                        let extracted = AXOverlayCardExtractor.extractCards(
-                            for: overlays,
-                            primaryScreenHeight: primaryHeight,
-                            isRightToLeft: isRightToLeft,
-                            isCancelled: { cancelledFlag.withLock { $0 } }
-                        )
-                        continuation.resume(returning: extracted)
-                    }
+            let waitState = OSAllocatedUnfairLock(initialState: OverlayPrepWaitState())
+
+            @Sendable func resolve(_ result: [CGWindowID: OverlayExtractionResult]?) {
+                let continuation = waitState.withLock { state -> CheckedContinuation<[CGWindowID: OverlayExtractionResult]?, Never>? in
+                    guard !state.isResolved else { return nil }
+                    state.isResolved = true
+                    let cont = state.continuation
+                    state.continuation = nil
+                    return cont
                 }
-            } onCancel: {
-                cancelledFlag.withLock { $0 = true }
+                continuation?.resume(returning: result)
             }
+
+            let extracted: [CGWindowID: OverlayExtractionResult]?
+            if Task.isCancelled {
+                cancelledFlag.withLock { $0 = true }
+                extracted = nil
+            } else {
+                extracted = await withTaskCancellationHandler {
+                    await withCheckedContinuation { continuation in
+                        let alreadyResolved = waitState.withLock { state -> Bool in
+                            guard !state.isResolved else { return true }
+                            state.continuation = continuation
+                            return false
+                        }
+                        if alreadyResolved {
+                            continuation.resume(returning: nil)
+                            return
+                        }
+                        DispatchQueue.global(qos: .userInitiated).async {
+                            let isCancelled: @Sendable () -> Bool = { cancelledFlag.withLock { $0 } }
+                            let result: [CGWindowID: OverlayExtractionResult]
+                            if let customExtractor {
+                                result = customExtractor(overlays, isCancelled)
+                            } else {
+                                result = AXOverlayCardExtractor.extractCards(
+                                    for: overlays,
+                                    primaryScreenHeight: primaryHeight,
+                                    isRightToLeft: isRightToLeft,
+                                    isCancelled: isCancelled
+                                )
+                            }
+                            resolve(result)
+                        }
+                    }
+                } onCancel: {
+                    cancelledFlag.withLock { $0 = true }
+                    resolve(nil)
+                }
+            }
+            extractionsByWindowID = extracted ?? [:]
         } else {
             extractionsByWindowID = [:]
         }
 
-        guard generation == snapshotGeneration, !Task.isCancelled else { return }
+        guard generation == snapshotGeneration,
+              !inFlightOverlayWindows.isEmpty,
+              inFlightOverlayGeneration == generation
+        else { return }
+        inFlightOverlayWindows = []
+        applyOverlayExtractions(overlays: overlays, extractionsByWindowID: extractionsByWindowID)
+    }
 
+    /// Synchronously merges any in-flight or pending overlays as fallback overlays/compact banners
+    /// if pre-capture timed out before snip launch, so Notification Center detection is never lost.
+    func finalizePendingOverlayFallbackIfNeeded() {
+        if !inFlightOverlayWindows.isEmpty && inFlightOverlayGeneration == snapshotGeneration {
+            let overlays = inFlightOverlayWindows
+            inFlightOverlayWindows = []
+            applyOverlayExtractions(overlays: overlays, extractionsByWindowID: [:])
+        } else if !pendingOverlayWindows.isEmpty {
+            let overlays = pendingOverlayWindows
+            pendingOverlayWindows = []
+            applyOverlayExtractions(overlays: overlays, extractionsByWindowID: [:])
+        }
+    }
+
+    private func applyOverlayExtractions(
+        overlays: [OverlayWindowEntry],
+        extractionsByWindowID: [CGWindowID: OverlayExtractionResult]
+    ) {
         var cardsByWindowID: [CGWindowID: [CGRect]] = [:]
         var confirmedEmptyIDs: Set<CGWindowID> = []
         for (windowID, result) in extractionsByWindowID {
@@ -470,10 +566,20 @@ public final class SmartElementDetector {
         return remaining
     }
 
+    /// Single-pass Tier 1 + Tier 2 eligibility lookup for 120 Hz hover tracking.
+    func hoverLookup(at globalPoint: CGPoint) -> (windowRect: CGRect?, shouldQueryAX: Bool) {
+        let hit = Self.hitTest(windows, at: globalPoint)
+        guard axWorker != nil else {
+            return (hit?.frame, false)
+        }
+        let (target, overlay) = resolveTier2Targets(at: globalPoint, precomputedHit: hit)
+        return (hit?.frame, target != nil || overlay != nil)
+    }
+
     /// Returns whether Tier 2 AX element refinement should run at `globalPoint`.
     public func shouldRequestElementRect(at globalPoint: CGPoint) -> Bool {
         guard axWorker != nil else { return false }
-        let (target, overlay) = resolveTier2Targets(at: globalPoint)
+        let (target, overlay) = resolveTier2Targets(at: globalPoint, precomputedHit: Self.hitTest(windows, at: globalPoint))
         return target != nil || overlay != nil
     }
 
@@ -485,28 +591,35 @@ public final class SmartElementDetector {
     ) {
         snapshotGeneration &+= 1
         self.regularWindows = regularWindows
+        rebuildRegularWindowIndex()
         self.windows = windows
         self.fallbackOverlayWindows = fallbackOverlayWindows
         self.pendingOverlayWindows = pendingOverlayWindows
+        self.inFlightOverlayWindows = []
+        self.inFlightOverlayGeneration = 0
     }
 
     private func resolveTier2Targets(
-        at globalPoint: CGPoint
+        at globalPoint: CGPoint,
+        precomputedHit: DetectedWindow?
     ) -> (targetWindow: DetectedWindow?, overlayFallback: OverlayWindowEntry?) {
-        let hit = Self.hitTest(windows, at: globalPoint)
+        let hit = precomputedHit
         if let hit, !hit.allowsTier2Refinement {
             return (nil, nil)
         }
 
-        let regularHitIndex = hit.flatMap { window in
-            regularWindows.firstIndex { $0.windowID == window.windowID }
-        }
-        let overlayFallback = fallbackOverlayWindows.first { entry in
-            guard entry.window.frame.contains(globalPoint) else { return false }
-            if let regularHitIndex {
-                return entry.zOrderIndex <= regularHitIndex
+        let overlayFallback: OverlayWindowEntry?
+        if fallbackOverlayWindows.isEmpty {
+            overlayFallback = nil
+        } else {
+            let regularHitIndex = hit.flatMap { regularWindowIndexByID[$0.windowID] }
+            overlayFallback = fallbackOverlayWindows.first { entry in
+                guard entry.window.frame.contains(globalPoint) else { return false }
+                if let regularHitIndex {
+                    return entry.zOrderIndex <= regularHitIndex
+                }
+                return true
             }
-            return true
         }
 
         let regularTarget: DetectedWindow?
@@ -594,14 +707,20 @@ public final class SmartElementDetector {
                 minimumSize: minimumSize
             ) else { continue }
 
+            let validOverlay = isValidCompositeOverlayGeometryAndLayer(window)
+            let allowedRegular = isAllowedRegularWindow(window, screenFrames: screenFrames)
+            // Skip bundle ID lookup completely for windows that fail both overlay and regular filters
+            // (e.g. Dock, Menubar strips, ScreenSaver, tooltips, desktop layers).
+            guard validOverlay || allowedRegular else { continue }
+
             if isNotificationCenterProcess(
                 window,
                 bundleIdentifierResolver: resolvedBundleID(for:)
             ) {
-                if isValidCompositeOverlayGeometryAndLayer(window) {
+                if validOverlay {
                     overlays.append(OverlayWindowEntry(window: window, zOrderIndex: regular.count))
                 }
-            } else if isAllowedRegularWindow(window, screenFrames: screenFrames) {
+            } else if allowedRegular {
                 regular.append(window)
             }
         }
@@ -1391,7 +1510,10 @@ public final class SmartElementDetector {
     ) {
         guard let axWorker else { return }
 
-        let (targetWindow, overlayFallback) = resolveTier2Targets(at: globalPoint)
+        let (targetWindow, overlayFallback) = resolveTier2Targets(
+            at: globalPoint,
+            precomputedHit: Self.hitTest(windows, at: globalPoint)
+        )
         guard targetWindow != nil || overlayFallback != nil else {
             axWorker.cancelPending()
             return
@@ -1579,6 +1701,33 @@ enum AXElementReader {
     }
 
     private static let maxCoordinateMagnitude: CGFloat = 1_000_000
+    private static let defaultMaxElementArrayCount = 350
+
+    private nonisolated(unsafe) static let nodeAttributeKeys: CFArray = [
+        "AXRole" as CFString,
+        "AXSubrole" as CFString,
+        "AXIdentifier" as CFString,
+        "AXRoleDescription" as CFString,
+        "AXPosition" as CFString,
+        "AXSize" as CFString,
+    ] as CFArray
+
+    private nonisolated(unsafe) static let nodeAttributeKeysWithParent: CFArray = [
+        "AXRole" as CFString,
+        "AXSubrole" as CFString,
+        "AXIdentifier" as CFString,
+        "AXRoleDescription" as CFString,
+        "AXPosition" as CFString,
+        "AXSize" as CFString,
+        "AXParent" as CFString,
+    ] as CFArray
+
+    private nonisolated(unsafe) static let lightAttributeKeysWithParent: CFArray = [
+        "AXRole" as CFString,
+        "AXPosition" as CFString,
+        "AXSize" as CFString,
+        "AXParent" as CFString,
+    ] as CFArray
 
     private static let leafRolesToSkipChildren: Set<String> = [
         "AXStaticText",
@@ -1650,9 +1799,8 @@ enum AXElementReader {
         var pid: pid_t = 0
         AXUIElementGetPid(element, &pid)
 
-        let attributes: [CFString] = includeParent
-            ? ["AXRole" as CFString, "AXSubrole" as CFString, "AXIdentifier" as CFString, "AXRoleDescription" as CFString, "AXPosition" as CFString, "AXSize" as CFString, "AXParent" as CFString]
-            : ["AXRole" as CFString, "AXSubrole" as CFString, "AXIdentifier" as CFString, "AXRoleDescription" as CFString, "AXPosition" as CFString, "AXSize" as CFString]
+        let attributes = includeParent ? nodeAttributeKeysWithParent : nodeAttributeKeys
+        let expectedCount = includeParent ? 7 : 6
 
         var rawValues: CFArray?
         var role: String?
@@ -1664,10 +1812,10 @@ enum AXElementReader {
         var parent: AXUIElement?
         var timedOut = false
 
-        let status = AXUIElementCopyMultipleAttributeValues(element, attributes as CFArray, [], &rawValues)
+        let status = AXUIElementCopyMultipleAttributeValues(element, attributes, [], &rawValues)
         if status == .success,
            let array = rawValues as? [AnyObject],
-           array.count == attributes.count {
+           array.count == expectedCount {
             if containsCannotCompleteError(in: array) {
                 timedOut = true
             }
@@ -1722,13 +1870,6 @@ enum AXElementReader {
         var pid: pid_t = 0
         AXUIElementGetPid(element, &pid)
 
-        let attributes = [
-            "AXRole" as CFString,
-            "AXPosition" as CFString,
-            "AXSize" as CFString,
-            "AXParent" as CFString,
-        ] as CFArray
-
         var rawValues: CFArray?
         var role: String?
         var position: CGPoint?
@@ -1736,7 +1877,7 @@ enum AXElementReader {
         var parent: AXUIElement?
         var timedOut = false
 
-        let status = AXUIElementCopyMultipleAttributeValues(element, attributes, [], &rawValues)
+        let status = AXUIElementCopyMultipleAttributeValues(element, lightAttributeKeysWithParent, [], &rawValues)
         if status == .success,
            let array = rawValues as? [AnyObject],
            array.count == 4 {
@@ -1789,29 +1930,35 @@ enum AXElementReader {
         return fallback
     }
 
-    static func readChildren(of element: AXUIElement, role: String?, timedOut: inout Bool) -> [AXUIElement] {
+    static func readChildren(
+        of element: AXUIElement,
+        role: String?,
+        maxCount: Int = defaultMaxElementArrayCount,
+        timedOut: inout Bool
+    ) -> [AXUIElement] {
+        guard maxCount > 0 else { return [] }
         if let role, leafRolesToSkipChildren.contains(role) {
             return []
         }
         if let role, visibleFirstContainerRoles.contains(role) {
-            if let visible = copyElementArray(element, attribute: "AXVisibleChildren", timedOut: &timedOut), !visible.isEmpty {
+            if let visible = copyElementArray(element, attribute: "AXVisibleChildren", maxCount: maxCount, timedOut: &timedOut), !visible.isEmpty {
                 return visible
             }
             guard !timedOut else { return [] }
-            if let children = copyElementArray(element, attribute: "AXChildren", timedOut: &timedOut), !children.isEmpty {
+            if let children = copyElementArray(element, attribute: "AXChildren", maxCount: maxCount, timedOut: &timedOut), !children.isEmpty {
                 return children
             }
             guard !timedOut else { return [] }
-            if role == "AXScrollArea", let contents = copyElementArray(element, attribute: "AXContents", timedOut: &timedOut) {
+            if role == "AXScrollArea", let contents = copyElementArray(element, attribute: "AXContents", maxCount: maxCount, timedOut: &timedOut) {
                 return contents
             }
             return []
         }
-        if let children = copyElementArray(element, attribute: "AXChildren", timedOut: &timedOut), !children.isEmpty {
+        if let children = copyElementArray(element, attribute: "AXChildren", maxCount: maxCount, timedOut: &timedOut), !children.isEmpty {
             return children
         }
         guard !timedOut else { return [] }
-        if let visible = copyElementArray(element, attribute: "AXVisibleChildren", timedOut: &timedOut), !visible.isEmpty {
+        if let visible = copyElementArray(element, attribute: "AXVisibleChildren", maxCount: maxCount, timedOut: &timedOut), !visible.isEmpty {
             return visible
         }
         return []
@@ -1909,12 +2056,25 @@ enum AXElementReader {
         return extractElement(from: raw as AnyObject)
     }
 
-    private static func copyElementArray(_ element: AXUIElement, attribute: String, timedOut: inout Bool) -> [AXUIElement]? {
+    private static func copyElementArray(
+        _ element: AXUIElement,
+        attribute: String,
+        maxCount: Int = defaultMaxElementArrayCount,
+        timedOut: inout Bool
+    ) -> [AXUIElement]? {
         var raw: CFTypeRef?
         let status = AXUIElementCopyAttributeValue(element, attribute as CFString, &raw)
         if status == .cannotComplete { timedOut = true }
         guard status == .success, let array = raw as? [AnyObject] else { return nil }
-        return array.compactMap(extractElement(from:))
+        let limit = min(array.count, max(0, maxCount))
+        var result: [AXUIElement] = []
+        result.reserveCapacity(limit)
+        for item in array.prefix(limit) {
+            if let elem = extractElement(from: item) {
+                result.append(elem)
+            }
+        }
+        return result
     }
 
     private static func copyString(_ element: AXUIElement, attribute: String, timedOut: inout Bool) -> String? {
@@ -2239,10 +2399,16 @@ enum AXOverlayCardExtractor {
         }
 
         var childSnapshots: [AXNodeSnapshot] = []
-        if depth < maxDepth {
-            let children = AXElementReader.readChildren(of: element, role: attrs.role, timedOut: &sawTimeout)
+        let remainingBudget = max(0, maxVisitedNodes - visitedNodes)
+        if depth < maxDepth && remainingBudget > 0 {
+            let children = AXElementReader.readChildren(
+                of: element,
+                role: attrs.role,
+                maxCount: remainingBudget,
+                timedOut: &sawTimeout
+            )
             let isSingleChild = children.count == 1
-            childSnapshots.reserveCapacity(children.count)
+            childSnapshots.reserveCapacity(min(children.count, remainingBudget))
             for child in children {
                 guard !isCancelled(),
                       visitedNodes < maxVisitedNodes,
@@ -2367,9 +2533,12 @@ final class AXQueryWorker: Sendable {
         let completion: @MainActor @Sendable (CGRect?, CGPoint, Bool) -> Void
     }
 
-    private struct State {
+    private struct State: Sendable {
         var pending: PendingWork?
-        var isScheduled = false
+        var isDraining = false
+        var scheduledWorkItem: UncheckedSendableBox<DispatchWorkItem>?
+        var scheduledToken: UInt64 = 0
+        var scheduledWakeUptime: TimeInterval = 0
         var lastQueryEndTime: TimeInterval = 0
         var cancelGeneration: UInt64 = 0
         var lastTargetWindowID: CGWindowID?
@@ -2403,7 +2572,7 @@ final class AXQueryWorker: Sendable {
     }
 
     func enqueue(_ request: Request, completion: @escaping @MainActor @Sendable (CGRect?, CGPoint, Bool) -> Void) {
-        let scheduleDelay: TimeInterval? = state.withLock { state in
+        let scheduled: (item: UncheckedSendableBox<DispatchWorkItem>, delay: TimeInterval, oldItem: UncheckedSendableBox<DispatchWorkItem>?)? = state.withLock { state in
             let nextTargetID = request.targetWindow?.windowID
             let nextOverlayID = request.overlayFallback?.windowID
             if state.lastTargetWindowID != nextTargetID || state.lastOverlayWindowID != nextOverlayID {
@@ -2418,31 +2587,54 @@ final class AXQueryWorker: Sendable {
                 generation: state.cancelGeneration,
                 completion: completion
             )
-            guard !state.isScheduled else { return nil }
-            state.isScheduled = true
-            return computeDelayLocked(state, for: request)
+            guard !state.isDraining else { return nil }
+            let now = ProcessInfo.processInfo.systemUptime
+            let delay = computeDelayLocked(state, for: request, now: now)
+            let desiredWake = now + delay
+            if let existing = state.scheduledWorkItem {
+                // Reschedule promptly when switching from a cooled-down hung PID to a responsive PID.
+                guard desiredWake + 0.005 < state.scheduledWakeUptime else { return nil }
+                state.scheduledToken &+= 1
+                let token = state.scheduledToken
+                let item = UncheckedSendableBox(DispatchWorkItem { [weak self] in self?.drain(token: token) })
+                state.scheduledWorkItem = item
+                state.scheduledWakeUptime = desiredWake
+                return (item, delay, existing)
+            }
+            state.scheduledToken &+= 1
+            let token = state.scheduledToken
+            let item = UncheckedSendableBox(DispatchWorkItem { [weak self] in self?.drain(token: token) })
+            state.scheduledWorkItem = item
+            state.scheduledWakeUptime = desiredWake
+            return (item, delay, nil)
         }
 
-        if let delay = scheduleDelay {
-            dispatchDrain(after: delay)
+        if let scheduled {
+            scheduled.oldItem?.value.cancel()
+            dispatchDrain(scheduled.item.value, after: scheduled.delay)
         }
     }
 
     func cancelPending() {
-        state.withLock { state in
+        let oldItem: UncheckedSendableBox<DispatchWorkItem>? = state.withLock { state in
             state.cancelGeneration &+= 1
             state.pending = nil
             state.lastTargetWindowID = nil
             state.lastOverlayWindowID = nil
+            state.scheduledToken &+= 1
+            let existing = state.scheduledWorkItem
+            state.scheduledWorkItem = nil
+            state.scheduledWakeUptime = 0
+            return existing
         }
+        oldItem?.value.cancel()
     }
 
     private static func primaryPID(for request: Request) -> pid_t? {
         request.overlayFallback?.pid ?? request.targetWindow?.pid
     }
 
-    private func computeDelayLocked(_ state: State, for request: Request?) -> TimeInterval {
-        let now = ProcessInfo.processInfo.systemUptime
+    private func computeDelayLocked(_ state: State, for request: Request?, now: TimeInterval = ProcessInfo.processInfo.systemUptime) -> TimeInterval {
         let pid = request.flatMap(Self.primaryPID(for:))
         let pidTimeouts = pid.flatMap { state.consecutiveTimeoutsByPID[$0] } ?? 0
         let backoffMultiplier = pidTimeouts > 0
@@ -2457,25 +2649,25 @@ final class AXQueryWorker: Sendable {
         return delay
     }
 
-    private func dispatchDrain(after delay: TimeInterval) {
+    private func dispatchDrain(_ item: DispatchWorkItem, after delay: TimeInterval) {
         if delay <= 0 {
-            queue.async { [weak self] in self?.drain() }
+            queue.async(execute: item)
         } else {
-            queue.asyncAfter(deadline: .now() + delay) { [weak self] in self?.drain() }
+            queue.asyncAfter(deadline: .now() + delay, execute: item)
         }
     }
 
-    private func drain() {
+    private func drain(token: UInt64) {
         let popped: PendingWork? = state.withLock { state in
-            guard let work = state.pending else {
-                state.isScheduled = false
-                return nil
-            }
+            guard token == state.scheduledToken else { return nil }
+            state.scheduledWorkItem = nil
+            state.scheduledWakeUptime = 0
+            guard let work = state.pending else { return nil }
             state.pending = nil
             if work.generation != state.cancelGeneration {
-                state.isScheduled = false
                 return nil
             }
+            state.isDraining = true
             return work
         }
         guard let work = popped else { return }
@@ -2492,7 +2684,8 @@ final class AXQueryWorker: Sendable {
             result = performQuery(work.request, isCancelled: isCancelled)
         }
 
-        let (shouldDeliver, nextDelay): (Bool, TimeInterval?) = state.withLock { state in
+        let (shouldDeliver, nextSchedule): (Bool, (item: UncheckedSendableBox<DispatchWorkItem>, delay: TimeInterval)?) = state.withLock { state in
+            state.isDraining = false
             // Stamp end-time after IPC completes so slow apps get real cooldown instead of 100% saturation.
             let now = ProcessInfo.processInfo.systemUptime
             state.lastQueryEndTime = now
@@ -2517,18 +2710,22 @@ final class AXQueryWorker: Sendable {
             let stillValid = state.cancelGeneration == workGen
             let hasNewerPending = state.pending != nil
 
-            let delay: TimeInterval?
-            if hasNewerPending {
-                state.isScheduled = true
-                delay = computeDelayLocked(state, for: state.pending?.request)
+            let scheduled: (item: UncheckedSendableBox<DispatchWorkItem>, delay: TimeInterval)?
+            if hasNewerPending, state.scheduledWorkItem == nil {
+                let delay = computeDelayLocked(state, for: state.pending?.request, now: now)
+                state.scheduledToken &+= 1
+                let nextToken = state.scheduledToken
+                let item = UncheckedSendableBox(DispatchWorkItem { [weak self] in self?.drain(token: nextToken) })
+                state.scheduledWorkItem = item
+                state.scheduledWakeUptime = now + delay
+                scheduled = (item, delay)
             } else {
-                state.isScheduled = false
-                delay = nil
+                scheduled = nil
             }
 
             // Drop cancelled results and suppress stale `nil` when a newer query is already queued.
             let deliver = stillValid && !(result.rect == nil && hasNewerPending)
-            return (deliver, delay)
+            return (deliver, scheduled)
         }
 
         if shouldDeliver {
@@ -2544,8 +2741,8 @@ final class AXQueryWorker: Sendable {
             }
         }
 
-        if let nextDelay {
-            dispatchDrain(after: nextDelay)
+        if let nextSchedule {
+            dispatchDrain(nextSchedule.item.value, after: nextSchedule.delay)
         }
     }
 

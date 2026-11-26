@@ -55,6 +55,10 @@ public struct ScrollFrameBuffer: Sendable {
     /// Initializes a canonical buffer directly from a ScreenCaptureKit `kCVPixelFormatType_32BGRA`
     /// `CVPixelBuffer`, releasing the read-only pixel buffer lock before returning.
     public init?(pixelBuffer: CVPixelBuffer) {
+        self.init(pixelBuffer: pixelBuffer, extractColorSpace: true)
+    }
+
+    init?(pixelBuffer: CVPixelBuffer, extractColorSpace: Bool) {
         guard !CVPixelBufferIsPlanar(pixelBuffer) else { return nil }
         let width = CVPixelBufferGetWidth(pixelBuffer)
         let height = CVPixelBufferGetHeight(pixelBuffer)
@@ -78,33 +82,45 @@ public struct ScrollFrameBuffer: Sendable {
         let (requiredSrcBytes, totalOverflow) = leadingRowsBytes.addingReportingOverflow(dstBytesPerRow)
         guard !totalOverflow, requiredSrcBytes <= dataSize else { return nil }
 
-        var data = Data(count: layout.byteCount)
-        data.withUnsafeMutableBytes { dstRaw in
-            guard let dstPtr = dstRaw.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
+        // Avoid zero-filling 10–25 MB before immediately overwriting every byte at 20 Hz.
+        let data: Data
+        if srcBytesPerRow == dstBytesPerRow {
+            data = Data(bytes: baseAddress, count: layout.byteCount)
+        } else {
+            let rawStorage = UnsafeMutableRawPointer.allocate(byteCount: layout.byteCount, alignment: 16)
+            let dstPtr = rawStorage.assumingMemoryBound(to: UInt8.self)
             let srcPtr = baseAddress.assumingMemoryBound(to: UInt8.self)
-            if srcBytesPerRow == dstBytesPerRow {
-                dstPtr.update(from: srcPtr, count: layout.byteCount)
-            } else {
-                for y in 0..<height {
-                    dstPtr.advanced(by: y * dstBytesPerRow)
-                        .update(from: srcPtr.advanced(by: y * srcBytesPerRow), count: dstBytesPerRow)
-                }
+            for y in 0..<height {
+                dstPtr.advanced(by: y * dstBytesPerRow)
+                    .initialize(from: srcPtr.advanced(by: y * srcBytesPerRow), count: dstBytesPerRow)
             }
+            data = Data(bytesNoCopy: rawStorage, count: layout.byteCount, deallocator: .custom { ptr, _ in
+                ptr.deallocate()
+            })
         }
 
-        let attachedCS = CVBufferCopyAttachment(pixelBuffer, kCVImageBufferCGColorSpaceKey, nil)
-        let rawCGCS: CGColorSpace? = attachedCS.flatMap { raw in
-            CFGetTypeID(raw) == CGColorSpace.typeID ? unsafeDowncast(raw, to: CGColorSpace.self) : nil
+        let colorSpaceName: String?
+        let iccProfileData: Data?
+        if extractColorSpace {
+            let attachedCS = CVBufferCopyAttachment(pixelBuffer, kCVImageBufferCGColorSpaceKey, nil)
+            let rawCGCS: CGColorSpace? = attachedCS.flatMap { raw in
+                CFGetTypeID(raw) == CGColorSpace.typeID ? unsafeDowncast(raw, to: CGColorSpace.self) : nil
+            }
+            let cgCS = rawCGCS.map { Self.resolvedOutputRGBColorSpace(for: $0) }
+            colorSpaceName = cgCS?.name as String?
+            iccProfileData = cgCS?.name == nil ? (cgCS?.copyICCData() as Data?) : nil
+        } else {
+            colorSpaceName = nil
+            iccProfileData = nil
         }
-        let cgCS = rawCGCS.map { Self.resolvedOutputRGBColorSpace(for: $0) }
 
         self.init(
             width: width,
             height: height,
             bytesPerRow: dstBytesPerRow,
             bgraData: data,
-            colorSpaceName: cgCS?.name as String?,
-            iccProfileData: cgCS?.name == nil ? (cgCS?.copyICCData() as Data?) : nil
+            colorSpaceName: colorSpaceName,
+            iccProfileData: iccProfileData
         )
     }
 
@@ -251,7 +267,9 @@ public struct ScrollFrameBuffer: Sendable {
         let (byteStart, startOverflow) = yStart.multipliedReportingOverflow(by: bytesPerRow)
         let (byteEnd, endOverflow) = (yStart + sliceHeight).multipliedReportingOverflow(by: bytesPerRow)
         guard !startOverflow, !endOverflow, byteStart >= 0, byteEnd <= bgraData.count else { return nil }
-        let sliceData = bgraData.subdata(in: byteStart..<byteEnd)
+        let sliceData = (byteStart == 0 && byteEnd == bgraData.count)
+            ? bgraData
+            : bgraData.subdata(in: byteStart..<byteEnd)
         guard let provider = CGDataProvider(data: sliceData as CFData) else { return nil }
         return CGImage(
             width: width,
@@ -324,6 +342,8 @@ public final class ScrollImageStitcher {
 
     private var initialFrame: ScrollFrameBuffer?
     private var frontierFrame: ScrollFrameBuffer?
+    private var outputColorSpace: CGColorSpace?
+    private var cachedFrontierProfile: ColumnProfiles?
     private var committedSlices: [CGImage] = []
     private var currentSlicesHeight: Int = 0
     private var latestBottomCap: CGImage?
@@ -332,6 +352,8 @@ public final class ScrollImageStitcher {
     private var rightSidebarFillStrip: CGImage?
     private var hasLockedSidebars: Bool = false
     private var cumulativeScrolledHeight: Int = 0
+
+    internal var isRetainingInitialFrameForTesting: Bool { initialFrame != nil }
 
     public var effectiveMaxTotalHeight: Int {
         guard width > 0 else { return maxTotalHeight }
@@ -362,6 +384,8 @@ public final class ScrollImageStitcher {
         width = 0
         initialFrame = nil
         frontierFrame = nil
+        outputColorSpace = nil
+        cachedFrontierProfile = nil
         committedSlices.removeAll()
         currentSlicesHeight = 0
         latestBottomCap = nil
@@ -382,6 +406,8 @@ public final class ScrollImageStitcher {
         width = frame.width
         initialFrame = frame
         frontierFrame = frame
+        outputColorSpace = frame.resolvedColorSpace()
+        cachedFrontierProfile = nil
         committedSlices.removeAll()
         currentSlicesHeight = 0
         latestBottomCap = nil
@@ -436,33 +462,44 @@ public final class ScrollImageStitcher {
         guard binSpan >= 8 else { return (minX, maxX) }
 
         var changedRows = [Int](repeating: 0, count: binSpan)
+        var binByteOffsets = [Int](repeating: 0, count: binSpan)
+        for offset in 0..<binSpan {
+            let b = startBin + offset
+            binByteOffsets[offset] = min(b * binW + binW / 2, width - 1) * 4
+        }
+
+        // Traverse row-major so pixel loads stream sequentially through L1 cache lines.
         previous.bgraData.withUnsafeBytes { prevRaw in
             current.bgraData.withUnsafeBytes { currRaw in
-                guard let prevPtr = prevRaw.baseAddress?.assumingMemoryBound(to: UInt8.self),
-                      let currPtr = currRaw.baseAddress?.assumingMemoryBound(to: UInt8.self)
-                else { return }
-                let prevBytes = previous.bytesPerRow
-                let currBytes = current.bytesPerRow
+                binByteOffsets.withUnsafeBufferPointer { colBuf in
+                    changedRows.withUnsafeMutableBufferPointer { changedBuf in
+                        guard let prevPtr = prevRaw.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                              let currPtr = currRaw.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                              let colPtr = colBuf.baseAddress,
+                              let changedPtr = changedBuf.baseAddress
+                        else { return }
+                        let prevBytes = previous.bytesPerRow
+                        let currBytes = current.bytesPerRow
 
-                for offset in 0..<binSpan {
-                    let b = startBin + offset
-                    let x = min(b * binW + binW / 2, width - 1)
-                    let xOff = x * 4
-                    var changes = 0
-                    for r in 0..<rowSampleCount {
-                        let y = sampleRows[r]
-                        let pPx = y * prevBytes + xOff
-                        let cPx = y * currBytes + xOff
-                        let diff = max(
-                            abs(Int(prevPtr[pPx]) - Int(currPtr[cPx])),
-                            max(
-                                abs(Int(prevPtr[pPx + 1]) - Int(currPtr[cPx + 1])),
-                                abs(Int(prevPtr[pPx + 2]) - Int(currPtr[cPx + 2]))
-                            )
-                        )
-                        if diff > 5 { changes += 1 }
+                        for r in 0..<rowSampleCount {
+                            let y = sampleRows[r]
+                            let pRow = y * prevBytes
+                            let cRow = y * currBytes
+                            for offset in 0..<binSpan {
+                                let xOff = colPtr[offset]
+                                let pPx = pRow + xOff
+                                let cPx = cRow + xOff
+                                let diff = max(
+                                    abs(Int(prevPtr[pPx]) - Int(currPtr[cPx])),
+                                    max(
+                                        abs(Int(prevPtr[pPx + 1]) - Int(currPtr[cPx + 1])),
+                                        abs(Int(prevPtr[pPx + 2]) - Int(currPtr[cPx + 2]))
+                                    )
+                                )
+                                if diff > 5 { changedPtr[offset] += 1 }
+                            }
+                        }
                     }
-                    changedRows[offset] = changes
                 }
             }
         }
@@ -508,19 +545,27 @@ public final class ScrollImageStitcher {
     private static func evaluateFramePair(
         previous: ScrollFrameBuffer,
         current: ScrollFrameBuffer,
+        cachedPrevProfile: ColumnProfiles?,
         stickyLeft: Int,
         stickyRight: Int,
         lockedTop: Int,
         lockedBottom: Int,
         fallbackBottomCap: Int,
         maxAllowedMAD: Double
-    ) -> (sticky: ScrollStickyBounds, match: ScrollMatchResult)? {
-        func runMatch(in range: (minX: Int, maxX: Int)) -> (sticky: ScrollStickyBounds, match: ScrollMatchResult)? {
+    ) -> (sticky: ScrollStickyBounds, match: ScrollMatchResult, currentProfile: ColumnProfiles)? {
+        func runMatch(in range: (minX: Int, maxX: Int)) -> (sticky: ScrollStickyBounds, match: ScrollMatchResult, currentProfile: ColumnProfiles)? {
+            let prevProf: ColumnProfiles
+            if let cached = cachedPrevProfile, cached.minX == range.minX, cached.maxX == range.maxX {
+                prevProf = cached
+            } else {
+                prevProf = columnProfiles(for: previous, activeMinX: range.minX, activeMaxX: range.maxX)
+            }
+            let currProf = columnProfiles(for: current, activeMinX: range.minX, activeMaxX: range.maxX)
+
             let sticky = detectStickyBounds(
-                previous: previous,
-                current: current,
-                activeMinX: range.minX,
-                activeMaxX: range.maxX
+                prevProf: prevProf,
+                currProf: currProf,
+                height: previous.height
             )
             guard !sticky.isIdenticalFrame else { return nil }
 
@@ -532,6 +577,8 @@ public final class ScrollImageStitcher {
             guard let match = estimateVerticalShift(
                 previous: previous,
                 current: current,
+                prevProf: prevProf,
+                currProf: currProf,
                 dynamicTop: matchTop,
                 dynamicBottom: matchBottom,
                 activeMinX: range.minX,
@@ -540,7 +587,7 @@ public final class ScrollImageStitcher {
             ) else {
                 return nil
             }
-            return (sticky, match)
+            return (sticky, match, currProf)
         }
 
         let baseRange = activeColumnRange(
@@ -586,6 +633,7 @@ public final class ScrollImageStitcher {
             var evaluated = Self.evaluateFramePair(
                 previous: frontier,
                 current: frame,
+                cachedPrevProfile: cachedFrontierProfile,
                 stickyLeft: tentativeSidebars.stickyLeft,
                 stickyRight: tentativeSidebars.stickyRight,
                 lockedTop: 0,
@@ -598,6 +646,7 @@ public final class ScrollImageStitcher {
                 evaluated = Self.evaluateFramePair(
                     previous: frontier,
                     current: frame,
+                    cachedPrevProfile: cachedFrontierProfile,
                     stickyLeft: 0,
                     stickyRight: 0,
                     lockedTop: 0,
@@ -606,7 +655,7 @@ public final class ScrollImageStitcher {
                     maxAllowedMAD: maxAllowedMAD
                 )
             }
-            guard let (sticky, match) = evaluated else { return false }
+            guard let (sticky, match, currentProfile) = evaluated else { return false }
 
             detectedStickyTop = sticky.stickyTop
             detectedStickyBottom = sticky.stickyBottom
@@ -649,6 +698,10 @@ public final class ScrollImageStitcher {
             }
             committedSlices.append(baseSlice)
             currentSlicesHeight = baseSlice.height
+            if hasLockedSidebars {
+                // Once base slice and sidebar fill strips are committed, `initialFrame` is no longer needed.
+                initialFrame = nil
+            }
 
             let remaining = heightCap - currentSlicesHeight - lockedBottomCapHeight
             let allowedDy = min(match.dy, remaining)
@@ -663,6 +716,7 @@ public final class ScrollImageStitcher {
                 latestBottomCap = frame.cropCGImage(yStart: commitBottom, height: lockedBottomCapHeight)
             }
             frontierFrame = frame
+            cachedFrontierProfile = currentProfile
             stitchedFrameCount += 1
             if totalStitchedHeight >= heightCap || allowedDy < match.dy {
                 isAtHeightLimit = true
@@ -675,6 +729,7 @@ public final class ScrollImageStitcher {
         var evaluated = Self.evaluateFramePair(
             previous: frontier,
             current: frame,
+            cachedPrevProfile: cachedFrontierProfile,
             stickyLeft: detectedStickyLeft,
             stickyRight: detectedStickyRight,
             lockedTop: detectedStickyTop,
@@ -686,6 +741,7 @@ public final class ScrollImageStitcher {
             evaluated = Self.evaluateFramePair(
                 previous: frontier,
                 current: frame,
+                cachedPrevProfile: cachedFrontierProfile,
                 stickyLeft: 0,
                 stickyRight: 0,
                 lockedTop: detectedStickyTop,
@@ -694,7 +750,7 @@ public final class ScrollImageStitcher {
                 maxAllowedMAD: maxAllowedMAD
             )
         }
-        guard let (_, match) = evaluated else { return false }
+        guard let (_, match, currentProfile) = evaluated else { return false }
 
         let commitBottom = frameHeight - lockedBottomCapHeight
         let heightCap = effectiveMaxTotalHeight
@@ -739,6 +795,7 @@ public final class ScrollImageStitcher {
                     yEnd: commitBottom
                 )
             }
+            initialFrame = nil
         }
 
         if lockedBottomCapHeight > 0,
@@ -747,6 +804,7 @@ public final class ScrollImageStitcher {
         }
 
         frontierFrame = frame
+        cachedFrontierProfile = currentProfile
         stitchedFrameCount += 1
         if totalStitchedHeight >= heightCap || allowedDy < match.dy {
             isAtHeightLimit = true
@@ -754,11 +812,17 @@ public final class ScrollImageStitcher {
         return true
     }
 
+    private func resolvedOutputColorSpace() -> CGColorSpace {
+        if let outputColorSpace { return outputColorSpace }
+        if let initial = initialFrame { return initial.resolvedColorSpace() }
+        if let frontier = frontierFrame { return frontier.resolvedColorSpace() }
+        return CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+    }
+
     /// Composites all committed slices into a single tall `CGImage` preserving full resolution.
     public func buildFinalImage() -> CGImage? {
-        guard let initial = initialFrame else { return nil }
         if committedSlices.isEmpty {
-            return initial.cropCGImage(yStart: 0, height: initial.height)
+            return initialFrame?.cropCGImage(yStart: 0, height: initialFrame?.height ?? 0)
         }
 
         let totalHeight = totalStitchedHeight
@@ -772,7 +836,7 @@ public final class ScrollImageStitcher {
             height: totalHeight,
             bitsPerComponent: 8,
             bytesPerRow: 0,
-            space: initial.resolvedColorSpace(),
+            space: resolvedOutputColorSpace(),
             bitmapInfo: ScrollFrameBuffer.canonicalBitmapInfo.rawValue
         ) else { return nil }
         context.interpolationQuality = .none
@@ -810,26 +874,108 @@ public final class ScrollImageStitcher {
         return context.makeImage()
     }
 
+    /// Consumes retained frame buffers and releases slices incrementally as they are drawn so
+    /// peak RSS during final export avoids simultaneously retaining all raw frames, slices, and output.
+    func consumeAndBuildFinalImage() -> CGImage? {
+        defer { clear() }
+        if committedSlices.isEmpty {
+            guard let initial = initialFrame else { return nil }
+            return initial.cropCGImage(yStart: 0, height: initial.height)
+        }
+
+        let targetWidth = width
+        let totalHeight = totalStitchedHeight
+        let colorSpace = resolvedOutputColorSpace()
+        let stickyBottom = detectedStickyBottom
+        let stickyLeft = detectedStickyLeft
+        let stickyRight = detectedStickyRight
+        let leftStrip = leftSidebarFillStrip
+        let rightStrip = rightSidebarFillStrip
+        let cap = latestBottomCap
+        let slice0Height = committedSlices.first?.height
+        var slices: [CGImage?] = committedSlices.map { $0 }
+
+        // Release raw BGRA frame buffers and references before allocating the large output context.
+        initialFrame = nil
+        frontierFrame = nil
+        cachedFrontierProfile = nil
+        committedSlices.removeAll()
+        latestBottomCap = nil
+
+        guard targetWidth > 0, totalHeight > 0 else { return nil }
+        let (pixelCount, pixelOverflow) = targetWidth.multipliedReportingOverflow(by: totalHeight)
+        guard !pixelOverflow, pixelCount <= max(maxTotalPixels, targetWidth * 128) else { return nil }
+
+        guard let context = CGContext(
+            data: nil,
+            width: targetWidth,
+            height: totalHeight,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: colorSpace,
+            bitmapInfo: ScrollFrameBuffer.canonicalBitmapInfo.rawValue
+        ) else { return nil }
+        context.interpolationQuality = .none
+
+        var cursorTopFromImageTop = 0
+        for index in slices.indices {
+            if let slice = slices[index] {
+                let cgY = totalHeight - cursorTopFromImageTop - slice.height
+                context.draw(slice, in: CGRect(x: 0, y: cgY, width: targetWidth, height: slice.height))
+                cursorTopFromImageTop += slice.height
+                slices[index] = nil
+            }
+        }
+        if let cap {
+            context.draw(cap, in: CGRect(x: 0, y: 0, width: targetWidth, height: cap.height))
+        }
+
+        if let slice0Height {
+            let fillEndY = stickyBottom > 0 ? (totalHeight - stickyBottom) : totalHeight
+            let fillHeight = fillEndY - slice0Height
+            if fillHeight > 0 {
+                let cgBottom = totalHeight - fillEndY
+                if let leftStrip, stickyLeft > 0 {
+                    context.draw(leftStrip, in: CGRect(x: 0, y: cgBottom, width: stickyLeft, height: fillHeight))
+                }
+                if let rightStrip, stickyRight > 0 {
+                    context.draw(
+                        rightStrip,
+                        in: CGRect(x: targetWidth - stickyRight, y: cgBottom, width: stickyRight, height: fillHeight)
+                    )
+                }
+            }
+        }
+
+        return context.makeImage()
+    }
+
     /// Renders a lightweight live preview showing either the whole strip (when short) or the
     /// bottom-most trailing section so scrolling progress stays sharp in the HUD rail.
     public func buildPreviewImage(maxWidth: Int = 180, maxHeight: Int = 520) -> CGImage? {
-        guard let initial = initialFrame else { return nil }
         let totalHeight = totalStitchedHeight
         guard width > 0, totalHeight > 0, maxWidth > 0, maxHeight > 0 else { return nil }
+        let safeMaxWidth = min(maxWidth, 4096)
+        let safeMaxHeight = min(maxHeight, 4096)
 
-        let targetWidth = min(maxWidth, width)
+        let targetWidth = min(safeMaxWidth, width)
         let scaleFactor = CGFloat(targetWidth) / CGFloat(width)
+        guard scaleFactor.isFinite, scaleFactor > 0 else { return nil }
         let scaledFullHeight = CGFloat(totalHeight) * scaleFactor
 
         let visibleSourceStartY: Int
         let previewHeight: Int
-        if scaledFullHeight <= CGFloat(maxHeight) {
+        if scaledFullHeight <= CGFloat(safeMaxHeight) {
             visibleSourceStartY = 0
-            previewHeight = max(1, Int(scaledFullHeight.rounded()))
+            previewHeight = max(1, min(safeMaxHeight, Int(scaledFullHeight.rounded())))
         } else {
-            let sourceWindowHeight = max(1, Int((CGFloat(maxHeight) / scaleFactor).rounded(.up)))
+            let rawWindowHeight = (CGFloat(safeMaxHeight) / scaleFactor).rounded(.up)
+            let clampedWindowHeight = rawWindowHeight.isFinite
+                ? min(max(rawWindowHeight, 1), CGFloat(totalHeight))
+                : CGFloat(totalHeight)
+            let sourceWindowHeight = Int(clampedWindowHeight)
             visibleSourceStartY = max(0, totalHeight - sourceWindowHeight)
-            previewHeight = maxHeight
+            previewHeight = safeMaxHeight
         }
 
         guard let context = CGContext(
@@ -838,13 +984,13 @@ public final class ScrollImageStitcher {
             height: previewHeight,
             bitsPerComponent: 8,
             bytesPerRow: 0,
-            space: initial.resolvedColorSpace(),
+            space: resolvedOutputColorSpace(),
             bitmapInfo: ScrollFrameBuffer.canonicalBitmapInfo.rawValue
         ) else { return nil }
         context.interpolationQuality = .low
 
         if committedSlices.isEmpty {
-            if let img = initial.cropCGImage(yStart: 0, height: initial.height) {
+            if let initial = initialFrame, let img = initial.cropCGImage(yStart: 0, height: initial.height) {
                 let topInVisible = -visibleSourceStartY
                 let cgY = CGFloat(previewHeight) - (CGFloat(topInVisible + img.height) * scaleFactor)
                 context.draw(
@@ -1309,6 +1455,78 @@ public final class ScrollImageStitcher {
 
     // MARK: - Frame Comparison & Alignment
 
+    @inline(__always)
+    private static func rowSignatureDiffSum(
+        prev: UnsafePointer<UInt8>,
+        curr: UnsafePointer<UInt8>,
+        sigW: Int
+    ) -> Int {
+        var diffSum = 0
+        var i = 0
+        while i + 16 <= sigW {
+            let a = SIMD16<UInt8>(
+                prev[i], prev[i + 1], prev[i + 2], prev[i + 3],
+                prev[i + 4], prev[i + 5], prev[i + 6], prev[i + 7],
+                prev[i + 8], prev[i + 9], prev[i + 10], prev[i + 11],
+                prev[i + 12], prev[i + 13], prev[i + 14], prev[i + 15]
+            )
+            let b = SIMD16<UInt8>(
+                curr[i], curr[i + 1], curr[i + 2], curr[i + 3],
+                curr[i + 4], curr[i + 5], curr[i + 6], curr[i + 7],
+                curr[i + 8], curr[i + 9], curr[i + 10], curr[i + 11],
+                curr[i + 12], curr[i + 13], curr[i + 14], curr[i + 15]
+            )
+            let diff = pointwiseMax(a, b) &- pointwiseMin(a, b)
+            diffSum += Int(SIMD16<UInt16>(truncatingIfNeeded: diff).wrappedSum())
+            i += 16
+        }
+        while i < sigW {
+            diffSum += abs(Int(prev[i]) - Int(curr[i]))
+            i += 1
+        }
+        return diffSum
+    }
+
+    @inline(__always)
+    private static func rowSignatureDiffAndChanged(
+        prev: UnsafePointer<UInt8>,
+        curr: UnsafePointer<UInt8>,
+        sigW: Int,
+        changeThreshold: UInt8
+    ) -> (diffSum: Int, changedSamples: Int) {
+        var diffSum = 0
+        var changedSamples = 0
+        let thresholdVec = SIMD16<UInt8>(repeating: changeThreshold)
+        let zeros = SIMD16<UInt8>(repeating: 0)
+        let ones = SIMD16<UInt8>(repeating: 1)
+        var i = 0
+        while i + 16 <= sigW {
+            let a = SIMD16<UInt8>(
+                prev[i], prev[i + 1], prev[i + 2], prev[i + 3],
+                prev[i + 4], prev[i + 5], prev[i + 6], prev[i + 7],
+                prev[i + 8], prev[i + 9], prev[i + 10], prev[i + 11],
+                prev[i + 12], prev[i + 13], prev[i + 14], prev[i + 15]
+            )
+            let b = SIMD16<UInt8>(
+                curr[i], curr[i + 1], curr[i + 2], curr[i + 3],
+                curr[i + 4], curr[i + 5], curr[i + 6], curr[i + 7],
+                curr[i + 8], curr[i + 9], curr[i + 10], curr[i + 11],
+                curr[i + 12], curr[i + 13], curr[i + 14], curr[i + 15]
+            )
+            let diff = pointwiseMax(a, b) &- pointwiseMin(a, b)
+            diffSum += Int(SIMD16<UInt16>(truncatingIfNeeded: diff).wrappedSum())
+            changedSamples += Int(zeros.replacing(with: ones, where: diff .>= thresholdVec).wrappedSum())
+            i += 16
+        }
+        while i < sigW {
+            let d = abs(Int(prev[i]) - Int(curr[i]))
+            diffSum += d
+            if d >= Int(changeThreshold) { changedSamples += 1 }
+            i += 1
+        }
+        return (diffSum, changedSamples)
+    }
+
     private static func isEssentiallyIdenticalFullFrame(
         previous: ScrollFrameBuffer,
         current: ScrollFrameBuffer
@@ -1321,15 +1539,15 @@ public final class ScrollImageStitcher {
         var identicalRows = 0
         previous.rowSignatures.withUnsafeBufferPointer { prevSig in
             current.rowSignatures.withUnsafeBufferPointer { currSig in
+                guard let prevBase = prevSig.baseAddress, let currBase = currSig.baseAddress else { return }
                 for y in 0..<height {
                     let base = y * sigW
-                    var diffSum = 0
-                    var changedSamples = 0
-                    for i in 0..<sigW {
-                        let d = abs(Int(prevSig[base + i]) - Int(currSig[base + i]))
-                        diffSum += d
-                        if d >= 14 { changedSamples += 1 }
-                    }
+                    let (diffSum, changedSamples) = rowSignatureDiffAndChanged(
+                        prev: prevBase.advanced(by: base),
+                        curr: currBase.advanced(by: base),
+                        sigW: sigW,
+                        changeThreshold: 14
+                    )
                     if diffSum <= sigW && changedSamples <= 1 {
                         identicalRows += 1
                     }
@@ -1340,6 +1558,8 @@ public final class ScrollImageStitcher {
     }
 
     private struct ColumnProfiles {
+        let minX: Int
+        let maxX: Int
         let sigW: Int
         let rowSignatures: [UInt8]
         let rowEnergy: [Int32]
@@ -1358,6 +1578,8 @@ public final class ScrollImageStitcher {
 
         if cMin == defaultMinX && cMax == defaultMaxX {
             return ColumnProfiles(
+                minX: cMin,
+                maxX: cMax,
                 sigW: buffer.signatureWidth,
                 rowSignatures: buffer.rowSignatures,
                 rowEnergy: buffer.rowEnergy,
@@ -1403,6 +1625,8 @@ public final class ScrollImageStitcher {
         }
 
         return ColumnProfiles(
+            minX: cMin,
+            maxX: cMax,
             sigW: sigW,
             rowSignatures: signatures,
             rowEnergy: horizEnergies,
@@ -1421,11 +1645,18 @@ public final class ScrollImageStitcher {
         guard height == current.height, previous.width == current.width, height > 0 else {
             return ScrollStickyBounds(stickyTop: 0, stickyBottom: 0, isIdenticalFrame: false)
         }
-
         let prevProf = columnProfiles(for: previous, activeMinX: activeMinX, activeMaxX: activeMaxX)
         let currProf = columnProfiles(for: current, activeMinX: activeMinX, activeMaxX: activeMaxX)
+        return detectStickyBounds(prevProf: prevProf, currProf: currProf, height: height)
+    }
+
+    private static func detectStickyBounds(
+        prevProf: ColumnProfiles,
+        currProf: ColumnProfiles,
+        height: Int
+    ) -> ScrollStickyBounds {
         let sigW = prevProf.sigW
-        guard sigW > 0, sigW == currProf.sigW else {
+        guard height > 0, sigW > 0, sigW == currProf.sigW else {
             return ScrollStickyBounds(stickyTop: 0, stickyBottom: 0, isIdenticalFrame: false)
         }
 
@@ -1434,15 +1665,15 @@ public final class ScrollImageStitcher {
         var staticRows = 0
         prevProf.rowSignatures.withUnsafeBufferPointer { prevSig in
             currProf.rowSignatures.withUnsafeBufferPointer { currSig in
+                guard let prevBase = prevSig.baseAddress, let currBase = currSig.baseAddress else { return }
                 for y in 0..<height {
                     let base = y * sigW
-                    var diffSum = 0
-                    var changedSamples = 0
-                    for i in 0..<sigW {
-                        let d = abs(Int(prevSig[base + i]) - Int(currSig[base + i]))
-                        diffSum += d
-                        if d >= 12 { changedSamples += 1 }
-                    }
+                    let (diffSum, changedSamples) = rowSignatureDiffAndChanged(
+                        prev: prevBase.advanced(by: base),
+                        curr: currBase.advanced(by: base),
+                        sigW: sigW,
+                        changeThreshold: 12
+                    )
                     let meanDiff = diffSum / sigW
                     rowDiffs[y] = meanDiff
                     rowChanged[y] = changedSamples
@@ -1512,8 +1743,35 @@ public final class ScrollImageStitcher {
 
         let prevProf = columnProfiles(for: previous, activeMinX: activeMinX, activeMaxX: activeMaxX)
         let currProf = columnProfiles(for: current, activeMinX: activeMinX, activeMaxX: activeMaxX)
+        return estimateVerticalShift(
+            previous: previous,
+            current: current,
+            prevProf: prevProf,
+            currProf: currProf,
+            dynamicTop: dynamicTop,
+            dynamicBottom: dynamicBottom,
+            activeMinX: activeMinX,
+            activeMaxX: activeMaxX,
+            maxAllowedMAD: maxAllowedMAD
+        )
+    }
+
+    private static func estimateVerticalShift(
+        previous: ScrollFrameBuffer,
+        current: ScrollFrameBuffer,
+        prevProf: ColumnProfiles,
+        currProf: ColumnProfiles,
+        dynamicTop: Int,
+        dynamicBottom: Int,
+        activeMinX: Int?,
+        activeMaxX: Int?,
+        maxAllowedMAD: Double
+    ) -> ScrollMatchResult? {
+        let height = previous.height
         let sigW = prevProf.sigW
-        guard sigW > 0, sigW == currProf.sigW else { return nil }
+        guard height == current.height, previous.width == current.width, sigW > 0, sigW == currProf.sigW else {
+            return nil
+        }
 
         let topBound = max(0, dynamicTop)
         let bottomBound = min(height, dynamicBottom)
@@ -1607,6 +1865,7 @@ public final class ScrollImageStitcher {
 
         prevProf.rowSignatures.withUnsafeBufferPointer { prevSig in
             currProf.rowSignatures.withUnsafeBufferPointer { currSig in
+                guard let prevBase = prevSig.baseAddress, let currBase = currSig.baseAddress else { return }
                 var dy = 1
                 while dy <= maxShift {
                     let prevStart = chosenAnchorY
@@ -1616,9 +1875,11 @@ public final class ScrollImageStitcher {
                     while row < bandHeight {
                         let pBase = (prevStart + row) * sigW
                         let cBase = (currStart + row) * sigW
-                        for i in 0..<sigW {
-                            diffSum += abs(Int(prevSig[pBase + i]) - Int(currSig[cBase + i]))
-                        }
+                        diffSum += rowSignatureDiffSum(
+                            prev: prevBase.advanced(by: pBase),
+                            curr: currBase.advanced(by: cBase),
+                            sigW: sigW
+                        )
                         if diffSum > earlyExitTotal { break }
                         row += rowStep
                     }
@@ -1678,35 +1939,55 @@ public final class ScrollImageStitcher {
 
         previous.bgraData.withUnsafeBytes { prevRaw in
             current.bgraData.withUnsafeBytes { currRaw in
-                guard let prevPtr = prevRaw.baseAddress?.assumingMemoryBound(to: UInt8.self),
-                      let currPtr = currRaw.baseAddress?.assumingMemoryBound(to: UInt8.self)
-                else { return }
+                colOffsets.withUnsafeBufferPointer { colBuf in
+                    guard let prevPtr = prevRaw.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                          let currPtr = currRaw.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                          let colPtr = colBuf.baseAddress
+                    else { return }
 
-                for dy in orderedDys {
-                    let overlapRows = dynamicHeight - dy
-                    guard overlapRows >= minOverlap else { continue }
-                    let rowStride = max(1, overlapRows / 200)
-                    var totalAbsDiff = 0
-                    var sampleChannels = 0
-                    var yOffset = 0
-                    while yOffset < overlapRows {
-                        let pRow = (topBound + dy + yOffset) * prevRowBytes
-                        let cRow = (topBound + yOffset) * currRowBytes
-                        for colByteOffset in colOffsets {
-                            let pPx = pRow + colByteOffset
-                            let cPx = cRow + colByteOffset
-                            totalAbsDiff += abs(Int(prevPtr[pPx]) - Int(currPtr[cPx]))
-                            totalAbsDiff += abs(Int(prevPtr[pPx + 1]) - Int(currPtr[cPx + 1]))
-                            totalAbsDiff += abs(Int(prevPtr[pPx + 2]) - Int(currPtr[cPx + 2]))
+                    let channelsPerRow = fineCols * 3
+                    for dy in orderedDys {
+                        let overlapRows = dynamicHeight - dy
+                        guard overlapRows >= minOverlap else { continue }
+                        let rowStride = max(1, overlapRows / 200)
+                        let sampledRows = (overlapRows + rowStride - 1) / rowStride
+                        let expectedChannels = sampledRows * channelsPerRow
+                        guard expectedChannels > 0 else { continue }
+
+                        // Exact mathematical early-exit: any candidate whose running diff already exceeds
+                        // `min(maxAllowedMAD, bestMAD) * expectedChannels` can never win or pass acceptance.
+                        let cutoffMAD = bestDy == nil ? maxAllowedMAD : min(maxAllowedMAD, bestMAD)
+                        let rawBudget = (cutoffMAD * Double(expectedChannels)).rounded(.up)
+                        let maxDiffBudget = rawBudget.isFinite ? Int(min(rawBudget, Double(Int.max / 2))) + 1 : Int.max
+
+                        var totalAbsDiff = 0
+                        var sampleChannels = 0
+                        var yOffset = 0
+                        var aborted = false
+                        while yOffset < overlapRows {
+                            let pRow = (topBound + dy + yOffset) * prevRowBytes
+                            let cRow = (topBound + yOffset) * currRowBytes
+                            for colIdx in 0..<fineCols {
+                                let colByteOffset = colPtr[colIdx]
+                                let pPx = pRow + colByteOffset
+                                let cPx = cRow + colByteOffset
+                                totalAbsDiff += abs(Int(prevPtr[pPx]) - Int(currPtr[cPx]))
+                                totalAbsDiff += abs(Int(prevPtr[pPx + 1]) - Int(currPtr[cPx + 1]))
+                                totalAbsDiff += abs(Int(prevPtr[pPx + 2]) - Int(currPtr[cPx + 2]))
+                            }
+                            if totalAbsDiff > maxDiffBudget {
+                                aborted = true
+                                break
+                            }
+                            sampleChannels += channelsPerRow
+                            yOffset += rowStride
                         }
-                        sampleChannels += fineCols * 3
-                        yOffset += rowStride
-                    }
-                    guard sampleChannels > 0 else { continue }
-                    let mad = Double(totalAbsDiff) / Double(sampleChannels)
-                    if bestDy == nil || mad < bestMAD - 0.35 || (mad < bestMAD && bestMAD > 2.0) {
-                        bestMAD = mad
-                        bestDy = dy
+                        guard !aborted, sampleChannels > 0 else { continue }
+                        let mad = Double(totalAbsDiff) / Double(sampleChannels)
+                        if bestDy == nil || mad < bestMAD - 0.35 || (mad < bestMAD && bestMAD > 2.0) {
+                            bestMAD = mad
+                            bestDy = dy
+                        }
                     }
                 }
             }

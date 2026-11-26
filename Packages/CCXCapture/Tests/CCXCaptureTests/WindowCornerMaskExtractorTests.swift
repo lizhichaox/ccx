@@ -1019,4 +1019,85 @@ struct WindowCornerMaskExtractorTests {
         try await Task.sleep(for: .milliseconds(30))
         #expect(!finished)
     }
+
+    @Test func extractAndApplyMaskFastPathMatchesFullMaskOutputAndGuardsHugeScaleOverflow() throws {
+        let frame = CGRect(x: 40, y: 60, width: 320, height: 220)
+        let scale: CGFloat = 2
+        let w = Int(frame.width * scale)
+        let h = Int(frame.height * scale)
+
+        // 1. Compare opaque rounded, translucent rounded, asymmetric, and mixed-DPI outputs pixel-for-pixel.
+        let cases: [(radii: AdaptiveCornerRadii, interiorAlpha: CGFloat, outW: Int, outH: Int)] = [
+            (AdaptiveCornerRadii(topLeft: 16, topRight: 16, bottomLeft: 16, bottomRight: 16), 1.0, w, h),
+            (AdaptiveCornerRadii(topLeft: 14, topRight: 14, bottomLeft: 14, bottomRight: 14), 0.5, w, h),
+            (AdaptiveCornerRadii(topLeft: 20, topRight: 20, bottomLeft: 0, bottomRight: 0), 1.0, w, h),
+            (AdaptiveCornerRadii(topLeft: 20, topRight: 20, bottomLeft: 20, bottomRight: 0), 1.0, 320, 220),
+        ]
+
+        for testCase in cases {
+            let winImg = try makeWindowImage(
+                widthPoints: frame.width,
+                heightPoints: frame.height,
+                scale: scale,
+                radii: testCase.radii,
+                interiorAlpha: testCase.interiorAlpha
+            )
+            let frozen = try makeSolidOpaqueImage(
+                pixelWidth: testCase.outW,
+                pixelHeight: testCase.outH,
+                rgb: (0.25, 0.55, 0.85)
+            )
+            let extracted = try #require(WindowCornerMaskExtractor.extractMask(
+                windowImage: winImg,
+                windowFrame: frame,
+                selectionRect: frame,
+                eligibleCorners: .all,
+                outputPixelSize: (width: testCase.outW, height: testCase.outH),
+                displayScale: scale
+            ))
+            let refMasked = WindowCornerMaskExtractor.applyMask(extracted.maskImage, to: frozen)
+            let fastMasked = try #require(WindowCornerMaskExtractor.extractAndApplyMask(
+                windowImage: winImg,
+                windowFrame: frame,
+                selectionRect: frame,
+                eligibleCorners: .all,
+                to: frozen,
+                displayScale: scale
+            ))
+
+            let refRGBA = try rasterizeRGBA(refMasked)
+            let fastRGBA = try rasterizeRGBA(fastMasked)
+            #expect(refRGBA.width == fastRGBA.width && refRGBA.height == fastRGBA.height)
+            var maxChannelDiff = 0
+            for idx in 0..<refRGBA.bytes.count {
+                let d = abs(Int(refRGBA.bytes[idx]) - Int(fastRGBA.bytes[idx]))
+                if d > maxChannelDiff { maxChannelDiff = d }
+            }
+            #expect(maxChannelDiff <= 1)
+        }
+
+        // 2. Extreme finite displayScale with tiny windowFrame must not trap on Int(CGFloat) conversion.
+        let smallImg = try makeWindowImage(
+            widthPoints: 40,
+            heightPoints: 40,
+            scale: 1,
+            radii: AdaptiveCornerRadii(topLeft: 8, topRight: 8, bottomLeft: 8, bottomRight: 8)
+        )
+        let tinyFrame = CGRect(x: 0, y: 0, width: 1e-20, height: 1e-20)
+        #expect(WindowCornerMaskExtractor.extractMask(
+            windowImage: smallImg,
+            windowFrame: tinyFrame,
+            selectionRect: tinyFrame,
+            eligibleCorners: .all,
+            outputPixelSize: (width: 40, height: 40),
+            displayScale: 1e22
+        ) == nil)
+        #expect(WindowCornerMaskExtractor.extractCornerRadii(
+            windowImage: smallImg,
+            windowFrame: tinyFrame,
+            selectionRect: tinyFrame,
+            eligibleCorners: .all,
+            displayScale: 1e22
+        ) == .zero)
+    }
 }

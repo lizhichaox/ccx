@@ -35,19 +35,22 @@ public final class ScrollCaptureEngine {
     private var isStarted = false
     private var isStopped = false
 
-    public init(request: ScrollCaptureRequest, fallbackInitialImage: CGImage) {
+    public init(request: ScrollCaptureRequest, fallbackInitialImage: CGImage, generatesPreview: Bool = true) {
         self.request = request
         self.fallbackInitialImage = fallbackInitialImage
-        self.worker = ScrollStitchWorker(scale: request.scale)
+        self.worker = ScrollStitchWorker(scale: request.scale, generatesPreview: generatesPreview)
+    }
+
+    /// Enables or disables live preview thumbnail generation on the stitch worker.
+    public func setGeneratesPreview(_ enabled: Bool) {
+        worker.setGeneratesPreview(enabled)
     }
 
     public func start(excludingWindowIDs: Set<CGWindowID>) async throws {
         guard !isStopped, !isStarted else { return }
         isStarted = true
 
-        if let seeded = ScrollFrameBuffer(cgImage: fallbackInitialImage) {
-            await worker.seedInitial(seeded)
-        }
+        await worker.seedInitial(cgImage: fallbackInitialImage)
         guard !isStopped else { return }
 
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
@@ -193,24 +196,34 @@ private final class ScrollStitchWorker: @unchecked Sendable {
     private struct GateState: Sendable {
         var inFlightCount = 0
         var isCancelled = false
+        var generatesPreview: Bool
     }
 
+    private static let previewMinInterval: TimeInterval = 1.0 / 12.0
+
     private let queue = DispatchQueue(label: "com.lizhichaox.ccx.scroll-stitch", qos: .userInitiated)
-    private let gate = OSAllocatedUnfairLock(initialState: GateState())
+    private let gate: OSAllocatedUnfairLock<GateState>
     private let stitcher: ScrollImageStitcher
     private var hasReceivedStreamFrame = false
     private var rejectedFrameCount = 0
+    private var lastPreviewUptime: TimeInterval = 0
 
-    init(scale: CGFloat) {
+    init(scale: CGFloat, generatesPreview: Bool = true) {
         self.stitcher = ScrollImageStitcher(scale: scale)
+        self.gate = OSAllocatedUnfairLock(initialState: GateState(generatesPreview: generatesPreview))
     }
 
-    func seedInitial(_ frame: ScrollFrameBuffer) async {
+    func setGeneratesPreview(_ enabled: Bool) {
+        gate.withLock { $0.generatesPreview = enabled }
+    }
+
+    func seedInitial(cgImage: CGImage) async {
         await withCheckedContinuation { continuation in
             queue.async { [weak self] in
-                if let self, !self.cancelled() {
+                if let self, !self.cancelled(), let frame = ScrollFrameBuffer(cgImage: cgImage) {
                     self.hasReceivedStreamFrame = false
                     self.rejectedFrameCount = 0
+                    self.lastPreviewUptime = 0
                     self.stitcher.seed(frame)
                 }
                 continuation.resume()
@@ -263,7 +276,7 @@ private final class ScrollStitchWorker: @unchecked Sendable {
                         "Seeded first stream frame \(frame.width)x\(frame.height) (fallback was \(previousSize.0)x\(previousSize.1))"
                     )
                     if (self.stitcher.width, self.stitcher.totalStitchedHeight) != previousSize {
-                        let progress = self.makeProgress(includePreview: true)
+                        let progress = self.makeProgress(includePreview: true, forcePreview: true)
                         onUpdate(progress)
                     }
                     return
@@ -272,7 +285,7 @@ private final class ScrollStitchWorker: @unchecked Sendable {
 
             if self.stitcher.append(frame) {
                 self.rejectedFrameCount = 0
-                let progress = self.makeProgress(includePreview: true)
+                let progress = self.makeProgress(includePreview: true, forcePreview: self.stitcher.isAtHeightLimit)
                 onUpdate(progress)
             } else {
                 self.rejectedFrameCount += 1
@@ -292,8 +305,7 @@ private final class ScrollStitchWorker: @unchecked Sendable {
                     continuation.resume(returning: nil)
                     return
                 }
-                let finalImage = self.stitcher.buildFinalImage()
-                self.stitcher.clear()
+                let finalImage = self.stitcher.consumeAndBuildFinalImage()
                 continuation.resume(returning: finalImage)
             }
         }
@@ -310,12 +322,24 @@ private final class ScrollStitchWorker: @unchecked Sendable {
         gate.withLock { $0.isCancelled }
     }
 
-    private func makeProgress(includePreview: Bool) -> ScrollCaptureProgress {
-        ScrollCaptureProgress(
+    private func makeProgress(includePreview: Bool, forcePreview: Bool = false) -> ScrollCaptureProgress {
+        let shouldRenderPreview: Bool
+        if includePreview && gate.withLock({ $0.generatesPreview }) {
+            let now = ProcessInfo.processInfo.systemUptime
+            if forcePreview || lastPreviewUptime == 0 || (now - lastPreviewUptime) >= Self.previewMinInterval {
+                lastPreviewUptime = now
+                shouldRenderPreview = true
+            } else {
+                shouldRenderPreview = false
+            }
+        } else {
+            shouldRenderPreview = false
+        }
+        return ScrollCaptureProgress(
             pixelWidth: stitcher.width,
             pixelHeight: stitcher.totalStitchedHeight,
             frameCount: stitcher.stitchedFrameCount,
-            previewImage: includePreview ? stitcher.buildPreviewImage() : nil,
+            previewImage: shouldRenderPreview ? stitcher.buildPreviewImage() : nil,
             reachedLimit: stitcher.isAtHeightLimit
         )
     }
@@ -328,6 +352,8 @@ private final class StreamOutputHandler: NSObject, SCStreamOutput, SCStreamDeleg
     private let worker: ScrollStitchWorker
     private let onProgress: @Sendable (ScrollCaptureProgress) -> Void
     private let onStreamError: @Sendable (Error) -> Void
+    /// Serialized on `streamQueue`: only extract ICC/color-space metadata on the first stream frame.
+    private var hasExtractedColorSpace = false
 
     init(
         worker: ScrollStitchWorker,
@@ -352,12 +378,14 @@ private final class StreamOutputHandler: NSObject, SCStreamOutput, SCStreamDeleg
         else { return }
 
         guard worker.tryReserveSlot() else { return }
+        let shouldExtractCS = !hasExtractedColorSpace
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer),
-              let frame = ScrollFrameBuffer(pixelBuffer: pixelBuffer)
+              let frame = ScrollFrameBuffer(pixelBuffer: pixelBuffer, extractColorSpace: shouldExtractCS)
         else {
             worker.releaseReservedSlot()
             return
         }
+        hasExtractedColorSpace = true
 
         worker.enqueueReserved(frame, onUpdate: onProgress)
     }
@@ -415,13 +443,14 @@ public final class AutoScrollDriver {
     }
 
     public static func scrollTargetPoint(in captureScreenRect: CGRect, avoiding hudFrame: CGRect? = nil) -> CGPoint {
+        guard isFinitePositiveRect(captureScreenRect) else { return .zero }
         let rect = captureScreenRect.standardized
         let center = CGPoint(x: rect.midX, y: rect.midY)
-        guard let hudFrame, !hudFrame.isNull, !hudFrame.isEmpty else {
+        guard let hudFrame, isFinitePositiveRect(hudFrame) else {
             return center
         }
 
-        let paddedHUD = hudFrame.insetBy(dx: -10, dy: -10)
+        let paddedHUD = hudFrame.standardized.insetBy(dx: -10, dy: -10)
         guard paddedHUD.contains(center) else {
             return center
         }
@@ -449,7 +478,15 @@ public final class AutoScrollDriver {
 
     public static func scrollStepLines(for captureHeight: CGFloat) -> Int32 {
         guard captureHeight.isFinite, captureHeight > 0 else { return 2 }
-        return Int32(min(max(Int((captureHeight / 180).rounded()), 2), 5))
+        let clamped = min(max((captureHeight / 180).rounded(), 2), 5)
+        return Int32(clamped)
+    }
+
+    private static func isFinitePositiveRect(_ rect: CGRect) -> Bool {
+        !rect.isNull && !rect.isInfinite
+            && rect.origin.x.isFinite && rect.origin.y.isFinite
+            && rect.size.width.isFinite && rect.size.height.isFinite
+            && rect.size.width != 0 && rect.size.height != 0
     }
 
     public func start(
@@ -459,6 +496,7 @@ public final class AutoScrollDriver {
         avoiding hudFrame: CGRect? = nil
     ) {
         guard !isRunning else { return }
+        guard Self.isFinitePositiveRect(captureScreenRect), primaryScreenHeight.isFinite else { return }
         guard trustChecker() else {
             onAccessibilityRequired?()
             return

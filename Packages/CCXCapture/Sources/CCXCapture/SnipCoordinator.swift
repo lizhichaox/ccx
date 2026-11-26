@@ -1,6 +1,7 @@
 import AppKit
 import CCXAnnotate
 import CCXCore
+import os
 import OSLog
 import ScreenCaptureKit
 
@@ -45,12 +46,15 @@ public final class SnipCoordinator {
             }
             defer { overlayPrepTask.cancel() }
             do {
-                let session = try await ScreenSnapshotEngine.captureSession(geometries: geometries)
+                let session = try await ScreenSnapshotEngine.captureSession(
+                    geometries: geometries,
+                    includeShareableWindows: mode == .snip
+                )
                 // Bound waiting on overlay AX pre-capture so a hung WidgetKit XPC can never stall snip launch.
-                await Self.awaitWithTimeout(nanoseconds: 160_000_000) {
-                    await overlayPrepTask.value
+                let prepCompleted = await Self.awaitTask(overlayPrepTask, timeoutNanoseconds: 160_000_000)
+                if !prepCompleted {
+                    detector.finalizePendingOverlayFallbackIfNeeded()
                 }
-                overlayPrepTask.cancel()
                 guard let self, self.isSessionActive, !Task.isCancelled else { return }
                 PermissionManager.setScreenRecordingVerified(true)
                 self.presentOverlay(
@@ -73,19 +77,77 @@ public final class SnipCoordinator {
         }
     }
 
-    private static func awaitWithTimeout(
-        nanoseconds: UInt64,
-        operation: @escaping @Sendable () async -> Void
-    ) async {
-        await withTaskGroup(of: Void.self) { group in
-            group.addTask {
-                await operation()
+    private struct TimeoutWaitState: Sendable {
+        var continuation: CheckedContinuation<Bool, Never>?
+        var timerTask: Task<Void, Never>?
+        var waitTask: Task<Void, Never>?
+        var isResolved = false
+    }
+
+    /// Races an unstructured `Task` against a wall-clock timeout and caller cancellation.
+    /// Returns `true` if `task` finished before timeout; otherwise cancels `task` and returns `false` promptly.
+    internal nonisolated static func awaitTask(
+        _ task: Task<Void, Never>,
+        timeoutNanoseconds: UInt64
+    ) async -> Bool {
+        if Task.isCancelled {
+            task.cancel()
+            return false
+        }
+        let state = OSAllocatedUnfairLock(initialState: TimeoutWaitState())
+
+        @Sendable func resolve(_ completed: Bool) {
+            let pending = state.withLock { s -> (CheckedContinuation<Bool, Never>?, Task<Void, Never>?, Task<Void, Never>?) in
+                guard !s.isResolved else { return (nil, nil, nil) }
+                s.isResolved = true
+                let cont = s.continuation
+                let timer = s.timerTask
+                let wait = s.waitTask
+                s.continuation = nil
+                s.timerTask = nil
+                s.waitTask = nil
+                return (cont, timer, wait)
             }
-            group.addTask {
-                try? await Task.sleep(nanoseconds: nanoseconds)
+            pending.1?.cancel()
+            pending.2?.cancel()
+            if !completed {
+                task.cancel()
             }
-            _ = await group.next()
-            group.cancelAll()
+            pending.0?.resume(returning: completed)
+        }
+
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                let alreadyResolved = state.withLock { s -> Bool in
+                    guard !s.isResolved else { return true }
+                    s.continuation = continuation
+                    return false
+                }
+                if alreadyResolved {
+                    continuation.resume(returning: false)
+                    return
+                }
+                let timerTask = Task {
+                    try? await Task.sleep(nanoseconds: timeoutNanoseconds)
+                    resolve(false)
+                }
+                let waitTask = Task {
+                    await task.value
+                    resolve(true)
+                }
+                let tasksToCancel = state.withLock { s -> (Task<Void, Never>?, Task<Void, Never>?) in
+                    if s.isResolved {
+                        return (timerTask, waitTask)
+                    }
+                    s.timerTask = timerTask
+                    s.waitTask = waitTask
+                    return (nil, nil)
+                }
+                tasksToCancel.0?.cancel()
+                tasksToCancel.1?.cancel()
+            }
+        } onCancel: {
+            resolve(false)
         }
     }
 

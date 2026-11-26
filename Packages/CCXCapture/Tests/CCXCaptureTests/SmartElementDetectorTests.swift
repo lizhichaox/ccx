@@ -1116,6 +1116,106 @@ struct SmartElementDetectorTests {
         await waitOnBackground(done3)
         #expect(worker.timeoutCountForTesting(pid: hungPID) == 0)
     }
+
+    @Test @MainActor func snipCoordinatorAwaitTaskTimesOutPromptlyAndPreservesOverlayFallback() async throws {
+        // 1. SnipCoordinator.awaitTask returns promptly at timeout even when an unstructured task blocks.
+        let gate = DispatchSemaphore(value: 0)
+        defer { gate.signal() }
+
+        let (completed, elapsed) = await Task.detached(priority: .userInitiated) {
+            let hungTask = Task<Void, Never> {
+                await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                    DispatchQueue.global(qos: .utility).async {
+                        _ = gate.wait(timeout: .now() + 3)
+                        cont.resume()
+                    }
+                }
+            }
+            let start = ContinuousClock.now
+            let ok = await SnipCoordinator.awaitTask(hungTask, timeoutNanoseconds: 40_000_000)
+            return (ok, ContinuousClock.now - start)
+        }.value
+
+        #expect(!completed)
+        #expect(elapsed < .milliseconds(400))
+
+        // 2. Cancelling a hung prepareOverlayElements wakes promptly and preserves fallback overlays & compact banners.
+        let chrome = DetectedWindow(windowID: 1, ownerPID: 20, ownerName: "Chrome", layer: 0, frame: CGRect(x: 0, y: 0, width: 1512, height: 948))
+        let compactBanner = OverlayWindowEntry(
+            window: DetectedWindow(windowID: 2, ownerPID: 1127, ownerName: "Notification Center", layer: 23, frame: CGRect(x: 1140, y: 860, width: 350, height: 90)),
+            zOrderIndex: 0
+        )
+        let fullScreenNC = OverlayWindowEntry(
+            window: DetectedWindow(windowID: 3, ownerPID: 1127, ownerName: "Notification Center", layer: 23, frame: CGRect(x: 0, y: 0, width: 1512, height: 982)),
+            zOrderIndex: 0
+        )
+        let detector = SmartElementDetector(enableAccessibility: true, forceAccessibilityForTesting: true)
+        detector.setDetectedStateForTesting(
+            regularWindows: [chrome],
+            windows: [chrome],
+            fallbackOverlayWindows: [],
+            pendingOverlayWindows: [compactBanner, fullScreenNC]
+        )
+
+        let xpcBlocked = DispatchSemaphore(value: 0)
+        let releaseXPC = DispatchSemaphore(value: 0)
+        defer { releaseXPC.signal() }
+
+        let prepTask = Task { @MainActor in
+            await detector.prepareOverlayElements { _, _ in
+                xpcBlocked.signal()
+                _ = releaseXPC.wait(timeout: .now() + 3)
+                return [:]
+            }
+        }
+        await waitOnBackground(xpcBlocked)
+        let cancelStart = ContinuousClock.now
+        let prepFinished = await SnipCoordinator.awaitTask(prepTask, timeoutNanoseconds: 35_000_000)
+        let wakeElapsed = ContinuousClock.now - cancelStart
+        detector.finalizePendingOverlayFallbackIfNeeded()
+
+        #expect(!prepFinished)
+        #expect(wakeElapsed < .milliseconds(400))
+        // Compact banner is spliced into `windows`, and full-screen NC is preserved in `fallbackOverlayWindows`.
+        #expect(detector.windows.map(\.windowID) == [2, 1])
+        #expect(detector.fallbackOverlayWindows.map(\.window.windowID) == [3])
+    }
+
+    @Test @MainActor func axQueryWorkerSwitchingFromHungPIDToFastPIDDoesNotStallBehindCooldown() async throws {
+        let hungPID: pid_t = 9001
+        let fastPID: pid_t = 9002
+        let hungWin = AXQueryWorker.WindowTarget(windowID: 201, pid: hungPID, containerFrame: CGRect(x: 0, y: 0, width: 500, height: 400))
+        let fastWin = AXQueryWorker.WindowTarget(windowID: 202, pid: fastPID, containerFrame: CGRect(x: 500, y: 0, width: 500, height: 400))
+
+        let worker = AXQueryWorker(excludedPID: 1, minimumInterval: 0) { request, _ in
+            if request.targetWindow?.pid == hungPID {
+                return AXQueryWorker.QueryResult(rect: nil, isOverlay: false, timedOut: true)
+            }
+            return AXQueryWorker.QueryResult(rect: CGRect(x: 520, y: 40, width: 80, height: 30), isOverlay: false, timedOut: false)
+        }
+
+        // Trigger 3 consecutive timeouts on hungPID so it enters a 300ms cooldown.
+        for i in 0..<3 {
+            let sem = DispatchSemaphore(value: 0)
+            worker.enqueue(AXQueryWorker.Request(point: CGPoint(x: 20 + i, y: 20), primaryScreenHeight: 982, targetWindow: hungWin, overlayFallback: nil)) { _, _, _ in
+                sem.signal()
+            }
+            await waitOnBackground(sem)
+        }
+        #expect(worker.timeoutCountForTesting(pid: hungPID) == 3)
+
+        // Schedule a query on hungPID (armed on a 300ms asyncAfter cooldown timer), then immediately switch to fastPID.
+        worker.enqueue(AXQueryWorker.Request(point: CGPoint(x: 40, y: 20), primaryScreenHeight: 982, targetWindow: hungWin, overlayFallback: nil)) { _, _, _ in }
+
+        let fastDone = DispatchSemaphore(value: 0)
+        let switchStart = ContinuousClock.now
+        worker.enqueue(AXQueryWorker.Request(point: CGPoint(x: 550, y: 50), primaryScreenHeight: 982, targetWindow: fastWin, overlayFallback: nil)) { _, _, _ in
+            fastDone.signal()
+        }
+        await waitOnBackground(fastDone)
+        let elapsed = ContinuousClock.now - switchStart
+        #expect(elapsed < .milliseconds(150))
+    }
 }
 
 @Suite("Overlay geometry")

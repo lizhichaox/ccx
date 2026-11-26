@@ -883,5 +883,78 @@ struct ScrollImageStitcherTests {
         #expect(AutoScrollDriver.scrollStepLines(for: .infinity) == 2)
         #expect(AutoScrollDriver.scrollStepLines(for: -50) == 2)
         #expect(AutoScrollDriver.scrollStepLines(for: 900) == 5)
+        #expect(AutoScrollDriver.scrollStepLines(for: 1e30) == 5)
+        #expect(AutoScrollDriver.scrollTargetPoint(in: .null) == .zero)
+        #expect(AutoScrollDriver.scrollTargetPoint(in: .infinite) == .zero)
+    }
+
+    @Test func stitcherReleasesInitialFrameAfterSidebarLockConsumesCleanlyAndGuardsPreviewBounds() throws {
+        let width = 360
+        let viewportH = 300
+        let shifts = [0, 80, 170, 260, 355]
+        let docHeight = shifts.last! + viewportH
+        let doc = try renderSyntheticDocument(width: width, height: docHeight)
+
+        let stitcher = ScrollImageStitcher(scale: 2)
+        for (index, offset) in shifts.enumerated() {
+            let img = try renderViewport(from: doc, scrollY: offset, viewportHeight: viewportH)
+            let buf = try #require(ScrollFrameBuffer(cgImage: img))
+            #expect(stitcher.append(buf))
+            if index >= 1 {
+                // Once cumulative scroll >= sidebarLockMinScroll and base slice is committed, initialFrame is released.
+                #expect(!stitcher.isRetainingInitialFrameForTesting)
+            }
+        }
+
+        // Unbounded public preview maxWidth/maxHeight clamp safely without trapping or OOM.
+        let boundedPreview = try #require(stitcher.buildPreviewImage(maxWidth: .max, maxHeight: .max))
+        #expect(boundedPreview.width <= 4096 && boundedPreview.height <= 4096)
+
+        // Both non-mutating buildFinalImage() and peak-memory-saving consumeAndBuildFinalImage() match ground truth.
+        let standardFinal = try #require(stitcher.buildFinalImage())
+        #expect(try maxPixelChannelDiff(standardFinal, doc) == 0)
+
+        let consumedFinal = try #require(stitcher.consumeAndBuildFinalImage())
+        #expect(try maxPixelChannelDiff(consumedFinal, doc) == 0)
+        #expect(stitcher.stitchedFrameCount == 0 && stitcher.totalStitchedHeight == 0)
+
+        // Non-extracting pixelBuffer path (used after frame 0) copies padded BGRA rows cleanly without zero-fill.
+        var paddedPB: CVPixelBuffer?
+        let attrs: [String: Any] = [kCVPixelBufferBytesPerRowAlignmentKey as String: 256]
+        #expect(CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            64,
+            48,
+            kCVPixelFormatType_32BGRA,
+            attrs as CFDictionary,
+            &paddedPB
+        ) == kCVReturnSuccess)
+        let pb = try #require(paddedPB)
+        CVPixelBufferLockBaseAddress(pb, [])
+        if let base = CVPixelBufferGetBaseAddress(pb)?.assumingMemoryBound(to: UInt8.self) {
+            let bpr = CVPixelBufferGetBytesPerRow(pb)
+            for y in 0..<48 {
+                for x in 0..<64 {
+                    let px = y * bpr + x * 4
+                    base[px] = UInt8((x + y) & 0xFF)
+                    base[px + 1] = UInt8((x * 3) & 0xFF)
+                    base[px + 2] = UInt8((y * 5) & 0xFF)
+                    base[px + 3] = 255
+                }
+            }
+        }
+        CVPixelBufferUnlockBaseAddress(pb, [])
+
+        let fastBuf = try #require(ScrollFrameBuffer(pixelBuffer: pb, extractColorSpace: false))
+        #expect(fastBuf.width == 64 && fastBuf.height == 48)
+        #expect(fastBuf.colorSpaceName == nil && fastBuf.iccProfileData == nil)
+        fastBuf.bgraData.withUnsafeBytes { raw in
+            let ptr = raw.baseAddress!.assumingMemoryBound(to: UInt8.self)
+            #expect(ptr[0] == 0 && ptr[1] == 0 && ptr[2] == 0)
+            let lastPx = 47 * fastBuf.bytesPerRow + 63 * 4
+            #expect(ptr[lastPx] == UInt8((63 + 47) & 0xFF))
+            #expect(ptr[lastPx + 1] == UInt8((63 * 3) & 0xFF))
+            #expect(ptr[lastPx + 2] == UInt8((47 * 5) & 0xFF))
+        }
     }
 }

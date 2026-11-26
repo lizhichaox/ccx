@@ -1615,4 +1615,43 @@ struct SnipOverlayViewTests {
             #expect(surface is NSGlassEffectView)
         }
     }
+
+    @Test func annotationCanvasHidesWhenEmptyResetClearsMosaicCacheAndExtremeCoordsDoNotTrap() throws {
+        let view = SnipOverlayView(snapshot: try makeSnapshot(size: CGSize(width: 400, height: 300)), topInset: 0)
+        // Unused annotation canvas and handle layer remain hidden before any annotation or selection exists.
+        #expect(view.isAnnotationCanvasHiddenForTesting)
+        #expect(view.isHandleLayerHiddenForTesting)
+
+        try selectRect(CGRect(x: 20, y: 20, width: 200, height: 150), on: view)
+        #expect(view.isAnnotationCanvasHiddenForTesting)
+        #expect(!view.isHandleLayerHiddenForTesting)
+        #expect(!view.isBorderLayerHiddenForTesting)
+
+        // Drawing a rectangle unhides annotation canvas; undo hides it again cleanly.
+        view.keyDown(with: try makeKeyEvent(characters: "1", modifiers: [], keyCode: 18))
+        view.mouseDown(with: try makeMouseEvent(type: .leftMouseDown, at: CGPoint(x: 40, y: 40)))
+        #expect(!view.isAnnotationCanvasHiddenForTesting)
+        view.mouseDragged(with: try makeMouseEvent(type: .leftMouseDragged, at: CGPoint(x: 120, y: 100)))
+        view.mouseUp(with: try makeMouseEvent(type: .leftMouseUp, at: CGPoint(x: 120, y: 100)))
+        #expect(!view.isAnnotationCanvasHiddenForTesting)
+
+        #expect(view.performKeyEquivalent(with: try makeKeyEvent(characters: "z", modifiers: [.command], keyCode: 6)))
+        #expect(view.isAnnotationCanvasHiddenForTesting)
+
+        // Resetting selection clears any cached MosaicImageCache variants and hides handles.
+        _ = view.mosaicCache.filteredImage(mode: .pixelate, size: .medium, backingScale: 2)
+        view.resetSelection()
+        #expect(view.isAnnotationCanvasHiddenForTesting)
+        #expect(view.isHandleLayerHiddenForTesting)
+
+        // Huge finite mouse coordinates never trap in updateMagnifier or HUD initialization.
+        view.primeWithMouseLocation(CGPoint(x: 1e30, y: -1e30))
+        #expect(view.isMagnifierHidden)
+
+        let hugeHUD = ScrollCaptureHUDPanel(
+            captureRect: CGRect(x: 0, y: 0, width: 1e30, height: 1e30),
+            visibleFrame: CGRect(x: 0, y: 0, width: 1440, height: 900)
+        )
+        #expect(hugeHUD.hudContentBounds.height == 44)
+    }
 }

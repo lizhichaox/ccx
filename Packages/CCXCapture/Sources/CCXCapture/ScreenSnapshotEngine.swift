@@ -118,16 +118,19 @@ public enum ScreenSnapshotEngine {
 
     nonisolated static func captureSession(
         geometries: [CGDirectDisplayID: ScreenGeometry],
-        excludingWindowIDs: Set<CGWindowID> = []
+        excludingWindowIDs: Set<CGWindowID> = [],
+        includeShareableWindows: Bool = true
     ) async throws -> DisplayCaptureSession {
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
         let excludedWindows = excludingWindowIDs.isEmpty
             ? []
             : content.windows.filter { excludingWindowIDs.contains($0.windowID) }
         var shareableWindows: [CGWindowID: UncheckedSendableBox<SCWindow>] = [:]
-        shareableWindows.reserveCapacity(content.windows.count)
-        for window in content.windows where !excludingWindowIDs.contains(window.windowID) {
-            shareableWindows[window.windowID] = UncheckedSendableBox(window)
+        if includeShareableWindows {
+            shareableWindows.reserveCapacity(content.windows.count)
+            for window in content.windows where !excludingWindowIDs.contains(window.windowID) {
+                shareableWindows[window.windowID] = UncheckedSendableBox(window)
+            }
         }
 
         var jobs: [(UncheckedSendableBox<SCContentFilter>, ScreenGeometry)] = []
@@ -237,6 +240,15 @@ public enum ScreenSnapshotEngine {
         return true
     }
 
+    nonisolated static func clampedPixelDimension(
+        _ raw: CGFloat,
+        minimum: Int,
+        maximum: Int = 16_384
+    ) -> Int? {
+        guard raw.isFinite, raw >= CGFloat(minimum), maximum >= minimum else { return nil }
+        return Int(min(raw, CGFloat(maximum)))
+    }
+
     private nonisolated static func isFinitePositiveRect(_ rect: CGRect, minimumSide: CGFloat) -> Bool {
         !rect.isNull && !rect.isInfinite
             && rect.origin.x.isFinite && rect.origin.y.isFinite
@@ -288,11 +300,11 @@ public enum ScreenSnapshotEngine {
 
         let rawWidth = (contentRect.width * effectiveScale).rounded()
         let rawHeight = (contentRect.height * effectiveScale).rounded()
-        guard rawWidth.isFinite, rawHeight.isFinite, rawWidth >= 2, rawHeight >= 2 else {
+        guard let pixelWidth = clampedPixelDimension(rawWidth, minimum: 2),
+              let pixelHeight = clampedPixelDimension(rawHeight, minimum: 2)
+        else {
             return nil
         }
-        let pixelWidth = min(max(2, Int(rawWidth)), 16_384)
-        let pixelHeight = min(max(2, Int(rawHeight)), 16_384)
 
         let configuration = SCStreamConfiguration()
         configuration.width = pixelWidth
@@ -345,11 +357,11 @@ public enum ScreenSnapshotEngine {
         }
         let rawWidth = (geometry.frame.width * geometry.scale).rounded()
         let rawHeight = (geometry.frame.height * geometry.scale).rounded()
-        guard rawWidth.isFinite, rawHeight.isFinite, rawWidth >= 1, rawHeight >= 1 else {
+        guard let pixelWidth = clampedPixelDimension(rawWidth, minimum: 1),
+              let pixelHeight = clampedPixelDimension(rawHeight, minimum: 1)
+        else {
             throw ScreenSnapshotError.captureFailed
         }
-        let pixelWidth = min(max(1, Int(rawWidth)), 16_384)
-        let pixelHeight = min(max(1, Int(rawHeight)), 16_384)
 
         if #available(macOS 26.0, *) {
             do {
@@ -368,11 +380,14 @@ public enum ScreenSnapshotEngine {
                     return image
                 }
             } catch {
-                if isPermissionDeniedError(error) { throw error }
+                if isPermissionDeniedError(error) || error is CancellationError || Task.isCancelled {
+                    throw error
+                }
                 logger.warning("macOS 26 captureScreenshot failed, falling back to captureImage: \(error.localizedDescription)")
             }
         }
 
+        try Task.checkCancellation()
         return try await captureLegacyImage(filter: filter, pixelWidth: pixelWidth, pixelHeight: pixelHeight)
     }
 

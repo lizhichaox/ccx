@@ -67,6 +67,7 @@ final class ScrollCaptureController {
     private var borderPanel: ScrollCaptureFramePanel?
     private var hudPanel: ScrollCaptureHUDPanel?
     private var previewPanel: ScrollCapturePreviewPanel?
+    private var startTask: Task<Void, Never>?
 
     nonisolated(unsafe) private var localKeyMonitor: Any?
     nonisolated(unsafe) private var screenParametersObserver: NSObjectProtocol?
@@ -122,6 +123,7 @@ final class ScrollCaptureController {
         self.borderPanel = border
         self.hudPanel = hud
         self.previewPanel = preview
+        self.engine.setGeneratesPreview(preview != nil)
 
         border.orderFrontRegardless()
         preview?.orderFrontRegardless()
@@ -145,7 +147,7 @@ final class ScrollCaptureController {
         installMonitors()
         installScreenParametersObserver()
 
-        Task { @MainActor [weak self] in
+        startTask = Task { @MainActor [weak self] in
             guard let self, !self.isClosed else { return }
             do {
                 try await self.engine.start(excludingWindowIDs: excludedWindowIDs)
@@ -313,7 +315,12 @@ final class ScrollCaptureController {
         guard !isClosed else { return }
         isClosed = true
         pendingAutoScrollStart = false
+        startTask?.cancel()
+        startTask = nil
         autoScroll.stop()
+        autoScroll.onStateChanged = nil
+        autoScroll.onReachedBottom = nil
+        autoScroll.onAccessibilityRequired = nil
         removeMonitors()
         removeScreenParametersObserver()
         if cancelEngine {
@@ -326,9 +333,13 @@ final class ScrollCaptureController {
         hudPanel?.onCopy = nil
         hudPanel?.onSave = nil
         hudPanel?.onCancel = nil
+        previewPanel?.clearImage()
         borderPanel?.orderOut(nil)
         hudPanel?.orderOut(nil)
         previewPanel?.orderOut(nil)
+        borderPanel?.contentView = nil
+        hudPanel?.contentView = nil
+        previewPanel?.contentView = nil
         borderPanel?.close()
         hudPanel?.close()
         previewPanel?.close()
@@ -511,7 +522,7 @@ final class ScrollCaptureController {
 
 // MARK: - Visual Styling & Auxiliary Panels
 
-enum ScrollCaptureVisualAccent {
+enum ScrollCaptureVisualAccent: Equatable {
     case active
     case autoScroll
     case warning
@@ -551,26 +562,45 @@ private final class ScrollCaptureFramePanel: NSPanel {
     }
 
     func setAccent(_ accent: ScrollCaptureVisualAccent) {
-        frameView.accentColor = accent.nsColor
+        frameView.accent = accent
     }
 }
 
+/// GPU-composited border-only view with zero software backing store allocation.
 private final class ScrollBorderView: NSView {
-    var accentColor: NSColor = .systemMint {
-        didSet { needsDisplay = true }
+    private let borderLayer = CALayer()
+    var accent: ScrollCaptureVisualAccent = .active {
+        didSet {
+            guard accent != oldValue else { return }
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            borderLayer.borderColor = accent.nsColor.cgColor
+            CATransaction.commit()
+        }
     }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.backgroundColor = nil
+        borderLayer.backgroundColor = nil
+        borderLayer.borderWidth = 2.5
+        borderLayer.cornerRadius = 5
+        borderLayer.borderColor = accent.nsColor.cgColor
+        layer?.addSublayer(borderLayer)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
     override var isOpaque: Bool { false }
 
-    override func draw(_ dirtyRect: NSRect) {
-        NSColor.clear.setFill()
-        dirtyRect.fill()
-
-        let strokeRect = bounds.insetBy(dx: 2, dy: 2)
-        let outerPath = NSBezierPath(roundedRect: strokeRect, xRadius: 5, yRadius: 5)
-        outerPath.lineWidth = 2.5
-        accentColor.setStroke()
-        outerPath.stroke()
+    override func layout() {
+        super.layout()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        borderLayer.frame = bounds.insetBy(dx: 0.75, dy: 0.75)
+        CATransaction.commit()
     }
 }
 
@@ -603,6 +633,10 @@ internal final class ScrollCaptureHUDPanel: NSPanel, NSWindowDelegate {
     private let visibleFrame: CGRect
     private var hasCustomPosition = false
     private var isProgrammaticFrameUpdate = false
+    private var lastStatusText: String?
+    private var lastAccent: ScrollCaptureVisualAccent?
+    private var lastIsRunning: Bool?
+    private var lastSizeTextLength = 0
 
     private let innerContainer = NSView()
     private let rootStack = NSStackView()
@@ -646,9 +680,16 @@ internal final class ScrollCaptureHUDPanel: NSPanel, NSWindowDelegate {
         let surface = Self.makeGlassSurface(contentView: innerContainer, cornerRadius: Self.cornerRadius)
         contentView = surface
 
-        let initialWidth = captureRect.width.isFinite ? max(1, Int(captureRect.width.rounded())) : 1
-        let initialHeight = captureRect.height.isFinite ? max(1, Int(captureRect.height.rounded())) : 1
-        sizeLabel.stringValue = "\(initialWidth) × \(initialHeight)"
+        let maxDim = CGFloat(ScrollFrameBuffer.maxFrameDimension)
+        let initialWidth = captureRect.width.isFinite
+            ? Int(min(max(captureRect.width.rounded(), 1), maxDim))
+            : 1
+        let initialHeight = captureRect.height.isFinite
+            ? Int(min(max(captureRect.height.rounded(), 1), maxDim))
+            : 1
+        let initialSizeText = "\(initialWidth) × \(initialHeight)"
+        sizeLabel.stringValue = initialSizeText
+        lastSizeTextLength = initialSizeText.count
         updateAutoScroll(isRunning: false, status: CCXL10n.text("Scroll down", zh: "向下滚动"), accent: .active)
     }
 
@@ -665,30 +706,60 @@ internal final class ScrollCaptureHUDPanel: NSPanel, NSWindowDelegate {
         isAutoScrolling: Bool
     ) {
         lastHeightPixels = height
-        sizeLabel.stringValue = "\(width) × \(height)"
-        updateAutoScroll(isRunning: isAutoScrolling, status: status, accent: accent)
+        let sizeText = "\(width) × \(height)"
+        let sizeLengthChanged = sizeText.count != lastSizeTextLength
+        if sizeLabel.stringValue != sizeText {
+            sizeLabel.stringValue = sizeText
+            lastSizeTextLength = sizeText.count
+        }
+        updateAutoScroll(
+            isRunning: isAutoScrolling,
+            status: status,
+            accent: accent,
+            forceLayout: sizeLengthChanged
+        )
     }
 
-    func updateAutoScroll(isRunning: Bool, status: String, accent: ScrollCaptureVisualAccent) {
-        dotView.layer?.backgroundColor = accent.nsColor.cgColor
-        statusLabel.stringValue = status
-        let needsAXStatus = CCXL10n.text("Needs Accessibility", zh: "需要辅助功能")
-        statusLabel.toolTip = (status == needsAXStatus || status == "Needs Accessibility")
-            ? CCXL10n.text(
-                "Enable Accessibility for CCX in System Settings to use Auto-Scroll, or scroll manually.",
-                zh: "请在系统设置中为 CCX 开启辅助功能以使用自动滚动，或手动滚动。"
-            )
-            : nil
-        switch accent {
-        case .active:
-            statusLabel.textColor = NSColor.white.withAlphaComponent(0.74)
-        case .autoScroll:
-            statusLabel.textColor = .systemCyan
-        case .warning:
-            statusLabel.textColor = .systemOrange
+    func updateAutoScroll(
+        isRunning: Bool,
+        status: String,
+        accent: ScrollCaptureVisualAccent,
+        forceLayout: Bool = false
+    ) {
+        let statusChanged = lastStatusText != status
+        let accentChanged = lastAccent != accent
+        let runningChanged = lastIsRunning != isRunning
+
+        if accentChanged {
+            lastAccent = accent
+            dotView.layer?.backgroundColor = accent.nsColor.cgColor
+            switch accent {
+            case .active:
+                statusLabel.textColor = NSColor.white.withAlphaComponent(0.74)
+            case .autoScroll:
+                statusLabel.textColor = .systemCyan
+            case .warning:
+                statusLabel.textColor = .systemOrange
+            }
         }
-        autoButton.setRunning(isRunning)
-        resizeToFit()
+        if statusChanged {
+            lastStatusText = status
+            statusLabel.stringValue = status
+            let needsAXStatus = CCXL10n.text("Needs Accessibility", zh: "需要辅助功能")
+            statusLabel.toolTip = (status == needsAXStatus || status == "Needs Accessibility")
+                ? CCXL10n.text(
+                    "Enable Accessibility for CCX in System Settings to use Auto-Scroll, or scroll manually.",
+                    zh: "请在系统设置中为 CCX 开启辅助功能以使用自动滚动，或手动滚动。"
+                )
+                : nil
+        }
+        if runningChanged {
+            lastIsRunning = isRunning
+            autoButton.setRunning(isRunning)
+        }
+        if forceLayout || statusChanged || runningChanged {
+            resizeToFit()
+        }
     }
 
     private func resizeToFit() {
@@ -1174,6 +1245,10 @@ private final class ScrollCapturePreviewPanel: NSPanel {
 
         contentView = container
         setFrame(frame, display: true)
+    }
+
+    func clearImage() {
+        imageView.image = nil
     }
 
     func update(image: CGImage, heightRatio: CGFloat) {

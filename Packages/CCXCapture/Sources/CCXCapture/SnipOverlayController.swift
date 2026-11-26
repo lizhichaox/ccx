@@ -19,10 +19,11 @@ final class SnipOverlayPanel: NSPanel {
 final class SnipOverlayController {
     private static let silhouetteCommitTimeoutNanoseconds: UInt64 = 120_000_000
     private static let maxCachedSilhouettes = 8
+    private static let maxCachedSilhouetteBytes = 64 * 1024 * 1024
 
-    private let snapshots: [DisplaySnapshot]
+    private var snapshots: [DisplaySnapshot]
     private let detector: SmartElementDetector
-    private let shareableWindows: [CGWindowID: UncheckedSendableBox<SCWindow>]
+    private var shareableWindows: [CGWindowID: UncheckedSendableBox<SCWindow>]
     private let silhouetteProvider: (@Sendable (CGWindowID, CGFloat) async -> CapturedWindowSilhouette?)?
     private let selectionMode: SnipSelectionMode
     private let initialStyle: AnnotationStyle
@@ -36,6 +37,8 @@ final class SnipOverlayController {
     private var screenParametersObserver: NSObjectProtocol?
     private var silhouetteTasks: [CGWindowID: Task<CapturedWindowSilhouette?, Never>] = [:]
     private var resolvedSilhouettes: [CGWindowID: CapturedWindowSilhouette?] = [:]
+    private var resolvedSilhouetteBytes: [CGWindowID: Int] = [:]
+    private var totalCachedSilhouetteBytes = 0
     private var resolvedSilhouetteOrder: [CGWindowID] = []
     private var previewUpdateTasks: [ObjectIdentifier: Task<Void, Never>] = [:]
     private var finishTask: Task<Void, Never>?
@@ -100,6 +103,9 @@ final class SnipOverlayController {
                 initialStyle: initialStyle,
                 previousSelectionRect: previousSelections[snapshot.displayID]
             )
+            view.hoverTargetProvider = { [weak self] global in
+                self?.detector.hoverLookup(at: global) ?? (nil, false)
+            }
             view.hoverRectProvider = { [weak self] global in self?.detector.windowRect(at: global) }
             view.shouldQueryElementRect = { [weak self] global in
                 self?.detector.shouldRequestElementRect(at: global) ?? false
@@ -239,7 +245,11 @@ final class SnipOverlayController {
         for task in silhouetteTasks.values { task.cancel() }
         silhouetteTasks.removeAll()
         resolvedSilhouettes.removeAll()
+        resolvedSilhouetteBytes.removeAll()
+        totalCachedSilhouetteBytes = 0
         resolvedSilhouetteOrder.removeAll()
+        shareableWindows.removeAll()
+        snapshots.removeAll()
 
         if let screenParametersObserver {
             NotificationCenter.default.removeObserver(screenParametersObserver)
@@ -255,6 +265,7 @@ final class SnipOverlayController {
             view.onHoverActive = nil
             view.hasSiblingSelection = nil
             view.shouldBecomeKeyOnHover = nil
+            view.hoverTargetProvider = nil
             view.hoverRectProvider = nil
             view.shouldQueryElementRect = nil
             view.elementRectRequester = nil
@@ -287,13 +298,39 @@ final class SnipOverlayController {
         var isResolved = false
     }
 
+    private static func estimatedSilhouetteBytes(_ silhouette: CapturedWindowSilhouette?) -> Int {
+        guard let image = silhouette?.image else { return 0 }
+        let (pixels, pOverflow) = image.width.multipliedReportingOverflow(by: image.height)
+        guard !pOverflow else { return Int.max / 4 }
+        let (bytes, bOverflow) = pixels.multipliedReportingOverflow(by: 4)
+        return bOverflow ? Int.max / 4 : bytes
+    }
+
     private func cacheResolvedSilhouette(_ silhouette: CapturedWindowSilhouette?, for windowID: CGWindowID) {
+        if let prevBytes = resolvedSilhouetteBytes.removeValue(forKey: windowID) {
+            totalCachedSilhouetteBytes = max(0, totalCachedSilhouetteBytes - prevBytes)
+        }
+        let bytes = Self.estimatedSilhouetteBytes(silhouette)
         resolvedSilhouettes[windowID] = silhouette
+        resolvedSilhouetteBytes[windowID] = bytes
+        totalCachedSilhouetteBytes += bytes
         resolvedSilhouetteOrder.removeAll { $0 == windowID }
         resolvedSilhouetteOrder.append(windowID)
-        while resolvedSilhouetteOrder.count > Self.maxCachedSilhouettes {
+        while resolvedSilhouetteOrder.count > Self.maxCachedSilhouettes
+            || (resolvedSilhouetteOrder.count > 1 && totalCachedSilhouetteBytes > Self.maxCachedSilhouetteBytes) {
             let evicted = resolvedSilhouetteOrder.removeFirst()
             resolvedSilhouettes.removeValue(forKey: evicted)
+            if let evictedBytes = resolvedSilhouetteBytes.removeValue(forKey: evicted) {
+                totalCachedSilhouetteBytes = max(0, totalCachedSilhouetteBytes - evictedBytes)
+            }
+        }
+    }
+
+    private func cancelSupersededSilhouetteTasks(keeping activeWindowID: CGWindowID?) {
+        guard !isFinishing else { return }
+        for (wid, task) in silhouetteTasks where wid != activeWindowID {
+            task.cancel()
+            silhouetteTasks.removeValue(forKey: wid)
         }
     }
 
@@ -350,14 +387,21 @@ final class SnipOverlayController {
               !isClosed,
               !isFinishing,
               let localRect
-        else { return }
+        else {
+            cancelSupersededSilhouetteTasks(keeping: nil)
+            return
+        }
 
         let globalRect = localRect.offsetBy(
             dx: view.snapshot.screenFrame.minX,
             dy: view.snapshot.screenFrame.minY
         )
-        guard let target = detector.matchingWindowCornerTarget(for: globalRect) else { return }
+        guard let target = detector.matchingWindowCornerTarget(for: globalRect) else {
+            cancelSupersededSilhouetteTasks(keeping: nil)
+            return
+        }
         let windowID = target.window.windowID
+        cancelSupersededSilhouetteTasks(keeping: windowID)
         guard hasSilhouetteSource(for: windowID) else { return }
 
         // Fast synchronous path when this window's silhouette is already cached in the session.
@@ -600,7 +644,7 @@ final class SnipOverlayController {
             finishImageExport(rect: rect, buildOutcome: SnipOutcome.quickSave)
             return
         case let .scroll(rect):
-            let initialResult = Self.makeResult(localRect: rect, snapshot: view.snapshot)
+            let initialResult = Self.makeResult(localRect: rect, snapshot: view.snapshot, detachFromSnapshot: true)
             if initialResult != nil {
                 onSelectionCommitted?(view.snapshot.displayID, rect)
             }
@@ -669,7 +713,8 @@ final class SnipOverlayController {
         snapshot: DisplaySnapshot,
         cornerTarget: WindowCornerTarget? = nil,
         windowSilhouette: CapturedWindowSilhouette? = nil,
-        cornerMask: CGImage? = nil
+        cornerMask: CGImage? = nil,
+        detachFromSnapshot: Bool = false
     ) -> SnipResult? {
         let imageSize = CGSize(width: snapshot.image.width, height: snapshot.image.height)
         let pixelRect = CoordinateConverter.appKitLocalRectToImagePixelRect(
@@ -682,14 +727,59 @@ final class SnipOverlayController {
         }
         let scale = snapshot.screenFrame.width > 0 ? imageSize.width / snapshot.screenFrame.width : snapshot.backingScaleFactor
         let screenRect = localRect.offsetBy(dx: snapshot.screenFrame.minX, dy: snapshot.screenFrame.minY)
-        let finalImage = applyAdaptiveCornerMaskIfNeeded(
+        let maskedImage = applyAdaptiveCornerMaskIfNeeded(
             to: cropped,
             globalRect: screenRect,
             cornerTarget: cornerTarget,
             windowSilhouette: windowSilhouette,
             cornerMask: cornerMask
         )
+        // `CGImage.cropping(to:)` retains the entire full-display backing buffer/IOSurface.
+        // Materialize a tightly-sized detached copy when unmasked and smaller than the display
+        // (or explicitly requested, e.g. for ScrollCaptureRequest) so display snapshots free promptly.
+        let finalImage: CGImage = if maskedImage === cropped {
+            detachCroppedImage(cropped, from: snapshot.image, forceDetach: detachFromSnapshot)
+        } else {
+            maskedImage
+        }
         return SnipResult(image: finalImage, scale: scale, screenRect: screenRect)
+    }
+
+    /// Copies `cropped` into a tightly-sized standalone `CGImage` when smaller than `fullImage`
+    /// (or `forceDetach` is `true`) so pinned snips and scroll sessions do not retain full-display
+    /// `IOSurface` framebuffers.
+    nonisolated static func detachCroppedImage(
+        _ cropped: CGImage,
+        from fullImage: CGImage,
+        forceDetach: Bool = false
+    ) -> CGImage {
+        let cropW = cropped.width
+        let cropH = cropped.height
+        let (cropPixels, cropOverflow) = cropW.multipliedReportingOverflow(by: cropH)
+        guard !cropOverflow, cropPixels > 0, cropPixels <= 150_000_000 else { return cropped }
+
+        if !forceDetach {
+            let (fullPixels, fullOverflow) = fullImage.width.multipliedReportingOverflow(by: fullImage.height)
+            guard !fullOverflow, fullPixels > 0 else { return cropped }
+            // Detach when crop is < 75% of the full display pixel area.
+            let (cropTimes4, c4Overflow) = cropPixels.multipliedReportingOverflow(by: 4)
+            let (fullTimes3, f3Overflow) = fullPixels.multipliedReportingOverflow(by: 3)
+            if !c4Overflow && !f3Overflow && cropTimes4 >= fullTimes3 {
+                return cropped
+            }
+        }
+
+        guard let context = WindowCornerMaskExtractor.makeOutputRGBAContext(
+            width: cropW,
+            height: cropH,
+            matching: cropped
+        ) else {
+            return cropped
+        }
+        context.setBlendMode(.copy)
+        context.interpolationQuality = .none
+        context.draw(cropped, in: CGRect(x: 0, y: 0, width: cropW, height: cropH))
+        return context.makeImage() ?? cropped
     }
 
     /// Crops the exact backing pixels, bakes any committed annotations at full Retina resolution,
@@ -755,17 +845,17 @@ final class SnipOverlayController {
         guard let cornerTarget,
               let windowSilhouette,
               silhouetteMatchesTarget(windowSilhouette, target: cornerTarget),
-              let extracted = WindowCornerMaskExtractor.extractMask(
+              let masked = WindowCornerMaskExtractor.extractAndApplyMask(
                   windowImage: windowSilhouette.image,
                   windowFrame: cornerTarget.backingWindowFrame,
                   selectionRect: globalRect,
                   eligibleCorners: cornerTarget.eligibleCorners,
-                  outputPixelSize: (width: image.width, height: image.height),
+                  to: image,
                   displayScale: windowSilhouette.pointPixelScale
               )
         else {
             return image
         }
-        return WindowCornerMaskExtractor.applyMask(extracted.maskImage, to: image)
+        return masked
     }
 }
