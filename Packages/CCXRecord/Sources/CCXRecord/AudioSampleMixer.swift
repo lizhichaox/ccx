@@ -395,8 +395,7 @@ public struct DualAudioMixer: Sendable {
             aligned.withUnsafeBufferPointer { src in
                 guard let srcBase = src.baseAddress else { return }
                 for idx in 0..<usableCount {
-                    let raw = srcBase[idx]
-                    dst[idx] = raw.isFinite ? raw : 0
+                    dst[idx] = softClip(srcBase[idx])
                 }
             }
         }
@@ -446,9 +445,16 @@ public struct DualAudioMixer: Sendable {
             }
         }
 
-        lastMixPTS = pts
+        // Keep emitted PTS strictly monotonic & non-overlapping when system audio resumes
+        // after a stalled-microphone flush advanced `lastEmittedEndPTS`.
+        var emitPTS = pts
+        if let prevEnd = lastEmittedEndPTS, prevEnd.isNumeric, emitPTS < prevEnd {
+            emitPTS = prevEnd
+        }
+
+        lastMixPTS = emitPTS
         let frameDuration = CMTime(value: CMTimeValue(usableSystemCount / 2), timescale: CMTimeScale(Self.sampleRate))
-        let systemEnd = CMTimeAdd(pts, frameDuration)
+        let systemEnd = CMTimeAdd(emitPTS, frameDuration)
         if let prevEnd = lastEmittedEndPTS, prevEnd.isNumeric {
             lastEmittedEndPTS = systemEnd > prevEnd ? systemEnd : prevEnd
         } else {
@@ -458,14 +464,14 @@ public struct DualAudioMixer: Sendable {
         let availableMic = unreadMicCount
         if availableMic == 0 {
             let mixed = mixIntoScratch(system: alignedSystem, microphone: [][...])
-            return (mixed, pts)
+            return (mixed, emitPTS)
         }
 
         let takeCount = min(usableSystemCount, availableMic)
         let alignedCount = takeCount - (takeCount % 2)
         guard alignedCount > 0 else {
             let mixed = mixIntoScratch(system: alignedSystem, microphone: [][...])
-            return (mixed, pts)
+            return (mixed, emitPTS)
         }
 
         let micSlice = micQueue[micReadOffset..<(micReadOffset + alignedCount)]
@@ -480,7 +486,7 @@ public struct DualAudioMixer: Sendable {
             micQueuePTS = CMTimeAdd(head, advance)
         }
 
-        return (mixed, pts)
+        return (mixed, emitPTS)
     }
 
     public mutating func pushMicrophone(_ samples: [Float], pts: CMTime) -> [(samples: [Float], pts: CMTime)] {

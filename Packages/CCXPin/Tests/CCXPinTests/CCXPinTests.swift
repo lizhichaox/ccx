@@ -1243,7 +1243,12 @@ final class PinPanelAndManagerTests: XCTestCase {
         XCTAssertTrue(manager.pin(content: .image(img, scale: 2), at: CGRect(x: 120, y: 120, width: 120, height: 70)))
         let panel = try XCTUnwrap(manager.panels.first)
 
-        func makeScrollEvent(deltaY: Int32, deltaX: Int32 = 0, momentumPhase: Int64 = 0) -> NSEvent? {
+        func makeScrollEvent(
+            deltaY: Int32,
+            deltaX: Int32 = 0,
+            momentumPhase: Int64 = 0,
+            flags: CGEventFlags = []
+        ) -> NSEvent? {
             guard let cgEvent = CGEvent(
                 scrollWheelEvent2Source: nil,
                 units: .pixel,
@@ -1252,6 +1257,7 @@ final class PinPanelAndManagerTests: XCTestCase {
                 wheel2: deltaX,
                 wheel3: 0
             ) else { return nil }
+            cgEvent.flags = flags
             cgEvent.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
             cgEvent.setIntegerValueField(.scrollWheelEventMomentumPhase, value: momentumPhase)
             return NSEvent(cgEvent: cgEvent)
@@ -1275,6 +1281,20 @@ final class PinPanelAndManagerTests: XCTestCase {
             panel.scrollWheel(with: activeZoom)
             XCTAssertGreaterThan(panel.state.zoom, 1.05)
         }
+
+        // Ctrl+scroll adjusts opacity cleanly and flashes opacity readout even at floor/ceiling limits.
+        if let ctrlScrollDown = makeScrollEvent(deltaY: -40, flags: .maskControl) {
+            panel.scrollWheel(with: ctrlScrollDown)
+            XCTAssertLessThan(panel.state.opacity, 0.9)
+            XCTAssertTrue(panel.lastHUDTextForTesting?.hasPrefix("Opacity ") == true)
+        }
+        panel.setOpacity(0.1)
+        if let ctrlScrollAtFloor = makeScrollEvent(deltaY: -40, flags: .maskControl) {
+            panel.scrollWheel(with: ctrlScrollAtFloor)
+            XCTAssertEqual(panel.state.opacity, 0.1, accuracy: 0.001)
+            XCTAssertEqual(panel.lastHUDTextForTesting, "Opacity 10%")
+        }
+        panel.setOpacity(1.0)
 
         // With toolbar open & drawing tool active, momentum scroll from thickness gesture must NOT zoom the pin.
         panel.setZoom(1.0)
@@ -2437,5 +2457,111 @@ final class PinPanelAndManagerTests: XCTestCase {
         controller.handleMouseDragged(at: CGPoint(x: 60, y: 50), constrain: false, in: contentView, panel: panel)
         XCTAssertEqual(redrawRects.count, countAfterDown + 1)
         controller.handleMouseUp(at: CGPoint(x: 60, y: 50), in: contentView, panel: panel)
+    }
+
+    func testMilestoneV010ClickThroughBadgeLiquidGlassHUDSeamClampingAndHardening() throws {
+        let (store, _) = makeStore()
+        let manager = PinManager(clipboardStore: store)
+        defer { manager.closeAllPins() }
+
+        let img = makePinTestImage(width: 320, height: 180) { _, _ in (120, 140, 160, 255) }
+        XCTAssertTrue(manager.pin(content: .image(img, scale: 2), at: CGRect(x: 120, y: 120, width: 160, height: 90)))
+        let panel = try XCTUnwrap(manager.panels.first)
+
+        // 1. Click-through corner badge: hidden when interactive, visible & continuous-corner when click-through,
+        //    switches to compact icon-only pill on narrow pins, and hides in thumbnail mode.
+        let badge = panel.clickThroughBadgeForTesting
+        XCTAssertTrue(badge.isHidden)
+        XCTAssertNil(badge.hitTest(.zero))
+        XCTAssertEqual(badge.layer?.cornerCurve, .continuous)
+
+        panel.setClickThrough(true)
+        XCTAssertFalse(badge.isHidden)
+        XCTAssertGreaterThan(badge.frame.width, 50)
+        panel.setZoom(0.5) // 80x45 -> compact badge (22pt wide)
+        XCTAssertFalse(badge.isHidden)
+        XCTAssertLessThanOrEqual(badge.frame.width, 26)
+        panel.toggleThumbnail()
+        XCTAssertTrue(badge.isHidden)
+        panel.toggleThumbnail()
+        panel.setClickThrough(false)
+        XCTAssertTrue(badge.isHidden)
+        panel.setZoom(1.0)
+
+        // 2. Liquid Glass continuous corners on HUD pill + hover button + narrow-pin HUD width clamping.
+        let hud = panel.hudViewForTesting
+        XCTAssertEqual(hud.layer?.cornerCurve, .continuous)
+        XCTAssertEqual(panel.hoverToolbarButtonForTesting?.layer?.cornerCurve, .continuous)
+        panel.setZoom(0.5) // 80x45
+        panel.flashHUD("Pinned · Click-Through")
+        XCTAssertFalse(hud.isHidden)
+        XCTAssertLessThanOrEqual(hud.frame.width, (panel.contentView?.bounds.width ?? 80) - 11.5)
+        panel.setZoom(1.0)
+
+        // 3. Context menu exposes OCR `t` shortcut & SF Symbol icons cleanly in en and zh-Hans.
+        let menu = panel.makeContextMenu()
+        let ocrItem = try XCTUnwrap(menu.items.first(where: { $0.title == "Copy Text (OCR)" }))
+        XCTAssertEqual(ocrItem.keyEquivalent, "t")
+        XCTAssertEqual(ocrItem.keyEquivalentModifierMask, [])
+        XCTAssertNotNil(ocrItem.image)
+        let copyItem = try XCTUnwrap(menu.items.first(where: { $0.title == "Copy" }))
+        XCTAssertNotNil(copyItem.image)
+
+        // 4. Annotation bracket keys `[` and `]` step stroke size cleanly with HUD feedback.
+        panel.showAnnotationToolbar(initialTool: .rectangle)
+        let sizeBefore = panel.currentAnnotationStyle.size.progress
+        let rightBracket = try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: 0,
+            context: nil, characters: "]", charactersIgnoringModifiers: "]", isARepeat: false, keyCode: 30
+        ))
+        panel.keyDown(with: rightBracket)
+        XCTAssertGreaterThan(panel.currentAnnotationStyle.size.progress, sizeBefore)
+        XCTAssertNotNil(panel.lastHUDTextForTesting)
+        let leftBracket = try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: 0,
+            context: nil, characters: "[", charactersIgnoringModifiers: "[", isARepeat: false, keyCode: 33
+        ))
+        panel.keyDown(with: leftBracket)
+        XCTAssertEqual(panel.currentAnnotationStyle.size.progress, sizeBefore, accuracy: 0.01)
+        panel.closeToolbar(commit: false)
+
+        // 5. Multi-display seam preservation + thumbnail notch/menu-bar full-visibility clamping.
+        let screenA = CGRect(x: 0, y: 0, width: 1440, height: 862)
+        let screenB = CGRect(x: 1440, y: 0, width: 2560, height: 1402)
+        let straddlingSmallPin = CGRect(x: 1410, y: 300, width: 60, height: 60)
+        XCTAssertEqual(
+            PinLayout.clampedOriginToScreens(straddlingSmallPin, screens: [screenA, screenB]),
+            straddlingSmallPin,
+            "Pin cleanly spanning a multi-display seam must not snap abruptly"
+        )
+        let notchOverlappedThumb = CGRect(x: 600, y: 830, width: 72, height: 72)
+        let rescuedThumb = PinLayout.clampedOriginToScreens(
+            notchOverlappedThumb,
+            screens: [screenA],
+            keepFullyVisible: true
+        )
+        XCTAssertLessThanOrEqual(rescuedThumb.maxY, screenA.maxY)
+        XCTAssertGreaterThanOrEqual(rescuedThumb.minY, screenA.minY)
+
+        // 6. Extreme / malformed pin inputs: oversized direct PinPanel frame, Zalgo combining marks,
+        //    and huge whitespace-prefixed strings stay strictly bounded.
+        let hugePanel = PinPanel(
+            content: .image(img, scale: 1),
+            frame: CGRect(x: 0, y: 0, width: 50_000, height: 40_000)
+        )
+        defer { hugePanel.close() }
+        XCTAssertLessThanOrEqual(hugePanel.frame.width, PinLayout.maxWindowDimension)
+        XCTAssertLessThanOrEqual(hugePanel.frame.height, PinLayout.maxWindowDimension)
+        XCTAssertLessThanOrEqual(hugePanel.frame.width * hugePanel.frame.height, PinLayout.maxWindowArea + 10_000)
+
+        let zalgoCluster = "a" + String(repeating: "\u{0301}", count: 40)
+        let zalgoPayload = String(repeating: zalgoCluster, count: 600)
+        let boundedZalgo = PinLayout.displayText(for: zalgoPayload)
+        XCTAssertLessThanOrEqual(boundedZalgo.utf8.count, PinLayout.maxDisplayTextLength * 4 + 4)
+
+        let hugeLeadingSpaces = String(repeating: " ", count: 20_000) + "Tail"
+        let spacePanel = PinPanel(content: .text(hugeLeadingSpaces), frame: CGRect(x: 50, y: 50, width: 120, height: 48))
+        defer { spacePanel.close() }
+        XCTAssertEqual(spacePanel.contentView?.accessibilityLabel(), "Pinned text")
     }
 }

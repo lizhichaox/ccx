@@ -207,7 +207,11 @@ public final class GifRecordingEncoder: @unchecked Sendable {
     }
 
     public func appendImage(_ image: CGImage, pts: CMTime) {
-        guard pts.isNumeric else { return }
+        guard pts.isNumeric,
+              image.width > 0, image.height > 0,
+              image.width <= Self.maxSourcePixelDimension,
+              image.height <= Self.maxSourcePixelDimension
+        else { return }
         let frame = PendingImageFrame(image: image, pts: pts)
         let shouldSchedule: Bool = gate.withLock { state in
             guard state.isAcceptingInput, !state.isPaused, !state.limitReached, !state.isCancelled else { return false }
@@ -310,7 +314,8 @@ public final class GifRecordingEncoder: @unchecked Sendable {
                 self.isFinished = true
                 self.timeline.finish(at: finishWallTime)
 
-                let finalEnd = max(self.lastObservedPTS, self.timeline.recordedDurationSeconds)
+                let rawFinalEnd = max(self.lastObservedPTS, self.timeline.recordedDurationSeconds)
+                let finalEnd = rawFinalEnd.isFinite ? max(0, rawFinalEnd) : 0
                 if let last = self.pendingFrame {
                     let finalSpan = finalEnd - last.startPTS
                     let delay = finalSpan >= Self.minFrameDelay ? finalSpan : self.minInterval

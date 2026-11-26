@@ -20,6 +20,7 @@ final class RecordingBorderPanel: NSPanel {
     var borderContentView: NSView { borderView }
     var isSizeLabelHidden: Bool { borderView.isSizeLabelHidden }
     var sizeLabelText: String { borderView.sizeLabelText }
+    var sizeLabelCornerCurveForTesting: CALayerCornerCurve? { borderView.sizeLabelCornerCurve }
     var renderCountForTesting: Int { borderView.renderCount }
     var hasActiveShapeLayerBackingForTesting: Bool { borderView.hasActiveShapeLayerBacking }
 
@@ -119,6 +120,13 @@ final class RecordingBorderPanel: NSPanel {
         return borderView.selectAll()
     }
 
+    /// Cancels an active move/resize/redraw drag, restoring the pre-drag region cleanly.
+    @discardableResult
+    func cancelActiveAdjustment() -> RecordingRegion? {
+        guard isInteractive, isActivelyAdjusting else { return nil }
+        return borderView.cancelActiveAdjustment()
+    }
+
     private func applyCaptureChrome(phase: RecordingPhase, region: RecordingRegion) {
         let wasInteractive = isInteractive
         isInteractive = false
@@ -180,6 +188,7 @@ private final class RecordingBorderView: NSView {
     var isRedrawing: Bool { isInteractive && adjuster.isRedrawing }
     var isSizeLabelHidden: Bool { sizeLabel.isHidden }
     var sizeLabelText: String { sizeLabel.stringValue }
+    var sizeLabelCornerCurve: CALayerCornerCurve? { sizeLabel.layer?.cornerCurve }
     var hasActiveShapeLayerBacking: Bool {
         dashedEdges.contains { !$0.isHidden || $0.path != nil }
     }
@@ -328,6 +337,19 @@ private final class RecordingBorderView: NSView {
         return currentRegion
     }
 
+    func cancelActiveAdjustment() -> RecordingRegion? {
+        guard isInteractive, adjuster.isInteracting else { return nil }
+        adjuster.cancelInteraction()
+        isSpaceDown = false
+        let restored = currentRegion.updating(localRect: adjuster.rect)
+        currentRegion = restored
+        render()
+        updateCursor()
+        onRegionChanged?(restored)
+        onInteractionStateChanged?(false)
+        return restored
+    }
+
     // MARK: - Mouse & Keyboard
 
     override func mouseEntered(with event: NSEvent) {
@@ -453,6 +475,7 @@ private final class RecordingBorderView: NSView {
 
         captureBorderLayer.backgroundColor = nil
         captureBorderLayer.borderWidth = 2.5
+        captureBorderLayer.cornerCurve = .continuous
         captureBorderLayer.zPosition = 3
         captureBorderLayer.isHidden = true
         root.addSublayer(captureBorderLayer)
@@ -473,7 +496,8 @@ private final class RecordingBorderView: NSView {
             handleLayer.backgroundColor = handleFill
             handleLayer.borderColor = handleStroke
             handleLayer.borderWidth = 1.5
-            handleLayer.cornerRadius = 2
+            handleLayer.cornerRadius = 3
+            handleLayer.cornerCurve = .continuous
             handleLayer.zPosition = 4
             root.addSublayer(handleLayer)
         }
@@ -485,9 +509,12 @@ private final class RecordingBorderView: NSView {
         sizeLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
         sizeLabel.textColor = .white
         sizeLabel.drawsBackground = true
-        sizeLabel.backgroundColor = NSColor.black.withAlphaComponent(0.75)
+        sizeLabel.backgroundColor = NSColor.black.withAlphaComponent(0.78)
         sizeLabel.wantsLayer = true
-        sizeLabel.layer?.cornerRadius = 4
+        sizeLabel.layer?.cornerRadius = 6
+        sizeLabel.layer?.cornerCurve = .continuous
+        sizeLabel.layer?.borderWidth = 0.75
+        sizeLabel.layer?.borderColor = NSColor.white.withAlphaComponent(0.18).cgColor
         sizeLabel.layer?.masksToBounds = true
         sizeLabel.layer?.zPosition = 10
         sizeLabel.isHidden = true
@@ -652,7 +679,7 @@ private final class RecordingBorderView: NSView {
     private func updateSizeLabel(for rect: CGRect) {
         let liveRegion = currentRegion.updating(localRect: rect)
         let pixelSize = liveRegion.pixelSize(for: settings.format)
-        let formatted = " \(Int(pixelSize.width)) × \(Int(pixelSize.height)) "
+        let formatted = " \(Int(pixelSize.width)) × \(Int(pixelSize.height)) · \(settings.effectiveFPS) fps "
         if formatted != lastSizeLabelText {
             lastSizeLabelText = formatted
             sizeLabel.stringValue = formatted
@@ -821,6 +848,10 @@ final class RecordingControlPanel: NSPanel, NSWindowDelegate {
     var isCompletedContainerVisible: Bool { activeRow === completedRow }
     var timerText: String { timerLabel.stringValue }
     var summaryText: String { summaryLabel.stringValue }
+    var summaryToolTipForTesting: String? { summaryLabel.toolTip }
+    var isRecordingPulseActiveForTesting: Bool {
+        statusDot.layer?.animation(forKey: Self.pulseAnimationKey) != nil
+    }
     var isPopupMenuOpen: Bool { fpsPicker.isMenuOpen }
     var fpsBadgeText: String { fpsPicker.displayText }
     var recordingBadgeText: String { recordingBadgeLabel.stringValue }
@@ -887,11 +918,20 @@ final class RecordingControlPanel: NSPanel, NSWindowDelegate {
               newVisibleFrame.width > 0, newVisibleFrame.height > 0
         else { return }
         visibleFrame = newVisibleFrame
+        if hasCustomPosition {
+            let clamped = Self.clampedFrame(frame, within: newVisibleFrame)
+            if clamped.origin != frame.origin {
+                isProgrammaticFrameUpdate = true
+                setFrameOrigin(clamped.origin)
+                isProgrammaticFrameUpdate = false
+            }
+        }
         resizeToFitActiveRow(recenter: !hasCustomPosition)
     }
 
     /// Stops animations, clears delegate and callbacks, and closes the panel cleanly.
     func tearDown() {
+        stopRecordingPulse()
         spinner.stopAnimation(nil)
         delegate = nil
         onSettingsChanged = nil
@@ -973,11 +1013,13 @@ final class RecordingControlPanel: NSPanel, NSWindowDelegate {
             cursorButton.toolTip = settings.showsCursor
                 ? CCXL10n.text("Mouse Cursor: Shown", zh: "鼠标指针：显示")
                 : CCXL10n.text("Mouse Cursor: Hidden", zh: "鼠标指针：隐藏")
+            stopRecordingPulse()
             spinner.stopAnimation(nil)
 
         case .recording:
             mountActiveRow(recordingRow)
             statusDot.layer?.backgroundColor = NSColor.systemRed.cgColor
+            startRecordingPulse()
             let formatted = RecordingResult.formatDuration(elapsedSeconds)
             lastRenderedTimerText = formatted
             timerLabel.stringValue = formatted
@@ -993,6 +1035,7 @@ final class RecordingControlPanel: NSPanel, NSWindowDelegate {
 
         case .paused:
             mountActiveRow(recordingRow)
+            stopRecordingPulse()
             statusDot.layer?.backgroundColor = NSColor.systemOrange.cgColor
             let formatted = RecordingResult.formatDuration(elapsedSeconds)
             lastRenderedTimerText = formatted
@@ -1009,6 +1052,7 @@ final class RecordingControlPanel: NSPanel, NSWindowDelegate {
 
         case .finalizing:
             mountActiveRow(finalizingRow)
+            stopRecordingPulse()
             finalizingLabel.stringValue = settings.format == .gif
                 ? CCXL10n.text("Encoding GIF...", zh: "正在生成 GIF…")
                 : CCXL10n.text("Saving \(settings.format.label)...", zh: "正在保存 \(settings.format.label)…")
@@ -1016,11 +1060,48 @@ final class RecordingControlPanel: NSPanel, NSWindowDelegate {
 
         case .completed(let result):
             mountActiveRow(completedRow)
+            stopRecordingPulse()
             summaryLabel.stringValue = "\(result.format.label) · \(result.formattedDuration) · \(result.formattedFileSize)"
+            let pxW = max(1, Int(result.pixelSize.width.rounded()))
+            let pxH = max(1, Int(result.pixelSize.height.rounded()))
+            summaryLabel.toolTip = "\(pxW) × \(pxH) · \(result.format.label) · \(result.formattedDuration) · \(result.formattedFileSize)"
             spinner.stopAnimation(nil)
         }
 
         resizeToFitActiveRow(recenter: phaseChanged)
+    }
+
+    private static let pulseAnimationKey = "ccx.recording.pulse"
+
+    private func startRecordingPulse() {
+        guard let dotLayer = statusDot.layer else { return }
+        if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            dotLayer.removeAnimation(forKey: Self.pulseAnimationKey)
+            dotLayer.opacity = 1
+            return
+        }
+        guard dotLayer.animation(forKey: Self.pulseAnimationKey) == nil else { return }
+        let pulse = CABasicAnimation(keyPath: "opacity")
+        pulse.fromValue = 1.0
+        pulse.toValue = 0.32
+        pulse.duration = 0.9
+        pulse.autoreverses = true
+        pulse.repeatCount = .infinity
+        pulse.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        dotLayer.add(pulse, forKey: Self.pulseAnimationKey)
+    }
+
+    private func stopRecordingPulse() {
+        statusDot.layer?.removeAnimation(forKey: Self.pulseAnimationKey)
+        statusDot.layer?.opacity = 1
+    }
+
+    private static func clampedFrame(_ rect: CGRect, within bounds: CGRect) -> CGRect {
+        let maxX = max(bounds.minX + 8, bounds.maxX - rect.width - 8)
+        let maxY = max(bounds.minY + 6, bounds.maxY - rect.height - 6)
+        let clampedX = min(max(rect.minX, bounds.minX + 8), maxX)
+        let clampedY = min(max(rect.minY, bounds.minY + 6), maxY)
+        return CGRect(x: clampedX.rounded(), y: clampedY.rounded(), width: rect.width, height: rect.height)
     }
 
     // MARK: - Test & Control Helpers
@@ -1305,7 +1386,7 @@ final class RecordingControlPanel: NSPanel, NSWindowDelegate {
         let saveButton = HUDIconOnlyButton(symbol: "square.and.arrow.down", tooltip: CCXL10n.text("Save As (⌘S)", zh: "另存为 (⌘S)")) { [weak self] in
             self?.onSave?()
         }
-        let revealButton = HUDIconOnlyButton(symbol: "folder", tooltip: CCXL10n.text("Save & Reveal in Finder", zh: "保存并在访达中显示")) { [weak self] in
+        let revealButton = HUDIconOnlyButton(symbol: "folder", tooltip: CCXL10n.text("Save & Reveal in Finder (⌘R)", zh: "保存并在访达中显示 (⌘R)")) { [weak self] in
             self?.onReveal?()
         }
         let actionsStack = NSStackView(views: [copyButton, saveButton, revealButton])
@@ -1460,6 +1541,7 @@ private final class FormatSegmentedControl: NSView {
         super.init(frame: frameRect)
         wantsLayer = true
         layer?.cornerRadius = 8
+        layer?.cornerCurve = .continuous
         layer?.backgroundColor = NSColor.white.withAlphaComponent(0.08).cgColor
         translatesAutoresizingMaskIntoConstraints = false
         setContentHuggingPriority(.required, for: .horizontal)
@@ -1512,6 +1594,7 @@ private final class FormatSegmentButton: HUDHoverButton {
         bezelStyle = .regularSquare
         wantsLayer = true
         layer?.cornerRadius = 6
+        layer?.cornerCurve = .continuous
         toolTip = "\(format.label) (\(format.detailDescription))"
         target = self
         action = #selector(pressed)
@@ -1575,6 +1658,7 @@ private final class FPSPickerControl: NSView {
         super.init(frame: frameRect)
         wantsLayer = true
         layer?.cornerRadius = 8
+        layer?.cornerCurve = .continuous
         layer?.borderWidth = 1
         translatesAutoresizingMaskIntoConstraints = false
         setContentHuggingPriority(.required, for: .horizontal)
@@ -1720,6 +1804,7 @@ private final class HUDIconToggleButton: HUDHoverButton {
         imageScaling = .scaleNone
         wantsLayer = true
         layer?.cornerRadius = 8
+        layer?.cornerCurve = .continuous
         target = self
         action = #selector(pressed)
         translatesAutoresizingMaskIntoConstraints = false
@@ -1798,6 +1883,7 @@ private final class PrimaryPillButton: HUDHoverButton {
         imageScaling = .scaleNone
         wantsLayer = true
         layer?.cornerRadius = 8
+        layer?.cornerCurve = .continuous
         toolTip = tooltip
         target = self
         action = #selector(pressed)
@@ -1843,6 +1929,7 @@ private final class HUDIconOnlyButton: HUDHoverButton {
         imageScaling = .scaleNone
         wantsLayer = true
         layer?.cornerRadius = 8
+        layer?.cornerCurve = .continuous
         toolTip = tooltip
         target = self
         action = #selector(pressed)
@@ -1882,6 +1969,7 @@ private final class CloseIconButton: HUDHoverButton {
         imageScaling = .scaleNone
         wantsLayer = true
         layer?.cornerRadius = 8
+        layer?.cornerCurve = .continuous
         toolTip = tooltip
         target = self
         action = #selector(pressed)

@@ -39,6 +39,7 @@ public final class ScreenRecordingEngine {
     private var isStartingCapture = false
     private var isStopping = false
     private var isCancelled = false
+    private var didCompleteSuccessfully = false
     private var isStopped: Bool { isStopping || isCancelled }
 
     public init(region: RecordingRegion, settings: RecordingSettings, outputURL: URL) {
@@ -192,6 +193,7 @@ public final class ScreenRecordingEngine {
 
         let attrs = try? FileManager.default.attributesOfItem(atPath: outputURL.path)
         let bytes = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
+        didCompleteSuccessfully = true
         return RecordingResult(
             fileURL: outputURL,
             format: effectiveSettings.format,
@@ -226,6 +228,9 @@ public final class ScreenRecordingEngine {
         activeFinalizingWriter = nil
         activeFinalizingEncoder?.cancel()
         activeFinalizingEncoder = nil
+        if !didCompleteSuccessfully {
+            RecordingFileSecurity.removeRegularFileIfPresent(at: outputURL)
+        }
 
         // If `startStream` is currently awaiting `startCapture()`, or `stop()` is already
         // awaiting `stopCapture()`, they observe `isCancelled` on return without racing.

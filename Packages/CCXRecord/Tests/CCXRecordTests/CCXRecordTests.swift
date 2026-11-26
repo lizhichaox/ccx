@@ -1550,6 +1550,173 @@ struct CCXRecordTests {
         #expect(!borderPanel.hasActiveShapeLayerBackingForTesting)
     }
 
+    @Test @MainActor func milestoneV010SecurityTimelineAudioAndRecordingHUDErgonomics() async throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("ccx-v010-\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: root) }
+
+        // 1. Hard-linked files are rejected by verifyOutputURLForFinalize and ignored by restrictFilePermissions.
+        let sensitiveFile = root.appendingPathComponent("sensitive.dat")
+        try Data("secret".utf8).write(to: sensitiveFile)
+        #expect(chmod(sensitiveFile.path, 0o644) == 0)
+        let hardLink = root.appendingPathComponent("CCX-Rec-hardlink.gif")
+        #expect(link(sensitiveFile.path, hardLink.path) == 0)
+        #expect(throws: Error.self) {
+            try RecordingFileSecurity.verifyOutputURLForFinalize(hardLink)
+        }
+        RecordingFileSecurity.restrictFilePermissions(at: hardLink)
+        var st = stat()
+        #expect(lstat(sensitiveFile.path, &st) == 0 && (st.st_mode & 0o777) == 0o644)
+
+        // 2. RecordingTimeline ignores stale pre-pause PTS after resume without losing pause offset.
+        var timeline = RecordingTimeline()
+        #expect(timeline.acceptVideoPTS(CMTime(seconds: 10.0, preferredTimescale: 1000)) == .zero)
+        timeline.pause()
+        #expect(timeline.acceptVideoPTS(CMTime(seconds: 12.0, preferredTimescale: 1000)) == nil)
+        timeline.resume()
+        // Stale out-of-order frame <= pauseStart must be dropped and NOT clear pauseStartPTS.
+        #expect(timeline.acceptVideoPTS(CMTime(seconds: 11.5, preferredTimescale: 1000)) == nil)
+        let resumed = timeline.acceptVideoPTS(CMTime(seconds: 15.0, preferredTimescale: 1000))
+        #expect(abs((resumed?.seconds ?? -1) - 2.0) < 0.001)
+
+        // 3. DualAudioMixer keeps system PTS strictly monotonic after a stalled-mic flush and soft-clips single-source audio.
+        var mixer = DualAudioMixer()
+        let t0 = CMTime(value: 0, timescale: 48_000)
+        _ = mixer.pushSystem([Float](repeating: 0.1, count: 1000), pts: t0)
+        let stalledMic = mixer.pushMicrophone(
+            [Float](repeating: 0.2, count: 9_600),
+            pts: CMTime(seconds: 0.25, preferredTimescale: 48_000)
+        )
+        #expect(stalledMic.count == 1)
+        let micFlushEnd = CMTimeAdd(stalledMic[0].pts, CMTime(value: 4_800, timescale: 48_000))
+        // Resumed system audio arriving with overlapping PTS 0.28s (< micFlushEnd 0.35s) is clamped forward.
+        let resumedSys = mixer.pushSystem(
+            [Float](repeating: 0.15, count: 1000),
+            pts: CMTime(seconds: 0.28, preferredTimescale: 48_000)
+        )
+        #expect(resumedSys.count == 1)
+        #expect(resumedSys[0].pts >= micFlushEnd)
+
+        var scratch: [Float] = []
+        let overdriven: [Float] = [2.5, -3.0, .nan, 0.5]
+        let sanitized = DualAudioMixer.sanitize(overdriven[...], into: &scratch)
+        #expect(sanitized.count == 4)
+        #expect(sanitized[0] > 0.85 && sanitized[0] <= 1.0)
+        #expect(sanitized[1] < -0.85 && sanitized[1] >= -1.0)
+        #expect(sanitized[2] == 0 && abs(sanitized[3] - 0.5) < 0.0001)
+
+        // 4. ScreenRecordingEngine.cancel() removes a pre-existing staged file cleanly.
+        let region = RecordingRegion(
+            displayID: 1,
+            displayFrame: CGRect(x: 0, y: 0, width: 1200, height: 800),
+            localRect: CGRect(x: 100, y: 100, width: 400, height: 300),
+            screenRect: CGRect(x: 100, y: 100, width: 400, height: 300),
+            scale: 2
+        )
+        let strayFile = root.appendingPathComponent("CCX-Rec-stray.mp4")
+        try Data("partial".utf8).write(to: strayFile)
+        let engine = ScreenRecordingEngine(region: region, settings: RecordingSettings(), outputURL: strayFile)
+        engine.cancel()
+        #expect(!fm.fileExists(atPath: strayFile.path))
+
+        // 5. Pre-record dimension+FPS pill, continuous corners, mid-drag Esc recovery, recording pulse,
+        //    Cmd+R reveal in .completed, custom-position rescue, and wrapped underlying error mapping.
+        let suiteName = "CCXRecordV010-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let coordinator = RecordingCoordinator(settingsStore: RecordingSettingsStore(defaults: defaults))
+        var outcomes: [RecordingOutcome] = []
+        coordinator.startSession(region: region) { outcomes.append($0) }
+        let borderPanel = try #require(coordinator.borderPanelForTesting)
+        #expect(borderPanel.sizeLabelCornerCurveForTesting == .continuous)
+        #expect(borderPanel.sizeLabelText.contains("800 × 600"))
+        #expect(borderPanel.sizeLabelText.contains("60 fps"))
+
+        // Mid-drag Escape cancels only the drag and keeps the session active at the previous rect.
+        let borderView = borderPanel.borderContentView
+        let originalLocalRect = borderPanel.currentRegion.localRect
+        borderView.mouseDown(with: try makeMouseEvent(type: .leftMouseDown, at: CGPoint(x: 500, y: 400)))
+        borderView.mouseDragged(with: try makeMouseEvent(type: .leftMouseDragged, at: CGPoint(x: 700, y: 500)))
+        #expect(borderPanel.isActivelyAdjusting)
+        if let borderWin = coordinator.borderPanelWindowNumberForTesting, borderWin > 0 {
+            #expect(coordinator.handleLocalKeyDown(keyCode: 53, modifiers: [], chars: "", windowNumber: borderWin, isEditingText: false))
+            #expect(coordinator.isSessionActive)
+            #expect(!borderPanel.isActivelyAdjusting)
+            #expect(borderPanel.currentRegion.localRect == originalLocalRect)
+        }
+
+        // Cmd+R in .completed phase emits .reveal.
+        let fakeResult = RecordingResult(
+            fileURL: root.appendingPathComponent("done.mp4"),
+            format: .mp4,
+            duration: 4,
+            fileSizeBytes: 512_000,
+            pixelSize: CGSize(width: 800, height: 600),
+            screenRect: region.screenRect
+        )
+        coordinator.setPhaseForTesting(.completed(fakeResult))
+        if let controlWin = coordinator.controlPanelWindowNumberForTesting, controlWin > 0 {
+            #expect(coordinator.handleLocalKeyDown(keyCode: 15, modifiers: [.command], chars: "r", windowNumber: controlWin, isEditingText: false))
+            #expect(!coordinator.isSessionActive)
+            if case .reveal(let revealed)? = outcomes.last {
+                #expect(revealed == fakeResult)
+            } else {
+                Issue.record("Expected .reveal outcome from Cmd+R in .completed phase")
+            }
+        } else {
+            coordinator.cancelActiveSession()
+        }
+
+        // Control panel pulse toggles cleanly on recording vs paused, summary tooltip carries dimensions,
+        // and custom-positioned panel stranded off-screen is rescued on updateVisibleFrame.
+        let controlPanel = RecordingControlPanel(
+            captureRect: region.screenRect,
+            visibleFrame: CGRect(x: 0, y: 0, width: 1200, height: 800),
+            settings: RecordingSettings(format: .mp4)
+        )
+        defer { controlPanel.tearDown() }
+        controlPanel.update(phase: .recording, settings: RecordingSettings(format: .mp4), elapsedSeconds: 2)
+        if !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            #expect(controlPanel.isRecordingPulseActiveForTesting)
+        }
+        controlPanel.update(phase: .paused, settings: RecordingSettings(format: .mp4), elapsedSeconds: 2)
+        #expect(!controlPanel.isRecordingPulseActiveForTesting)
+        controlPanel.update(phase: .completed(fakeResult), settings: RecordingSettings(format: .mp4), elapsedSeconds: 4)
+        #expect(controlPanel.summaryToolTipForTesting?.contains("800 × 600") == true)
+
+        controlPanel.setFrameOrigin(CGPoint(x: 3200, y: 500))
+        #expect(controlPanel.hasCustomPosition)
+        let smallScreen = CGRect(x: 0, y: 0, width: 1200, height: 800)
+        controlPanel.updateVisibleFrame(smallScreen)
+        #expect(controlPanel.frame.maxX <= smallScreen.maxX)
+        #expect(controlPanel.frame.minX >= smallScreen.minX)
+
+        // Wrapped underlying ENOSPC inside AVFoundationErrorDomain maps cleanly in en and zh-Hans,
+        // and specific outer AVError codes take priority over generic underlying AVError.unknown.
+        let underlyingENOSPC = NSError(domain: NSPOSIXErrorDomain, code: Int(ENOSPC))
+        let wrappedAV = NSError(
+            domain: AVFoundationErrorDomain,
+            code: AVError.Code.unknown.rawValue,
+            userInfo: [NSUnderlyingErrorKey: underlyingENOSPC]
+        )
+        let underlyingUnknownAV = NSError(domain: AVFoundationErrorDomain, code: AVError.Code.unknown.rawValue)
+        let specificOuterDiskFull = NSError(
+            domain: AVFoundationErrorDomain,
+            code: AVError.Code.diskFull.rawValue,
+            userInfo: [NSUnderlyingErrorKey: underlyingUnknownAV]
+        )
+        CCXL10n.withLanguageForTesting(.en) {
+            #expect(RecordingCoordinator.userFacingErrorMessage(for: wrappedAV).contains("disk space"))
+            #expect(RecordingCoordinator.userFacingErrorMessage(for: specificOuterDiskFull).contains("disk space"))
+        }
+        CCXL10n.withLanguageForTesting(.zhHans) {
+            #expect(RecordingCoordinator.userFacingErrorMessage(for: wrappedAV) == "磁盘空间不足，无法保存录屏。")
+            #expect(RecordingCoordinator.userFacingErrorMessage(for: specificOuterDiskFull) == "磁盘空间不足，无法保存录屏。")
+        }
+    }
+
     private func makeTestBGRAPixelBuffer(width: Int, height: Int, r: UInt8, g: UInt8, b: UInt8) -> CVPixelBuffer? {
         var pixelBuffer: CVPixelBuffer?
         let status = CVPixelBufferCreate(

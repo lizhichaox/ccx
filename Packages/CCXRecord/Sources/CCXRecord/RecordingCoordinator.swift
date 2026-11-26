@@ -239,6 +239,7 @@ public final class RecordingCoordinator {
                 self.engine = nil
                 self.phase = .completed(result)
                 self.refreshChrome()
+                self.controlPanel?.makeKeyAndOrderFront(nil)
             } catch {
                 guard let self, self.isSessionActive, self.sessionGeneration == generation else { return }
                 self.engine = nil
@@ -645,7 +646,16 @@ public final class RecordingCoordinator {
 
         if keyCode == 53 && mods.isEmpty { // Escape
             switch phase {
-            case .ready, .recording, .paused, .completed:
+            case .ready:
+                if borderPanel?.isActivelyAdjusting == true {
+                    if let restored = borderPanel?.cancelActiveAdjustment() {
+                        region = restored
+                    }
+                    return true
+                }
+                cancelActiveSession()
+                return true
+            case .recording, .paused, .completed:
                 cancelActiveSession()
                 return true
             case .finalizing:
@@ -747,6 +757,9 @@ public final class RecordingCoordinator {
                 case "s":
                     emitCompleted(.save)
                     return true
+                case "r":
+                    emitCompleted(.reveal)
+                    return true
                 case "w":
                     cancelActiveSession()
                     return true
@@ -766,7 +779,13 @@ public final class RecordingCoordinator {
             let mods = event.modifierFlags
             Task { @MainActor [weak self] in
                 guard let self, self.shouldHandleGlobalEscape(modifiers: mods) else { return }
-                self.cancelActiveSession()
+                if self.borderPanel?.isActivelyAdjusting == true {
+                    if let restored = self.borderPanel?.cancelActiveAdjustment() {
+                        self.region = restored
+                    }
+                } else {
+                    self.cancelActiveSession()
+                }
             }
         }
 
@@ -810,6 +829,7 @@ public final class RecordingCoordinator {
 
     var controlPanelWindowNumberForTesting: Int? { controlPanel?.windowNumber }
     var borderPanelWindowNumberForTesting: Int? { borderPanel?.windowNumber }
+    var borderPanelForTesting: RecordingBorderPanel? { borderPanel }
 
     func setPhaseForTesting(_ testPhase: RecordingPhase) {
         self.phase = testPhase
@@ -845,6 +865,10 @@ public final class RecordingCoordinator {
 
     /// Maps technical ScreenCaptureKit, AVFoundation, and filesystem errors to clear user-facing copy.
     static func userFacingErrorMessage(for error: Error) -> String {
+        userFacingErrorMessage(for: error, depth: 0)
+    }
+
+    private static func userFacingErrorMessage(for error: Error, depth: Int) -> String {
         if let recordingError = error as? RecordingError,
            let description = recordingError.errorDescription {
             return description
@@ -899,9 +923,22 @@ public final class RecordingCoordinator {
             if nsError.code == AVError.Code.diskFull.rawValue {
                 return CCXL10n.text("Not enough disk space to save the recording.", zh: "磁盘空间不足，无法保存录屏。")
             }
-            if nsError.code == AVError.Code.deviceWasDisconnected.rawValue {
+            if nsError.code == AVError.Code.deviceWasDisconnected.rawValue || nsError.code == AVError.Code.deviceNotConnected.rawValue {
                 return CCXL10n.text("A recording device was disconnected. Please try again.", zh: "录制设备已断开，请重试。")
             }
+            if nsError.code == AVError.Code.maximumFileSizeReached.rawValue || nsError.code == AVError.Code.maximumDurationReached.rawValue {
+                return CCXL10n.text("Recording reached the maximum file size limit.", zh: "录屏已达到文件大小上限。")
+            }
+        }
+
+        if depth < 3, let underlying = nsError.userInfo[NSUnderlyingErrorKey] as? NSError {
+            let mapped = userFacingErrorMessage(for: underlying, depth: depth + 1)
+            if mapped != underlying.localizedDescription {
+                return mapped
+            }
+        }
+
+        if nsError.domain == AVFoundationErrorDomain {
             return CCXL10n.text("Could not encode the video recording. Please try again.", zh: "无法编码录屏视频，请重试。")
         }
 

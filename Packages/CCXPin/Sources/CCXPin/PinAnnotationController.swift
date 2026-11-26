@@ -176,9 +176,19 @@ final class PinAnnotationController: NSObject, NSTextFieldDelegate {
         toolbarPanel = floating
 
         panel.addChildWindow(floating, ordered: .above)
+        let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        if !reduceMotion {
+            floating.alphaValue = 0
+        }
         floating.orderFrontRegardless()
         syncToolbar(on: panel)
         repositionToolbar(for: panel)
+        if !reduceMotion {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.12
+                floating.animator().alphaValue = 1
+            }
+        }
     }
 
     func closeToolbar(on panel: PinPanel, commit: Bool) -> CGImage? {
@@ -503,9 +513,11 @@ final class PinAnnotationController: NSObject, NSTextFieldDelegate {
             activeDrag = .none
         case .text:
             activeDrag = .none
+            let maxOriginY = max(4, canvasBounds.maxY - 4)
+            let minOriginY = min(canvasBounds.minY + currentStyle.size.fontSize * 1.4, maxOriginY)
             let startOrigin = CGPoint(
                 x: min(max(canvasPoint.x, canvasBounds.minX + 4), max(canvasBounds.minX + 4, canvasBounds.maxX - 84)),
-                y: min(max(canvasPoint.y + currentStyle.size.fontSize * 0.55, canvasBounds.minY + currentStyle.size.fontSize * 1.4), canvasBounds.maxY - 4)
+                y: min(max(canvasPoint.y + currentStyle.size.fontSize * 0.55, minOriginY), maxOriginY)
             )
             beginInlineTextEditor(
                 at: startOrigin,
@@ -781,6 +793,15 @@ final class PinAnnotationController: NSObject, NSTextFieldDelegate {
             }
             if chars == "t" {
                 onToolbarAction?(.ocr)
+                return true
+            }
+            if (chars == "[" || chars == "]"), shouldShowStyleBar {
+                let delta: CGFloat = (chars == "]") ? 0.08 : -0.08
+                let baseSize = document.selectedItem?.style.size ?? currentStyle.size
+                let nextSize = baseSize.adjusted(byProgressDelta: delta)
+                resetScrollUndoCoalescing()
+                resetSliderUndoCoalescing()
+                applyStrokeSize(nextSize, recordUndo: true, showHUD: true, on: panel)
                 return true
             }
             if let tool = AnnotationTool.forNumberKey(chars) {

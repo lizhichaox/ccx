@@ -214,6 +214,11 @@ enum RecordingFileSecurity {
                     CCXL10n.text("Recording output file is not owned by the current user.", zh: "录屏输出文件不属于当前用户。")
                 )
             }
+            guard st.st_nlink == 1 else {
+                throw RecordingError.writerInitializationFailed(
+                    CCXL10n.text("Refusing to write recording to a hard-linked file.", zh: "无法将录屏写入硬链接文件。")
+                )
+            }
         } else if errno != ENOENT {
             throw RecordingError.writerInitializationFailed(
                 CCXL10n.text("Could not access the recording output location.", zh: "无法访问录屏输出位置。")
@@ -233,7 +238,8 @@ enum RecordingFileSecurity {
         var st = stat()
         guard fstat(fd, &st) == 0,
               (st.st_mode & S_IFMT) == S_IFREG,
-              st.st_uid == getuid()
+              st.st_uid == getuid(),
+              st.st_nlink == 1
         else {
             return
         }

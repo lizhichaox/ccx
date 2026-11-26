@@ -19,11 +19,12 @@ public struct RecordingTimeline: Sendable {
     public init() {}
 
     public var recordedDurationSeconds: TimeInterval {
-        let videoSeconds = lastAdjustedVideoPTS.flatMap { $0.isNumeric ? $0.seconds : nil } ?? 0
-        let sysAudioSeconds = lastAdjustedSystemAudioPTS.flatMap { $0.isNumeric ? $0.seconds : nil } ?? 0
-        let micAudioSeconds = lastAdjustedMicAudioPTS.flatMap { $0.isNumeric ? $0.seconds : nil } ?? 0
+        let videoSeconds = lastAdjustedVideoPTS.flatMap { $0.isNumeric && $0.seconds.isFinite ? $0.seconds : nil } ?? 0
+        let sysAudioSeconds = lastAdjustedSystemAudioPTS.flatMap { $0.isNumeric && $0.seconds.isFinite ? $0.seconds : nil } ?? 0
+        let micAudioSeconds = lastAdjustedMicAudioPTS.flatMap { $0.isNumeric && $0.seconds.isFinite ? $0.seconds : nil } ?? 0
         let mediaMax = max(videoSeconds, max(sysAudioSeconds, micAudioSeconds))
-        return max(0, max(mediaMax, finalAdjustedDuration ?? 0))
+        let finalSeconds = (finalAdjustedDuration?.isFinite == true) ? (finalAdjustedDuration ?? 0) : 0
+        return max(0, max(mediaMax, finalSeconds))
     }
 
     /// Marks the timeline paused. Passing a monotonic host `wallTime` removes the exact pause
@@ -86,12 +87,17 @@ public struct RecordingTimeline: Sendable {
         }
 
         if let pauseStart = pauseStartPTS {
-            pauseStartPTS = nil
             if sessionStartPTS != nil {
                 let delta = CMTimeSubtract(rawPTS, pauseStart)
-                if delta.isNumeric && delta > .zero {
-                    totalPausedDuration = CMTimeAdd(totalPausedDuration, delta)
+                guard delta.isNumeric else { return nil }
+                // Drop stale out-of-order pre-pause frames without clearing `pauseStartPTS`.
+                if delta <= .zero {
+                    return nil
                 }
+                pauseStartPTS = nil
+                totalPausedDuration = CMTimeAdd(totalPausedDuration, delta)
+            } else {
+                pauseStartPTS = nil
             }
         }
 
@@ -133,11 +139,14 @@ public struct RecordingTimeline: Sendable {
         guard let start = sessionStartPTS else { return nil }
 
         if let pauseStart = pauseStartPTS {
-            pauseStartPTS = nil
             let delta = CMTimeSubtract(rawPTS, pauseStart)
-            if delta.isNumeric && delta > .zero {
-                totalPausedDuration = CMTimeAdd(totalPausedDuration, delta)
+            guard delta.isNumeric else { return nil }
+            // Drop stale out-of-order pre-pause audio without losing the pause offset.
+            if delta <= .zero {
+                return nil
             }
+            pauseStartPTS = nil
+            totalPausedDuration = CMTimeAdd(totalPausedDuration, delta)
         }
 
         let shifted = CMTimeSubtract(rawPTS, totalPausedDuration)

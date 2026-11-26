@@ -53,6 +53,8 @@ public final class PinPanel: NSPanel, NSWindowDelegate {
     internal var hoverToolbarButtonForTesting: NSButton? { pinView.hoverToolbarButton }
     internal var borderLayerForTesting: CALayer { pinView.borderLayerForTesting }
     internal var annotationOverlayViewForTesting: NSView { pinView.annotationOverlayViewForTesting }
+    internal var clickThroughBadgeForTesting: NSView { pinView.clickThroughBadgeForTesting }
+    internal var hudViewForTesting: NSView { pinView.hudViewForTesting }
     internal var hasTransparentCornersForTesting: Bool { pinView.hasTransparentCornersForTesting }
     internal private(set) var shadowInvalidationCountForTesting = 0
 
@@ -87,14 +89,13 @@ public final class PinPanel: NSPanel, NSWindowDelegate {
         }
         self.state = state
         self.baseSize = PinLayout.baseSize(for: content)
-        let safeFrame = PinLayout.isFiniteRect(frame)
-            ? CGRect(
-                x: frame.origin.x,
-                y: frame.origin.y,
-                width: max(1, frame.width),
-                height: max(1, frame.height)
-            )
-            : CGRect(origin: .zero, size: PinLayout.frameSize(baseSize: self.baseSize, state: state))
+        let safeFrame: CGRect
+        if PinLayout.isFiniteRect(frame) {
+            let clampedSize = PinLayout.clampedWindowSize(CGSize(width: max(1, frame.width), height: max(1, frame.height)))
+            safeFrame = CGRect(origin: frame.origin, size: clampedSize)
+        } else {
+            safeFrame = CGRect(origin: .zero, size: PinLayout.frameSize(baseSize: self.baseSize, state: state))
+        }
         let isImageContent: Bool
         if case .image = content { isImageContent = true } else { isImageContent = false }
         self.pinView = PinContentView(
@@ -159,17 +160,34 @@ public final class PinPanel: NSPanel, NSWindowDelegate {
             resignKey()
         }
 
+        let needsContentRedraw = previous == nil
+            || previous?.isThumbnail != state.isThumbnail
+            || previous?.showsBorder != state.showsBorder
+            || previous?.isClickThrough != state.isClickThrough
+            || previous?.rotationDegrees != state.rotationDegrees
+            || previous?.isFlippedHorizontally != state.isFlippedHorizontally
+            || previous?.isFlippedVertically != state.isFlippedVertically
+            || previous?.zoom != state.zoom
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+
+        var frameDidResize = false
         if let anchor {
             let size = PinLayout.frameSize(baseSize: baseSize, state: state)
             if size != frame.size {
                 var target = PinLayout.resizedFrame(frame, to: size, keeping: anchor)
                 if previous != nil {
-                    target = PinLayout.clampedOriginToScreens(target, screens: NSScreen.screens.map(\.visibleFrame))
+                    target = PinLayout.clampedOriginToScreens(
+                        target,
+                        screens: NSScreen.screens.map(\.visibleFrame),
+                        keepFullyVisible: state.isThumbnail
+                    )
                 }
                 isApplyingFrameProgrammatically = true
                 setFrame(target, display: false)
                 isApplyingFrameProgrammatically = false
-                annotationController?.handleParentFrameDidChange(for: self)
+                frameDidResize = true
             }
         }
 
@@ -182,22 +200,23 @@ public final class PinPanel: NSPanel, NSWindowDelegate {
             pinView.updateTrackingAreas()
         }
 
-        let needsContentRedraw = previous == nil
-            || previous?.isThumbnail != state.isThumbnail
-            || previous?.showsBorder != state.showsBorder
-            || previous?.isClickThrough != state.isClickThrough
-            || previous?.rotationDegrees != state.rotationDegrees
-            || previous?.isFlippedHorizontally != state.isFlippedHorizontally
-            || previous?.isFlippedVertically != state.isFlippedVertically
-            || previous?.zoom != state.zoom
-        if needsContentRedraw {
+        if needsContentRedraw || frameDidResize {
             pinView.syncVisualState()
             if pinView.usesDirectDrawing {
                 pinView.needsDisplay = true
+                if frameDidResize {
+                    pinView.displayIfNeeded()
+                }
             }
             if activeAnnotationController != nil {
                 pinView.invalidateAnnotations()
             }
+        }
+
+        CATransaction.commit()
+
+        if frameDidResize {
+            annotationController?.handleParentFrameDidChange(for: self)
         }
 
         let needsImmediateShadowInvalidation = previous == nil
@@ -233,7 +252,8 @@ public final class PinPanel: NSPanel, NSWindowDelegate {
                         : CCXL10n.text("Interactive", zh: "已解除穿透")
                 )
             } else if abs(previous.zoom - state.zoom) > 0.0001 {
-                pinView.showHUD("\(Int((state.zoom * 100).rounded()))%")
+                let effective = PinLayout.effectiveZoom(for: baseSize, state: state)
+                pinView.showHUD("\(Int((effective * 100).rounded()))%")
             } else if abs(previous.opacity - state.opacity) > 0.0001 {
                 let pct = Int((state.opacity * 100).rounded())
                 pinView.showHUD(CCXL10n.text("Opacity \(pct)%", zh: "不透明度 \(pct)%"))
@@ -459,13 +479,44 @@ public final class PinPanel: NSPanel, NSWindowDelegate {
 
     internal var lastHUDTextForTesting: String? { pinView.lastHUDText }
 
+    private func adjustInteractiveZoom(by factor: CGFloat, anchor: CGPoint) {
+        guard !state.isThumbnail, factor.isFinite, factor > 0 else { return }
+        let currentEffective = PinLayout.effectiveZoom(for: baseSize, state: state)
+        let maxState = PinState(
+            zoom: PinState.zoomRange.upperBound,
+            rotationDegrees: state.rotationDegrees
+        )
+        let maxEffective = PinLayout.effectiveZoom(for: baseSize, state: maxState)
+        var nextState = state
+        let desired = min(max(currentEffective * factor, PinState.zoomRange.lowerBound), maxEffective)
+        nextState.setZoom(desired)
+        if abs(nextState.zoom - state.zoom) > 0.0001 {
+            updateState(nextState, anchor: anchor)
+        } else {
+            let pct = Int((PinLayout.effectiveZoom(for: baseSize, state: state) * 100).rounded())
+            pinView.showHUD("\(pct)%")
+        }
+    }
+
+    private func adjustInteractiveOpacity(by step: CGFloat) {
+        guard step.isFinite else { return }
+        var nextState = state
+        nextState.adjustOpacity(by: step)
+        if abs(nextState.opacity - state.opacity) > 0.0001 {
+            updateState(nextState)
+        } else if !state.isThumbnail {
+            let pct = Int((state.opacity * 100).rounded())
+            pinView.showHUD(CCXL10n.text("Opacity \(pct)%", zh: "不透明度 \(pct)%"))
+        }
+    }
+
     // MARK: - Events
 
     override public func magnify(with event: NSEvent) {
         guard !state.isThumbnail, event.magnification.isFinite, event.magnification != 0 else { return }
         let factor = min(max(1 + event.magnification, 0.2), 5.0)
         let anchor = PinLayout.clampedPoint(NSEvent.mouseLocation, to: frame)
-        mutateState(anchor: anchor) { $0.multiplyZoom(by: factor) }
+        adjustInteractiveZoom(by: factor, anchor: anchor)
     }
 
     override public func scrollWheel(with event: NSEvent) {
@@ -482,11 +533,11 @@ public final class PinPanel: NSPanel, NSWindowDelegate {
         let clampedDelta = min(max(delta, -120), 120)
         if event.modifierFlags.contains(.control) {
             let step = event.hasPreciseScrollingDeltas ? clampedDelta * 0.005 : (clampedDelta > 0 ? 0.05 : -0.05)
-            mutateState { $0.adjustOpacity(by: step) }
+            adjustInteractiveOpacity(by: step)
         } else if !state.isThumbnail {
             let factor = event.hasPreciseScrollingDeltas ? exp(clampedDelta * 0.01) : (clampedDelta > 0 ? 1.1 : 1 / 1.1)
             let anchor = PinLayout.clampedPoint(NSEvent.mouseLocation, to: frame)
-            mutateState(anchor: anchor) { $0.multiplyZoom(by: factor) }
+            adjustInteractiveZoom(by: factor, anchor: anchor)
         }
     }
 
@@ -551,10 +602,10 @@ public final class PinPanel: NSPanel, NSWindowDelegate {
                 }
                 return
             case "=", "+":
-                if !state.isThumbnail { mutateState(anchor: frameCenter) { $0.multiplyZoom(by: 1.1) } }
+                if !state.isThumbnail { adjustInteractiveZoom(by: 1.1, anchor: frameCenter) }
                 return
             case "-":
-                if !state.isThumbnail { mutateState(anchor: frameCenter) { $0.multiplyZoom(by: 1 / 1.1) } }
+                if !state.isThumbnail { adjustInteractiveZoom(by: 1 / 1.1, anchor: frameCenter) }
                 return
             default:
                 break
@@ -564,8 +615,13 @@ public final class PinPanel: NSPanel, NSWindowDelegate {
     }
 
     private func nudgeFrame(dx: CGFloat, dy: CGFloat) {
+        guard dx.isFinite, dy.isFinite else { return }
         let candidate = frame.offsetBy(dx: dx, dy: dy)
-        let clamped = PinLayout.clampedOriginToScreens(candidate, screens: NSScreen.screens.map(\.visibleFrame))
+        let clamped = PinLayout.clampedOriginToScreens(
+            candidate,
+            screens: NSScreen.screens.map(\.visibleFrame),
+            keepFullyVisible: state.isThumbnail
+        )
         setFrameOrigin(clamped.origin)
     }
 
@@ -650,10 +706,10 @@ public final class PinPanel: NSPanel, NSWindowDelegate {
                 if !state.isThumbnail { setZoom(1) }
                 return true
             case "=", "+":
-                if !state.isThumbnail { mutateState(anchor: frameCenter) { $0.multiplyZoom(by: 1.1) } }
+                if !state.isThumbnail { adjustInteractiveZoom(by: 1.1, anchor: frameCenter) }
                 return true
             case "-":
-                if !state.isThumbnail { mutateState(anchor: frameCenter) { $0.multiplyZoom(by: 1 / 1.1) } }
+                if !state.isThumbnail { adjustInteractiveZoom(by: 1 / 1.1, anchor: frameCenter) }
                 return true
             default: break
             }
@@ -715,66 +771,81 @@ public final class PinPanel: NSPanel, NSWindowDelegate {
                     ? CCXL10n.text("Hide Toolbar", zh: "收起工具栏")
                     : CCXL10n.text("Show Toolbar", zh: "显示工具栏"),
                 #selector(toggleAnnotationToolbarFromMenu(_:)),
-                key: "e"
+                key: "e",
+                symbol: isToolbarVisible ? "checkmark.circle" : "pencil.tip.crop.circle"
             )
             toolbarItem.keyEquivalentModifierMask = []
-            toolbarItem.image = NSImage(
-                systemSymbolName: isToolbarVisible ? "checkmark.circle" : "pencil.tip.crop.circle",
-                accessibilityDescription: nil
-            )
             menu.addItem(toolbarItem)
             menu.addItem(.separator())
         }
-        menu.addItem(menuItem(CCXL10n.text("Copy", zh: "拷贝"), #selector(copyPin(_:)), key: "c"))
+        menu.addItem(menuItem(CCXL10n.text("Copy", zh: "拷贝"), #selector(copyPin(_:)), key: "c", symbol: "doc.on.doc"))
         switch content {
         case .image:
-            menu.addItem(menuItem(CCXL10n.text("Copy Text (OCR)", zh: "识别文字 (OCR)"), #selector(recognizeTextFromMenu(_:))))
+            let ocrItem = menuItem(
+                CCXL10n.text("Copy Text (OCR)", zh: "识别文字 (OCR)"),
+                #selector(recognizeTextFromMenu(_:)),
+                key: "t",
+                symbol: "text.viewfinder"
+            )
+            ocrItem.keyEquivalentModifierMask = []
+            menu.addItem(ocrItem)
         case .color:
-            menu.addItem(menuItem(CCXL10n.text("Copy HEX", zh: "拷贝 HEX"), #selector(copyHexColor(_:))))
-            menu.addItem(menuItem(CCXL10n.text("Copy RGB", zh: "拷贝 RGB"), #selector(copyRGBColor(_:))))
-            menu.addItem(menuItem(CCXL10n.text("Copy HSL", zh: "拷贝 HSL"), #selector(copyHSLColor(_:))))
+            menu.addItem(menuItem(CCXL10n.text("Copy HEX", zh: "拷贝 HEX"), #selector(copyHexColor(_:)), symbol: "number"))
+            menu.addItem(menuItem(CCXL10n.text("Copy RGB", zh: "拷贝 RGB"), #selector(copyRGBColor(_:)), symbol: "paintpalette"))
+            menu.addItem(menuItem(CCXL10n.text("Copy HSL", zh: "拷贝 HSL"), #selector(copyHSLColor(_:)), symbol: "dial.medium"))
         case .text:
             break
         }
-        menu.addItem(menuItem(CCXL10n.text("Save PNG", zh: "保存 PNG"), #selector(savePin(_:)), key: "s"))
-        let quickSave = menuItem(CCXL10n.text("Quick Save PNG", zh: "快速保存 PNG"), #selector(quickSavePin(_:)), key: "s")
+        menu.addItem(menuItem(CCXL10n.text("Save PNG", zh: "保存 PNG"), #selector(savePin(_:)), key: "s", symbol: "square.and.arrow.down"))
+        let quickSave = menuItem(CCXL10n.text("Quick Save PNG", zh: "快速保存 PNG"), #selector(quickSavePin(_:)), key: "s", symbol: "arrow.down.circle")
         quickSave.keyEquivalentModifierMask = [.command, .shift]
         menu.addItem(quickSave)
-        menu.addItem(menuItem(CCXL10n.text("Duplicate", zh: "创建副本"), #selector(duplicatePin(_:)), key: "d"))
+        menu.addItem(menuItem(CCXL10n.text("Duplicate", zh: "创建副本"), #selector(duplicatePin(_:)), key: "d", symbol: "plus.square.on.square"))
         menu.addItem(.separator())
 
-        let resetZoomItem = menuItem(CCXL10n.text("Reset Zoom (100%)", zh: "实际大小 (100%)"), #selector(resetZoom(_:)), key: "0")
+        let resetZoomItem = menuItem(CCXL10n.text("Reset Zoom (100%)", zh: "实际大小 (100%)"), #selector(resetZoom(_:)), key: "0", symbol: "1.magnifyingglass")
         resetZoomItem.isEnabled = !state.isThumbnail
         menu.addItem(resetZoomItem)
 
-        let rotateCW = menuItem(CCXL10n.text("Rotate 90°", zh: "顺时针旋转 90°"), #selector(rotate90(_:)), key: "r")
+        let rotateCW = menuItem(CCXL10n.text("Rotate 90°", zh: "顺时针旋转 90°"), #selector(rotate90(_:)), key: "r", symbol: "rotate.right")
         rotateCW.keyEquivalentModifierMask = []
         rotateCW.isEnabled = !state.isThumbnail
         menu.addItem(rotateCW)
 
-        let rotateCCW = menuItem(CCXL10n.text("Rotate 90° CCW", zh: "逆时针旋转 90°"), #selector(rotate270(_:)), key: "r")
+        let rotateCCW = menuItem(CCXL10n.text("Rotate 90° CCW", zh: "逆时针旋转 90°"), #selector(rotate270(_:)), key: "r", symbol: "rotate.left")
         rotateCCW.keyEquivalentModifierMask = [.shift]
         rotateCCW.isEnabled = !state.isThumbnail
         menu.addItem(rotateCCW)
 
-        let flipH = menuItem(CCXL10n.text("Flip Horizontal", zh: "水平翻转"), #selector(flipHorizontalFromMenu(_:)), key: "h")
+        let flipH = menuItem(
+            CCXL10n.text("Flip Horizontal", zh: "水平翻转"),
+            #selector(flipHorizontalFromMenu(_:)),
+            key: "h",
+            symbol: "arrow.left.and.right.righttriangle.left.righttriangle.right"
+        )
         flipH.keyEquivalentModifierMask = []
         flipH.state = state.isFlippedHorizontally ? .on : .off
         flipH.isEnabled = !state.isThumbnail
         menu.addItem(flipH)
 
-        let flipV = menuItem(CCXL10n.text("Flip Vertical", zh: "垂直翻转"), #selector(flipVerticalFromMenu(_:)), key: "v")
+        let flipV = menuItem(
+            CCXL10n.text("Flip Vertical", zh: "垂直翻转"),
+            #selector(flipVerticalFromMenu(_:)),
+            key: "v",
+            symbol: "arrow.up.and.down.righttriangle.up.righttriangle.down"
+        )
         flipV.keyEquivalentModifierMask = []
         flipV.state = state.isFlippedVertically ? .on : .off
         flipV.isEnabled = !state.isThumbnail
         menu.addItem(flipV)
 
-        let resetAll = menuItem(CCXL10n.text("Reset All Transforms", zh: "重置全部变换"), #selector(resetAllFromMenu(_:)), key: "0")
+        let resetAll = menuItem(CCXL10n.text("Reset All Transforms", zh: "重置全部变换"), #selector(resetAllFromMenu(_:)), key: "0", symbol: "arrow.counterclockwise")
         resetAll.keyEquivalentModifierMask = [.command, .shift]
         menu.addItem(resetAll)
 
         let opacityTitle = CCXL10n.text("Opacity", zh: "不透明度")
         let opacityItem = NSMenuItem(title: opacityTitle, action: nil, keyEquivalent: "")
+        opacityItem.image = NSImage(systemSymbolName: "circle.lefthalf.filled", accessibilityDescription: nil)
         let opacityMenu = NSMenu(title: opacityTitle)
         for percent in [100, 80, 60, 40, 20] {
             let item = menuItem("\(percent)%", #selector(setOpacityFromMenu(_:)), tag: percent)
@@ -785,36 +856,46 @@ public final class PinPanel: NSPanel, NSWindowDelegate {
         menu.addItem(opacityItem)
         menu.addItem(.separator())
 
-        let clickThrough = menuItem(CCXL10n.text("Toggle Click-Through", zh: "鼠标穿透"), #selector(toggleClickThroughFromMenu(_:)))
+        let clickThrough = menuItem(CCXL10n.text("Toggle Click-Through", zh: "鼠标穿透"), #selector(toggleClickThroughFromMenu(_:)), symbol: "cursorarrow.click")
         clickThrough.state = state.isClickThrough ? .on : .off
         menu.addItem(clickThrough)
-        let thumbnail = menuItem(CCXL10n.text("Toggle Thumbnail", zh: "缩略图模式"), #selector(toggleThumbnailFromMenu(_:)))
+        let thumbnail = menuItem(CCXL10n.text("Toggle Thumbnail", zh: "缩略图模式"), #selector(toggleThumbnailFromMenu(_:)), symbol: "rectangle.compress.vertical")
         thumbnail.state = state.isThumbnail ? .on : .off
         menu.addItem(thumbnail)
-        let showBorder = menuItem(CCXL10n.text("Show Border", zh: "显示边框"), #selector(toggleBorderFromMenu(_:)))
+        let showBorder = menuItem(CCXL10n.text("Show Border", zh: "显示边框"), #selector(toggleBorderFromMenu(_:)), symbol: "square")
         showBorder.state = state.showsBorder ? .on : .off
         menu.addItem(showBorder)
-        let showShadow = menuItem(CCXL10n.text("Show Shadow", zh: "显示阴影"), #selector(toggleShadowFromMenu(_:)))
+        let showShadow = menuItem(CCXL10n.text("Show Shadow", zh: "显示阴影"), #selector(toggleShadowFromMenu(_:)), symbol: "shadow")
         showShadow.state = state.showsShadow ? .on : .off
         menu.addItem(showShadow)
         menu.addItem(.separator())
-        menu.addItem(menuItem(CCXL10n.text("Close Pin", zh: "关闭贴图"), #selector(closePin(_:)), key: "w"))
+        menu.addItem(menuItem(CCXL10n.text("Close Pin", zh: "关闭贴图"), #selector(closePin(_:)), key: "w", symbol: "xmark.circle"))
         let clickThroughCount = clickThroughCountProvider?() ?? 0
         if clickThroughCount > 0 {
             menu.addItem(menuItem(
                 CCXL10n.text("Unlock Click-Through Pins (\(clickThroughCount))", zh: "解除全部穿透 (\(clickThroughCount))"),
-                #selector(unlockAllClickThroughPins(_:))
+                #selector(unlockAllClickThroughPins(_:)),
+                symbol: "lock.open"
             ))
         }
-        menu.addItem(menuItem(CCXL10n.text("Hide All Pins", zh: "隐藏全部贴图"), #selector(hideAllPins(_:))))
-        menu.addItem(menuItem(CCXL10n.text("Close All Pins", zh: "关闭全部贴图"), #selector(closeAllPins(_:))))
+        menu.addItem(menuItem(CCXL10n.text("Hide All Pins", zh: "隐藏全部贴图"), #selector(hideAllPins(_:)), symbol: "eye.slash"))
+        menu.addItem(menuItem(CCXL10n.text("Close All Pins", zh: "关闭全部贴图"), #selector(closeAllPins(_:)), symbol: "xmark.square"))
         return menu
     }
 
-    private func menuItem(_ title: String, _ action: Selector, key: String = "", tag: Int = 0) -> NSMenuItem {
+    private func menuItem(
+        _ title: String,
+        _ action: Selector,
+        key: String = "",
+        tag: Int = 0,
+        symbol: String? = nil
+    ) -> NSMenuItem {
         let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
         item.target = self
         item.tag = tag
+        if let symbol {
+            item.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
+        }
         return item
     }
 
@@ -941,6 +1022,8 @@ final class PinContentView: NSView {
     var hoverToolbarButton: NSButton { hoverToolbarControl }
     var borderLayerForTesting: CALayer { borderLayer }
     var annotationOverlayViewForTesting: NSView { annotationOverlayView }
+    var clickThroughBadgeForTesting: NSView { clickThroughBadge }
+    var hudViewForTesting: NSView { hudView }
     var hasTransparentCornersForTesting: Bool { cachedCornerAnalysis.hasTransparentCorners }
 
     private let imageContainerLayer = CALayer()
@@ -953,6 +1036,7 @@ final class PinContentView: NSView {
         width: PinHoverToolbarButton.diameter,
         height: PinHoverToolbarButton.diameter
     ))
+    private let clickThroughBadge = PinClickThroughBadgeView()
     private let hudView = PinHUDView()
 
     private var hudHideTask: Task<Void, Never>?
@@ -993,6 +1077,11 @@ final class PinContentView: NSView {
         hoverToolbarControl.target = self
         hoverToolbarControl.action = #selector(handleHoverToolbarButtonClick(_:))
         addSubview(hoverToolbarControl)
+
+        clickThroughBadge.isHidden = true
+        clickThroughBadge.layer?.zPosition = 42
+        clickThroughBadge.setAccessibilityElement(false)
+        addSubview(clickThroughBadge)
 
         hudView.isHidden = true
         hudView.layer?.zPosition = 50
@@ -1048,6 +1137,7 @@ final class PinContentView: NSView {
         }
         positionHoverToolbarButton()
         updateHoverToolbarButtonVisibility()
+        updateClickThroughBadge()
         if !hudView.isHidden {
             positionHUD()
         }
@@ -1253,16 +1343,22 @@ final class PinContentView: NSView {
         CATransaction.commit()
         positionHoverToolbarButton()
         updateHoverToolbarButtonVisibility()
+        updateClickThroughBadge()
         updateAccessibility(for: panel)
     }
+
+    private static let maxAccessibilityLeadingScan = 4_096
 
     private static func accessibilityPreview(for text: String, maxCharacters: Int = 48) -> String {
         var idx = text.startIndex
         let end = text.endIndex
-        while idx < end, text[idx].isWhitespace || text[idx].isNewline {
+        var scanned = 0
+        while idx < end, scanned < maxAccessibilityLeadingScan,
+              text[idx].isWhitespace || text[idx].isNewline {
             text.formIndex(after: &idx)
+            scanned += 1
         }
-        guard idx < end else { return "" }
+        guard idx < end, scanned < maxAccessibilityLeadingScan else { return "" }
         let cutoff = text.index(idx, offsetBy: maxCharacters, limitedBy: end) ?? end
         var sliceEnd = cutoff
         while sliceEnd > idx {
@@ -1357,13 +1453,44 @@ final class PinContentView: NSView {
     }
 
     private func positionHUD() {
-        let size = hudView.intrinsicContentSize
+        let intrinsic = hudView.intrinsicContentSize
+        let maxWidth = max(36, bounds.width - 12)
+        let width = min(intrinsic.width, maxWidth)
+        let height = intrinsic.height
         hudView.frame = CGRect(
-            x: (bounds.midX - size.width / 2).rounded(),
-            y: (bounds.midY - size.height / 2).rounded(),
-            width: size.width,
-            height: size.height
+            x: (bounds.midX - width / 2).rounded(),
+            y: (bounds.midY - height / 2).rounded(),
+            width: width,
+            height: height
         )
+        hudView.layoutSubtreeIfNeeded()
+    }
+
+    private func updateClickThroughBadge() {
+        guard let panel,
+              panel.state.isClickThrough,
+              !panel.state.isThumbnail,
+              bounds.width >= 64,
+              bounds.height >= 36
+        else {
+            clickThroughBadge.isHidden = true
+            return
+        }
+        let compact = bounds.width < 132 || bounds.height < 44
+        clickThroughBadge.configure(compact: compact)
+        let intrinsic = clickThroughBadge.intrinsicContentSize
+        let inset: CGFloat = 8
+        let maxWidth = max(22, bounds.width - inset * 2)
+        let width = min(intrinsic.width, maxWidth)
+        let height = intrinsic.height
+        clickThroughBadge.frame = CGRect(
+            x: inset,
+            y: max(inset, (bounds.maxY - inset - height).rounded()),
+            width: width,
+            height: height
+        )
+        clickThroughBadge.isHidden = false
+        clickThroughBadge.layoutSubtreeIfNeeded()
     }
 
     func cancelPendingDragAndClicks() {
@@ -1378,6 +1505,7 @@ final class PinContentView: NSView {
         lastDoubleClickActionTimestamp = 0
         isPointerInside = false
         hoverToolbarControl.isHidden = true
+        clickThroughBadge.isHidden = true
         cachedCornerAnalysisImage = nil
         cachedCornerAnalysis = .square
         lastDirtyAnnotationCanvasRect = nil
@@ -1468,14 +1596,20 @@ final class PinContentView: NSView {
         updateHoverToolbarButtonVisibility()
     }
 
+    private static var effectiveDoubleClickInterval: TimeInterval {
+        let raw = NSEvent.doubleClickInterval
+        return (raw.isFinite && raw >= 0.1 && raw <= 2.0) ? raw : 0.5
+    }
+
     private func isDoubleClickEvent(_ event: NSEvent, atScreenPoint screenPoint: CGPoint) -> Bool {
+        let doubleClickInterval = Self.effectiveDoubleClickInterval
         if event.clickCount >= 2 {
             // Prevent an accidental 3rd rapid click right after a double-click action from bouncing back.
             if event.clickCount == 3,
                event.timestamp > 0,
                lastDoubleClickActionTimestamp > 0 {
                 let sinceAction = event.timestamp - lastDoubleClickActionTimestamp
-                if sinceAction > 0 && sinceAction <= NSEvent.doubleClickInterval {
+                if sinceAction > 0 && sinceAction <= doubleClickInterval {
                     return false
                 }
             }
@@ -1486,7 +1620,7 @@ final class PinContentView: NSView {
               last.timestamp > 0
         else { return false }
         let delta = event.timestamp - last.timestamp
-        guard delta > 0 && delta <= NSEvent.doubleClickInterval else { return false }
+        guard delta > 0 && delta <= doubleClickInterval else { return false }
         let distance = hypot(screenPoint.x - last.screenPoint.x, screenPoint.y - last.screenPoint.y)
         return distance <= 6
     }
@@ -1785,6 +1919,7 @@ private final class PinHoverToolbarButton: NSButton {
 
         wantsLayer = true
         layer?.cornerRadius = Self.diameter / 2
+        layer?.cornerCurve = .continuous
         layer?.masksToBounds = false
         layer?.borderWidth = 0.75
         layer?.shadowColor = NSColor.black.cgColor
@@ -1878,19 +2013,137 @@ private final class PinHoverToolbarButton: NSButton {
     }
 }
 
+private final class PinClickThroughBadgeView: NSView {
+    private static let badgeHeight: CGFloat = 20
+    private static let badgeCornerRadius: CGFloat = 10
+
+    private let iconView = NSImageView()
+    private let label = NSTextField(labelWithString: "")
+    private var isCompact = false
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        appearance = NSAppearance(named: .darkAqua)
+        wantsLayer = true
+        layer?.cornerRadius = Self.badgeCornerRadius
+        layer?.cornerCurve = .continuous
+        layer?.masksToBounds = true
+        layer?.backgroundColor = NSColor(white: 0.08, alpha: 0.80).cgColor
+        layer?.borderWidth = 0.75
+        layer?.borderColor = NSColor.systemCyan.withAlphaComponent(0.65).cgColor
+
+        let symbolConfig = NSImage.SymbolConfiguration(pointSize: 10, weight: .semibold)
+        let symbol = NSImage(systemSymbolName: "cursorarrow.click", accessibilityDescription: nil)?
+            .withSymbolConfiguration(symbolConfig)
+        symbol?.isTemplate = true
+        iconView.image = symbol
+        iconView.contentTintColor = .systemCyan
+        iconView.imageScaling = .scaleProportionallyDown
+        addSubview(iconView)
+
+        label.font = .systemFont(ofSize: 10, weight: .semibold)
+        label.textColor = NSColor.white.withAlphaComponent(0.95)
+        label.lineBreakMode = .byTruncatingTail
+        label.maximumNumberOfLines = 1
+        addSubview(label)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    func configure(compact: Bool) {
+        isCompact = compact
+        label.isHidden = compact
+        if !compact {
+            let text = CCXL10n.text("Click-Through", zh: "穿透")
+            if label.stringValue != text {
+                label.stringValue = text
+                label.sizeToFit()
+            }
+        }
+    }
+
+    override var intrinsicContentSize: NSSize {
+        if isCompact {
+            return NSSize(width: 22, height: Self.badgeHeight)
+        }
+        let labelWidth = ceil(label.intrinsicContentSize.width)
+        return NSSize(width: 7 + 11 + 4 + labelWidth + 8, height: Self.badgeHeight)
+    }
+
+    override func layout() {
+        super.layout()
+        let iconSide: CGFloat = 11
+        if isCompact {
+            iconView.frame = CGRect(
+                x: ((bounds.width - iconSide) / 2).rounded(),
+                y: ((bounds.height - iconSide) / 2).rounded(),
+                width: iconSide,
+                height: iconSide
+            )
+            return
+        }
+        iconView.frame = CGRect(
+            x: 7,
+            y: ((bounds.height - iconSide) / 2).rounded(),
+            width: iconSide,
+            height: iconSide
+        )
+        label.sizeToFit()
+        let labelX = iconView.frame.maxX + 4
+        let availW = max(0, bounds.width - labelX - 7)
+        let labelW = min(ceil(label.frame.width), availW)
+        label.frame = CGRect(
+            x: labelX,
+            y: ((bounds.height - label.frame.height) / 2).rounded(),
+            width: labelW,
+            height: label.frame.height
+        )
+    }
+}
+
 private final class PinHUDView: NSView {
+    private static let pillHeight: CGFloat = 24
+    private static let pillCornerRadius: CGFloat = 12
+
+    private let contentHost = NSView()
     private let label = NSTextField(labelWithString: "")
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
+        appearance = NSAppearance(named: .darkAqua)
         wantsLayer = true
-        layer?.backgroundColor = NSColor.black.withAlphaComponent(0.74).cgColor
-        layer?.cornerRadius = 11
+        layer?.cornerRadius = Self.pillCornerRadius
+        layer?.cornerCurve = .continuous
         layer?.masksToBounds = true
+
+        if #available(macOS 26.0, *) {
+            let glass = NSGlassEffectView()
+            glass.cornerRadius = Self.pillCornerRadius
+            glass.style = .regular
+            glass.wantsLayer = true
+            glass.layer?.cornerRadius = Self.pillCornerRadius
+            glass.layer?.cornerCurve = .continuous
+            glass.layer?.masksToBounds = true
+            glass.autoresizingMask = [.width, .height]
+            contentHost.autoresizingMask = [.width, .height]
+            glass.contentView = contentHost
+            addSubview(glass)
+        } else {
+            layer?.backgroundColor = NSColor.black.withAlphaComponent(0.78).cgColor
+            layer?.borderWidth = 0.75
+            layer?.borderColor = NSColor.white.withAlphaComponent(0.18).cgColor
+            contentHost.autoresizingMask = [.width, .height]
+            addSubview(contentHost)
+        }
 
         label.font = .monospacedDigitSystemFont(ofSize: 11.5, weight: .semibold)
         label.textColor = .white
-        addSubview(label)
+        label.lineBreakMode = .byTruncatingTail
+        label.maximumNumberOfLines = 1
+        contentHost.addSubview(label)
     }
 
     @available(*, unavailable)
@@ -1905,16 +2158,26 @@ private final class PinHUDView: NSView {
 
     override var intrinsicContentSize: NSSize {
         let labelSize = label.intrinsicContentSize
-        return NSSize(width: ceil(labelSize.width) + 18, height: 22)
+        return NSSize(width: ceil(labelSize.width) + 20, height: Self.pillHeight)
     }
 
     override func layout() {
         super.layout()
+        for subview in subviews {
+            if subview.frame != bounds {
+                subview.frame = bounds
+            }
+        }
+        if contentHost.frame != bounds {
+            contentHost.frame = bounds
+        }
         label.sizeToFit()
+        let maxLabelWidth = max(0, bounds.width - 14)
+        let width = min(ceil(label.frame.width), maxLabelWidth)
         label.frame = CGRect(
-            x: ((bounds.width - label.frame.width) / 2).rounded(),
+            x: ((bounds.width - width) / 2).rounded(),
             y: ((bounds.height - label.frame.height) / 2).rounded(),
-            width: label.frame.width,
+            width: width,
             height: label.frame.height
         )
     }

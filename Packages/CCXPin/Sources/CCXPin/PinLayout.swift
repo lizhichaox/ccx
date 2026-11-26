@@ -257,14 +257,54 @@ enum PinLayout {
     }
 
     static func displayText(for text: String) -> String {
+        let maxUTF8Bytes = maxDisplayTextLength * 4
         if text.utf8.count <= maxDisplayTextLength {
             return text
         }
-        if let cutoff = text.index(text.startIndex, offsetBy: maxDisplayTextLength, limitedBy: text.endIndex),
-           cutoff < text.endIndex {
-            return String(text[..<cutoff]) + "…"
+        var index = text.startIndex
+        let end = text.endIndex
+        var charCount = 0
+        var utf8Count = 0
+        while index < end && charCount < maxDisplayTextLength {
+            let next = text.index(after: index)
+            let clusterBytes = text.utf8.distance(from: index, to: next)
+            if utf8Count + clusterBytes > maxUTF8Bytes {
+                break
+            }
+            utf8Count += clusterBytes
+            charCount += 1
+            index = next
+        }
+        if index < end {
+            return String(text[..<index]) + "…"
         }
         return text
+    }
+
+    /// Clamps an arbitrary requested window size to safe WindowServer / Metal backing-store limits
+    /// while preserving aspect ratio if oversized.
+    static func clampedWindowSize(_ size: CGSize) -> CGSize {
+        guard size.width.isFinite, size.height.isFinite, size.width > 0, size.height > 0 else {
+            return CGSize(width: 1, height: 1)
+        }
+        var width = max(1, size.width)
+        var height = max(1, size.height)
+        let maxSide = max(width, height)
+        let area = width * height
+        var scale: CGFloat = 1
+        if maxSide > maxWindowDimension {
+            scale = min(scale, maxWindowDimension / maxSide)
+        }
+        if area.isFinite && area > maxWindowArea {
+            scale = min(scale, sqrt(maxWindowArea / area))
+        } else if !area.isFinite {
+            scale = min(scale, maxWindowDimension / maxSide)
+        }
+        if scale < 1 {
+            width = max(1, (width * scale).rounded(.down))
+            height = max(1, (height * scale).rounded(.down))
+        }
+        return CGSize(width: min(width, maxWindowDimension), height: min(height, maxWindowDimension))
     }
 
     /// Rejects zero-dimension images and safely downsamples oversized images to fit within pixel budgets.
@@ -494,25 +534,45 @@ enum PinLayout {
         }?.visibleFrame
     }
 
-    /// Ensures `frame` retains at least `minVisibleMargin` points overlapping at least one active
-    /// screen's `visibleFrame` so pins can never be lost off-screen via nudging, zooming, or display disconnect.
+    /// Ensures `frame` retains at least `minVisibleMargin` points overlapping active screen
+    /// `visibleFrame`s (including smoothly across multi-display seams) so pins can never be lost
+    /// off-screen via nudging, zooming, or display disconnect. When `keepFullyVisible` is `true`
+    /// (for compact thumbnails), keeps the entire frame inside the target screen's `visibleFrame`
+    /// so it is never hidden behind a menu bar or display notch.
     static func clampedOriginToScreens(
         _ frame: CGRect,
         screens: [CGRect],
-        minVisibleMargin: CGFloat = minVisibleMargin
+        minVisibleMargin: CGFloat = minVisibleMargin,
+        keepFullyVisible: Bool = false
     ) -> CGRect {
         guard isFiniteRect(frame) else { return frame }
         let validScreens = screens.filter { isFiniteRect($0) && $0.width > 0 && $0.height > 0 }
         guard !validScreens.isEmpty else { return frame }
 
         let safeMargin = minVisibleMargin.isFinite ? minVisibleMargin : Self.minVisibleMargin
-        let marginX = min(max(1, safeMargin), max(1, frame.width))
-        let marginY = min(max(1, safeMargin), max(1, frame.height))
+        let marginX = keepFullyVisible ? max(1, frame.width) : min(max(1, safeMargin), max(1, frame.width))
+        let marginY = keepFullyVisible ? max(1, frame.height) : min(max(1, safeMargin), max(1, frame.height))
+
+        var visibleArea: CGFloat = 0
+        var visibleUnion: CGRect = .null
         for screen in validScreens {
             let overlap = screen.intersection(frame)
-            if !overlap.isNull, overlap.width >= marginX, overlap.height >= marginY {
-                return frame
+            if !overlap.isNull, !overlap.isEmpty {
+                if overlap.width >= marginX, overlap.height >= marginY {
+                    return frame
+                }
+                visibleArea += overlap.width * overlap.height
+                visibleUnion = visibleUnion.isNull ? overlap : visibleUnion.union(overlap)
             }
+        }
+        // Preserve pins cleanly straddling a multi-display seam when their combined visible span
+        // across displays meets the visibility threshold.
+        if !keepFullyVisible,
+           !visibleUnion.isNull,
+           visibleUnion.width >= marginX,
+           visibleUnion.height >= marginY,
+           visibleArea >= marginX * marginY {
+            return frame
         }
 
         let center = CGPoint(x: frame.midX, y: frame.midY)
@@ -522,10 +582,21 @@ enum PinLayout {
             return frame
         }
 
-        let minX = target.minX - frame.width + marginX
-        let maxX = target.maxX - marginX
-        let minY = target.minY - frame.height + marginY
-        let maxY = target.maxY - marginY
+        let minX: CGFloat
+        let maxX: CGFloat
+        let minY: CGFloat
+        let maxY: CGFloat
+        if keepFullyVisible, frame.width <= target.width, frame.height <= target.height {
+            minX = target.minX
+            maxX = target.maxX - frame.width
+            minY = target.minY
+            maxY = target.maxY - frame.height
+        } else {
+            minX = target.minX - frame.width + min(max(1, safeMargin), max(1, frame.width))
+            maxX = target.maxX - min(max(1, safeMargin), max(1, frame.width))
+            minY = target.minY - frame.height + min(max(1, safeMargin), max(1, frame.height))
+            maxY = target.maxY - min(max(1, safeMargin), max(1, frame.height))
+        }
 
         let clampedX = minX <= maxX ? min(max(frame.origin.x, minX), maxX) : target.minX
         let clampedY = minY <= maxY ? min(max(frame.origin.y, minY), maxY) : target.minY
