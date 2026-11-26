@@ -6,8 +6,8 @@ Security updates are provided for the latest release in the current minor series
 
 | Version | Supported | Platform Requirement |
 | --- | --- | --- |
-| `0.8.x` (latest) | Yes | macOS 15.0 Sequoia or later (`arm64` / `x86_64`) |
-| `< 0.8.0` | No | — |
+| `0.9.x` (latest) | Yes | macOS 15.0 Sequoia or later (`arm64` / `x86_64`) |
+| `< 0.9.0` | No | — |
 
 ## Security & Privacy Architecture
 

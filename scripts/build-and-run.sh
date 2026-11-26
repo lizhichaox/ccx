@@ -72,7 +72,7 @@ fi
 
 TARGET_BUILD="$CURRENT_BUILD"
 if [[ "$BUMP_BUILD" -eq 1 ]]; then
-  TARGET_BUILD=$((CURRENT_BUILD + 1))
+  TARGET_BUILD=$((10#$CURRENT_BUILD + 1))
   echo "==> Version $CURRENT_VERSION (building as build $TARGET_BUILD, +1 on success)"
 else
   echo "==> Version $CURRENT_VERSION (build $TARGET_BUILD, no bump)"
@@ -142,7 +142,13 @@ else
     echo "warning: no valid \"Apple Development\" signing identity found in the keychain." >&2
     echo "warning: falling back to ad-hoc signing (CODE_SIGN_IDENTITY=-)." >&2
     echo "warning: Screen Recording / Accessibility grants will NOT persist across rebuilds." >&2
-    SIGNING_ARGS+=("CODE_SIGN_IDENTITY=-" "CODE_SIGN_STYLE=Manual" "DEVELOPMENT_TEAM=")
+    SIGNING_ARGS+=(
+      "CODE_SIGN_IDENTITY=-"
+      "CODE_SIGN_STYLE=Manual"
+      "DEVELOPMENT_TEAM="
+      "ENABLE_HARDENED_RUNTIME=NO"
+      "OTHER_CODE_SIGN_FLAGS="
+    )
   fi
 fi
 
@@ -164,7 +170,9 @@ fi
 # Persist the bumped CURRENT_PROJECT_VERSION only after xcodebuild succeeds.
 if [[ "$BUMP_BUILD" -eq 1 ]]; then
   TMP_PROJECT_YML="$(mktemp "${ROOT_DIR}/project.yml.tmp.XXXXXX")"
-  trap 'rm -f "$TMP_PROJECT_YML"' EXIT
+  trap 'rm -f -- "$TMP_PROJECT_YML"' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
   awk -v build="$TARGET_BUILD" '
     !done && /^[[:space:]]*CURRENT_PROJECT_VERSION:/ {
       sub(/:.*/, ": " build)
@@ -173,8 +181,8 @@ if [[ "$BUMP_BUILD" -eq 1 ]]; then
     { print }
   ' project.yml > "$TMP_PROJECT_YML"
   chmod 644 "$TMP_PROJECT_YML"
-  mv "$TMP_PROJECT_YML" project.yml
-  trap - EXIT
+  mv -- "$TMP_PROJECT_YML" project.yml
+  trap - EXIT INT TERM
   CURRENT_BUILD="$TARGET_BUILD"
   echo "==> Updated project.yml to build $CURRENT_BUILD"
 fi
@@ -184,22 +192,28 @@ if [[ "$BUILD_ONLY" -eq 1 ]]; then
   exit 0
 fi
 
-# Quit any running instance before replacing or launching the app bundle.
-if pgrep -x CCX >/dev/null 2>&1; then
+# Quit any running CCX instance owned by the current user before replacing or launching the app bundle.
+CURRENT_UID="$(id -u)"
+CCX_PROC_PATTERN='/CCX\.app/Contents/MacOS/CCX$'
+ccx_is_running() {
+  pgrep -u "$CURRENT_UID" -f "$CCX_PROC_PATTERN" >/dev/null 2>&1
+}
+
+if ccx_is_running; then
   echo "==> Quitting running CCX"
   osascript -e 'tell application id "com.lizhichaox.ccx" to quit' >/dev/null 2>&1 || true
   for _ in 1 2 3 4 5 6 7 8 9 10; do
-    pgrep -x CCX >/dev/null 2>&1 || break
+    ccx_is_running || break
     sleep 0.3
   done
-  if pgrep -x CCX >/dev/null 2>&1; then
-    pkill -TERM -x CCX >/dev/null 2>&1 || true
+  if ccx_is_running; then
+    pkill -TERM -u "$CURRENT_UID" -f "$CCX_PROC_PATTERN" >/dev/null 2>&1 || true
     for _ in 1 2 3 4 5 6 7 8 9 10; do
-      pgrep -x CCX >/dev/null 2>&1 || break
+      ccx_is_running || break
       sleep 0.2
     done
   fi
-  if pgrep -x CCX >/dev/null 2>&1; then
+  if ccx_is_running; then
     echo "error: running CCX instance did not exit (a recording or dialog may be open); quit CCX and retry." >&2
     exit 1
   fi
@@ -207,33 +221,47 @@ fi
 
 LAUNCH_APP="$APP_PATH"
 if [[ "$INSTALL_APP" -eq 1 ]]; then
-  mkdir -p "$INSTALL_DIR"
+  if [[ -L "$INSTALL_DIR" ]]; then
+    echo "error: install directory must not be a symlink: $INSTALL_DIR" >&2
+    exit 1
+  fi
+  mkdir -p -- "$INSTALL_DIR"
+  if [[ -L "$INSTALLED_APP" ]]; then
+    echo "error: refusing to replace symlinked install target: $INSTALLED_APP" >&2
+    exit 1
+  fi
   STAGING_DIR="$(mktemp -d "$INSTALL_DIR/.CCX.app.staging.XXXXXX")"
   BACKUP_DIR=""
   cleanup_install() {
-    if [[ -n "$BACKUP_DIR" && -d "$BACKUP_DIR/CCX.app" && ! -d "$INSTALLED_APP" ]]; then
-      mv "$BACKUP_DIR/CCX.app" "$INSTALLED_APP" >/dev/null 2>&1 || true
+    if [[ -n "$BACKUP_DIR" && -d "$BACKUP_DIR/CCX.app" && ! -e "$INSTALLED_APP" && ! -L "$INSTALLED_APP" ]]; then
+      mv -- "$BACKUP_DIR/CCX.app" "$INSTALLED_APP" >/dev/null 2>&1 || true
     fi
-    rm -rf "$STAGING_DIR" ${BACKUP_DIR:+"$BACKUP_DIR"}
+    rm -rf -- "$STAGING_DIR" ${BACKUP_DIR:+"$BACKUP_DIR"}
   }
   trap cleanup_install EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
 
   STAGING_APP="$STAGING_DIR/CCX.app"
   echo "==> Installing to $INSTALLED_APP"
-  ditto "$APP_PATH" "$STAGING_APP"
+  ditto -- "$APP_PATH" "$STAGING_APP"
 
-  if [[ -e "$INSTALLED_APP" ]]; then
+  if [[ -e "$INSTALLED_APP" || -L "$INSTALLED_APP" ]]; then
+    if [[ -L "$INSTALLED_APP" ]]; then
+      echo "error: refusing to replace symlinked install target: $INSTALLED_APP" >&2
+      exit 1
+    fi
     BACKUP_DIR="$(mktemp -d "$INSTALL_DIR/.CCX.app.backup.XXXXXX")"
-    mv "$INSTALLED_APP" "$BACKUP_DIR/CCX.app"
+    mv -- "$INSTALLED_APP" "$BACKUP_DIR/CCX.app"
   fi
-  mv "$STAGING_APP" "$INSTALLED_APP"
+  mv -- "$STAGING_APP" "$INSTALLED_APP"
 
   if [[ -n "$BACKUP_DIR" ]]; then
-    rm -rf "$BACKUP_DIR"
+    rm -rf -- "$BACKUP_DIR"
     BACKUP_DIR=""
   fi
-  rm -rf "$STAGING_DIR"
-  trap - EXIT
+  rm -rf -- "$STAGING_DIR"
+  trap - EXIT INT TERM
 
   if [[ -x "$LSREGISTER" ]]; then
     "$LSREGISTER" -f "$INSTALLED_APP" >/dev/null 2>&1 || true

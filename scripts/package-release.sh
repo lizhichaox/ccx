@@ -219,12 +219,15 @@ load_notarize_env() {
     val="${val#"${val%%[![:space:]]*}"}"
     val="${val%"${val##*[![:space:]]}"}"
 
-    if [[ ${#val} -ge 2 && "$val" == \"*\" ]]; then
-      val="${val#\"}"
-      val="${val%\"}"
-    elif [[ ${#val} -ge 2 && "$val" == \'*\' ]]; then
-      val="${val#\'}"
-      val="${val%\'}"
+    local dq_re='^"([^"]*)"([[:space:]]*(#.*)?)?$'
+    local sq_re="^'([^']*)'([[:space:]]*(#.*)?)?$"
+    if [[ "$val" =~ $dq_re ]]; then
+      val="${BASH_REMATCH[1]}"
+    elif [[ "$val" =~ $sq_re ]]; then
+      val="${BASH_REMATCH[1]}"
+    else
+      val="${val%%[[:space:]]#*}"
+      val="${val%"${val##*[![:space:]]}"}"
     fi
 
     case "$key" in
@@ -382,12 +385,14 @@ CLEANUP_PATHS=()
 cleanup() {
   local p
   for p in ${CLEANUP_PATHS[@]+"${CLEANUP_PATHS[@]}"}; do
-    if [[ -n "$p" && -e "$p" ]]; then
-      rm -rf "$p"
+    if [[ -n "$p" && ( -e "$p" || -L "$p" ) ]]; then
+      rm -rf -- "$p"
     fi
   done
 }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # Resolves a valid, unexpired codesigning identity matching $1 (prefix/substring or SHA-1 hash).
 # Sets global RESOLVED_SIGN_HASH, RESOLVED_SIGN_NAME, and RESOLVED_TEAM_ID.
@@ -587,8 +592,12 @@ notarize_artifact() {
       printf '%s\n' "$submit_json" >&2
     fi
     if [[ -n "$submission_id" ]]; then
-      echo "==> Fetching Apple notary log for submission ${submission_id}" >&2
-      xcrun notarytool log "$submission_id" "${NOTARY_ARGS[@]}" >&2 || echo "warning: failed to fetch notary log for submission ${submission_id}" >&2
+      if [[ "$submission_id" =~ ^[0-9a-fA-F-]+$ ]]; then
+        echo "==> Fetching Apple notary log for submission ${submission_id}" >&2
+        xcrun notarytool log "$submission_id" "${NOTARY_ARGS[@]}" >&2 || echo "warning: failed to fetch notary log for submission ${submission_id}" >&2
+      else
+        echo "warning: ignoring malformed notary submission ID" >&2
+      fi
     fi
     exit 1
   fi
@@ -683,20 +692,50 @@ codesign --verify --deep --strict --verbose=2 "$BUILT_APP"
 echo "    [ok] codesign --verify --deep --strict passed"
 
 # (e) Verify entitlements and Hardened Runtime flag.
-ENTITLEMENTS_OUT="$(codesign -d --entitlements :- "$BUILT_APP" 2>&1 || codesign -d --entitlements - "$BUILT_APP" 2>&1)"
-if ! printf '%s\n' "$ENTITLEMENTS_OUT" | grep -q 'com.apple.security.device.audio-input'; then
-  echo "error: missing com.apple.security.device.audio-input entitlement in $BUILT_APP" >&2
+ENTITLEMENTS_XML="$(codesign -d --entitlements - --xml "$BUILT_APP" 2>/dev/null || true)"
+if [[ -z "$ENTITLEMENTS_XML" ]]; then
+  echo "error: failed to read XML entitlements from $BUILT_APP" >&2
   exit 1
 fi
-echo "    [ok] com.apple.security.device.audio-input entitlement present"
+
+extract_entitlement_bool() {
+  local key="$1"
+  local escaped_key="${key//./\\.}"
+  printf '%s' "$ENTITLEMENTS_XML" | plutil -extract "$escaped_key" raw -o - - 2>/dev/null || true
+}
+
+AUDIO_INPUT_ENT="$(extract_entitlement_bool "com.apple.security.device.audio-input")"
+if [[ "$AUDIO_INPUT_ENT" != "true" ]]; then
+  echo "error: com.apple.security.device.audio-input entitlement must be true in $BUILT_APP (got '${AUDIO_INPUT_ENT:-<missing>}')" >&2
+  exit 1
+fi
+echo "    [ok] com.apple.security.device.audio-input entitlement verified (true)"
+
+APP_SANDBOX_ENT="$(extract_entitlement_bool "com.apple.security.app-sandbox")"
+if [[ -n "$APP_SANDBOX_ENT" && "$APP_SANDBOX_ENT" != "false" ]]; then
+  echo "error: com.apple.security.app-sandbox must be false or omitted in $BUILT_APP (got '$APP_SANDBOX_ENT')" >&2
+  exit 1
+fi
+echo "    [ok] Non-sandboxed entitlement verified"
 
 if [[ "$ADHOC" -eq 0 ]]; then
-  if printf '%s\n' "$ENTITLEMENTS_OUT" | grep -Fq 'com.apple.security.get-task-allow'; then
-    echo "error: forbidden com.apple.security.get-task-allow entitlement present in $BUILT_APP (will be rejected by Apple notarization)" >&2
-    printf '%s\n' "$ENTITLEMENTS_OUT" >&2
-    exit 1
-  fi
-  echo "    [ok] No get-task-allow entitlement present"
+  FORBIDDEN_ENTITLEMENTS=(
+    "com.apple.security.get-task-allow"
+    "com.apple.security.cs.disable-library-validation"
+    "com.apple.security.cs.allow-jit"
+    "com.apple.security.cs.allow-unsigned-executable-memory"
+    "com.apple.security.cs.debugger"
+    "com.apple.security.cs.allow-dyld-environment-variables"
+  )
+  for forbidden_ent in "${FORBIDDEN_ENTITLEMENTS[@]}"; do
+    ent_val="$(extract_entitlement_bool "$forbidden_ent")"
+    if [[ "$ent_val" == "true" ]]; then
+      echo "error: forbidden entitlement $forbidden_ent=true present in $BUILT_APP" >&2
+      printf '%s\n' "$ENTITLEMENTS_XML" >&2
+      exit 1
+    fi
+  done
+  echo "    [ok] No debug or Hardened Runtime escape entitlements present"
 
   CODESIGN_INFO="$(codesign -dvv "$BUILT_APP" 2>&1)"
   if ! printf '%s\n' "$CODESIGN_INFO" | grep -Eq 'flags=.*runtime'; then
@@ -713,8 +752,8 @@ if [[ "$ADHOC" -eq 0 ]]; then
 fi
 
 # Resolve output directory path and copy verified CCX.app cleanly.
-mkdir -p "$OUT_DIR"
-OUT_DIR_ABS="$(cd "$OUT_DIR" && pwd)"
+mkdir -p -- "$OUT_DIR"
+OUT_DIR_ABS="$(cd -- "$OUT_DIR" && pwd)"
 DIST_APP="$OUT_DIR_ABS/CCX.app"
 
 APP_STAGE_DIR="$(mktemp -d "${OUT_DIR_ABS}/.CCX.app.stage.XXXXXX")"
@@ -770,10 +809,18 @@ fi
 
 if [[ "${#ARTIFACT_BASENAMES[@]}" -gt 0 ]]; then
   echo "==> Generating SHA256SUMS.txt"
+  TMP_SUMS="$(mktemp "${OUT_DIR_ABS}/.SHA256SUMS.txt.tmp.XXXXXX")"
+  CLEANUP_PATHS+=("$TMP_SUMS")
   (
-    cd "$OUT_DIR_ABS"
-    shasum -a 256 ${ARTIFACT_BASENAMES[@]+"${ARTIFACT_BASENAMES[@]}"} > SHA256SUMS.txt
+    cd -- "$OUT_DIR_ABS"
+    shasum -a 256 ${ARTIFACT_BASENAMES[@]+"${ARTIFACT_BASENAMES[@]}"} > "$TMP_SUMS"
   )
+  chmod 644 "$TMP_SUMS"
+  if [[ -L "$OUT_DIR_ABS/SHA256SUMS.txt" ]]; then
+    echo "error: refusing to overwrite symlinked SHA256SUMS.txt" >&2
+    exit 1
+  fi
+  mv -- "$TMP_SUMS" "$OUT_DIR_ABS/SHA256SUMS.txt"
 fi
 
 echo "==> Gatekeeper assessment (spctl)"

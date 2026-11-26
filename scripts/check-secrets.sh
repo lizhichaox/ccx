@@ -41,6 +41,7 @@ ALLOWED_ENV_TEMPLATES = {
 PLACEHOLDER_VALUES = {
     "XXXXXXXXXX",
     "YOUR_TEAM_ID",
+    "CCX-NOTARY",
     "CHANGEME",
     "REPLACE_ME",
     "EXAMPLE",
@@ -298,7 +299,7 @@ def is_staged_gitlink(repo_root: str, rel_path: str) -> bool:
 
 def scan_staged(repo_root: str, local_secrets: list[tuple[str, str, str]]) -> tuple[list[str], int]:
     findings: list[str] = []
-    res = run_git(["diff", "--cached", "--name-only", "--diff-filter=ACMR", "-z"], cwd=repo_root)
+    res = run_git(["diff", "--cached", "--name-only", "--diff-filter=ACMRT", "-z"], cwd=repo_root)
     raw_paths = [p.decode("utf-8", errors="surrogateescape") for p in res.stdout.split(b"\x00") if p]
 
     for rel_path in raw_paths:

@@ -41,13 +41,13 @@ IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT_VERSION"
 
 case "$1" in
   patch)
-    NEW_VERSION="$MAJOR.$MINOR.$((PATCH + 1))"
+    NEW_VERSION="$((10#$MAJOR)).$((10#$MINOR)).$((10#$PATCH + 1))"
     ;;
   minor)
-    NEW_VERSION="$MAJOR.$((MINOR + 1)).0"
+    NEW_VERSION="$((10#$MAJOR)).$((10#$MINOR + 1)).0"
     ;;
   major)
-    NEW_VERSION="$((MAJOR + 1)).0.0"
+    NEW_VERSION="$((10#$MAJOR + 1)).0.0"
     ;;
   *)
     if [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -61,7 +61,9 @@ case "$1" in
 esac
 
 TMP_FILE="$(mktemp "${PROJECT_YML}.tmp.XXXXXX")"
-trap 'rm -f "$TMP_FILE"' EXIT
+trap 'rm -f -- "$TMP_FILE"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 awk -v ver="$NEW_VERSION" '
   !done && /^[[:space:]]*MARKETING_VERSION:/ {
     sub(/:.*/, ": \"" ver "\"")
@@ -70,7 +72,7 @@ awk -v ver="$NEW_VERSION" '
   { print }
 ' "$PROJECT_YML" > "$TMP_FILE"
 chmod 644 "$TMP_FILE"
-mv "$TMP_FILE" "$PROJECT_YML"
-trap - EXIT
+mv -- "$TMP_FILE" "$PROJECT_YML"
+trap - EXIT INT TERM
 
 echo "==> MARKETING_VERSION: $CURRENT_VERSION -> $NEW_VERSION"
