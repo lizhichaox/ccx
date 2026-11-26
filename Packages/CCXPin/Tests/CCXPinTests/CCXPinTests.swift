@@ -2263,4 +2263,179 @@ final class PinPanelAndManagerTests: XCTestCase {
         XCTAssertEqual(panel.borderLayerForTesting.borderWidth, 0)
         XCTAssertTrue(panel.borderLayerForTesting.isHidden)
     }
+
+    func testBackingStoreInvariantsOverlayReleaseThumbnailShortcutsAndLargeTextSafety() throws {
+        let (store, _) = makeStore()
+        let manager = PinManager(clipboardStore: store)
+        defer { manager.closeAllPins() }
+
+        let img = makePinTestImage(width: 240, height: 140) { _, _ in (200, 210, 220, 255) }
+        XCTAssertTrue(manager.pin(content: .image(img, scale: 2), at: CGRect(x: 120, y: 120, width: 120, height: 70)))
+        let imagePanel = try XCTUnwrap(manager.panels.first)
+
+        // 1. Image pins use layer-only PinContentView (`wantsUpdateLayer == true`) to avoid empty full-window IOSurfaces;
+        //    text & color cards keep direct drawing (`wantsUpdateLayer == false`).
+        XCTAssertEqual(imagePanel.contentView?.wantsUpdateLayer, true)
+        XCTAssertTrue(manager.pin(content: .text("Card"), at: CGRect(x: 260, y: 120, width: 100, height: 48)))
+        let textPanel = try XCTUnwrap(manager.panels.last)
+        XCTAssertEqual(textPanel.contentView?.wantsUpdateLayer, false)
+        XCTAssertTrue(manager.pin(content: .color(CCXColorSample(red: 10, green: 20, blue: 30)), at: CGRect(x: 380, y: 120, width: 236, height: 88)))
+        let colorPanel = try XCTUnwrap(manager.panels.last)
+        XCTAssertEqual(colorPanel.contentView?.wantsUpdateLayer, false)
+
+        // 2. Annotation overlay starts collapsed (.zero) and releases its frame & layer contents on toolbar close.
+        let overlay = imagePanel.annotationOverlayViewForTesting
+        XCTAssertTrue(overlay.isHidden)
+        XCTAssertEqual(overlay.frame, .zero)
+
+        imagePanel.showAnnotationToolbar()
+        XCTAssertFalse(overlay.isHidden)
+        XCTAssertEqual(overlay.frame, imagePanel.contentView?.bounds)
+
+        imagePanel.closeToolbar(commit: false)
+        XCTAssertTrue(overlay.isHidden)
+        XCTAssertEqual(overlay.frame, .zero)
+        XCTAssertNil(overlay.layer?.contents)
+
+        // 3. Hover toolbar button has an explicit shadowPath and skips its own hover tracking area while hidden.
+        let hoverButton = try XCTUnwrap(imagePanel.hoverToolbarButtonForTesting)
+        XCTAssertNotNil(hoverButton.layer?.shadowPath)
+        XCTAssertTrue(hoverButton.isHidden)
+        XCTAssertTrue(hoverButton.trackingAreas.filter { ($0.owner as AnyObject?) === hoverButton }.isEmpty)
+
+        // 4. Disabling shadow skips subsequent WindowServer shadow invalidations.
+        imagePanel.setShowsShadow(false)
+        let shadowCountOff = imagePanel.shadowInvalidationCountForTesting
+        imagePanel.rotateClockwise()
+        imagePanel.toggleFlipHorizontal()
+        imagePanel.setZoom(1.5)
+        XCTAssertEqual(imagePanel.shadowInvalidationCountForTesting, shadowCountOff)
+        imagePanel.setShowsShadow(true)
+        imagePanel.resetAllTransforms()
+
+        // 5. Thumbnail mode blocks r/Shift+r/h/v/0 keyboard shortcuts (matching disabled context menu items),
+        //    while Shift+0 resets all transforms and restores from thumbnail.
+        imagePanel.toggleThumbnail()
+        XCTAssertTrue(imagePanel.state.isThumbnail)
+        let rKey = try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: 0,
+            context: nil, characters: "r", charactersIgnoringModifiers: "r", isARepeat: false, keyCode: 15
+        ))
+        let hKey = try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: 0,
+            context: nil, characters: "h", charactersIgnoringModifiers: "h", isARepeat: false, keyCode: 4
+        ))
+        let vKey = try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: 0,
+            context: nil, characters: "v", charactersIgnoringModifiers: "v", isARepeat: false, keyCode: 9
+        ))
+        let zeroKey = try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: 0,
+            context: nil, characters: "0", charactersIgnoringModifiers: "0", isARepeat: false, keyCode: 29
+        ))
+        let shiftZero = try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: [.shift], timestamp: 0, windowNumber: 0,
+            context: nil, characters: ")", charactersIgnoringModifiers: ")", isARepeat: false, keyCode: 29
+        ))
+        imagePanel.keyDown(with: rKey)
+        imagePanel.keyDown(with: hKey)
+        imagePanel.keyDown(with: vKey)
+        imagePanel.keyDown(with: zeroKey)
+        XCTAssertEqual(imagePanel.state.rotationDegrees, 0)
+        XCTAssertFalse(imagePanel.state.isFlippedHorizontally)
+        XCTAssertFalse(imagePanel.state.isFlippedVertically)
+        XCTAssertTrue(imagePanel.state.isThumbnail)
+
+        imagePanel.keyDown(with: shiftZero)
+        XCTAssertFalse(imagePanel.state.isThumbnail)
+
+        // 6. Single-patch corner analysis matches all 4 corner orientations accurately.
+        for degrees in [0, 90, 180, 270] {
+            let asym = try makeRoundedPinTestImage(width: 200, height: 140, cornerRadiusPixels: 32, topOnly: true)
+            let rotated = try XCTUnwrap(PinLayout.rotatedImage(asym, clockwiseDegrees: degrees))
+            let analysis = PinLayout.analyzeCorners(of: rotated)
+            XCTAssertTrue(analysis.hasTransparentCorners)
+            let radius = try XCTUnwrap(analysis.estimatedCornerRadiusPixels)
+            XCTAssertEqual(radius, 32, accuracy: 6)
+        }
+
+        // 7. Multi-MB text pin & inline annotation text editor enforce O(1) bounds cleanly.
+        let hugeClipboardText = "   " + String(repeating: "B", count: 200_000) + "   "
+        XCTAssertTrue(manager.pin(content: .text(hugeClipboardText), at: nil))
+        let hugeTextPanel = try XCTUnwrap(manager.panels.last)
+        let a11yLabel = try XCTUnwrap(hugeTextPanel.contentView?.accessibilityLabel())
+        XCTAssertLessThanOrEqual(a11yLabel.count, 80)
+
+        imagePanel.showAnnotationToolbar(initialTool: .text)
+        let textClick = try XCTUnwrap(NSEvent.mouseEvent(
+            with: .leftMouseDown, location: CGPoint(x: 20, y: 35), modifierFlags: [], timestamp: 0,
+            windowNumber: 0, context: nil, eventNumber: 1, clickCount: 1, pressure: 1
+        ))
+        imagePanel.contentView?.mouseDown(with: textClick)
+        let editor = try XCTUnwrap(imagePanel.inlineEditorForTesting)
+        editor.stringValue = String(repeating: "Z", count: AnnotationItem.maxTextLength + 500)
+        imagePanel.closeToolbar(commit: true)
+        if case let .text(_, savedContent)? = imagePanel.annotationDocumentForTesting?.items.first?.kind {
+            XCTAssertEqual(savedContent.count, AnnotationItem.maxTextLength)
+        } else {
+            XCTFail("Expected committed bounded text annotation")
+        }
+
+        // 8. First drag tick on move/resize unions previous and new bounding boxes (no ghost artifacts),
+        //    and sub-threshold pen jitter skips redundant redraws.
+        let largeImg = makePinTestImage(width: 400, height: 300) { _, _ in (220, 220, 220, 255) }
+        let panel = PinPanel(content: .image(largeImg, scale: 1), frame: CGRect(x: 100, y: 100, width: 400, height: 300))
+        defer { panel.close() }
+        let contentView = try XCTUnwrap(panel.contentView)
+        let controller = PinAnnotationController(baseImage: largeImg, initialStyle: AnnotationStyle())
+        var redrawRects: [CGRect?] = []
+        controller.onNeedRedraw = { redrawRects.append($0) }
+        controller.openToolbar(on: panel, in: contentView, initialStyle: AnnotationStyle(), initialTool: .select)
+        defer { controller.teardownForClose(on: panel) }
+
+        let initialRect = CGRect(x: 20, y: 20, width: 160, height: 120)
+        controller.document.commit(AnnotationItem(kind: .rectangle(initialRect), style: AnnotationStyle()))
+
+        // Move > 64pt on the very first drag tick: dirty rect must cover both initialRect and moved rect.
+        redrawRects.removeAll()
+        _ = controller.handleMouseDown(at: CGPoint(x: 20, y: 80), clickCount: 1, in: contentView, panel: panel)
+        controller.handleMouseDragged(at: CGPoint(x: 200, y: 180), constrain: false, in: contentView, panel: panel)
+        let moveDirty = try XCTUnwrap(redrawRects.last ?? nil)
+        XCTAssertTrue(moveDirty.contains(initialRect))
+        let movedBox = try XCTUnwrap(controller.document.selectedItem?.boundingBox)
+        XCTAssertTrue(moveDirty.contains(movedBox))
+        controller.handleMouseUp(at: CGPoint(x: 200, y: 180), in: contentView, panel: panel)
+
+        // Resize inward > 64pt on the very first drag tick: dirty rect must cover both old and resized boxes.
+        let preResizeBox = try XCTUnwrap(controller.document.selectedItem?.boundingBox)
+        redrawRects.removeAll()
+        _ = controller.handleMouseDown(
+            at: CGPoint(x: preResizeBox.maxX, y: preResizeBox.maxY),
+            clickCount: 1,
+            in: contentView,
+            panel: panel
+        )
+        controller.handleMouseDragged(
+            at: CGPoint(x: preResizeBox.minX + 10, y: preResizeBox.minY + 10),
+            constrain: false,
+            in: contentView,
+            panel: panel
+        )
+        let resizeDirty = try XCTUnwrap(redrawRects.last ?? nil)
+        XCTAssertTrue(resizeDirty.contains(preResizeBox))
+        let postResizeBox = try XCTUnwrap(controller.document.selectedItem?.boundingBox)
+        XCTAssertTrue(resizeDirty.contains(postResizeBox))
+        controller.handleMouseUp(at: CGPoint(x: preResizeBox.minX + 10, y: preResizeBox.minY + 10), in: contentView, panel: panel)
+
+        // Pen tool: sub-threshold drag (< 2.5pt) must not trigger a redraw; valid drag appends in-place cleanly.
+        controller.toolbarViewForTesting?.onToolSelected?(.pen)
+        redrawRects.removeAll()
+        _ = controller.handleMouseDown(at: CGPoint(x: 50, y: 50), clickCount: 1, in: contentView, panel: panel)
+        let countAfterDown = redrawRects.count
+        controller.handleMouseDragged(at: CGPoint(x: 51, y: 51), constrain: false, in: contentView, panel: panel)
+        XCTAssertEqual(redrawRects.count, countAfterDown)
+        controller.handleMouseDragged(at: CGPoint(x: 60, y: 50), constrain: false, in: contentView, panel: panel)
+        XCTAssertEqual(redrawRects.count, countAfterDown + 1)
+        controller.handleMouseUp(at: CGPoint(x: 60, y: 50), in: contentView, panel: panel)
+    }
 }

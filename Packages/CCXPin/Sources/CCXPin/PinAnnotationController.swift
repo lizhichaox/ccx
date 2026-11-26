@@ -59,7 +59,7 @@ final class PinAnnotationController: NSObject, NSTextFieldDelegate {
     var currentStyle: AnnotationStyle
 
     var onStyleUpdated: ((AnnotationStyle) -> Void)?
-    var onNeedRedraw: (() -> Void)?
+    var onNeedRedraw: ((CGRect?) -> Void)?
     var onShowHUD: ((String) -> Void)?
     var onToolbarAction: ((AnnotationToolbarAction) -> Void)?
 
@@ -80,6 +80,8 @@ final class PinAnnotationController: NSObject, NSTextFieldDelegate {
     private var editingTextOrigin: CGPoint?
     private var editingOriginalItem: AnnotationItem?
     private var preEditStyle: AnnotationStyle?
+    private var lastSyncedInlineFontSize: CGFloat?
+    private var lastSyncedInlineColor: AnnotationColor?
     private var isEndingInlineEdit = false
 
     private var scrollUndoActive = false
@@ -108,6 +110,7 @@ final class PinAnnotationController: NSObject, NSTextFieldDelegate {
 
     func replaceBaseImage(_ newBaseImage: CGImage) {
         baseImage = newBaseImage
+        mosaicCache?.clear()
         mosaicCache = nil
         document.clear()
         activeDrag = .none
@@ -206,8 +209,12 @@ final class PinAnnotationController: NSObject, NSTextFieldDelegate {
         NSCursor.arrow.set()
 
         let result: CGImage? = (commit && didMutate) ? bakedImage(baseSize: panel.baseSize) : nil
+        if document.items.isEmpty && !document.canRedo {
+            document.clear()
+        }
+        mosaicCache?.clear()
         mosaicCache = nil
-        onNeedRedraw?()
+        onNeedRedraw?(nil)
         return result
     }
 
@@ -227,6 +234,7 @@ final class PinAnnotationController: NSObject, NSTextFieldDelegate {
         resetScrollUndoCoalescing()
         resetSliderUndoCoalescing()
         detachAndCloseToolbarPanel(from: panel)
+        mosaicCache?.clear()
         mosaicCache = nil
         hostPanel = nil
         hostContentView = nil
@@ -239,18 +247,21 @@ final class PinAnnotationController: NSObject, NSTextFieldDelegate {
 
     private func detachAndCloseToolbarPanel(from panel: PinPanel) {
         if let toolbar = toolbarView {
+            toolbar.cancelDragging()
             toolbar.onAction = nil
             toolbar.onToolSelected = nil
             toolbar.onStyleChanged = nil
             toolbar.onSizeChanged = nil
             toolbar.onSizeEditingStateChanged = nil
             toolbar.onDragMoved = nil
+            toolbar.onDragStateChanged = nil
             toolbar.onResetPosition = nil
         }
         if let floating = toolbarPanel {
             if panel.childWindows?.contains(floating) == true {
                 panel.removeChildWindow(floating)
             }
+            floating.contentView = nil
             floating.close()
         }
         toolbarPanel = nil
@@ -279,7 +290,7 @@ final class PinAnnotationController: NSObject, NSTextFieldDelegate {
         activeDrag = .none
         if document.draft != nil {
             document.draft = nil
-            onNeedRedraw?()
+            onNeedRedraw?(nil)
         }
     }
 
@@ -430,7 +441,7 @@ final class PinAnnotationController: NSObject, NSTextFieldDelegate {
         if inlineEditor != nil {
             commitInlineTextEditor(in: contentView, baseSize: baseSize, on: panel)
             activeDrag = .none
-            onNeedRedraw?()
+            onNeedRedraw?(nil)
             repositionToolbar(for: panel)
             return .handled
         }
@@ -439,7 +450,7 @@ final class PinAnnotationController: NSObject, NSTextFieldDelegate {
         if let selected = document.selectedItem,
            let handle = selected.hitTestHandle(at: canvasPoint, radius: handleRadius) {
             activeDrag = .resizingAnnotation(initial: selected, handle: handle, didPushUndo: false)
-            onNeedRedraw?()
+            onNeedRedraw?(nil)
             updateCursor(at: viewPoint, in: contentView.bounds, baseSize: baseSize)
             return .handled
         }
@@ -463,7 +474,7 @@ final class PinAnnotationController: NSObject, NSTextFieldDelegate {
                 return .handled
             }
             activeDrag = .movingAnnotation(initial: hit, startPoint: canvasPoint, didPushUndo: false)
-            onNeedRedraw?()
+            onNeedRedraw?(nil)
             repositionToolbar(for: panel)
             updateCursor(at: viewPoint, in: contentView.bounds, baseSize: baseSize)
             return .handled
@@ -475,7 +486,7 @@ final class PinAnnotationController: NSObject, NSTextFieldDelegate {
             if clickCount >= 2 {
                 return .doubleClickedEmptyToCommit
             }
-            onNeedRedraw?()
+            onNeedRedraw?(nil)
             repositionToolbar(for: panel)
             return .passThroughDragPin
         }
@@ -524,7 +535,7 @@ final class PinAnnotationController: NSObject, NSTextFieldDelegate {
             activeDrag = .drawing(.highlighter, origin: canvasPoint)
         }
 
-        onNeedRedraw?()
+        onNeedRedraw?(nil)
         repositionToolbar(for: panel)
         updateCursor(at: viewPoint, in: contentView.bounds, baseSize: baseSize)
         return .handled
@@ -541,11 +552,15 @@ final class PinAnnotationController: NSObject, NSTextFieldDelegate {
         let canvasPoint = toCanvas(viewPoint, in: contentView.bounds, baseSize: baseSize)
         lastMouseCanvasPoint = canvasPoint
 
+        let dirtyRect: CGRect?
         switch activeDrag {
         case .none:
             return
         case let .drawing(tool, origin):
-            updateDraft(tool: tool, origin: origin, current: canvasPoint, constrain: constrain)
+            guard updateDraft(tool: tool, origin: origin, current: canvasPoint, constrain: constrain, within: canvasBounds) else {
+                return
+            }
+            dirtyRect = document.draft?.boundingBox
         case let .movingAnnotation(initial, startPoint, didPushUndo):
             let rawDelta = CGSize(width: canvasPoint.x - startPoint.x, height: canvasPoint.y - startPoint.y)
             let delta = Self.clampedTranslation(for: initial.boundingBox, desired: rawDelta, within: canvasBounds)
@@ -554,24 +569,35 @@ final class PinAnnotationController: NSObject, NSTextFieldDelegate {
                 activeDrag = .movingAnnotation(initial: initial, startPoint: startPoint, didPushUndo: true)
             }
             if case let .movingAnnotation(_, _, pushed) = activeDrag, pushed {
-                document.replaceItem(initial.translated(by: delta), recordUndo: false)
+                let oldBox = document.selectedItem?.boundingBox ?? initial.boundingBox
+                let moved = initial.translated(by: delta)
+                document.replaceItem(moved, recordUndo: false)
+                dirtyRect = oldBox.union(moved.boundingBox)
+            } else {
+                return
             }
         case let .resizingAnnotation(initial, handle, didPushUndo):
             if !didPushUndo {
                 document.beginMutationSnapshot()
                 activeDrag = .resizingAnnotation(initial: initial, handle: handle, didPushUndo: true)
             }
+            let oldBox = document.selectedItem?.boundingBox ?? initial.boundingBox
             let updated = initial.resized(handle: handle, to: canvasPoint, constrain: constrain, within: canvasBounds)
             document.replaceItem(updated, recordUndo: false)
+            dirtyRect = oldBox.union(updated.boundingBox)
         }
 
-        onNeedRedraw?()
-        updateCursor(at: viewPoint, in: contentView.bounds, baseSize: baseSize)
+        onNeedRedraw?(dirtyRect)
     }
 
     func handleMouseUp(at viewPoint: CGPoint, in contentView: NSView, panel: PinPanel) {
         let canvasPoint = toCanvas(viewPoint, in: contentView.bounds, baseSize: panel.baseSize)
         lastMouseCanvasPoint = canvasPoint
+
+        if case .none = activeDrag {
+            updateCursor(at: viewPoint, in: contentView.bounds, baseSize: panel.baseSize)
+            return
+        }
 
         if case let .drawing(tool, _) = activeDrag {
             if let draft = document.draft, Self.isMeaningfulDraft(draft, tool: tool) {
@@ -582,7 +608,7 @@ final class PinAnnotationController: NSObject, NSTextFieldDelegate {
         }
 
         activeDrag = .none
-        onNeedRedraw?()
+        onNeedRedraw?(nil)
         repositionToolbar(for: panel)
         updateCursor(at: viewPoint, in: contentView.bounds, baseSize: panel.baseSize)
     }
@@ -603,7 +629,7 @@ final class PinAnnotationController: NSObject, NSTextFieldDelegate {
     func handleRightMouseDown(on panel: PinPanel) -> Bool {
         if isEditingText {
             cancelInlineTextEditor(in: hostContentView)
-            onNeedRedraw?()
+            onNeedRedraw?(nil)
             repositionToolbar(for: panel)
             return true
         }
@@ -673,7 +699,7 @@ final class PinAnnotationController: NSObject, NSTextFieldDelegate {
         document.commit(copy)
         resetScrollUndoCoalescing()
         resetSliderUndoCoalescing()
-        onNeedRedraw?()
+        onNeedRedraw?(nil)
         repositionToolbar(for: panel)
         return true
     }
@@ -687,7 +713,7 @@ final class PinAnnotationController: NSObject, NSTextFieldDelegate {
         if isEditingText {
             if event.keyCode == 53 {
                 cancelInlineTextEditor(in: hostContentView)
-                onNeedRedraw?()
+                onNeedRedraw?(nil)
                 repositionToolbar(for: panel)
                 return true
             }
@@ -706,7 +732,7 @@ final class PinAnnotationController: NSObject, NSTextFieldDelegate {
             if document.deleteSelected() {
                 resetScrollUndoCoalescing()
                 resetSliderUndoCoalescing()
-                onNeedRedraw?()
+                onNeedRedraw?(nil)
                 repositionToolbar(for: panel)
                 return true
             }
@@ -725,7 +751,7 @@ final class PinAnnotationController: NSObject, NSTextFieldDelegate {
             let clamped = Self.clampedTranslation(for: selected.boundingBox, desired: desired, within: canvasBounds)
             if clamped.width != 0 || clamped.height != 0 {
                 document.replaceItem(selected.translated(by: clamped), recordUndo: true)
-                onNeedRedraw?()
+                onNeedRedraw?(nil)
             }
             return true
         }
@@ -773,7 +799,7 @@ final class PinAnnotationController: NSObject, NSTextFieldDelegate {
         guard document.undo() else { return }
         resetScrollUndoCoalescing()
         resetSliderUndoCoalescing()
-        onNeedRedraw?()
+        onNeedRedraw?(nil)
         if let resolved = panel ?? hostPanel {
             repositionToolbar(for: resolved)
         }
@@ -786,7 +812,7 @@ final class PinAnnotationController: NSObject, NSTextFieldDelegate {
         guard document.redo() else { return }
         resetScrollUndoCoalescing()
         resetSliderUndoCoalescing()
-        onNeedRedraw?()
+        onNeedRedraw?(nil)
         if let resolved = panel ?? hostPanel {
             repositionToolbar(for: resolved)
         }
@@ -796,6 +822,14 @@ final class PinAnnotationController: NSObject, NSTextFieldDelegate {
 
     func controlTextDidChange(_ obj: Notification) {
         guard let field = inlineEditor, let hostContentView, let hostPanel else { return }
+        let bounded = AnnotationItem.boundedText(field.stringValue)
+        if bounded.utf8.count != field.stringValue.utf8.count {
+            field.stringValue = bounded
+            if let editor = field.currentEditor() as? NSTextView {
+                editor.string = bounded
+                editor.setSelectedRange(NSRange(location: (bounded as NSString).length, length: 0))
+            }
+        }
         syncInlineEditorAppearance(field, in: hostContentView, baseSize: hostPanel.baseSize)
     }
 
@@ -823,7 +857,7 @@ final class PinAnnotationController: NSObject, NSTextFieldDelegate {
         }
         if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
             cancelInlineTextEditor(in: hostContentView)
-            onNeedRedraw?()
+            onNeedRedraw?(nil)
             if let hostPanel { repositionToolbar(for: hostPanel) }
             return true
         }
@@ -869,6 +903,8 @@ final class PinAnnotationController: NSObject, NSTextFieldDelegate {
 
         editingTextOrigin = origin
         editingOriginalItem = existing
+        lastSyncedInlineFontSize = nil
+        lastSyncedInlineColor = nil
         inlineEditor = field
         contentView.addSubview(field)
         syncInlineEditorAppearance(field, in: contentView, baseSize: canvasBounds.size)
@@ -876,7 +912,7 @@ final class PinAnnotationController: NSObject, NSTextFieldDelegate {
         panel.makeKey()
         panel.makeFirstResponder(field)
         syncInlineEditorAppearance(field, in: contentView, baseSize: canvasBounds.size)
-        onNeedRedraw?()
+        onNeedRedraw?(nil)
         repositionToolbar(for: panel)
     }
 
@@ -884,16 +920,14 @@ final class PinAnnotationController: NSObject, NSTextFieldDelegate {
         guard let origin = editingTextOrigin,
               baseSize.width.isFinite, baseSize.height.isFinite,
               baseSize.width > 0, baseSize.height > 0,
-              contentView.bounds.width.isFinite, contentView.bounds.height.isFinite
+              contentView.bounds.width.isFinite, contentView.bounds.height.isFinite,
+              contentView.bounds.width > 0, contentView.bounds.height > 0
         else { return }
         let zoomX = contentView.bounds.width / baseSize.width
         let zoomY = contentView.bounds.height / baseSize.height
-        let textForMeasure = field.stringValue.hasSuffix("\n")
-            ? field.stringValue + " "
-            : field.stringValue
         let box = AnnotationItem.textBoundingBox(
             origin: origin,
-            content: textForMeasure,
+            content: field.stringValue,
             fontSize: currentStyle.size.fontSize
         )
         let availableWidth = max(24, baseSize.width - origin.x)
@@ -906,19 +940,23 @@ final class PinAnnotationController: NSObject, NSTextFieldDelegate {
 
         let viewX = min(max(origin.x * zoomX, 0), max(0, contentView.bounds.width - canvasWidth * zoomX))
         let viewY = min(max((origin.y - canvasHeight) * zoomY, 0), max(0, contentView.bounds.height - canvasHeight * zoomY))
-        let scaledFont = NSFont.systemFont(ofSize: max(6, currentStyle.size.fontSize * zoomY), weight: .bold)
+        let targetFontSize = max(6, min(256, currentStyle.size.fontSize * zoomY))
+        let styleChanged = lastSyncedInlineFontSize != targetFontSize || lastSyncedInlineColor != currentStyle.color
+        let scaledFont = NSFont.systemFont(ofSize: targetFontSize, weight: .bold)
         let textColor = currentStyle.color.nsColor
-        let luminance = 0.299 * currentStyle.color.r + 0.587 * currentStyle.color.g + 0.114 * currentStyle.color.b
-        let backdropColor = luminance < 0.2
-            ? NSColor.white.withAlphaComponent(0.76)
-            : NSColor.black.withAlphaComponent(0.38)
 
-        field.font = scaledFont
-        field.textColor = textColor
-        field.backgroundColor = backdropColor
+        if styleChanged {
+            let luminance = 0.299 * currentStyle.color.r + 0.587 * currentStyle.color.g + 0.114 * currentStyle.color.b
+            let backdropColor = luminance < 0.2
+                ? NSColor.white.withAlphaComponent(0.76)
+                : NSColor.black.withAlphaComponent(0.38)
+            field.font = scaledFont
+            field.textColor = textColor
+            field.backgroundColor = backdropColor
+        }
         field.frame = CGRect(x: viewX, y: viewY, width: canvasWidth * zoomX, height: canvasHeight * zoomY)
 
-        if let editor = field.currentEditor() as? NSTextView {
+        if styleChanged, let editor = field.currentEditor() as? NSTextView {
             editor.font = scaledFont
             editor.textColor = textColor
             editor.insertionPointColor = textColor
@@ -932,6 +970,8 @@ final class PinAnnotationController: NSObject, NSTextFieldDelegate {
                     range: NSRange(location: 0, length: storage.length)
                 )
             }
+            lastSyncedInlineFontSize = targetFontSize
+            lastSyncedInlineColor = currentStyle.color
         }
     }
 
@@ -940,7 +980,8 @@ final class PinAnnotationController: NSObject, NSTextFieldDelegate {
         isEndingInlineEdit = true
         defer { isEndingInlineEdit = false }
 
-        let trimmed = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let boundedValue = AnnotationItem.boundedText(field.stringValue)
+        let hasVisibleText = boundedValue.contains { !$0.isWhitespace && !$0.isNewline }
         let origin = editingTextOrigin
         let existing = editingOriginalItem
 
@@ -950,27 +991,29 @@ final class PinAnnotationController: NSObject, NSTextFieldDelegate {
         editingTextOrigin = nil
         editingOriginalItem = nil
         preEditStyle = nil
+        lastSyncedInlineFontSize = nil
+        lastSyncedInlineColor = nil
 
         if let existing {
-            if trimmed.isEmpty {
+            if !hasVisibleText {
                 document.selectedID = existing.id
                 document.deleteSelected()
             } else if let origin {
                 var updated = existing
-                updated.kind = .text(origin: origin, content: field.stringValue)
+                updated.kind = .text(origin: origin, content: boundedValue)
                 updated.style = currentStyle
                 if updated != existing {
                     document.replaceItem(updated, recordUndo: true)
                 }
                 document.selectedID = updated.id
             }
-        } else if !trimmed.isEmpty, let origin {
-            let item = AnnotationItem(kind: .text(origin: origin, content: field.stringValue), style: currentStyle)
+        } else if hasVisibleText, let origin {
+            let item = AnnotationItem(kind: .text(origin: origin, content: boundedValue), style: currentStyle)
             document.commit(item)
         }
 
         panel?.makeFirstResponder(contentView)
-        onNeedRedraw?()
+        onNeedRedraw?(nil)
     }
 
     private func cancelInlineTextEditor(in contentView: NSView?) {
@@ -983,6 +1026,8 @@ final class PinAnnotationController: NSObject, NSTextFieldDelegate {
         inlineEditor = nil
         editingTextOrigin = nil
         editingOriginalItem = nil
+        lastSyncedInlineFontSize = nil
+        lastSyncedInlineColor = nil
         if let restored = preEditStyle {
             currentStyle = restored
             onStyleUpdated?(restored)
@@ -1055,7 +1100,7 @@ final class PinAnnotationController: NSObject, NSTextFieldDelegate {
         }
         resetScrollUndoCoalescing()
         resetSliderUndoCoalescing()
-        onNeedRedraw?()
+        onNeedRedraw?(nil)
         if let panel {
             repositionToolbar(for: panel)
             if let hostContentView, let last = lastMouseCanvasPoint {
@@ -1074,7 +1119,7 @@ final class PinAnnotationController: NSObject, NSTextFieldDelegate {
         } else {
             document.updateSelectedStyle { $0 = style }
         }
-        onNeedRedraw?()
+        onNeedRedraw?(nil)
         if let panel {
             repositionToolbar(for: panel)
         }
@@ -1132,7 +1177,7 @@ final class PinAnnotationController: NSObject, NSTextFieldDelegate {
             onShowHUD?(effectiveTool.formattedSizeHUDLabel(for: size, mosaicMode: effectiveStyle.mosaicMode))
         }
 
-        onNeedRedraw?()
+        onNeedRedraw?(nil)
         if let panel {
             syncToolbar(on: panel)
         }
@@ -1174,32 +1219,65 @@ final class PinAnnotationController: NSObject, NSTextFieldDelegate {
         }
     }
 
-    private func updateDraft(tool: AnnotationTool, origin: CGPoint, current: CGPoint, constrain: Bool) {
-        guard var draft = document.draft else { return }
+    private func updateDraft(
+        tool: AnnotationTool,
+        origin: CGPoint,
+        current: CGPoint,
+        constrain: Bool,
+        within canvasBounds: CGRect
+    ) -> Bool {
+        guard var draft = document.draft else { return false }
+        // Handle freehand polylines before retaining any copy of `draft.kind` so releasing
+        // `document.draft` and swapping in `[]` preserves unique CoW array ownership (O(1) append).
+        switch tool {
+        case .pen:
+            if case var .pen(points) = draft.kind {
+                document.draft = nil
+                draft.kind = .pen([])
+                let appended = AnnotationItem.appendPointInPlace(current, to: &points)
+                draft.kind = .pen(points)
+                document.draft = draft
+                return appended
+            }
+            return false
+        case .highlighter:
+            if case var .highlighter(points) = draft.kind {
+                document.draft = nil
+                draft.kind = .highlighter([])
+                let appended = AnnotationItem.appendPointInPlace(current, to: &points)
+                draft.kind = .highlighter(points)
+                document.draft = draft
+                return appended
+            }
+            return false
+        case .rectangle, .ellipse, .mosaic, .arrow:
+            break
+        case .select, .text, .counter:
+            return false
+        }
+
+        let previousKind = draft.kind
         switch tool {
         case .rectangle:
-            draft.kind = .rectangle(AnnotationItem.constrainedRect(from: origin, to: current, square: constrain))
+            draft.kind = .rectangle(AnnotationItem.constrainedRect(from: origin, to: current, square: constrain, within: canvasBounds))
         case .ellipse:
-            draft.kind = .ellipse(AnnotationItem.constrainedRect(from: origin, to: current, square: constrain))
+            draft.kind = .ellipse(AnnotationItem.constrainedRect(from: origin, to: current, square: constrain, within: canvasBounds))
         case .mosaic:
             draft.kind = .mosaic(
-                AnnotationItem.constrainedRect(from: origin, to: current, square: constrain),
+                AnnotationItem.constrainedRect(from: origin, to: current, square: constrain, within: canvasBounds),
                 currentStyle.mosaicMode
             )
         case .arrow:
-            draft.kind = .arrow(start: origin, end: AnnotationItem.constrainedEnd(from: origin, to: current, snapAngle: constrain))
-        case .pen:
-            if case let .pen(points) = draft.kind {
-                draft.kind = .pen(AnnotationItem.appendPoint(current, to: points))
-            }
-        case .highlighter:
-            if case let .highlighter(points) = draft.kind {
-                draft.kind = .highlighter(AnnotationItem.appendPoint(current, to: points))
-            }
-        case .select, .text, .counter:
-            break
+            draft.kind = .arrow(
+                start: origin,
+                end: AnnotationItem.constrainedEnd(from: origin, to: current, snapAngle: constrain, within: canvasBounds)
+            )
+        case .pen, .highlighter, .select, .text, .counter:
+            return false
         }
+        guard draft.kind != previousKind else { return false }
         document.draft = draft
+        return true
     }
 
     private static func isMeaningfulDraft(_ item: AnnotationItem, tool: AnnotationTool) -> Bool {
@@ -1316,19 +1394,19 @@ final class PinAnnotationController: NSObject, NSTextFieldDelegate {
         cursor.set()
     }
 
+    private static let cachedResizeCursors: [AnnotationHandle: NSCursor] = [
+        .topLeft: NSCursor.frameResize(position: .topLeft, directions: .all),
+        .top: NSCursor.frameResize(position: .top, directions: .all),
+        .topRight: NSCursor.frameResize(position: .topRight, directions: .all),
+        .right: NSCursor.frameResize(position: .right, directions: .all),
+        .bottomRight: NSCursor.frameResize(position: .bottomRight, directions: .all),
+        .bottom: NSCursor.frameResize(position: .bottom, directions: .all),
+        .bottomLeft: NSCursor.frameResize(position: .bottomLeft, directions: .all),
+        .left: NSCursor.frameResize(position: .left, directions: .all),
+    ]
+
     private static func cursor(for handle: AnnotationHandle) -> NSCursor {
-        let position: NSCursor.FrameResizePosition? = switch handle {
-        case .topLeft: .topLeft
-        case .top: .top
-        case .topRight: .topRight
-        case .right: .right
-        case .bottomRight: .bottomRight
-        case .bottom: .bottom
-        case .bottomLeft: .bottomLeft
-        case .left: .left
-        case .start, .end: nil
-        }
-        return position.map { NSCursor.frameResize(position: $0, directions: .all) } ?? .crosshair
+        cachedResizeCursors[handle] ?? .crosshair
     }
 
     private static func visibleFrame(for panel: PinPanel) -> CGRect {

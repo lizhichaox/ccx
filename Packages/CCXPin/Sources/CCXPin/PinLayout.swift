@@ -131,21 +131,34 @@ enum PinLayout {
         let maxX = width - 1
         let maxY = height - 1
         var mask: CornerAlphaMask = []
-        if let tl = CCXColorSample.samplePixel(from: image, pixelX: 0, pixelY: 0),
-           tl.alpha < transparentCornerAlphaThreshold {
+        let tlTransparent = CCXColorSample.samplePixel(from: image, pixelX: 0, pixelY: 0).map {
+            $0.alpha < transparentCornerAlphaThreshold
+        } ?? false
+        if tlTransparent {
             mask.insert(.topLeft)
         }
-        if let tr = CCXColorSample.samplePixel(from: image, pixelX: maxX, pixelY: 0),
-           tr.alpha < transparentCornerAlphaThreshold {
+        if maxX == 0 {
+            if tlTransparent { mask.insert(.topRight) }
+        } else if let tr = CCXColorSample.samplePixel(from: image, pixelX: maxX, pixelY: 0),
+                  tr.alpha < transparentCornerAlphaThreshold {
             mask.insert(.topRight)
         }
-        if let bl = CCXColorSample.samplePixel(from: image, pixelX: 0, pixelY: maxY),
-           bl.alpha < transparentCornerAlphaThreshold {
-            mask.insert(.bottomLeft)
-        }
-        if let br = CCXColorSample.samplePixel(from: image, pixelX: maxX, pixelY: maxY),
-           br.alpha < transparentCornerAlphaThreshold {
-            mask.insert(.bottomRight)
+        if maxY == 0 {
+            if tlTransparent { mask.insert(.bottomLeft) }
+            if mask.contains(.topRight) { mask.insert(.bottomRight) }
+        } else {
+            let blTransparent = CCXColorSample.samplePixel(from: image, pixelX: 0, pixelY: maxY).map {
+                $0.alpha < transparentCornerAlphaThreshold
+            } ?? false
+            if blTransparent {
+                mask.insert(.bottomLeft)
+            }
+            if maxX == 0 {
+                if blTransparent { mask.insert(.bottomRight) }
+            } else if let br = CCXColorSample.samplePixel(from: image, pixelX: maxX, pixelY: maxY),
+                      br.alpha < transparentCornerAlphaThreshold {
+                mask.insert(.bottomRight)
+            }
         }
         return mask
     }
@@ -159,34 +172,81 @@ enum PinLayout {
         let maxSteps = min(min(width, height) / 2, maxCornerDiagonalScanSteps)
         guard maxSteps > 0 else { return 0 }
 
-        let probe: (startX: Int, startY: Int, stepX: Int, stepY: Int)
+        // Crop and rasterize one <=64x64 corner patch (<=16 KB) instead of 64 individual 1x1 crops/draws.
+        let patchOriginX: Int
+        let patchOriginY: Int
+        let startCol: Int
+        let startRow: Int
+        let stepCol: Int
+        let stepRow: Int
         if transparentCorners.contains(.topLeft) {
-            probe = (0, 0, 1, 1)
+            patchOriginX = 0
+            patchOriginY = 0
+            startCol = 0
+            startRow = 0
+            stepCol = 1
+            stepRow = 1
         } else if transparentCorners.contains(.topRight) {
-            probe = (width - 1, 0, -1, 1)
+            patchOriginX = width - maxSteps
+            patchOriginY = 0
+            startCol = maxSteps - 1
+            startRow = 0
+            stepCol = -1
+            stepRow = 1
         } else if transparentCorners.contains(.bottomLeft) {
-            probe = (0, height - 1, 1, -1)
+            patchOriginX = 0
+            patchOriginY = height - maxSteps
+            startCol = 0
+            startRow = maxSteps - 1
+            stepCol = 1
+            stepRow = -1
         } else if transparentCorners.contains(.bottomRight) {
-            probe = (width - 1, height - 1, -1, -1)
+            patchOriginX = width - maxSteps
+            patchOriginY = height - maxSteps
+            startCol = maxSteps - 1
+            startRow = maxSteps - 1
+            stepCol = -1
+            stepRow = -1
         } else {
             return 0
         }
 
+        let patchRect = CGRect(x: patchOriginX, y: patchOriginY, width: maxSteps, height: maxSteps)
+        guard let patch = image.cropping(to: patchRect),
+              let srgb = CGColorSpace(name: CGColorSpace.sRGB),
+              let ctx = CGContext(
+                  data: nil,
+                  width: maxSteps,
+                  height: maxSteps,
+                  bitsPerComponent: 8,
+                  bytesPerRow: 0,
+                  space: srgb,
+                  bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue
+              ),
+              let rawData = ctx.data
+        else {
+            return nil
+        }
+
+        ctx.setBlendMode(.copy)
+        ctx.interpolationQuality = .none
+        ctx.draw(patch, in: CGRect(x: 0, y: 0, width: maxSteps, height: maxSteps))
+
+        let rowBytes = ctx.bytesPerRow
+        let rgba = rawData.assumingMemoryBound(to: UInt8.self)
         var previousAlpha: UInt8 = 0
         for step in 0..<maxSteps {
-            let x = probe.startX + step * probe.stepX
-            let y = probe.startY + step * probe.stepY
-            guard let sample = CCXColorSample.samplePixel(from: image, pixelX: x, pixelY: y) else {
-                break
-            }
-            if sample.alpha >= 128 {
+            let col = startCol + step * stepCol
+            let row = startRow + step * stepRow
+            let alpha = rgba[row * rowBytes + col * 4 + 3]
+            if alpha >= 128 {
                 guard step > 0 else { return 0 }
-                let span = max(1, Int(sample.alpha) - Int(previousAlpha))
+                let span = max(1, Int(alpha) - Int(previousAlpha))
                 let fraction = CGFloat(128 - Int(previousAlpha)) / CGFloat(span)
                 let diagonalCrossing = (CGFloat(step) - 0.5) + fraction
                 return max(0, diagonalCrossing / diagonalCornerRadiusFactor)
             }
-            previousAlpha = sample.alpha
+            previousAlpha = alpha
         }
         return nil
     }
@@ -200,8 +260,11 @@ enum PinLayout {
         if text.utf8.count <= maxDisplayTextLength {
             return text
         }
-        guard text.count > maxDisplayTextLength else { return text }
-        return String(text.prefix(maxDisplayTextLength)) + "…"
+        if let cutoff = text.index(text.startIndex, offsetBy: maxDisplayTextLength, limitedBy: text.endIndex),
+           cutoff < text.endIndex {
+            return String(text[..<cutoff]) + "…"
+        }
+        return text
     }
 
     /// Rejects zero-dimension images and safely downsamples oversized images to fit within pixel budgets.
@@ -249,7 +312,11 @@ enum PinLayout {
         guard !overflowed, pixels <= maxImagePixelCount else { return nil }
 
         var candidates: [CGColorSpace] = []
-        if let preferredColorSpace, preferredColorSpace.model == .rgb {
+        if let preferredColorSpace,
+           preferredColorSpace.model == .rgb,
+           preferredColorSpace.supportsOutput,
+           !CGColorSpaceUsesExtendedRange(preferredColorSpace),
+           !CGColorSpaceUsesITUR_2100TF(preferredColorSpace) {
             candidates.append(preferredColorSpace)
         }
         if let p3 = CGColorSpace(name: CGColorSpace.displayP3) {
@@ -260,6 +327,7 @@ enum PinLayout {
         }
         candidates.append(CGColorSpaceCreateDeviceRGB())
 
+        let bitmapInfo = CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue
         for space in candidates {
             if let context = CGContext(
                 data: nil,
@@ -268,7 +336,7 @@ enum PinLayout {
                 bitsPerComponent: 8,
                 bytesPerRow: 0,
                 space: space,
-                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+                bitmapInfo: bitmapInfo
             ) {
                 return context
             }
@@ -293,13 +361,19 @@ enum PinLayout {
         }
     }
 
-    static func textAttributes(color: NSColor = .textColor) -> [NSAttributedString.Key: Any] {
+    private nonisolated(unsafe) static let wordWrapParagraphStyle: NSParagraphStyle = {
         let paragraph = NSMutableParagraphStyle()
         paragraph.lineBreakMode = .byWordWrapping
-        return [
-            .font: NSFont.systemFont(ofSize: 14),
+        return (paragraph.copy() as? NSParagraphStyle) ?? paragraph
+    }()
+
+    private nonisolated(unsafe) static let textCardFont: NSFont = .systemFont(ofSize: 14)
+
+    static func textAttributes(color: NSColor = .textColor) -> [NSAttributedString.Key: Any] {
+        [
+            .font: textCardFont,
             .foregroundColor: color,
-            .paragraphStyle: paragraph,
+            .paragraphStyle: wordWrapParagraphStyle,
         ]
     }
 
@@ -431,8 +505,9 @@ enum PinLayout {
         let validScreens = screens.filter { isFiniteRect($0) && $0.width > 0 && $0.height > 0 }
         guard !validScreens.isEmpty else { return frame }
 
-        let marginX = min(max(1, minVisibleMargin), max(1, frame.width))
-        let marginY = min(max(1, minVisibleMargin), max(1, frame.height))
+        let safeMargin = minVisibleMargin.isFinite ? minVisibleMargin : Self.minVisibleMargin
+        let marginX = min(max(1, safeMargin), max(1, frame.width))
+        let marginY = min(max(1, safeMargin), max(1, frame.height))
         for screen in validScreens {
             let overlap = screen.intersection(frame)
             if !overlap.isNull, overlap.width >= marginX, overlap.height >= marginY {

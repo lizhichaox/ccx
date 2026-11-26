@@ -17,12 +17,14 @@ public final class MosaicImageCache {
     private static let maxCachedVariants = 4
     private static let maxPixelCount = 120_000_000
     private static let maxBaseRGBACacheBytes = 64 * 1024 * 1024
+    private static let maxBackingScale: CGFloat = 16
+    private static let maxBlurRadiusPixels: CGFloat = 256
     private static let rgbaBitmapInfo: UInt32 =
         CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue
 
     private static let frostedVeilColor = CIColor(red: 0.557, green: 0.600, blue: 0.659, alpha: 0.08)
 
-    private static let sharedCIContext: CIContext = {
+    private nonisolated static let sharedCIContext: CIContext = {
         // Prefer Metal GPU context; CPU fallbacks handle headless sandboxes where createCGImage returns nil.
         if let device = MTLCreateSystemDefaultDevice() {
             return CIContext(mtlDevice: device, options: [.cacheIntermediates: false])
@@ -32,13 +34,15 @@ public final class MosaicImageCache {
 
     public let baseImage: CGImage
     private let maxCachedBytes: Int
-    private lazy var ciSource = CIImage(cgImage: baseImage)
+    private var ciSourceStorage: CIImage?
     private lazy var rgbColorSpace: CGColorSpace = Self.resolvedRGBColorSpace(for: baseImage)
     private var cachedBaseRGBA: [UInt8]?
     private var cachedHasTransparency: Bool?
+    private nonisolated(unsafe) var didUseGPUContext = false
     internal private(set) var baseRasterizationCount = 0
     internal var cachedVariantCount: Int { cache.count }
     internal var cachedByteCount: Int { totalCachedBytes }
+    internal var residentByteCount: Int { totalCachedBytes + (cachedBaseRGBA?.count ?? 0) }
     private var cache: [CacheKey: CGImage] = [:]
     private var variantBytes: [CacheKey: Int] = [:]
     private var totalCachedBytes = 0
@@ -49,13 +53,33 @@ public final class MosaicImageCache {
         self.maxCachedBytes = max(1, maxCachedBytes)
     }
 
-    /// Releases all cached filtered variants and the rasterized RGBA scratch buffer.
+    deinit {
+        if didUseGPUContext {
+            Self.sharedCIContext.clearCaches()
+        }
+    }
+
+    private func ensureCISource() -> CIImage {
+        if let existing = ciSourceStorage {
+            return existing
+        }
+        let created = CIImage(cgImage: baseImage)
+        ciSourceStorage = created
+        return created
+    }
+
+    /// Releases all cached filtered variants, the rasterized RGBA scratch buffer, and pooled GPU intermediates.
     public func clear() {
         cache.removeAll()
         variantBytes.removeAll()
         accessOrder.removeAll()
         totalCachedBytes = 0
         cachedBaseRGBA = nil
+        ciSourceStorage = nil
+        if didUseGPUContext {
+            Self.sharedCIContext.clearCaches()
+            didUseGPUContext = false
+        }
     }
 
     public func filteredImage(mode: MosaicMode, size: StrokeSize, backingScale: CGFloat) -> CGImage? {
@@ -65,9 +89,11 @@ public final class MosaicImageCache {
         let (pixelCount, pixelOverflow) = width.multipliedReportingOverflow(by: height)
         guard !pixelOverflow, pixelCount <= Self.maxPixelCount else { return nil }
 
-        let scale = max(backingScale.isFinite ? backingScale : 1, 1)
-        let blockPixels = max(4, Int((size.mosaicBlockSize * scale).rounded()))
-        let blurRadius = max(1, size.blurRadius * scale)
+        let rawScale = backingScale.isFinite ? backingScale : 1
+        let scale = min(max(rawScale, 1), Self.maxBackingScale)
+        let maxBlock = max(4, max(width, height))
+        let blockPixels = min(maxBlock, max(4, Int((size.mosaicBlockSize * scale).rounded())))
+        let blurRadius = min(Self.maxBlurRadiusPixels, max(1, size.blurRadius * scale))
         let pixelStrength = mode == .pixelate ? blockPixels : max(1, Int(blurRadius.rounded()))
         let key = CacheKey(mode: mode, pixelStrength: pixelStrength)
         if let cached = cache[key] {
@@ -95,7 +121,8 @@ public final class MosaicImageCache {
     }
 
     private func evictIfNeeded() {
-        while (cache.count > Self.maxCachedVariants || (cache.count > 1 && totalCachedBytes > maxCachedBytes)),
+        let baseBytes = cachedBaseRGBA?.count ?? 0
+        while (cache.count > Self.maxCachedVariants || (cache.count > 1 && (totalCachedBytes + baseBytes) > maxCachedBytes)),
               let evicted = accessOrder.first {
             accessOrder.removeFirst()
             cache.removeValue(forKey: evicted)
@@ -198,7 +225,8 @@ public final class MosaicImageCache {
             return nil
         }
         baseRasterizationCount += 1
-        if dims.byteCount <= Self.maxBaseRGBACacheBytes && dims.byteCount <= maxCachedBytes {
+        let baseCacheLimit = min(Self.maxBaseRGBACacheBytes, maxCachedBytes / 2)
+        if dims.byteCount <= baseCacheLimit {
             cachedBaseRGBA = rendered
         }
         return rendered
@@ -238,14 +266,34 @@ public final class MosaicImageCache {
                 return true
             }
         }
-        var found = false
-        var idx = 3
-        while idx < rgbaBytes.count {
-            if rgbaBytes[idx] < 255 {
-                found = true
-                break
+        let found = rgbaBytes.withUnsafeBytes { raw -> Bool in
+            let pixelCount = raw.count / 4
+            guard pixelCount > 0 else { return false }
+            // Big-endian RGBA8 stores alpha in byte[3], which maps to `UInt32(bigEndian: 0x0000_00FF)` on any host endianness.
+            let alphaMask = UInt32(bigEndian: 0x0000_00FF)
+            let simdMask = SIMD16<UInt32>(repeating: alphaMask)
+            var acc = simdMask
+            let limit = pixelCount - (pixelCount % 16)
+            var i = 0
+            while i < limit {
+                let chunk = raw.loadUnaligned(fromByteOffset: i * 4, as: SIMD16<UInt32>.self)
+                acc &= chunk
+                i += 16
+                if (i & 1023) == 0 && acc != simdMask {
+                    return true
+                }
             }
-            idx += 4
+            if acc != simdMask {
+                return true
+            }
+            while i < pixelCount {
+                let px = raw.loadUnaligned(fromByteOffset: i * 4, as: UInt32.self)
+                if (px & alphaMask) != alphaMask {
+                    return true
+                }
+                i += 1
+            }
+            return false
         }
         cachedHasTransparency = found
         return found
@@ -365,8 +413,8 @@ public final class MosaicImageCache {
         }
 
         outContext.interpolationQuality = .none
-        let scaledWidth = CGFloat(gridWidth * blockPixels)
-        let scaledHeight = CGFloat(gridHeight * blockPixels)
+        let scaledWidth = CGFloat(gridWidth) * CGFloat(blockPixels)
+        let scaledHeight = CGFloat(gridHeight) * CGFloat(blockPixels)
         // Align row 0 of the grid with the top edge (y = height in bottom-left CG coordinates).
         let targetRect = CGRect(
             x: 0,
@@ -390,11 +438,14 @@ public final class MosaicImageCache {
     }
 
     internal func gpuBlurCIImage(radius: CGFloat) -> CIImage? {
+        guard radius.isFinite, radius > 0 else { return nil }
+        let safeRadius = min(max(radius, 0.5), Self.maxBlurRadiusPixels)
+        let ciSource = ensureCISource()
         let extent = ciSource.extent
-        let preserveAlpha = Self.mayHaveTransparency(baseImage)
+        let preserveAlpha = cachedHasTransparency ?? Self.mayHaveTransparency(baseImage)
         guard let blur = CIFilter(name: "CIGaussianBlur") else { return nil }
         blur.setValue(ciSource.clampedToExtent(), forKey: kCIInputImageKey)
-        blur.setValue(radius, forKey: kCIInputRadiusKey)
+        blur.setValue(safeRadius, forKey: kCIInputRadiusKey)
         guard let blurred = blur.outputImage?.cropped(to: extent) else { return nil }
 
         // Normalize premultiplied blur alpha before saturation and frosted veil so interior pixels
@@ -433,12 +484,15 @@ public final class MosaicImageCache {
 
     internal func gpuBlurredImage(radius: CGFloat) -> CGImage? {
         guard let masked = gpuBlurCIImage(radius: radius) else { return nil }
-        let extent = ciSource.extent
+        let extent = ensureCISource().extent
+        didUseGPUContext = true
         return Self.sharedCIContext.createCGImage(masked, from: extent, format: .RGBA8, colorSpace: rgbColorSpace)
             ?? Self.sharedCIContext.createCGImage(masked, from: extent)
     }
 
     internal func cpuBlurredImage(radius: CGFloat) -> CGImage? {
+        guard radius.isFinite, radius > 0 else { return nil }
+        let safeRadius = min(max(radius, 1), Self.maxBlurRadiusPixels)
         let width = baseImage.width
         let height = baseImage.height
         guard let dims = Self.checkedRGBA8Dimensions(width: width, height: height),
@@ -446,91 +500,102 @@ public final class MosaicImageCache {
         else {
             return nil
         }
-        let bytesPerRow = dims.bytesPerRow
+        let srcBytesPerRow = dims.bytesPerRow
         let preserveAlpha = bufferHasTransparency(srcBytes)
 
-        var dstBytes = [UInt8](repeating: 0, count: dims.byteCount)
+        // Allocate the CGContext-owned destination directly so `outContext.makeImage()` transfers
+        // ownership without copying a second full-resolution bitmap.
+        guard let outContext = makeRGBA8Context(
+            data: nil,
+            width: width,
+            height: height,
+            bytesPerRow: srcBytesPerRow
+        ), let dstBase = outContext.data else {
+            return nil
+        }
+        let dstBytesPerRow = outContext.bytesPerRow
+        guard dstBytesPerRow >= srcBytesPerRow else { return nil }
+
         let minDim = min(width, height)
         let maxOddKernel = minDim % 2 == 1 ? minDim : max(1, minDim - 1)
-        let desiredOdd = max(3, Int((radius * 1.2).rounded()) | 1)
+        let desiredOdd = max(3, Int((safeRadius * 1.2).rounded()) | 1)
         let kernel = UInt32(max(1, min(maxOddKernel, desiredOdd)))
 
         let convolveError: vImage_Error = srcBytes.withUnsafeBytes { srcRaw in
-            dstBytes.withUnsafeMutableBytes { dstRaw in
-                guard let srcBase = srcRaw.baseAddress, let dstBase = dstRaw.baseAddress else {
-                    return kvImageNullPointerArgument
-                }
-                var srcBuffer = vImage_Buffer(
-                    data: UnsafeMutableRawPointer(mutating: srcBase),
-                    height: vImagePixelCount(height),
-                    width: vImagePixelCount(width),
-                    rowBytes: bytesPerRow
-                )
-                var dstBuffer = vImage_Buffer(
-                    data: dstBase,
-                    height: vImagePixelCount(height),
-                    width: vImagePixelCount(width),
-                    rowBytes: bytesPerRow
-                )
-                var unusedBackground: [UInt8] = [0, 0, 0, 0]
-                return vImageTentConvolve_ARGB8888(
-                    &srcBuffer,
-                    &dstBuffer,
-                    nil,
-                    0,
-                    0,
-                    kernel,
-                    kernel,
-                    &unusedBackground,
-                    vImage_Flags(kvImageEdgeExtend)
-                )
+            guard let srcBase = srcRaw.baseAddress else {
+                return kvImageNullPointerArgument
             }
+            var srcBuffer = vImage_Buffer(
+                data: UnsafeMutableRawPointer(mutating: srcBase),
+                height: vImagePixelCount(height),
+                width: vImagePixelCount(width),
+                rowBytes: srcBytesPerRow
+            )
+            var dstBuffer = vImage_Buffer(
+                data: dstBase,
+                height: vImagePixelCount(height),
+                width: vImagePixelCount(width),
+                rowBytes: dstBytesPerRow
+            )
+            var unusedBackground: [UInt8] = [0, 0, 0, 0]
+            return vImageTentConvolve_ARGB8888(
+                &srcBuffer,
+                &dstBuffer,
+                nil,
+                0,
+                0,
+                kernel,
+                kernel,
+                &unusedBackground,
+                vImage_Flags(kvImageEdgeExtend)
+            )
         }
         guard convolveError == kvImageNoError else { return nil }
 
         if preserveAlpha {
-            for offset in stride(from: 0, to: dims.byteCount, by: 4) {
-                let srcA = srcBytes[offset + 3]
-                guard srcA > 0 else {
-                    dstBytes[offset] = 0
-                    dstBytes[offset + 1] = 0
-                    dstBytes[offset + 2] = 0
-                    dstBytes[offset + 3] = 0
-                    continue
-                }
-                let dstA = dstBytes[offset + 3]
-                if dstA == 0 {
-                    Self.writeOpaqueFallback(into: &dstBytes, at: offset)
-                } else if dstA < 255 {
-                    let inv = 255.0 / Float(dstA)
-                    dstBytes[offset] = UInt8(min(255, Int((Float(dstBytes[offset]) * inv).rounded())))
-                    dstBytes[offset + 1] = UInt8(min(255, Int((Float(dstBytes[offset + 1]) * inv).rounded())))
-                    dstBytes[offset + 2] = UInt8(min(255, Int((Float(dstBytes[offset + 2]) * inv).rounded())))
-                    dstBytes[offset + 3] = 255
+            let dstPtr = dstBase.assumingMemoryBound(to: UInt8.self)
+            srcBytes.withUnsafeBufferPointer { srcPtr in
+                guard let srcBase = srcPtr.baseAddress else { return }
+                for row in 0..<height {
+                    let srcRow = row * srcBytesPerRow
+                    let dstRow = row * dstBytesPerRow
+                    for col in 0..<width {
+                        let colOff = col * 4
+                        let srcA = srcBase[srcRow + colOff + 3]
+                        let dstOff = dstRow + colOff
+                        guard srcA > 0 else {
+                            dstPtr[dstOff] = 0
+                            dstPtr[dstOff + 1] = 0
+                            dstPtr[dstOff + 2] = 0
+                            dstPtr[dstOff + 3] = 0
+                            continue
+                        }
+                        let dstA = dstPtr[dstOff + 3]
+                        if dstA == 0 {
+                            dstPtr[dstOff] = 46
+                            dstPtr[dstOff + 1] = 46
+                            dstPtr[dstOff + 2] = 51
+                            dstPtr[dstOff + 3] = 255
+                        } else if dstA < 255 {
+                            let inv = 255.0 / Float(dstA)
+                            dstPtr[dstOff] = UInt8(min(255, Int((Float(dstPtr[dstOff]) * inv).rounded())))
+                            dstPtr[dstOff + 1] = UInt8(min(255, Int((Float(dstPtr[dstOff + 1]) * inv).rounded())))
+                            dstPtr[dstOff + 2] = UInt8(min(255, Int((Float(dstPtr[dstOff + 2]) * inv).rounded())))
+                            dstPtr[dstOff + 3] = 255
+                        }
+                    }
                 }
             }
         }
 
-        return dstBytes.withUnsafeMutableBytes { dstRaw in
-            guard let dstBase = dstRaw.baseAddress,
-                  let outContext = makeRGBA8Context(
-                      data: dstBase,
-                      width: width,
-                      height: height,
-                      bytesPerRow: bytesPerRow
-                  )
-            else {
-                return nil
-            }
-            let veilCG = CGColor(srgbRed: 0.557, green: 0.600, blue: 0.659, alpha: 0.08)
-            outContext.setFillColor(veilCG)
-            outContext.fill(CGRect(x: 0, y: 0, width: width, height: height))
-            if preserveAlpha {
-                outContext.setBlendMode(.destinationIn)
-                outContext.draw(baseImage, in: CGRect(x: 0, y: 0, width: width, height: height))
-            }
-            return outContext.makeImage()
+        let veilCG = CGColor(srgbRed: 0.557, green: 0.600, blue: 0.659, alpha: 0.08)
+        outContext.setFillColor(veilCG)
+        outContext.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        if preserveAlpha {
+            outContext.setBlendMode(.destinationIn)
+            outContext.draw(baseImage, in: CGRect(x: 0, y: 0, width: width, height: height))
         }
+        return outContext.makeImage()
     }
 
     private static func writeOpaqueFallback(into bytes: inout [UInt8], at offset: Int) {

@@ -439,11 +439,16 @@ public struct AnnotationItem: Identifiable, Equatable, Sendable {
         self.style = style
     }
 
+    /// Upper safety bounds preventing unbounded memory/CPU growth from extreme freehand drags or pasted text.
+    public static let maxPolylinePoints = 10_000
+    public static let maxTextLength = 4_096
+
     public var boundingBox: CGRect {
         switch kind {
         case let .rectangle(rect), let .ellipse(rect), let .mosaic(rect, _):
-            return rect.standardized
+            return Self.isFiniteRect(rect) ? rect.standardized : .zero
         case let .arrow(start, end):
+            guard start.x.isFinite, start.y.isFinite, end.x.isFinite, end.y.isFinite else { return .zero }
             return CGRect(
                 x: min(start.x, end.x),
                 y: min(start.y, end.y),
@@ -455,6 +460,7 @@ public struct AnnotationItem: Identifiable, Equatable, Sendable {
         case let .text(origin, content):
             return Self.textBoundingBox(origin: origin, content: content, fontSize: style.size.fontSize)
         case let .counter(center, _):
+            guard center.x.isFinite, center.y.isFinite else { return .zero }
             let r = style.size.counterDiameter / 2
             return CGRect(x: center.x - r, y: center.y - r, width: r * 2, height: r * 2)
         }
@@ -846,24 +852,53 @@ public struct AnnotationItem: Identifiable, Equatable, Sendable {
         return CGPoint(x: start.x + dirX * clippedLength, y: start.y + dirY * clippedLength)
     }
 
-    /// Appends `point` to a polyline only when it moved at least `minDistance` points from the tail.
+    /// Appends `point` to a polyline only when it moved at least `minDistance` points from the tail
+    /// and the polyline has not exceeded `maxPolylinePoints`.
     public static func appendPoint(_ point: CGPoint, to points: [CGPoint], minDistance: CGFloat = 2.5) -> [CGPoint] {
-        guard point.x.isFinite, point.y.isFinite else { return points }
-        let safeDist = minDistance.isFinite ? max(0, minDistance) : 2.5
-        guard let last = points.last else { return [point] }
-        guard hypot(point.x - last.x, point.y - last.y) >= safeDist else { return points }
-        return points + [point]
+        var updated = points
+        _ = appendPointInPlace(point, to: &updated, minDistance: minDistance)
+        return updated
     }
+
+    /// In-place amortized O(1) variant of `appendPoint` returning `true` when `point` was appended.
+    @discardableResult
+    public static func appendPointInPlace(_ point: CGPoint, to points: inout [CGPoint], minDistance: CGFloat = 2.5) -> Bool {
+        guard point.x.isFinite, point.y.isFinite, points.count < Self.maxPolylinePoints else { return false }
+        let safeDist = minDistance.isFinite ? max(0, minDistance) : 2.5
+        guard let last = points.last else {
+            points.append(point)
+            return true
+        }
+        guard hypot(point.x - last.x, point.y - last.y) >= safeDist else { return false }
+        points.append(point)
+        return true
+    }
+
+    /// Caps annotation text length in O(maxTextLength) time without scanning full multi-MB strings.
+    public static func boundedText(_ content: String) -> String {
+        if content.utf8.count <= maxTextLength {
+            return content
+        }
+        if let cutoff = content.index(content.startIndex, offsetBy: maxTextLength, limitedBy: content.endIndex),
+           cutoff < content.endIndex {
+            return String(content[..<cutoff])
+        }
+        return content
+    }
+
+    private nonisolated(unsafe) static let wordWrapParagraphStyle: NSParagraphStyle = {
+        let style = NSMutableParagraphStyle()
+        style.lineBreakMode = .byWordWrapping
+        return (style.copy() as? NSParagraphStyle) ?? style
+    }()
 
     /// Text attributes shared between the inline text editor and Canvas/CoreGraphics renderer.
     public static func textAttributes(color: AnnotationColor, fontSize: CGFloat) -> [NSAttributedString.Key: Any] {
-        let safeFontSize = fontSize.isFinite ? max(1, fontSize) : 14
-        let paragraph = NSMutableParagraphStyle()
-        paragraph.lineBreakMode = .byWordWrapping
+        let safeFontSize = fontSize.isFinite ? max(1, min(fontSize, 256)) : 14
         return [
             .font: NSFont.systemFont(ofSize: safeFontSize, weight: .bold),
             .foregroundColor: color.nsColor,
-            .paragraphStyle: paragraph,
+            .paragraphStyle: wordWrapParagraphStyle,
         ]
     }
 
@@ -876,10 +911,29 @@ public struct AnnotationItem: Identifiable, Equatable, Sendable {
     private struct TextMeasureCacheState: Sendable {
         var sizes: [TextMeasureKey: CGSize] = [:]
         var order: [TextMeasureKey] = []
+        var totalKeyBytes: Int = 0
     }
 
     private static let maxTextMeasureCacheEntries = 64
+    private static let maxTextMeasureCacheKeyBytes = 512
+    private static let maxTextMeasureCacheTotalBytes = 16 * 1024
     private static let textMeasureCache = OSAllocatedUnfairLock(initialState: TextMeasureCacheState())
+
+    internal static var textMeasureCacheCountForTesting: Int {
+        textMeasureCache.withLock { $0.sizes.count }
+    }
+
+    internal static var textMeasureCacheBytesForTesting: Int {
+        textMeasureCache.withLock { $0.totalKeyBytes }
+    }
+
+    internal static func clearTextMeasureCacheForTesting() {
+        textMeasureCache.withLock { state in
+            state.sizes.removeAll()
+            state.order.removeAll()
+            state.totalKeyBytes = 0
+        }
+    }
 
     /// Computes AppKit bottom-left bounds for `content` anchored at top-left `origin`.
     public static func textBoundingBox(
@@ -892,10 +946,13 @@ public struct AnnotationItem: Identifiable, Equatable, Sendable {
         let safeFontSize = fontSize.isFinite ? max(1, min(fontSize, 256)) : 14
         let safeMaxWidth = maxWidth.isFinite ? max(24, min(maxWidth, 4096)) : 640
 
-        let baseMeasured = content.isEmpty ? "Ag" : content
+        let bounded = boundedText(content)
+        let baseMeasured = bounded.isEmpty ? "Ag" : bounded
         // `NSAttributedString.boundingRect` ignores a trailing newline; append a space so Shift+Enter
         // immediately expands the box height to show the new empty line.
         let measured = baseMeasured.hasSuffix("\n") ? (baseMeasured + " ") : baseMeasured
+        let keyBytes = measured.utf8.count
+        let shouldCache = keyBytes <= maxTextMeasureCacheKeyBytes
         let key = TextMeasureKey(
             content: measured,
             fontTenths: Int((safeFontSize * 10).rounded()),
@@ -903,7 +960,14 @@ public struct AnnotationItem: Identifiable, Equatable, Sendable {
         )
 
         let size: CGSize
-        if let cached = textMeasureCache.withLock({ $0.sizes[key] }) {
+        if shouldCache, let cached = textMeasureCache.withLock({ state -> CGSize? in
+            guard let found = state.sizes[key] else { return nil }
+            if let idx = state.order.firstIndex(of: key), idx != state.order.count - 1 {
+                state.order.remove(at: idx)
+                state.order.append(key)
+            }
+            return found
+        }) {
             size = cached
         } else {
             let attributed = NSAttributedString(
@@ -917,14 +981,23 @@ public struct AnnotationItem: Identifiable, Equatable, Sendable {
             let width = max(24, ceil(measuredBounds.width) + 6)
             let height = max(ceil(safeFontSize * 1.35), ceil(measuredBounds.height) + 4)
             let computed = CGSize(width: width, height: height)
-            textMeasureCache.withLock { state in
-                if state.sizes[key] == nil {
-                    state.order.append(key)
-                }
-                state.sizes[key] = computed
-                while state.order.count > maxTextMeasureCacheEntries {
-                    let evicted = state.order.removeFirst()
-                    state.sizes.removeValue(forKey: evicted)
+            if shouldCache {
+                textMeasureCache.withLock { state in
+                    if state.sizes[key] == nil {
+                        state.order.append(key)
+                        state.totalKeyBytes += keyBytes
+                    } else if let idx = state.order.firstIndex(of: key) {
+                        state.order.remove(at: idx)
+                        state.order.append(key)
+                    }
+                    state.sizes[key] = computed
+                    while (state.order.count > maxTextMeasureCacheEntries || state.totalKeyBytes > maxTextMeasureCacheTotalBytes),
+                          !state.order.isEmpty {
+                        let evicted = state.order.removeFirst()
+                        if state.sizes.removeValue(forKey: evicted) != nil {
+                            state.totalKeyBytes = max(0, state.totalKeyBytes - evicted.content.utf8.count)
+                        }
+                    }
                 }
             }
             size = computed
@@ -964,14 +1037,19 @@ public struct AnnotationItem: Identifiable, Equatable, Sendable {
     }
 
     private static func polylineBounds(_ points: [CGPoint]) -> CGRect {
-        guard let first = points.first else { return .zero }
-        var minX = first.x, maxX = first.x, minY = first.y, maxY = first.y
-        for p in points.dropFirst() {
-            minX = min(minX, p.x)
-            maxX = max(maxX, p.x)
-            minY = min(minY, p.y)
-            maxY = max(maxY, p.y)
+        var minX: CGFloat = .infinity
+        var maxX: CGFloat = -.infinity
+        var minY: CGFloat = .infinity
+        var maxY: CGFloat = -.infinity
+        var foundFinite = false
+        for p in points where p.x.isFinite && p.y.isFinite {
+            foundFinite = true
+            if p.x < minX { minX = p.x }
+            if p.x > maxX { maxX = p.x }
+            if p.y < minY { minY = p.y }
+            if p.y > maxY { maxY = p.y }
         }
+        guard foundFinite else { return .zero }
         return CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
     }
 

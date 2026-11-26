@@ -331,7 +331,7 @@ public final class PinManager {
             guard let safeImage = PinLayout.sanitizedImage(image) else { return nil }
             return .image(safeImage, scale: PinLayout.sanitizedScale(scale))
         case let .text(string):
-            guard !string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+            guard string.contains(where: { !$0.isWhitespace && !$0.isNewline }) else { return nil }
             return .text(string)
         case .color:
             return content

@@ -15,6 +15,7 @@ public enum AnnotationRenderer {
 
         switch item.kind {
         case let .rectangle(raw):
+            guard isFiniteRect(raw) else { return }
             let rect = raw.standardized
             guard rect.width >= 1, rect.height >= 1 else { return }
             let cornerWidth = min(2, rect.width / 2)
@@ -27,6 +28,7 @@ public enum AnnotationRenderer {
             context.strokePath()
 
         case let .ellipse(raw):
+            guard isFiniteRect(raw) else { return }
             let rect = raw.standardized
             guard rect.width >= 1, rect.height >= 1 else { return }
             context.setStrokeColor(item.style.color.cgColor)
@@ -55,6 +57,7 @@ public enum AnnotationRenderer {
             )
 
         case let .mosaic(raw, mode):
+            guard isFiniteRect(raw) else { return }
             let rect = raw.standardized
             guard rect.width >= 1, rect.height >= 1 else { return }
             context.saveGState()
@@ -63,29 +66,44 @@ public enum AnnotationRenderer {
                 context.interpolationQuality = .none
             }
             if let filtered = mosaicImage?(mode, item.style.size) {
+                guard isFiniteRect(screenBounds) else {
+                    context.restoreGState()
+                    return
+                }
                 let visible = rect.intersection(screenBounds)
                 if !visible.isNull, !visible.isEmpty,
                    screenBounds.width > 0, screenBounds.height > 0 {
                     let scaleX = CGFloat(filtered.width) / screenBounds.width
                     let scaleY = CGFloat(filtered.height) / screenBounds.height
-                    let pxMinX = max(0, Int(floor((visible.minX - screenBounds.minX) * scaleX)))
-                    let pxMaxX = min(filtered.width, Int(ceil((visible.maxX - screenBounds.minX) * scaleX)))
-                    let pxMinY = max(0, Int(floor((screenBounds.maxY - visible.maxY) * scaleY)))
-                    let pxMaxY = min(filtered.height, Int(ceil((screenBounds.maxY - visible.minY) * scaleY)))
-                    let pixelRect = CGRect(
-                        x: pxMinX,
-                        y: pxMinY,
-                        width: max(0, pxMaxX - pxMinX),
-                        height: max(0, pxMaxY - pxMinY)
-                    )
-                    if !pixelRect.isEmpty, let cropped = filtered.cropping(to: pixelRect) {
-                        let drawRect = CGRect(
-                            x: screenBounds.minX + CGFloat(pxMinX) / scaleX,
-                            y: screenBounds.maxY - CGFloat(pxMaxY) / scaleY,
-                            width: CGFloat(cropped.width) / scaleX,
-                            height: CGFloat(cropped.height) / scaleY
+                    let rawMinX = floor((visible.minX - screenBounds.minX) * scaleX)
+                    let rawMaxX = ceil((visible.maxX - screenBounds.minX) * scaleX)
+                    let rawMinY = floor((screenBounds.maxY - visible.maxY) * scaleY)
+                    let rawMaxY = ceil((screenBounds.maxY - visible.minY) * scaleY)
+                    if scaleX.isFinite, scaleY.isFinite, scaleX > 0, scaleY > 0,
+                       rawMinX.isFinite, rawMaxX.isFinite, rawMinY.isFinite, rawMaxY.isFinite {
+                        let maxW = CGFloat(filtered.width)
+                        let maxH = CGFloat(filtered.height)
+                        let pxMinX = Int(min(max(rawMinX, 0), maxW))
+                        let pxMaxX = Int(min(max(rawMaxX, 0), maxW))
+                        let pxMinY = Int(min(max(rawMinY, 0), maxH))
+                        let pxMaxY = Int(min(max(rawMaxY, 0), maxH))
+                        let pixelRect = CGRect(
+                            x: pxMinX,
+                            y: pxMinY,
+                            width: max(0, pxMaxX - pxMinX),
+                            height: max(0, pxMaxY - pxMinY)
                         )
-                        context.draw(cropped, in: drawRect)
+                        if !pixelRect.isEmpty, let cropped = filtered.cropping(to: pixelRect) {
+                            let drawRect = CGRect(
+                                x: screenBounds.minX + CGFloat(pxMinX) / scaleX,
+                                y: screenBounds.maxY - CGFloat(pxMaxY) / scaleY,
+                                width: CGFloat(cropped.width) / scaleX,
+                                height: CGFloat(cropped.height) / scaleY
+                            )
+                            context.draw(cropped, in: drawRect)
+                        } else {
+                            context.draw(filtered, in: screenBounds)
+                        }
                     } else {
                         context.draw(filtered, in: screenBounds)
                     }
@@ -98,10 +116,11 @@ public enum AnnotationRenderer {
             context.restoreGState()
 
         case let .text(origin, content):
-            guard !content.isEmpty else { return }
-            let rect = AnnotationItem.textBoundingBox(origin: origin, content: content, fontSize: item.style.size.fontSize)
+            guard origin.x.isFinite, origin.y.isFinite, !content.isEmpty else { return }
+            let bounded = AnnotationItem.boundedText(content)
+            let rect = AnnotationItem.textBoundingBox(origin: origin, content: bounded, fontSize: item.style.size.fontSize)
             let attributed = NSAttributedString(
-                string: content,
+                string: bounded,
                 attributes: AnnotationItem.textAttributes(color: item.style.color, fontSize: item.style.size.fontSize)
             )
             context.saveGState()
@@ -117,6 +136,7 @@ public enum AnnotationRenderer {
             context.restoreGState()
 
         case let .counter(center, number):
+            guard center.x.isFinite, center.y.isFinite else { return }
             drawCounter(center: center, number: number, style: item.style, in: context)
         }
     }
@@ -135,32 +155,39 @@ public enum AnnotationRenderer {
             boundsToStroke = item.boundingBox.insetBy(dx: -4, dy: -4)
         }
 
+        let blueCG = NSColor.systemBlue.cgColor
         if let bounds = boundsToStroke {
-            context.setStrokeColor(NSColor.white.withAlphaComponent(0.65).cgColor)
+            context.setStrokeColor(CGColor(gray: 1, alpha: 0.65))
             context.setLineWidth(1.75)
             context.stroke(bounds)
 
-            context.setStrokeColor(NSColor.systemBlue.withAlphaComponent(0.95).cgColor)
+            context.setStrokeColor(blueCG.copy(alpha: 0.95) ?? blueCG)
             context.setLineWidth(1)
             context.setLineDash(phase: 0, lengths: [4, 3])
             context.stroke(bounds)
             context.setLineDash(phase: 0, lengths: [])
         }
 
-        for center in item.handlePoints.values {
-            let handleRect = CGRect(x: center.x - 4.5, y: center.y - 4.5, width: 9, height: 9)
-            context.saveGState()
-            context.setShadow(
-                offset: CGSize(width: 0, height: -0.5),
-                blur: 2,
-                color: CGColor(gray: 0, alpha: 0.35)
-            )
-            context.setFillColor(NSColor.white.cgColor)
-            context.fillEllipse(in: handleRect)
-            context.restoreGState()
+        let handleCenters = item.handlePoints.values
+        guard !handleCenters.isEmpty else { return }
 
-            context.setStrokeColor(NSColor.systemBlue.cgColor)
-            context.setLineWidth(1.5)
+        context.saveGState()
+        context.setShadow(
+            offset: CGSize(width: 0, height: -0.5),
+            blur: 2,
+            color: CGColor(gray: 0, alpha: 0.35)
+        )
+        context.setFillColor(CGColor(gray: 1, alpha: 1))
+        for center in handleCenters where center.x.isFinite && center.y.isFinite {
+            let handleRect = CGRect(x: center.x - 4.5, y: center.y - 4.5, width: 9, height: 9)
+            context.fillEllipse(in: handleRect)
+        }
+        context.restoreGState()
+
+        context.setStrokeColor(blueCG)
+        context.setLineWidth(1.5)
+        for center in handleCenters where center.x.isFinite && center.y.isFinite {
+            let handleRect = CGRect(x: center.x - 4.5, y: center.y - 4.5, width: 9, height: 9)
             context.strokeEllipse(in: handleRect)
         }
     }
@@ -231,6 +258,7 @@ public enum AnnotationRenderer {
 
         let sx = (screenSize.width.isFinite && screenSize.width > 0) ? CGFloat(baseImage.width) / screenSize.width : 1
         let sy = (screenSize.height.isFinite && screenSize.height > 0) ? CGFloat(baseImage.height) / screenSize.height : 1
+        guard sx.isFinite, sy.isFinite, sx >= 0.01, sx <= 64, sy >= 0.01, sy <= 64 else { return nil }
         let scale = max(sx, sy)
         let screenBounds = CGRect(
             origin: .zero,
@@ -244,6 +272,7 @@ public enum AnnotationRenderer {
         // mosaic patches align pixel-for-pixel with `cropped` even for fractional or edge-clamped selections.
         let cropOriginX = clampedCrop.minX / sx
         let cropOriginY = (CGFloat(baseImage.height) - clampedCrop.maxY) / sy
+        guard cropOriginX.isFinite, cropOriginY.isFinite else { return nil }
 
         guard let context = makeBakeContext(width: width, height: height, baseImage: baseImage) else {
             return nil
@@ -252,17 +281,38 @@ public enum AnnotationRenderer {
         let canvas = CGRect(x: 0, y: 0, width: width, height: height)
         context.draw(cropped, in: canvas)
 
-        let cornerPath = exteriorCornerPath(in: cropped, scaleX: sx, scaleY: sy)
+        let hasNonMosaicItems = document.items.contains {
+            if case .mosaic = $0.kind { return false }
+            return true
+        }
+        let cornerMask = hasNonMosaicItems ? exteriorCornerMask(in: cropped, scaleX: sx, scaleY: sy) : nil
         let interiorPath = CGMutablePath()
-        if let cornerPath {
+        if let cornerMask {
             interiorPath.addRect(canvas)
-            interiorPath.addPath(cornerPath)
+            interiorPath.addPath(cornerMask.path)
         }
 
         func drawInSelection(_ item: AnnotationItem, filtered: CGImage? = nil) {
             context.scaleBy(x: sx, y: sy)
             context.translateBy(x: -cropOriginX, y: -cropOriginY)
             draw(item, in: context, screenBounds: screenBounds) { _, _ in filtered }
+        }
+
+        func itemIntersectsProtectedCorners(_ item: AnnotationItem, cornerBounds: [CGRect]) -> Bool {
+            let strokePad = max(
+                item.style.size.highlighterWidth,
+                item.style.size.lineWidth * 5,
+                item.style.size.counterDiameter,
+                24
+            )
+            let localBox = item.boundingBox.insetBy(dx: -strokePad, dy: -strokePad)
+            let pixelBox = CGRect(
+                x: (localBox.minX - cropOriginX) * sx,
+                y: (localBox.minY - cropOriginY) * sy,
+                width: localBox.width * sx,
+                height: localBox.height * sy
+            )
+            return cornerBounds.contains { $0.intersects(pixelBox) }
         }
 
         for item in document.items {
@@ -273,14 +323,14 @@ public enum AnnotationRenderer {
                 // pixels are blended back in. The opaque fallback uses the destination alpha once.
                 context.setBlendMode(filtered == nil ? .sourceAtop : .copy)
                 drawInSelection(item, filtered: filtered)
-            } else if let cornerPath {
+            } else if let cornerMask, itemIntersectsProtectedCorners(item, cornerBounds: cornerMask.cornerBounds) {
                 context.saveGState()
                 context.addPath(interiorPath)
                 context.clip(using: .evenOdd)
                 drawInSelection(item)
                 context.restoreGState()
 
-                context.addPath(cornerPath)
+                context.addPath(cornerMask.path)
                 context.clip()
                 context.setBlendMode(.sourceAtop)
                 drawInSelection(item)
@@ -330,7 +380,12 @@ public enum AnnotationRenderer {
         return midpoints.allSatisfy { alphaAt($0.0, $0.1) ?? 0 >= 16 }
     }
 
-    private static func exteriorCornerPath(in image: CGImage, scaleX: CGFloat, scaleY: CGFloat) -> CGPath? {
+    private struct ExteriorCornerMask {
+        let path: CGPath
+        let cornerBounds: [CGRect]
+    }
+
+    private static func exteriorCornerMask(in image: CGImage, scaleX: CGFloat, scaleY: CGFloat) -> ExteriorCornerMask? {
         guard hasTransparentExteriorCorners(image) else { return nil }
 
         // Match the capture corner span and bound work even for malformed image scale metadata.
@@ -342,8 +397,13 @@ public enum AnnotationRenderer {
         else { return nil }
 
         let path = CGMutablePath()
+        var cornerBounds: [CGRect] = []
         let rowBytes = raster.bytesPerRow
         raster.setBlendMode(.copy)
+
+        var exterior = [Bool](repeating: false, count: width * height)
+        var pending: [(row: Int, col: Int)] = []
+        pending.reserveCapacity(width + height)
 
         for y in [0, image.height - height] {
             for x in [0, image.width - width] {
@@ -353,67 +413,79 @@ public enum AnnotationRenderer {
                 let cornerY = y == 0 ? 0 : height - 1
                 let innerX = width - 1 - cornerX
                 let innerY = height - 1 - cornerY
-                func alphaAt(_ pixel: Int) -> UInt8 {
-                    rgba[(pixel / width) * rowBytes + (pixel % width) * 4 + 3]
+                @inline(__always) func alphaAt(row: Int, col: Int) -> UInt8 {
+                    rgba[row * rowBytes + col * 4 + 3]
                 }
 
-                let seed = cornerY * width + cornerX
-                guard alphaAt(seed) < exteriorAlphaThreshold else { continue }
-                var exterior = [Bool](repeating: false, count: width * height)
-                exterior[seed] = true
-                var pending = [seed]
+                guard alphaAt(row: cornerY, col: cornerX) < exteriorAlphaThreshold else { continue }
+                exterior.withUnsafeMutableBufferPointer { $0.initialize(repeating: false) }
+                exterior[cornerY * width + cornerX] = true
+                pending.removeAll(keepingCapacity: true)
+                pending.append((cornerY, cornerX))
                 var reachesInnerEdge = false
-                while let pixel = pending.popLast() {
-                    let row = pixel / width
-                    let column = pixel % width
+                while let (row, column) = pending.popLast() {
                     if row == innerY || column == innerX {
                         reachesInnerEdge = true
                         break
                     }
-                    func visit(_ neighbor: Int) {
-                        guard !exterior[neighbor], alphaAt(neighbor) < exteriorAlphaThreshold else { return }
-                        exterior[neighbor] = true
-                        pending.append(neighbor)
+                    @inline(__always) func visit(r: Int, c: Int) {
+                        let idx = r * width + c
+                        guard !exterior[idx], alphaAt(row: r, col: c) < exteriorAlphaThreshold else { return }
+                        exterior[idx] = true
+                        pending.append((r, c))
                     }
-                    if column > 0 { visit(pixel - 1) }
-                    if column + 1 < width { visit(pixel + 1) }
-                    if row > 0 { visit(pixel - width) }
-                    if row + 1 < height { visit(pixel + width) }
+                    if column > 0 { visit(r: row, c: column - 1) }
+                    if column + 1 < width { visit(r: row, c: column + 1) }
+                    if row > 0 { visit(r: row - 1, c: column) }
+                    if row + 1 < height { visit(r: row + 1, c: column) }
                 }
                 guard !reachesInnerEdge else { continue }
 
                 // Include the nearby antialiasing fringe while leaving translucent chrome
                 // farther from the exterior available for ordinary source-over drawing.
-                func isProtected(_ column: Int, _ row: Int) -> Bool {
-                    let pixel = row * width + column
-                    if exterior[pixel] { return true }
-                    guard alphaAt(pixel) < 255 else { return false }
-                    for nearbyRow in max(0, row - 2)...min(height - 1, row + 2) {
-                        for nearbyColumn in max(0, column - 2)...min(width - 1, column + 2)
-                            where exterior[nearbyRow * width + nearbyColumn] {
+                func isProtected(column: Int, row: Int) -> Bool {
+                    if exterior[row * width + column] { return true }
+                    guard alphaAt(row: row, col: column) < 255 else { return false }
+                    let rMin = max(0, row - 2), rMax = min(height - 1, row + 2)
+                    let cMin = max(0, column - 2), cMax = min(width - 1, column + 2)
+                    for nearbyRow in rMin...rMax {
+                        let base = nearbyRow * width
+                        for nearbyColumn in cMin...cMax where exterior[base + nearbyColumn] {
                             return true
                         }
                     }
                     return false
                 }
 
+                var patchBounds = CGRect.null
                 for row in 0..<height {
                     var start: Int?
                     for column in 0...width {
-                        if column < width && isProtected(column, row) {
+                        if column < width && isProtected(column: column, row: row) {
                             if start == nil { start = column }
                         } else if let first = start {
-                            path.addRect(CGRect(
+                            let rect = CGRect(
                                 x: x + first, y: image.height - y - row - 1,
                                 width: column - first, height: 1
-                            ))
+                            )
+                            path.addRect(rect)
+                            patchBounds = patchBounds.union(rect)
                             start = nil
                         }
                     }
                 }
+                if !patchBounds.isNull, !patchBounds.isEmpty {
+                    cornerBounds.append(patchBounds)
+                }
             }
         }
-        return path.isEmpty ? nil : path
+        return path.isEmpty ? nil : ExteriorCornerMask(path: path, cornerBounds: cornerBounds)
+    }
+
+    private static func isFiniteRect(_ rect: CGRect) -> Bool {
+        !rect.isNull && !rect.isInfinite &&
+            rect.origin.x.isFinite && rect.origin.y.isFinite &&
+            rect.size.width.isFinite && rect.size.height.isFinite
     }
 
     private static func makeBakeContext(
@@ -467,10 +539,12 @@ public enum AnnotationRenderer {
         lineWidth: CGFloat,
         in context: CGContext
     ) {
+        guard start.x.isFinite, start.y.isFinite, end.x.isFinite, end.y.isFinite,
+              lineWidth.isFinite, lineWidth > 0 else { return }
         let dx = end.x - start.x
         let dy = end.y - start.y
         let length = hypot(dx, dy)
-        guard length >= 2 else { return }
+        guard length.isFinite, length >= 2 else { return }
 
         let ux = dx / length
         let uy = dy / length
@@ -507,7 +581,11 @@ public enum AnnotationRenderer {
         alpha: CGFloat,
         in context: CGContext
     ) {
-        guard let first = points.first else { return }
+        guard lineWidth.isFinite, lineWidth > 0, !points.isEmpty else { return }
+        let safePoints = points.allSatisfy { $0.x.isFinite && $0.y.isFinite }
+            ? points
+            : points.filter { $0.x.isFinite && $0.y.isFinite }
+        guard let first = safePoints.first else { return }
         let resolvedColor = alpha >= 0.999 ? color : (color.copy(alpha: alpha) ?? color)
         context.setStrokeColor(resolvedColor)
         context.setFillColor(resolvedColor)
@@ -515,7 +593,7 @@ public enum AnnotationRenderer {
         context.setLineCap(.round)
         context.setLineJoin(.round)
 
-        if points.count == 1 {
+        if safePoints.count == 1 {
             let r = lineWidth / 2
             context.fillEllipse(in: CGRect(x: first.x - r, y: first.y - r, width: lineWidth, height: lineWidth))
             return
@@ -523,17 +601,17 @@ public enum AnnotationRenderer {
 
         let path = CGMutablePath()
         path.move(to: first)
-        if points.count == 2 {
-            path.addLine(to: points[1])
+        if safePoints.count == 2 {
+            path.addLine(to: safePoints[1])
         } else {
-            for i in 1..<(points.count - 1) {
+            for i in 1..<(safePoints.count - 1) {
                 let mid = CGPoint(
-                    x: (points[i].x + points[i + 1].x) / 2,
-                    y: (points[i].y + points[i + 1].y) / 2
+                    x: (safePoints[i].x + safePoints[i + 1].x) / 2,
+                    y: (safePoints[i].y + safePoints[i + 1].y) / 2
                 )
-                path.addQuadCurve(to: mid, control: points[i])
+                path.addQuadCurve(to: mid, control: safePoints[i])
             }
-            if let last = points.last {
+            if let last = safePoints.last {
                 path.addLine(to: last)
             }
         }

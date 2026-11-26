@@ -247,15 +247,19 @@ public final class AnnotationActionToolbar: NSView {
             onResetPosition?()
             return
         }
+        let initialTopLeft: CGPoint
+        if useScreenCoordinatesForDrag {
+            guard let window else { return }
+            initialTopLeft = CGPoint(x: window.frame.minX, y: window.frame.maxY)
+        } else {
+            initialTopLeft = CGPoint(x: frame.minX, y: frame.maxY)
+        }
         let point = dragCoordinatePoint(for: event)
+        guard point.x.isFinite, point.y.isFinite, initialTopLeft.x.isFinite, initialTopLeft.y.isFinite else { return }
         isDragging = true
         dragDidMove = false
         dragStartPoint = point
-        if useScreenCoordinatesForDrag {
-            dragInitialTopLeft = window.map { CGPoint(x: $0.frame.minX, y: $0.frame.maxY) } ?? .zero
-        } else {
-            dragInitialTopLeft = CGPoint(x: frame.minX, y: frame.maxY)
-        }
+        dragInitialTopLeft = initialTopLeft
         dragHandle.isDragging = true
         onDragStateChanged?(true, point)
     }
@@ -263,8 +267,10 @@ public final class AnnotationActionToolbar: NSView {
     private func continueDrag(with event: NSEvent) {
         guard isDragging else { return }
         let point = dragCoordinatePoint(for: event)
+        guard point.x.isFinite, point.y.isFinite else { return }
         let dx = point.x - dragStartPoint.x
         let dy = point.y - dragStartPoint.y
+        guard dx.isFinite, dy.isFinite else { return }
         if !dragDidMove {
             guard hypot(dx, dy) >= 1 else { return }
             dragDidMove = true
@@ -508,6 +514,12 @@ public final class AnnotationActionToolbar: NSView {
         frame(for: selection, in: bounds, topInset: topInset, showsStyleBar: false, preset: .snip)
     }
 
+    private static func isFiniteRect(_ rect: CGRect) -> Bool {
+        !rect.isNull && !rect.isInfinite
+            && rect.origin.x.isFinite && rect.origin.y.isFinite
+            && rect.size.width.isFinite && rect.size.height.isFinite
+    }
+
     public static func frame(
         for selection: CGRect,
         in bounds: CGRect,
@@ -516,22 +528,25 @@ public final class AnnotationActionToolbar: NSView {
         preset: AnnotationToolbarPreset = .snip
     ) -> CGRect {
         let size = showsStyleBar ? expandedSize(for: preset) : preferredSize(for: preset)
+        let safeBounds = isFiniteRect(bounds) ? bounds.standardized : CGRect(origin: .zero, size: size)
+        let safeSelection = isFiniteRect(selection) ? selection.standardized : safeBounds
+        let safeTopInset = topInset.isFinite ? max(0, topInset) : 0
         let gap: CGFloat = 8
-        let usableMaxY = bounds.maxY - topInset
-        let maxX = max(bounds.minX, bounds.maxX - size.width)
-        let maxY = max(bounds.minY, usableMaxY - size.height)
+        let usableMaxY = safeBounds.maxY - safeTopInset
+        let maxX = max(safeBounds.minX, safeBounds.maxX - size.width)
+        let maxY = max(safeBounds.minY, usableMaxY - size.height)
         var origin = CGPoint(
-            x: (selection.midX - size.width / 2).rounded(),
-            y: selection.minY - gap - size.height
+            x: (safeSelection.midX - size.width / 2).rounded(),
+            y: safeSelection.minY - gap - size.height
         )
-        if origin.y < bounds.minY {
-            origin.y = selection.maxY + gap
+        if origin.y < safeBounds.minY {
+            origin.y = safeSelection.maxY + gap
             if origin.y + size.height > usableMaxY {
-                origin.y = selection.minY + gap
+                origin.y = safeSelection.minY + gap
             }
         }
-        origin.x = min(max(origin.x, bounds.minX), maxX)
-        origin.y = min(max(origin.y, bounds.minY), maxY)
+        origin.x = min(max(origin.x, safeBounds.minX), maxX)
+        origin.y = min(max(origin.y, safeBounds.minY), maxY)
         return CGRect(origin: origin, size: size)
     }
 
@@ -543,12 +558,20 @@ public final class AnnotationActionToolbar: NSView {
         in bounds: CGRect,
         topInset: CGFloat
     ) -> CGRect {
-        let usableMaxY = bounds.maxY - topInset
-        let maxX = max(bounds.minX, bounds.maxX - size.width)
-        let maxY = max(bounds.minY, usableMaxY - size.height)
-        let x = min(max(topLeft.x, bounds.minX), maxX)
-        let y = min(max(topLeft.y - size.height, bounds.minY), maxY)
-        return CGRect(origin: CGPoint(x: x, y: y), size: size)
+        let safeSize = CGSize(
+            width: (size.width.isFinite && size.width > 0) ? size.width : preferredSize.width,
+            height: (size.height.isFinite && size.height > 0) ? size.height : preferredSize.height
+        )
+        let safeBounds = isFiniteRect(bounds) ? bounds.standardized : CGRect(origin: .zero, size: safeSize)
+        let safeTopInset = topInset.isFinite ? max(0, topInset) : 0
+        let usableMaxY = safeBounds.maxY - safeTopInset
+        let maxX = max(safeBounds.minX, safeBounds.maxX - safeSize.width)
+        let maxY = max(safeBounds.minY, usableMaxY - safeSize.height)
+        let safeTopLeftX = topLeft.x.isFinite ? topLeft.x : safeBounds.minX
+        let safeTopLeftY = topLeft.y.isFinite ? topLeft.y : usableMaxY
+        let x = min(max(safeTopLeftX, safeBounds.minX), maxX)
+        let y = min(max(safeTopLeftY - safeSize.height, safeBounds.minY), maxY)
+        return CGRect(origin: CGPoint(x: x, y: y), size: safeSize)
     }
 
     private static func makeGlassSurface(
@@ -626,6 +649,22 @@ private class HoverButton: NSButton {
     // Keep button frames exact (30x30) regardless of SF Symbol vs custom image alignment insets
     // so selection/hover pills stay uniformly sized across all toolbar tools.
     override var alignmentRectInsets: NSEdgeInsets { NSEdgeInsetsZero }
+
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        super.viewWillMove(toWindow: newWindow)
+        if newWindow == nil {
+            if let hoverArea {
+                removeTrackingArea(hoverArea)
+                self.hoverArea = nil
+            }
+            isHovering = false
+        }
+    }
+
+    override func viewDidHide() {
+        super.viewDidHide()
+        isHovering = false
+    }
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
@@ -938,12 +977,18 @@ private final class StrokeSizeSlider: NSView {
     override func viewWillMove(toWindow newWindow: NSWindow?) {
         super.viewWillMove(toWindow: newWindow)
         if newWindow == nil {
+            if let hoverArea {
+                removeTrackingArea(hoverArea)
+                self.hoverArea = nil
+            }
+            isHovering = false
             cancelDragging()
         }
     }
 
     override func viewDidHide() {
         super.viewDidHide()
+        isHovering = false
         cancelDragging()
     }
 
@@ -1044,6 +1089,7 @@ private final class StrokeSizeSlider: NSView {
 }
 
 private final class ModePillButton: HoverButton {
+    private static let pillFont = NSFont.systemFont(ofSize: 11.5, weight: .semibold)
     let mosaicMode: MosaicMode
     var isChosen = false {
         didSet {
@@ -1056,7 +1102,7 @@ private final class ModePillButton: HoverButton {
         self.mosaicMode = mode
         super.init(frame: .zero)
         title = mode.label
-        font = .systemFont(ofSize: 11.5, weight: .semibold)
+        font = Self.pillFont
         isBordered = false
         wantsLayer = true
         layer?.cornerRadius = 6
@@ -1075,7 +1121,7 @@ private final class ModePillButton: HoverButton {
         let color: NSColor = isChosen ? .white : NSColor.white.withAlphaComponent(0.75)
         attributedTitle = NSAttributedString(
             string: mosaicMode.label,
-            attributes: [.font: NSFont.systemFont(ofSize: 11.5, weight: .semibold), .foregroundColor: color]
+            attributes: [.font: Self.pillFont, .foregroundColor: color]
         )
         if isChosen {
             layer?.backgroundColor = NSColor.systemBlue.withAlphaComponent(0.88).cgColor
@@ -1125,6 +1171,22 @@ private final class ToolbarDragHandleView: NSView {
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        super.viewWillMove(toWindow: newWindow)
+        if newWindow == nil {
+            if let hoverArea {
+                removeTrackingArea(hoverArea)
+                self.hoverArea = nil
+            }
+            isHovering = false
+        }
+    }
+
+    override func viewDidHide() {
+        super.viewDidHide()
+        isHovering = false
+    }
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()

@@ -1319,4 +1319,142 @@ struct CCXAnnotateTests {
             #expect(px.a == 255 && px.r > 200)
         }
     }
+
+    @Test func finiteOverflowGuardsTextAndPolylineCapsAndCacheCeiling() throws {
+        // 1. MosaicImageCache handles extreme/non-finite scale & radius safely without trapping,
+        //    and honors resident byte ceiling (variants + cachedBaseRGBA) + clear().
+        let width = 100
+        let height = 100
+        let ctx = try #require(CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue
+        ))
+        ctx.setFillColor(red: 0.25, green: 0.45, blue: 0.75, alpha: 1)
+        ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        ctx.setFillColor(red: 1, green: 1, blue: 1, alpha: 1)
+        for x in stride(from: 0, to: width, by: 8) {
+            ctx.fill(CGRect(x: x, y: 0, width: 3, height: height))
+        }
+        let opaqueRGBA = try #require(ctx.makeImage())
+
+        // Tight budget (50 KB for a 40 KB image): residentByteCount must stay <= 50 KB across modes.
+        let tightCache = MosaicImageCache(baseImage: opaqueRGBA, maxCachedBytes: 50_000)
+        #expect(tightCache.filteredImage(mode: .pixelate, size: .medium, backingScale: 1e20) != nil)
+        #expect(tightCache.filteredImage(mode: .blur, size: .large, backingScale: .infinity) != nil)
+        #expect(tightCache.filteredImage(mode: .blur, size: .small, backingScale: .nan) != nil)
+        #expect(tightCache.residentByteCount <= 50_000)
+
+        // Direct radius guards on gpuBlurCIImage / cpuBlurredImage reject invalid values & clamp extreme ones.
+        #expect(tightCache.gpuBlurCIImage(radius: .nan) == nil)
+        #expect(tightCache.gpuBlurCIImage(radius: .infinity) == nil)
+        #expect(tightCache.gpuBlurCIImage(radius: 0) == nil)
+        #expect(tightCache.gpuBlurCIImage(radius: -4) == nil)
+        #expect(tightCache.cpuBlurredImage(radius: .nan) == nil)
+        #expect(tightCache.cpuBlurredImage(radius: .infinity) == nil)
+        #expect(tightCache.cpuBlurredImage(radius: 0) == nil)
+        #expect(tightCache.cpuBlurredImage(radius: 1e20) != nil)
+
+        // After SIMD transparency scan on opaque RGBA, GPU blur skips unpremultiply/_srcIn stages cleanly.
+        let fastOpaqueGraph = try #require(tightCache.gpuBlurCIImage(radius: 16)).debugDescription
+        #expect(!fastOpaqueGraph.contains("unpremultiply"))
+        #expect(!fastOpaqueGraph.contains("_srcIn"))
+
+        // CPU blur zero-copy context path matches expected opaque RGBA output and clear() releases everything.
+        let cpuBlurred = try #require(tightCache.cpuBlurredImage(radius: 12))
+        #expect(cpuBlurred.width == width && cpuBlurred.height == height)
+        let midPx = try sampleRGBA(in: cpuBlurred, x: 50, y: 50)
+        #expect(midPx.a == 255)
+        tightCache.clear()
+        #expect(tightCache.cachedVariantCount == 0)
+        #expect(tightCache.cachedByteCount == 0)
+        #expect(tightCache.residentByteCount == 0)
+
+        // 2. Vectorized transparency check detects a single semi-transparent interior pixel in an opaque RGBA image.
+        ctx.setBlendMode(.copy)
+        ctx.setFillColor(red: 0.5, green: 0.5, blue: 0.5, alpha: 128.0 / 255.0)
+        ctx.fill(CGRect(x: 63, y: 47, width: 1, height: 1))
+        let singleTranslucent = try #require(ctx.makeImage())
+        let translucentCache = MosaicImageCache(baseImage: singleTranslucent)
+        let transPixelated = try #require(translucentCache.filteredImage(mode: .pixelate, size: .small, backingScale: 1))
+        #expect(try sampleRGBA(in: transPixelated, x: 63, y: height - 1 - 47).a == 128)
+        let transGraph = try #require(translucentCache.gpuBlurCIImage(radius: 10)).debugDescription
+        #expect(transGraph.contains("_srcIn"))
+
+        // 3. Polyline point cap & in-place append behavior.
+        var polyline: [CGPoint] = []
+        #expect(AnnotationItem.appendPointInPlace(CGPoint(x: 0, y: 0), to: &polyline))
+        #expect(!AnnotationItem.appendPointInPlace(CGPoint(x: 1, y: 1), to: &polyline, minDistance: 2.5))
+        #expect(!AnnotationItem.appendPointInPlace(CGPoint(x: CGFloat.nan, y: 5), to: &polyline))
+        #expect(polyline.count == 1)
+
+        var capped = (0..<AnnotationItem.maxPolylinePoints).map { CGPoint(x: CGFloat($0 * 4), y: 0) }
+        #expect(!AnnotationItem.appendPointInPlace(CGPoint(x: 999_999, y: 0), to: &capped))
+        #expect(capped.count == AnnotationItem.maxPolylinePoints)
+        #expect(AnnotationItem.appendPoint(CGPoint(x: 999_999, y: 0), to: capped).count == AnnotationItem.maxPolylinePoints)
+
+        // 4. Text length cap & bounded text-measure static cache.
+        AnnotationItem.clearTextMeasureCacheForTesting()
+        let hugeText = String(repeating: "A", count: 100_000)
+        #expect(AnnotationItem.boundedText(hugeText).count == AnnotationItem.maxTextLength)
+        let hugeBox = AnnotationItem.textBoundingBox(origin: CGPoint(x: 10, y: 200), content: hugeText, fontSize: 16)
+        #expect(hugeBox.width > 0 && hugeBox.height > 0)
+        // Oversized strings (> 512 bytes) must not pin entries in static textMeasureCache.
+        #expect(AnnotationItem.textMeasureCacheCountForTesting == 0)
+        #expect(AnnotationItem.textMeasureCacheBytesForTesting == 0)
+
+        for i in 0..<80 {
+            _ = AnnotationItem.textBoundingBox(
+                origin: CGPoint(x: 10, y: 100),
+                content: "Label #\(i) " + String(repeating: "x", count: 240),
+                fontSize: 16
+            )
+        }
+        #expect(AnnotationItem.textMeasureCacheCountForTesting <= 64)
+        #expect(AnnotationItem.textMeasureCacheBytesForTesting <= 16 * 1024)
+
+        // 5. Renderer & toolbar finite guards (no traps on subnormal screenSize / non-finite rects / arrows / polylines).
+        let doc = AnnotationDocument()
+        doc.commit(AnnotationItem(kind: .rectangle(.null), style: AnnotationStyle()))
+        doc.commit(AnnotationItem(kind: .arrow(start: CGPoint(x: CGFloat.infinity, y: 0), end: CGPoint(x: 10, y: 10)), style: AnnotationStyle()))
+        doc.commit(AnnotationItem(kind: .pen([CGPoint(x: CGFloat.nan, y: 0), CGPoint(x: 5, y: 5), CGPoint(x: 20, y: 20)]), style: AnnotationStyle()))
+        doc.commit(AnnotationItem(kind: .mosaic(CGRect(x: 5, y: 5, width: 20, height: 20), .pixelate), style: AnnotationStyle()))
+        #expect(AnnotationRenderer.bake(
+            baseImage: opaqueRGBA,
+            localSelectionRect: CGRect(x: 0, y: 0, width: 100, height: 100),
+            pixelCropRect: CGRect(x: 0, y: 0, width: 100, height: 100),
+            screenSize: CGSize(width: 1e-300, height: 100),
+            document: doc,
+            mosaicCache: nil
+        ) == nil)
+        #expect(AnnotationRenderer.bake(
+            baseImage: opaqueRGBA,
+            localSelectionRect: CGRect(x: 0, y: 0, width: 100, height: 100),
+            pixelCropRect: CGRect(x: 0, y: 0, width: 100, height: 100),
+            screenSize: CGSize(width: 100, height: 100),
+            document: doc,
+            mosaicCache: nil
+        ) != nil)
+
+        let toolbarFrame = AnnotationActionToolbar.frame(
+            for: .null,
+            in: .infinite,
+            topInset: .nan,
+            showsStyleBar: true,
+            preset: .pin
+        )
+        #expect(toolbarFrame.origin.x.isFinite && toolbarFrame.origin.y.isFinite)
+        let clampedToolbarFrame = AnnotationActionToolbar.clampedFrame(
+            anchoredAtTopLeft: CGPoint(x: CGFloat.nan, y: CGFloat.infinity),
+            size: CGSize(width: CGFloat.nan, height: -5),
+            in: CGRect(x: 0, y: 0, width: 800, height: 600),
+            topInset: .infinity
+        )
+        #expect(clampedToolbarFrame.origin.x.isFinite && clampedToolbarFrame.origin.y.isFinite)
+        #expect(clampedToolbarFrame.width > 0 && clampedToolbarFrame.height > 0)
+    }
 }
