@@ -2,6 +2,14 @@
 
 All notable changes to **CCX (Control · Command · X)** are documented in this file.
 
+## [0.9.4] - 2026-11-26
+
+### Fixed
+- **Unified TCC Code-Signing Identity & LaunchServices Hygiene (`scripts`)**: Updated `scripts/build-and-run.sh` to prefer a valid `Developer ID Application` certificate (matching release builds with `CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO`) over `Apple Development`, and added `lsregister -u` cleanup of build/staging `.app` bundles in `scripts/build-and-run.sh` and `scripts/package-release.sh` so switching between local builds, release DMGs, and in-app updates keeps an identical Designated Requirement and never invalidates macOS Screen Recording or Accessibility TCC grants.
+
+### Added
+- **Stale Screen Recording TCC Detection & One-Click Recovery (`CCXCore`, `App`)**: Added automatic post-relaunch verification (`SCShareableContent`) to detect stale macOS Screen Recording TCC entries (`csreq` mismatch after switching app signatures), along with a one-click **Reset** action (`tccutil reset`) in both the Setup Guide and **Settings** (with single-line bilingual `en` / `zh-Hans` copy and pixel-width regression tests) that clears stale grants and re-opens System Settings for a clean re-grant.
+
 ## [0.9.3] - 2026-11-26
 
 ### Added
