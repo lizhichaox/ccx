@@ -1,3 +1,4 @@
+import Accelerate
 import CoreGraphics
 import CoreMedia
 import CoreVideo
@@ -9,13 +10,15 @@ import UniformTypeIdentifiers
 /// Memory-bounded animated GIF encoder backed by ImageIO (`CGImageDestination`).
 ///
 /// Frames are processed on a private serial queue with bounded `OSAllocatedUnfairLock`
-/// backpressure, 1:1 zero-copy static fingerprinting on matching BGRA pixel buffers,
+/// backpressure, zero-copy static fingerprinting directly from locked BGRA pixel buffers
+/// (both 1:1 and scaled paths), Accelerate (`vImageScale_ARGB8888`) downscaling,
 /// centisecond delay-carry timing accuracy, and a hard pixel-memory / frame cap to prevent OOM.
 public final class GifRecordingEncoder: @unchecked Sendable {
     public static let defaultMaxFrameCount = 900
     public static let defaultMaxBufferedBytes = 256 * 1024 * 1024 // 256 MB uncompressed RGBA budget
 
     private static let maxDimension = 4_096
+    private static let maxSourcePixelDimension = 16_384
     private static let maxFPS = 60
     private static let maxFrameDelay: TimeInterval = 4.0
     private static let minFrameDelay: TimeInterval = 0.02
@@ -34,13 +37,22 @@ public final class GifRecordingEncoder: @unchecked Sendable {
         let pts: CMTime
     }
 
+    private enum PendingItem: Sendable {
+        case video(PendingVideoFrame)
+        case image(PendingImageFrame)
+        case pause(CMTime)
+        case resume(CMTime)
+    }
+
     private struct GateState: Sendable {
-        var pendingVideo: [PendingVideoFrame] = []
-        var pendingImages: [PendingImageFrame] = []
+        var items: [PendingItem] = []
+        var pendingVideoCount = 0
+        var pendingImageCount = 0
         var hasPoppedFirstVideo = false
         var isDrainScheduled = false
         var isPaused = false
         var isAcceptingInput = true
+        var isCancelled = false
         var limitReached = false
         var droppedVideoFrames = 0
         var onLimitReached: (@Sendable () -> Void)?
@@ -55,18 +67,21 @@ public final class GifRecordingEncoder: @unchecked Sendable {
     public let maxFrames: Int
 
     private var destination: CGImageDestination?
-    private let scaleContext: CGContext
+    private var lazyScaleContext: CGContext?
     private let rgbColorSpace: CGColorSpace
 
     private var timeline = RecordingTimeline()
     private var lastAcceptedPTS: TimeInterval?
-    private var pendingFrame: (image: CGImage, startPTS: TimeInterval, fingerprint: [UInt8])?
+    private var pendingFrame: (image: CGImage, startPTS: TimeInterval)?
+    private var pendingFingerprint: [UInt8]
     private var scratchFingerprint: [UInt8]
     private var lastObservedPTS: TimeInterval = 0
     private var delayCarry: TimeInterval = 0
     private var writtenFrames = 0
     private var materializedFrameCount = 0
     private var isFinished = false
+    private var finishedDuration: TimeInterval = 0
+    private var finishedError: Error?
 
     public var onLimitReached: (@Sendable () -> Void)? {
         get { gate.withLock { $0.onLimitReached } }
@@ -106,33 +121,22 @@ public final class GifRecordingEncoder: @unchecked Sendable {
         let budgetFrames = max(1, max(1, maxBufferedBytes) / bytesPerFrame)
         self.maxFrames = max(1, min(max(1, maxFrameCount), budgetFrames))
         self.gate = OSAllocatedUnfairLock(initialState: GateState(onLimitReached: onLimitReached))
-        self.scratchFingerprint = [UInt8](repeating: 0, count: Self.fingerprintGrid * Self.fingerprintGrid * 3)
+        let fingerprintLength = Self.fingerprintGrid * Self.fingerprintGrid * 3
+        self.pendingFingerprint = [UInt8](repeating: 0, count: fingerprintLength)
+        self.scratchFingerprint = [UInt8](repeating: 0, count: fingerprintLength)
 
         let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
         self.rgbColorSpace = colorSpace
 
-        let bitmapInfo = CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue
-        guard let context = CGContext(
-            data: nil,
-            width: targetWidth,
-            height: targetHeight,
-            bitsPerComponent: 8,
-            bytesPerRow: targetWidth * 4,
-            space: colorSpace,
-            bitmapInfo: bitmapInfo
-        ) else {
-            throw RecordingError.encoderInitializationFailed
-        }
-        context.interpolationQuality = .high
-        self.scaleContext = context
-
         try RecordingFileSecurity.validateOutputURLForWriting(outputURL)
+        try RecordingFileSecurity.createRestrictedEmptyFile(at: outputURL)
         guard let dest = CGImageDestinationCreateWithURL(
             outputURL as CFURL,
             UTType.gif.identifier as CFString,
             0,
             nil
         ) else {
+            RecordingFileSecurity.removeRegularFileIfPresent(at: outputURL)
             throw RecordingError.encoderInitializationFailed
         }
         let containerProperties: [CFString: Any] = [
@@ -145,30 +149,52 @@ public final class GifRecordingEncoder: @unchecked Sendable {
         self.destination = dest
     }
 
-    public func appendVideo(pixelBuffer: CVPixelBuffer, pts: CMTime) {
-        guard pts.isNumeric,
-              !CVPixelBufferIsPlanar(pixelBuffer),
+    static func validateBGRAPixelBuffer(_ pixelBuffer: CVPixelBuffer) -> (width: Int, height: Int, bytesPerRow: Int)? {
+        guard !CVPixelBufferIsPlanar(pixelBuffer),
               CVPixelBufferGetPixelFormatType(pixelBuffer) == kCVPixelFormatType_32BGRA
         else {
-            return
+            return nil
         }
         let width = CVPixelBufferGetWidth(pixelBuffer)
         let height = CVPixelBufferGetHeight(pixelBuffer)
         let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
-        guard width > 0, height > 0, bytesPerRow >= width * 4 else { return }
+        guard width > 0, height > 0,
+              width <= Self.maxSourcePixelDimension,
+              height <= Self.maxSourcePixelDimension
+        else {
+            return nil
+        }
+        let (rowBytes, rowOverflow) = width.multipliedReportingOverflow(by: 4)
+        guard !rowOverflow, bytesPerRow >= rowBytes else { return nil }
+        let (lastRowOffset, offsetOverflow) = (height - 1).multipliedReportingOverflow(by: bytesPerRow)
+        let (minRequiredBytes, totalOverflow) = lastRowOffset.addingReportingOverflow(rowBytes)
+        guard !offsetOverflow, !totalOverflow, minRequiredBytes > 0 else { return nil }
+        let dataSize = CVPixelBufferGetDataSize(pixelBuffer)
+        guard dataSize == 0 || dataSize >= minRequiredBytes else { return nil }
+        return (width, height, bytesPerRow)
+    }
+
+    public func appendVideo(pixelBuffer: CVPixelBuffer, pts: CMTime) {
+        guard pts.isNumeric, Self.validateBGRAPixelBuffer(pixelBuffer) != nil else { return }
 
         let frame = PendingVideoFrame(pixelBuffer: UncheckedSendableBox(pixelBuffer), pts: pts)
         let shouldSchedule: Bool = gate.withLock { state in
-            guard state.isAcceptingInput, !state.isPaused, !state.limitReached else { return false }
-            if state.pendingVideo.count >= Self.maxPendingVideoFrames {
-                if !state.hasPoppedFirstVideo && state.pendingVideo.count >= 2 {
-                    state.pendingVideo.remove(at: 1)
-                } else {
-                    state.pendingVideo.removeFirst()
+            guard state.isAcceptingInput, !state.isPaused, !state.limitReached, !state.isCancelled else { return false }
+            if state.pendingVideoCount >= Self.maxPendingVideoFrames {
+                var seenVideos = 0
+                let targetOrdinal = (!state.hasPoppedFirstVideo && state.pendingVideoCount >= 2) ? 1 : 0
+                if let evictIdx = state.items.firstIndex(where: { item in
+                    guard case .video = item else { return false }
+                    defer { seenVideos += 1 }
+                    return seenVideos == targetOrdinal
+                }) {
+                    state.items.remove(at: evictIdx)
+                    state.pendingVideoCount -= 1
+                    state.droppedVideoFrames += 1
                 }
-                state.droppedVideoFrames += 1
             }
-            state.pendingVideo.append(frame)
+            state.items.append(.video(frame))
+            state.pendingVideoCount += 1
             if state.isDrainScheduled { return false }
             state.isDrainScheduled = true
             return true
@@ -184,11 +210,18 @@ public final class GifRecordingEncoder: @unchecked Sendable {
         guard pts.isNumeric else { return }
         let frame = PendingImageFrame(image: image, pts: pts)
         let shouldSchedule: Bool = gate.withLock { state in
-            guard state.isAcceptingInput, !state.isPaused, !state.limitReached else { return false }
-            if state.pendingImages.count >= Self.maxPendingImageFrames {
-                state.pendingImages.removeFirst()
+            guard state.isAcceptingInput, !state.isPaused, !state.limitReached, !state.isCancelled else { return false }
+            if state.pendingImageCount >= Self.maxPendingImageFrames {
+                if let evictIdx = state.items.firstIndex(where: {
+                    if case .image = $0 { return true }
+                    return false
+                }) {
+                    state.items.remove(at: evictIdx)
+                    state.pendingImageCount -= 1
+                }
             }
-            state.pendingImages.append(frame)
+            state.items.append(.image(frame))
+            state.pendingImageCount += 1
             if state.isDrainScheduled { return false }
             state.isDrainScheduled = true
             return true
@@ -202,23 +235,43 @@ public final class GifRecordingEncoder: @unchecked Sendable {
 
     public func pause() {
         let now = CMClockGetTime(CMClockGetHostTimeClock())
-        gate.withLock { state in
+        let shouldSchedule: Bool = gate.withLock { state in
+            guard !state.isCancelled else { return false }
             state.isPaused = true
-            state.pendingVideo.removeAll(keepingCapacity: true)
-            state.pendingImages.removeAll(keepingCapacity: true)
+            state.items.removeAll { item in
+                switch item {
+                case .video, .image: true
+                case .pause, .resume: false
+                }
+            }
+            state.pendingVideoCount = 0
+            state.pendingImageCount = 0
+            state.items.append(.pause(now))
+            if state.isDrainScheduled { return false }
+            state.isDrainScheduled = true
+            return true
         }
-        queue.async { [weak self] in
-            self?.timeline.pause(at: now)
+        if shouldSchedule {
+            queue.async { [weak self] in
+                self?.drainPending()
+            }
         }
     }
 
     public func resume() {
         let now = CMClockGetTime(CMClockGetHostTimeClock())
-        gate.withLock { state in
+        let shouldSchedule: Bool = gate.withLock { state in
+            guard !state.isCancelled else { return false }
             state.isPaused = false
+            state.items.append(.resume(now))
+            if state.isDrainScheduled { return false }
+            state.isDrainScheduled = true
+            return true
         }
-        queue.async { [weak self] in
-            self?.timeline.resume(at: now)
+        if shouldSchedule {
+            queue.async { [weak self] in
+                self?.drainPending()
+            }
         }
     }
 
@@ -233,11 +286,27 @@ public final class GifRecordingEncoder: @unchecked Sendable {
                     continuation.resume(throwing: RecordingError.noFramesCaptured)
                     return
                 }
-                guard !self.isFinished else {
-                    continuation.resume(returning: (max(self.lastObservedPTS, self.timeline.recordedDurationSeconds), self.writtenFrames))
+                if self.isFinished {
+                    if let error = self.finishedError {
+                        continuation.resume(throwing: error)
+                    } else {
+                        continuation.resume(returning: (self.finishedDuration, self.writtenFrames))
+                    }
                     return
                 }
+                if self.gate.withLock({ $0.isCancelled }) {
+                    self.abortForCancellation()
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+
                 self.drainPending()
+                if self.gate.withLock({ $0.isCancelled }) {
+                    self.abortForCancellation()
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+
                 self.isFinished = true
                 self.timeline.finish(at: finishWallTime)
 
@@ -253,8 +322,27 @@ public final class GifRecordingEncoder: @unchecked Sendable {
 
                 guard self.writtenFrames > 0, let dest = self.destination else {
                     self.destination = nil
+                    self.lazyScaleContext = nil
+                    self.finishedError = RecordingError.noFramesCaptured
                     RecordingFileSecurity.removeRegularFileIfPresent(at: self.outputURL)
                     continuation.resume(throwing: RecordingError.noFramesCaptured)
+                    return
+                }
+
+                if self.gate.withLock({ $0.isCancelled }) {
+                    self.abortForCancellation()
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+
+                do {
+                    try RecordingFileSecurity.verifyOutputURLForFinalize(self.outputURL)
+                } catch {
+                    self.destination = nil
+                    self.lazyScaleContext = nil
+                    self.finishedError = error
+                    RecordingFileSecurity.removeRegularFileIfPresent(at: self.outputURL)
+                    continuation.resume(throwing: error)
                     return
                 }
 
@@ -262,7 +350,17 @@ public final class GifRecordingEncoder: @unchecked Sendable {
                     CGImageDestinationFinalize(dest)
                 }
                 self.destination = nil
+                self.lazyScaleContext = nil
+
+                if self.gate.withLock({ $0.isCancelled }) {
+                    self.finishedError = CancellationError()
+                    RecordingFileSecurity.removeRegularFileIfPresent(at: self.outputURL)
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+
                 guard finalized else {
+                    self.finishedError = RecordingError.encoderFinalizeFailed
                     RecordingFileSecurity.removeRegularFileIfPresent(at: self.outputURL)
                     continuation.resume(throwing: RecordingError.encoderFinalizeFailed)
                     return
@@ -270,6 +368,7 @@ public final class GifRecordingEncoder: @unchecked Sendable {
 
                 RecordingFileSecurity.restrictFilePermissions(at: self.outputURL)
                 let duration = max(self.minInterval, finalEnd)
+                self.finishedDuration = duration
                 continuation.resume(returning: (duration, self.writtenFrames))
             }
         }
@@ -278,16 +377,24 @@ public final class GifRecordingEncoder: @unchecked Sendable {
     public func cancel() {
         gate.withLock { state in
             state.isAcceptingInput = false
-            state.pendingVideo.removeAll()
-            state.pendingImages.removeAll()
+            state.isCancelled = true
+            state.items.removeAll()
+            state.pendingVideoCount = 0
+            state.pendingImageCount = 0
         }
         queue.async { [weak self] in
             guard let self, !self.isFinished else { return }
-            self.isFinished = true
-            self.pendingFrame = nil
-            self.destination = nil
-            RecordingFileSecurity.removeRegularFileIfPresent(at: self.outputURL)
+            self.abortForCancellation()
         }
+    }
+
+    private func abortForCancellation() {
+        isFinished = true
+        finishedError = CancellationError()
+        pendingFrame = nil
+        destination = nil
+        lazyScaleContext = nil
+        RecordingFileSecurity.removeRegularFileIfPresent(at: outputURL)
     }
 
     func debugMaterializedFrameCount() async -> Int {
@@ -306,37 +413,58 @@ public final class GifRecordingEncoder: @unchecked Sendable {
         }
     }
 
+    func debugHasAllocatedScaleContext() async -> Bool {
+        await withCheckedContinuation { continuation in
+            queue.async { [weak self] in
+                continuation.resume(returning: self?.lazyScaleContext != nil)
+            }
+        }
+    }
+
     // MARK: - Serial Queue Helpers
 
     private func drainPending() {
         while true {
-            let batch: ([PendingVideoFrame], [PendingImageFrame]) = gate.withLock { state in
-                let videos = state.pendingVideo
-                let images = state.pendingImages
-                state.pendingVideo.removeAll(keepingCapacity: true)
-                state.pendingImages.removeAll(keepingCapacity: true)
-                if !videos.isEmpty {
+            let items: [PendingItem] = gate.withLock { state in
+                if state.isCancelled {
+                    state.items.removeAll()
+                    state.pendingVideoCount = 0
+                    state.pendingImageCount = 0
+                    state.isDrainScheduled = false
+                    return []
+                }
+                let batch = state.items
+                state.items.removeAll(keepingCapacity: true)
+                if state.pendingVideoCount > 0 {
                     state.hasPoppedFirstVideo = true
                 }
-                if videos.isEmpty && images.isEmpty {
+                state.pendingVideoCount = 0
+                state.pendingImageCount = 0
+                if batch.isEmpty {
                     state.isDrainScheduled = false
                 }
-                return (videos, images)
+                return batch
             }
-            if batch.0.isEmpty && batch.1.isEmpty {
+            if items.isEmpty || isFinished {
                 break
             }
-            if isFinished {
-                break
-            }
-            for frame in batch.0 {
-                autoreleasepool {
-                    processVideoBuffer(frame.pixelBuffer.value, pts: frame.pts)
+            for item in items {
+                if isFinished || gate.withLock({ $0.isCancelled }) {
+                    break
                 }
-            }
-            for frame in batch.1 {
-                autoreleasepool {
-                    processCGImage(frame.image, pts: frame.pts)
+                switch item {
+                case .pause(let wallTime):
+                    timeline.pause(at: wallTime)
+                case .resume(let wallTime):
+                    timeline.resume(at: wallTime)
+                case .video(let frame):
+                    autoreleasepool {
+                        processVideoBuffer(frame.pixelBuffer.value, pts: frame.pts)
+                    }
+                case .image(let frame):
+                    autoreleasepool {
+                        processCGImage(frame.image, pts: frame.pts)
+                    }
                 }
             }
         }
@@ -347,8 +475,14 @@ public final class GifRecordingEncoder: @unchecked Sendable {
         let callback: (@Sendable () -> Void)? = gate.withLock { state in
             guard !state.limitReached else { return nil }
             state.limitReached = true
-            state.pendingVideo.removeAll()
-            state.pendingImages.removeAll()
+            state.items.removeAll { item in
+                switch item {
+                case .video, .image: true
+                case .pause, .resume: false
+                }
+            }
+            state.pendingVideoCount = 0
+            state.pendingImageCount = 0
             return state.onLimitReached
         }
         callback?()
@@ -357,15 +491,9 @@ public final class GifRecordingEncoder: @unchecked Sendable {
 
     private func processVideoBuffer(_ pixelBuffer: CVPixelBuffer, pts: CMTime) {
         guard !isFinished, writtenFrames < maxFrames else { return }
-        guard !CVPixelBufferIsPlanar(pixelBuffer),
-              CVPixelBufferGetPixelFormatType(pixelBuffer) == kCVPixelFormatType_32BGRA
-        else {
+        guard let (srcWidth, srcHeight, bytesPerRow) = Self.validateBGRAPixelBuffer(pixelBuffer) else {
             return
         }
-        let srcWidth = CVPixelBufferGetWidth(pixelBuffer)
-        let srcHeight = CVPixelBufferGetHeight(pixelBuffer)
-        let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
-        guard srcWidth > 0, srcHeight > 0, bytesPerRow >= srcWidth * 4 else { return }
 
         let now = CMClockGetTime(CMClockGetHostTimeClock())
         guard let adjusted = timeline.acceptVideoPTS(pts, wallTime: now) else { return }
@@ -381,53 +509,48 @@ public final class GifRecordingEncoder: @unchecked Sendable {
         defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
         guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else { return }
 
-        // Fast 1:1 path: fingerprint directly from locked BGRA memory before any full-frame copy.
-        if srcWidth == targetWidth && srcHeight == targetHeight {
-            lastAcceptedPTS = seconds
-            computeBGRAFingerprint(
-                baseAddress: baseAddress,
-                width: srcWidth,
-                height: srcHeight,
-                bytesPerRow: bytesPerRow,
-                into: &scratchFingerprint
-            )
-            if let pending = pendingFrame {
-                let elapsed = seconds - pending.startPTS
-                if elapsed < Self.maxFrameDelay,
-                   Self.areFingerprintsNearlyIdentical(pending.fingerprint, scratchFingerprint) {
-                    return
-                }
-                flushPendingFrame(pending, delay: elapsed)
-                pendingFrame = nil
-                if notifyLimitReachedIfNeeded() {
-                    return
-                }
-            }
-            guard copyBGRAToScaleContext(
-                baseAddress: baseAddress,
-                width: srcWidth,
-                height: srcHeight,
-                srcBytesPerRow: bytesPerRow
-            ) else {
-                return
-            }
-            guard let scaled = scaleContext.makeImage() else { return }
-            materializedFrameCount += 1
-            pendingFrame = (image: scaled, startPTS: seconds, fingerprint: scratchFingerprint)
-            return
-        }
-
-        // Scaled path: copy bytes once into CFData-backed CGImage (no throwaway CGContext).
-        guard let sourceImage = makeOwnedBGRAImage(
+        // Fingerprint directly from locked BGRA memory BEFORE any copy or scale (both 1:1 and scaled paths).
+        lastAcceptedPTS = seconds
+        computeBGRAFingerprint(
             baseAddress: baseAddress,
             width: srcWidth,
             height: srcHeight,
-            bytesPerRow: bytesPerRow
-        ) else {
-            return
+            bytesPerRow: bytesPerRow,
+            into: &scratchFingerprint
+        )
+        if let pending = pendingFrame {
+            let elapsed = seconds - pending.startPTS
+            if elapsed < Self.maxFrameDelay,
+               Self.areFingerprintsNearlyIdentical(pendingFingerprint, scratchFingerprint) {
+                return
+            }
+            flushPendingFrame(pending, delay: elapsed)
+            pendingFrame = nil
+            if notifyLimitReachedIfNeeded() {
+                return
+            }
         }
-        drawIntoScaleContext(from: sourceImage)
-        acceptScaleContextFrame(seconds: seconds)
+
+        let frameImage: CGImage?
+        if srcWidth == targetWidth && srcHeight == targetHeight {
+            frameImage = makeTightOpaqueBGRAImage(
+                baseAddress: baseAddress,
+                width: targetWidth,
+                height: targetHeight,
+                srcBytesPerRow: bytesPerRow
+            )
+        } else {
+            frameImage = makeScaledOpaqueBGRAImage(
+                baseAddress: baseAddress,
+                srcWidth: srcWidth,
+                srcHeight: srcHeight,
+                srcBytesPerRow: bytesPerRow
+            )
+        }
+        guard let frameImage else { return }
+        materializedFrameCount += 1
+        swap(&pendingFingerprint, &scratchFingerprint)
+        pendingFrame = (image: frameImage, startPTS: seconds)
     }
 
     private func processCGImage(_ image: CGImage, pts: CMTime) {
@@ -440,18 +563,19 @@ public final class GifRecordingEncoder: @unchecked Sendable {
         if let lastPTS = lastAcceptedPTS, (seconds - lastPTS) < minInterval * 0.85 {
             return
         }
-        drawIntoScaleContext(from: image)
-        acceptScaleContextFrame(seconds: seconds)
+        guard let context = ensureScaleContext() else { return }
+        drawIntoScaleContext(context, from: image)
+        acceptScaleContextFrame(context: context, seconds: seconds)
     }
 
-    private func acceptScaleContextFrame(seconds: TimeInterval) {
+    private func acceptScaleContextFrame(context: CGContext, seconds: TimeInterval) {
         lastAcceptedPTS = seconds
-        guard computeFingerprint(into: &scratchFingerprint) else { return }
+        guard computeScaleContextFingerprint(context: context, into: &scratchFingerprint) else { return }
 
         if let pending = pendingFrame {
             let elapsed = seconds - pending.startPTS
             if elapsed < Self.maxFrameDelay,
-               Self.areFingerprintsNearlyIdentical(pending.fingerprint, scratchFingerprint) {
+               Self.areFingerprintsNearlyIdentical(pendingFingerprint, scratchFingerprint) {
                 return
             }
             flushPendingFrame(pending, delay: elapsed)
@@ -461,12 +585,13 @@ public final class GifRecordingEncoder: @unchecked Sendable {
             }
         }
 
-        guard let scaled = scaleContext.makeImage() else { return }
+        guard let scaled = context.makeImage() else { return }
         materializedFrameCount += 1
-        pendingFrame = (image: scaled, startPTS: seconds, fingerprint: scratchFingerprint)
+        swap(&pendingFingerprint, &scratchFingerprint)
+        pendingFrame = (image: scaled, startPTS: seconds)
     }
 
-    private func flushPendingFrame(_ frame: (image: CGImage, startPTS: TimeInterval, fingerprint: [UInt8]), delay: TimeInterval) {
+    private func flushPendingFrame(_ frame: (image: CGImage, startPTS: TimeInterval), delay: TimeInterval) {
         guard let dest = destination else { return }
         let clamped = min(max(delay, Self.minFrameDelay), Self.maxFrameDelay)
         let adjusted = clamped + delayCarry
@@ -484,21 +609,96 @@ public final class GifRecordingEncoder: @unchecked Sendable {
         writtenFrames += 1
     }
 
-    private func makeOwnedBGRAImage(
+    private func ensureScaleContext() -> CGContext? {
+        if let lazyScaleContext {
+            return lazyScaleContext
+        }
+        let bitmapInfo = CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.premultipliedFirst.rawValue
+        guard let context = CGContext(
+            data: nil,
+            width: targetWidth,
+            height: targetHeight,
+            bitsPerComponent: 8,
+            bytesPerRow: targetWidth * 4,
+            space: rgbColorSpace,
+            bitmapInfo: bitmapInfo
+        ) else {
+            return nil
+        }
+        context.interpolationQuality = .high
+        lazyScaleContext = context
+        return context
+    }
+
+    private func makeTightOpaqueBGRAImage(
         baseAddress: UnsafeMutableRawPointer,
+        width: Int,
+        height: Int,
+        srcBytesPerRow: Int
+    ) -> CGImage? {
+        let dstBytesPerRow = width * 4
+        let (totalBytes, overflow) = dstBytesPerRow.multipliedReportingOverflow(by: height)
+        guard !overflow, totalBytes > 0,
+              let cfData = CFDataCreateMutable(kCFAllocatorDefault, totalBytes)
+        else {
+            return nil
+        }
+        CFDataSetLength(cfData, totalBytes)
+        guard let dstPtr = CFDataGetMutableBytePtr(cfData) else { return nil }
+        let srcPtr = baseAddress.assumingMemoryBound(to: UInt8.self)
+
+        if srcBytesPerRow == dstBytesPerRow {
+            memcpy(dstPtr, srcPtr, totalBytes)
+        } else {
+            for y in 0..<height {
+                memcpy(dstPtr + y * dstBytesPerRow, srcPtr + y * srcBytesPerRow, dstBytesPerRow)
+            }
+        }
+        return wrapOpaqueBGRAImage(data: cfData, width: width, height: height, bytesPerRow: dstBytesPerRow)
+    }
+
+    private func makeScaledOpaqueBGRAImage(
+        baseAddress: UnsafeMutableRawPointer,
+        srcWidth: Int,
+        srcHeight: Int,
+        srcBytesPerRow: Int
+    ) -> CGImage? {
+        let dstBytesPerRow = targetWidth * 4
+        let (totalBytes, overflow) = dstBytesPerRow.multipliedReportingOverflow(by: targetHeight)
+        guard !overflow, totalBytes > 0,
+              let cfData = CFDataCreateMutable(kCFAllocatorDefault, totalBytes)
+        else {
+            return nil
+        }
+        CFDataSetLength(cfData, totalBytes)
+        guard let dstPtr = CFDataGetMutableBytePtr(cfData) else { return nil }
+
+        var srcBuf = vImage_Buffer(
+            data: baseAddress,
+            height: vImagePixelCount(srcHeight),
+            width: vImagePixelCount(srcWidth),
+            rowBytes: srcBytesPerRow
+        )
+        var dstBuf = vImage_Buffer(
+            data: dstPtr,
+            height: vImagePixelCount(targetHeight),
+            width: vImagePixelCount(targetWidth),
+            rowBytes: dstBytesPerRow
+        )
+        let err = vImageScale_ARGB8888(&srcBuf, &dstBuf, nil, vImage_Flags(kvImageHighQualityResampling))
+        guard err == kvImageNoError else { return nil }
+        return wrapOpaqueBGRAImage(data: cfData, width: targetWidth, height: targetHeight, bytesPerRow: dstBytesPerRow)
+    }
+
+    private func wrapOpaqueBGRAImage(
+        data: CFMutableData,
         width: Int,
         height: Int,
         bytesPerRow: Int
     ) -> CGImage? {
-        let (totalBytes, overflow) = bytesPerRow.multipliedReportingOverflow(by: height)
-        guard !overflow, totalBytes > 0 else { return nil }
-        let srcPtr = baseAddress.assumingMemoryBound(to: UInt8.self)
-        guard let cfData = CFDataCreate(kCFAllocatorDefault, srcPtr, totalBytes),
-              let provider = CGDataProvider(data: cfData)
-        else {
-            return nil
-        }
-        let bitmapInfo = CGBitmapInfo(rawValue: CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.premultipliedFirst.rawValue)
+        guard let provider = CGDataProvider(data: data as CFData) else { return nil }
+        // Screen captures are opaque; `noneSkipFirst` avoids ImageIO alpha overhead and preserves all 256 GIF palette slots.
+        let bitmapInfo = CGBitmapInfo(rawValue: CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.noneSkipFirst.rawValue)
         return CGImage(
             width: width,
             height: height,
@@ -509,44 +709,14 @@ public final class GifRecordingEncoder: @unchecked Sendable {
             bitmapInfo: bitmapInfo,
             provider: provider,
             decode: nil,
-            shouldInterpolate: true,
+            shouldInterpolate: false,
             intent: .defaultIntent
         )
     }
 
-    private func copyBGRAToScaleContext(
-        baseAddress: UnsafeMutableRawPointer,
-        width: Int,
-        height: Int,
-        srcBytesPerRow: Int
-    ) -> Bool {
-        guard let dstRaw = scaleContext.data else { return false }
-        let dstBytesPerRow = scaleContext.bytesPerRow
-        guard dstBytesPerRow >= width * 4, scaleContext.height >= height else { return false }
-
-        let src = baseAddress.assumingMemoryBound(to: UInt8.self)
-        let dst = dstRaw.assumingMemoryBound(to: UInt8.self)
-        for y in 0..<height {
-            let srcRow = y * srcBytesPerRow
-            let dstRow = y * dstBytesPerRow
-            var offset = 0
-            let rowByteWidth = width * 4
-            while offset < rowByteWidth {
-                let s = srcRow + offset
-                let d = dstRow + offset
-                dst[d] = src[s + 2]     // R
-                dst[d + 1] = src[s + 1] // G
-                dst[d + 2] = src[s]     // B
-                dst[d + 3] = src[s + 3] // A
-                offset += 4
-            }
-        }
-        return true
-    }
-
-    private func drawIntoScaleContext(from sourceImage: CGImage) {
-        scaleContext.clear(CGRect(x: 0, y: 0, width: targetWidth, height: targetHeight))
-        scaleContext.draw(sourceImage, in: CGRect(x: 0, y: 0, width: targetWidth, height: targetHeight))
+    private func drawIntoScaleContext(_ context: CGContext, from sourceImage: CGImage) {
+        context.clear(CGRect(x: 0, y: 0, width: targetWidth, height: targetHeight))
+        context.draw(sourceImage, in: CGRect(x: 0, y: 0, width: targetWidth, height: targetHeight))
     }
 
     private func computeBGRAFingerprint(
@@ -562,54 +732,48 @@ public final class GifRecordingEncoder: @unchecked Sendable {
         if buffer.count != expectedCount {
             buffer = [UInt8](repeating: 0, count: expectedCount)
         }
-        var writeIndex = 0
-        for gy in 0..<grid {
-            let y = min(height - 1, (gy * height) / grid)
-            let rowOffset = y * bytesPerRow
-            for gx in 0..<grid {
-                let x = min(width - 1, (gx * width) / grid)
-                let idx = rowOffset + x * 4
-                buffer[writeIndex] = bytes[idx + 2]     // R
-                buffer[writeIndex + 1] = bytes[idx + 1] // G
-                buffer[writeIndex + 2] = bytes[idx]     // B
-                writeIndex += 3
+        buffer.withUnsafeMutableBufferPointer { dst in
+            var writeIndex = 0
+            for gy in 0..<grid {
+                let y = min(height - 1, (gy * height) / grid)
+                let rowOffset = y * bytesPerRow
+                for gx in 0..<grid {
+                    let x = min(width - 1, (gx * width) / grid)
+                    let idx = rowOffset + x * 4
+                    dst[writeIndex] = bytes[idx + 2]     // R
+                    dst[writeIndex + 1] = bytes[idx + 1] // G
+                    dst[writeIndex + 2] = bytes[idx]     // B
+                    writeIndex += 3
+                }
             }
         }
     }
 
     @discardableResult
-    private func computeFingerprint(into buffer: inout [UInt8]) -> Bool {
-        guard let rawPtr = scaleContext.data else { return false }
-        let bytesPerRow = scaleContext.bytesPerRow
-        guard bytesPerRow >= targetWidth * 4, scaleContext.height >= targetHeight else { return false }
-
-        let bytes = rawPtr.assumingMemoryBound(to: UInt8.self)
-        let grid = Self.fingerprintGrid
-        let expectedCount = grid * grid * 3
-        if buffer.count != expectedCount {
-            buffer = [UInt8](repeating: 0, count: expectedCount)
-        }
-        var writeIndex = 0
-        for gy in 0..<grid {
-            let y = min(targetHeight - 1, (gy * targetHeight) / grid)
-            let rowOffset = y * bytesPerRow
-            for gx in 0..<grid {
-                let x = min(targetWidth - 1, (gx * targetWidth) / grid)
-                let idx = rowOffset + x * 4
-                buffer[writeIndex] = bytes[idx]
-                buffer[writeIndex + 1] = bytes[idx + 1]
-                buffer[writeIndex + 2] = bytes[idx + 2]
-                writeIndex += 3
-            }
-        }
+    private func computeScaleContextFingerprint(context: CGContext, into buffer: inout [UInt8]) -> Bool {
+        guard let rawPtr = context.data else { return false }
+        let bytesPerRow = context.bytesPerRow
+        guard bytesPerRow >= targetWidth * 4, context.height >= targetHeight else { return false }
+        computeBGRAFingerprint(
+            baseAddress: rawPtr,
+            width: targetWidth,
+            height: targetHeight,
+            bytesPerRow: bytesPerRow,
+            into: &buffer
+        )
         return true
     }
 
     private static func areFingerprintsNearlyIdentical(_ lhs: [UInt8], _ rhs: [UInt8]) -> Bool {
         guard !lhs.isEmpty, lhs.count == rhs.count else { return false }
         var totalDiff = 0
-        for idx in 0..<lhs.count {
-            totalDiff += abs(Int(lhs[idx]) - Int(rhs[idx]))
+        lhs.withUnsafeBufferPointer { lBuf in
+            rhs.withUnsafeBufferPointer { rBuf in
+                guard let lBase = lBuf.baseAddress, let rBase = rBuf.baseAddress else { return }
+                for idx in 0..<lBuf.count {
+                    totalDiff += abs(Int(lBase[idx]) - Int(rBase[idx]))
+                }
+            }
         }
         let meanDiff = Double(totalDiff) / Double(lhs.count)
         return meanDiff <= identicalMeanChannelDelta

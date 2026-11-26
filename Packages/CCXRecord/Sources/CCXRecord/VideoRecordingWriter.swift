@@ -55,13 +55,22 @@ public final class VideoRecordingWriter: @unchecked Sendable {
         let source: RecordingAudioSource
     }
 
+    private enum PendingItem: Sendable {
+        case video(PendingVideoFrame)
+        case audio(PendingAudioSample)
+        case pause(CMTime)
+        case resume(CMTime)
+    }
+
     private struct GateState: Sendable {
-        var pendingVideo: [PendingVideoFrame] = []
-        var pendingAudio: [PendingAudioSample] = []
+        var items: [PendingItem] = []
+        var pendingVideoCount = 0
+        var pendingAudioCount = 0
         var hasPoppedFirstVideo = false
         var isDrainScheduled = false
         var isPaused = false
         var isAcceptingInput = true
+        var isCancelled = false
         var droppedVideoFrames = 0
         var droppedAudioBuffers = 0
         var onError: (@Sendable (Error) -> Void)?
@@ -80,7 +89,9 @@ public final class VideoRecordingWriter: @unchecked Sendable {
     private let pixelAdaptor: AVAssetWriterInputPixelBufferAdaptor
     private let audioInput: AVAssetWriterInput?
 
-    private let normalizer = AudioSampleNormalizer()
+    private let systemNormalizer = AudioSampleNormalizer()
+    private let micNormalizer = AudioSampleNormalizer()
+    private var singleSourceAudioScratch: [Float] = []
     private var mixer = DualAudioMixer()
     private var timeline = RecordingTimeline()
     private var sessionStarted = false
@@ -146,7 +157,12 @@ public final class VideoRecordingWriter: @unchecked Sendable {
         } catch {
             throw RecordingError.writerInitializationFailed(error.localizedDescription)
         }
-        writer.shouldOptimizeForNetworkUse = (format == .mp4)
+        if format == .mp4 {
+            writer.shouldOptimizeForNetworkUse = true
+            writer.directoryForTemporaryFiles = outputURL.deletingLastPathComponent()
+        } else {
+            writer.shouldOptimizeForNetworkUse = false
+        }
 
         let effectiveFPS = min(max(1, fps ?? format.targetFPS), Self.maxFPS)
         let pixelCount = Double(width) * Double(height)
@@ -165,10 +181,17 @@ public final class VideoRecordingWriter: @unchecked Sendable {
             compressionProperties[AVVideoProfileLevelKey] = AVVideoProfileLevelH264HighAutoLevel
         }
 
+        let colorProperties: [String: Any] = [
+            AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
+            AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
+            AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2,
+        ]
+
         let videoSettings: [String: Any] = [
             AVVideoCodecKey: codec,
             AVVideoWidthKey: width,
             AVVideoHeightKey: height,
+            AVVideoColorPropertiesKey: colorProperties,
             AVVideoCompressionPropertiesKey: compressionProperties,
         ]
         let vInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
@@ -180,16 +203,11 @@ public final class VideoRecordingWriter: @unchecked Sendable {
         }
         self.videoInput = vInput
 
-        let sourceAttrs: [String: Any] = [
-            kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
-            kCVPixelBufferWidthKey as String: width,
-            kCVPixelBufferHeightKey as String: height,
-            kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any](),
-            kCVPixelBufferMetalCompatibilityKey as String: true,
-        ]
+        // `pixelBufferPool` is never used; passing `nil` avoids creating an unused pool and lets
+        // VideoToolbox ingest both zero-copy `420v` (NV12) IOSurfaces and `32BGRA` buffers directly.
         self.pixelAdaptor = AVAssetWriterInputPixelBufferAdaptor(
             assetWriterInput: vInput,
-            sourcePixelBufferAttributes: sourceAttrs
+            sourcePixelBufferAttributes: nil
         )
         writer.add(vInput)
 
@@ -232,20 +250,31 @@ public final class VideoRecordingWriter: @unchecked Sendable {
     }
 
     public func appendVideo(pixelBuffer: CVPixelBuffer, pts: CMTime) {
-        guard pts.isNumeric else { return }
+        guard pts.isNumeric,
+              CVPixelBufferGetWidth(pixelBuffer) > 0,
+              CVPixelBufferGetHeight(pixelBuffer) > 0
+        else {
+            return
+        }
         let frame = PendingVideoFrame(pixelBuffer: UncheckedSendableBox(pixelBuffer), pts: pts)
         let shouldSchedule: Bool = gate.withLock { state in
-            guard state.isAcceptingInput, !state.isPaused else { return false }
-            if state.pendingVideo.count >= Self.maxPendingVideoFrames {
+            guard state.isAcceptingInput, !state.isPaused, !state.isCancelled else { return false }
+            if state.pendingVideoCount >= Self.maxPendingVideoFrames {
                 // Before the first frame establishes sessionStartPTS, keep slot 0 and evict slot 1.
-                if !state.hasPoppedFirstVideo && state.pendingVideo.count >= 2 {
-                    state.pendingVideo.remove(at: 1)
-                } else {
-                    state.pendingVideo.removeFirst()
+                var seenVideos = 0
+                let targetOrdinal = (!state.hasPoppedFirstVideo && state.pendingVideoCount >= 2) ? 1 : 0
+                if let evictIdx = state.items.firstIndex(where: { item in
+                    guard case .video = item else { return false }
+                    defer { seenVideos += 1 }
+                    return seenVideos == targetOrdinal
+                }) {
+                    state.items.remove(at: evictIdx)
+                    state.pendingVideoCount -= 1
+                    state.droppedVideoFrames += 1
                 }
-                state.droppedVideoFrames += 1
             }
-            state.pendingVideo.append(frame)
+            state.items.append(.video(frame))
+            state.pendingVideoCount += 1
             if state.isDrainScheduled { return false }
             state.isDrainScheduled = true
             return true
@@ -261,12 +290,19 @@ public final class VideoRecordingWriter: @unchecked Sendable {
         guard hasAudioTrack else { return }
         let sample = PendingAudioSample(sampleBuffer: UncheckedSendableBox(sampleBuffer), source: source)
         let shouldSchedule: Bool = gate.withLock { state in
-            guard state.isAcceptingInput, !state.isPaused else { return false }
-            if state.pendingAudio.count >= Self.maxPendingAudioBuffers {
-                state.pendingAudio.removeFirst()
-                state.droppedAudioBuffers += 1
+            guard state.isAcceptingInput, !state.isPaused, !state.isCancelled else { return false }
+            if state.pendingAudioCount >= Self.maxPendingAudioBuffers {
+                if let evictIdx = state.items.firstIndex(where: {
+                    if case .audio = $0 { return true }
+                    return false
+                }) {
+                    state.items.remove(at: evictIdx)
+                    state.pendingAudioCount -= 1
+                    state.droppedAudioBuffers += 1
+                }
             }
-            state.pendingAudio.append(sample)
+            state.items.append(.audio(sample))
+            state.pendingAudioCount += 1
             if state.isDrainScheduled { return false }
             state.isDrainScheduled = true
             return true
@@ -280,25 +316,43 @@ public final class VideoRecordingWriter: @unchecked Sendable {
 
     public func pause() {
         let now = CMClockGetTime(CMClockGetHostTimeClock())
-        gate.withLock { state in
+        let shouldSchedule: Bool = gate.withLock { state in
+            guard !state.isCancelled else { return false }
             state.isPaused = true
-            state.pendingVideo.removeAll(keepingCapacity: true)
-            state.pendingAudio.removeAll(keepingCapacity: true)
+            state.items.removeAll { item in
+                switch item {
+                case .video, .audio: true
+                case .pause, .resume: false
+                }
+            }
+            state.pendingVideoCount = 0
+            state.pendingAudioCount = 0
+            state.items.append(.pause(now))
+            if state.isDrainScheduled { return false }
+            state.isDrainScheduled = true
+            return true
         }
-        queue.async { [weak self] in
-            self?.timeline.pause(at: now)
-            self?.mixer.reset()
-            self?.normalizer.reset()
+        if shouldSchedule {
+            queue.async { [weak self] in
+                self?.drainPending()
+            }
         }
     }
 
     public func resume() {
         let now = CMClockGetTime(CMClockGetHostTimeClock())
-        gate.withLock { state in
+        let shouldSchedule: Bool = gate.withLock { state in
+            guard !state.isCancelled else { return false }
             state.isPaused = false
+            state.items.append(.resume(now))
+            if state.isDrainScheduled { return false }
+            state.isDrainScheduled = true
+            return true
         }
-        queue.async { [weak self] in
-            self?.timeline.resume(at: now)
+        if shouldSchedule {
+            queue.async { [weak self] in
+                self?.drainPending()
+            }
         }
     }
 
@@ -329,15 +383,36 @@ public final class VideoRecordingWriter: @unchecked Sendable {
                     continuation.resume(throwing: RecordingError.noFramesCaptured)
                     return
                 }
+                if self.gate.withLock({ $0.isCancelled }) {
+                    self.isFinished = true
+                    self.pendingFinishContinuations.append(continuation)
+                    if self.writer.status == .writing || self.writer.status == .unknown {
+                        self.writer.cancelWriting()
+                    }
+                    RecordingFileSecurity.removeRegularFileIfPresent(at: self.outputURL)
+                    self.completeFinish(with: .failure(CancellationError()))
+                    return
+                }
 
                 // Drain any frames accepted prior to finish() before closing inputs.
                 self.drainPending()
+                if self.gate.withLock({ $0.isCancelled }) {
+                    self.isFinished = true
+                    self.pendingFinishContinuations.append(continuation)
+                    if self.writer.status == .writing || self.writer.status == .unknown {
+                        self.writer.cancelWriting()
+                    }
+                    RecordingFileSecurity.removeRegularFileIfPresent(at: self.outputURL)
+                    self.completeFinish(with: .failure(CancellationError()))
+                    return
+                }
+
                 self.isFinished = true
                 self.isFinalizing = true
                 self.pendingFinishContinuations.append(continuation)
 
                 if self.sessionStarted && self.expectsSystemAudio && self.expectsMicrophone {
-                    if let tail = self.mixer.flush() {
+                    if let tail = self.mixer.flushSlice() {
                         self.appendMixedPCM(tail.samples, pts: tail.pts)
                     }
                 }
@@ -359,11 +434,22 @@ public final class VideoRecordingWriter: @unchecked Sendable {
                 self.audioInput?.markAsFinished()
 
                 let writerRef = UncheckedSendableBox(self.writer)
-                self.writer.finishWriting { [weak self] in
+                // Capture `self` strongly in this one-shot completion so pending continuations can never leak.
+                self.writer.finishWriting {
                     let status = writerRef.value.status
                     let writerError = writerRef.value.error
-                    guard let self else { return }
                     self.queue.async {
+                        if self.finishedSummary != nil || self.finishedError != nil {
+                            if self.gate.withLock({ $0.isCancelled }) {
+                                RecordingFileSecurity.removeRegularFileIfPresent(at: self.outputURL)
+                            }
+                            return
+                        }
+                        if self.gate.withLock({ $0.isCancelled }) {
+                            RecordingFileSecurity.removeRegularFileIfPresent(at: self.outputURL)
+                            self.completeFinish(with: .failure(CancellationError()))
+                            return
+                        }
                         if status == .completed {
                             RecordingFileSecurity.restrictFilePermissions(at: self.outputURL)
                             self.completeFinish(with: .success((capturedDuration, capturedFrames)))
@@ -384,8 +470,10 @@ public final class VideoRecordingWriter: @unchecked Sendable {
     public func cancel() {
         gate.withLock { state in
             state.isAcceptingInput = false
-            state.pendingVideo.removeAll()
-            state.pendingAudio.removeAll()
+            state.isCancelled = true
+            state.items.removeAll()
+            state.pendingVideoCount = 0
+            state.pendingAudioCount = 0
         }
         queue.async { [weak self] in
             self?.performCancelOnQueue()
@@ -396,8 +484,10 @@ public final class VideoRecordingWriter: @unchecked Sendable {
     func cancelAndWait() {
         gate.withLock { state in
             state.isAcceptingInput = false
-            state.pendingVideo.removeAll()
-            state.pendingAudio.removeAll()
+            state.isCancelled = true
+            state.items.removeAll()
+            state.pendingVideoCount = 0
+            state.pendingAudioCount = 0
         }
         queue.sync {
             performCancelOnQueue()
@@ -405,10 +495,23 @@ public final class VideoRecordingWriter: @unchecked Sendable {
     }
 
     private func performCancelOnQueue() {
+        if isFinalizing {
+            mixer.reset()
+            systemNormalizer.reset()
+            micNormalizer.reset()
+            if writer.status == .writing || writer.status == .unknown {
+                writer.cancelWriting()
+            }
+            RecordingFileSecurity.removeRegularFileIfPresent(at: outputURL)
+            completeFinish(with: .failure(CancellationError()))
+            return
+        }
         guard !isFinished else { return }
         isFinished = true
+        finishedError = CancellationError()
         mixer.reset()
-        normalizer.reset()
+        systemNormalizer.reset()
+        micNormalizer.reset()
         if writer.status == .writing || writer.status == .unknown {
             writer.cancelWriting()
         }
@@ -434,30 +537,46 @@ public final class VideoRecordingWriter: @unchecked Sendable {
 
     private func drainPending() {
         while true {
-            let batch: ([PendingVideoFrame], [PendingAudioSample]) = gate.withLock { state in
-                let videos = state.pendingVideo
-                let audios = state.pendingAudio
-                state.pendingVideo.removeAll(keepingCapacity: true)
-                state.pendingAudio.removeAll(keepingCapacity: true)
-                if !videos.isEmpty {
+            let items: [PendingItem] = gate.withLock { state in
+                if state.isCancelled {
+                    state.items.removeAll()
+                    state.pendingVideoCount = 0
+                    state.pendingAudioCount = 0
+                    state.isDrainScheduled = false
+                    return []
+                }
+                let batch = state.items
+                state.items.removeAll(keepingCapacity: true)
+                if state.pendingVideoCount > 0 {
                     state.hasPoppedFirstVideo = true
                 }
-                if videos.isEmpty && audios.isEmpty {
+                state.pendingVideoCount = 0
+                state.pendingAudioCount = 0
+                if batch.isEmpty {
                     state.isDrainScheduled = false
                 }
-                return (videos, audios)
+                return batch
             }
-            if batch.0.isEmpty && batch.1.isEmpty {
+            if items.isEmpty || isFinished {
                 break
             }
-            if isFinished {
-                break
-            }
-            for frame in batch.0 {
-                processVideo(pixelBuffer: frame.pixelBuffer.value, pts: frame.pts)
-            }
-            for sample in batch.1 {
-                processAudio(sampleBuffer: sample.sampleBuffer.value, source: sample.source)
+            for item in items {
+                if isFinished || gate.withLock({ $0.isCancelled }) {
+                    break
+                }
+                switch item {
+                case .pause(let now):
+                    timeline.pause(at: now)
+                    mixer.reset()
+                    systemNormalizer.reset()
+                    micNormalizer.reset()
+                case .resume(let now):
+                    timeline.resume(at: now)
+                case .video(let frame):
+                    processVideo(pixelBuffer: frame.pixelBuffer.value, pts: frame.pts)
+                case .audio(let sample):
+                    processAudio(sampleBuffer: sample.sampleBuffer.value, source: sample.source)
+                }
             }
         }
     }
@@ -471,8 +590,9 @@ public final class VideoRecordingWriter: @unchecked Sendable {
             guard !state.didReportError else { return nil }
             state.didReportError = true
             state.isAcceptingInput = false
-            state.pendingVideo.removeAll()
-            state.pendingAudio.removeAll()
+            state.items.removeAll()
+            state.pendingVideoCount = 0
+            state.pendingAudioCount = 0
             return state.onError
         }
         if let callback {
@@ -488,7 +608,10 @@ public final class VideoRecordingWriter: @unchecked Sendable {
             return
         }
         guard writer.status == .writing else { return }
-        guard videoInput.isReadyForMoreMediaData else { return }
+        guard videoInput.isReadyForMoreMediaData else {
+            gate.withLock { $0.droppedVideoFrames += 1 }
+            return
+        }
 
         let now = CMClockGetTime(CMClockGetHostTimeClock())
         guard let adjustedPTS = timeline.acceptVideoPTS(pts, wallTime: now) else { return }
@@ -501,6 +624,9 @@ public final class VideoRecordingWriter: @unchecked Sendable {
             frameCount += 1
         } else {
             reportWriterFailureIfNeeded()
+            if writer.status != .failed {
+                Self.logger.warning("Failed to append video frame at pts=\(adjustedPTS.seconds) (status=\(self.writer.status.rawValue))")
+            }
         }
     }
 
@@ -518,27 +644,31 @@ public final class VideoRecordingWriter: @unchecked Sendable {
         }
 
         let rawPTS = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-        guard let adjustedPTS = timeline.acceptAudioPTS(rawPTS) else { return }
+        guard let adjustedPTS = timeline.acceptAudioPTS(rawPTS, source: source) else { return }
 
-        let samples = normalizer.normalize(sampleBuffer)
+        let activeNormalizer = (source == .system) ? systemNormalizer : micNormalizer
+        let samples = activeNormalizer.normalizeSlice(sampleBuffer)
         guard !samples.isEmpty else { return }
 
         if isDualSource {
-            let emitted: [(samples: [Float], pts: CMTime)] = switch source {
+            let emitted: (samples: ArraySlice<Float>, pts: CMTime)? = switch source {
             case .system:
-                mixer.pushSystem(samples, pts: adjustedPTS)
+                mixer.pushSystemSlice(samples, pts: adjustedPTS)
             case .microphone:
-                mixer.pushMicrophone(samples, pts: adjustedPTS)
+                mixer.pushMicrophoneSlice(samples, pts: adjustedPTS)
             }
-            for chunk in emitted {
+            if let chunk = emitted {
                 appendMixedPCM(chunk.samples, pts: chunk.pts)
             }
         } else {
-            appendMixedPCM(samples, pts: adjustedPTS)
+            let sanitized = DualAudioMixer.sanitize(samples, into: &singleSourceAudioScratch)
+            if !sanitized.isEmpty {
+                appendMixedPCM(sanitized, pts: adjustedPTS)
+            }
         }
     }
 
-    private func appendMixedPCM(_ samples: [Float], pts: CMTime) {
+    private func appendMixedPCM(_ samples: ArraySlice<Float>, pts: CMTime) {
         guard sessionStarted, let audioInput, audioInput.isReadyForMoreMediaData else { return }
         if let prev = lastAppendedAudioPTS, pts <= prev {
             return

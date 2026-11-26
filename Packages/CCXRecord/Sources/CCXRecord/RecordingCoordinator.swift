@@ -11,7 +11,7 @@ import ScreenCaptureKit
 @MainActor
 public final class RecordingCoordinator {
     private static let logger = Logger(subsystem: "com.lizhichaox.ccx", category: "RecordingCoordinator")
-    private static let activeStagedURLs = OSAllocatedUnfairLock<Set<URL>>(initialState: [])
+    private nonisolated static let activeStagedURLs = OSAllocatedUnfairLock<Set<URL>>(initialState: [])
 
     public var onStatusChanged: ((RecordingMenuBarStatus?) -> Void)?
     public var onNotice: ((String, String) -> Void)?
@@ -33,17 +33,17 @@ public final class RecordingCoordinator {
     private var effectiveSettings: RecordingSettings?
     private var completion: (@MainActor (RecordingOutcome) -> Void)?
 
-    private var borderPanel: RecordingBorderPanel?
-    private var controlPanel: RecordingControlPanel?
-    private var pendingEngine: ScreenRecordingEngine?
-    private var engine: ScreenRecordingEngine?
-    private var stagedFileURL: URL?
+    nonisolated(unsafe) private var borderPanel: RecordingBorderPanel?
+    nonisolated(unsafe) private var controlPanel: RecordingControlPanel?
+    nonisolated(unsafe) private var pendingEngine: ScreenRecordingEngine?
+    nonisolated(unsafe) private var engine: ScreenRecordingEngine?
+    nonisolated(unsafe) private var stagedFileURL: URL?
 
     private var isStartingRecording = false
     private var accumulatedElapsed: TimeInterval = 0
     private var activeSegmentStartTime: TimeInterval?
     private var lastEmittedElapsedSecond: Int?
-    private var elapsedTimer: Timer?
+    nonisolated(unsafe) private var elapsedTimer: Timer?
 
     nonisolated(unsafe) private var globalKeyMonitor: Any?
     nonisolated(unsafe) private var localKeyMonitor: Any?
@@ -55,16 +55,33 @@ public final class RecordingCoordinator {
     }
 
     deinit {
+        if let staged = stagedFileURL {
+            let standardized = staged.standardizedFileURL
+            Self.activeStagedURLs.withLock { _ = $0.remove(standardized) }
+        }
         let monitors = [globalKeyMonitor, localKeyMonitor].compactMap { $0 }.map(UncheckedSendableBox.init)
         let observer = screenParametersObserver.map(UncheckedSendableBox.init)
-        if Thread.isMainThread {
-            for monitor in monitors { NSEvent.removeMonitor(monitor.value) }
-            if let observer { NotificationCenter.default.removeObserver(observer.value) }
-        } else if !monitors.isEmpty || observer != nil {
-            DispatchQueue.main.async {
+        let timerBox = elapsedTimer.map(UncheckedSendableBox.init)
+        let pendingEngineBox = pendingEngine.map(UncheckedSendableBox.init)
+        let engineBox = engine.map(UncheckedSendableBox.init)
+        let borderBox = borderPanel.map(UncheckedSendableBox.init)
+        let controlBox = controlPanel.map(UncheckedSendableBox.init)
+
+        let cleanupMain: @Sendable () -> Void = {
+            MainActor.assumeIsolated {
+                timerBox?.value.invalidate()
                 for monitor in monitors { NSEvent.removeMonitor(monitor.value) }
                 if let observer { NotificationCenter.default.removeObserver(observer.value) }
+                pendingEngineBox?.value.cancel()
+                engineBox?.value.cancel()
+                borderBox?.value.tearDown()
+                controlBox?.value.tearDown()
             }
+        }
+        if Thread.isMainThread {
+            cleanupMain()
+        } else if !monitors.isEmpty || observer != nil || timerBox != nil || pendingEngineBox != nil || engineBox != nil || borderBox != nil || controlBox != nil {
+            DispatchQueue.main.async(execute: cleanupMain)
         }
     }
 
@@ -117,7 +134,9 @@ public final class RecordingCoordinator {
         border.onRegionChanged = { [weak self] updated in
             guard let self, self.isSessionActive, self.phase == .ready, !self.isStartingRecording else { return }
             self.region = updated
-            self.controlPanel?.updateCaptureRect(updated.screenRect)
+            if self.borderPanel?.isActivelyAdjusting != true {
+                self.controlPanel?.updateCaptureRect(updated.screenRect)
+            }
         }
         border.onInteractionStateChanged = { [weak self] isAdjusting in
             guard let self, self.isSessionActive, self.phase == .ready, !self.isStartingRecording else { return }
@@ -210,10 +229,10 @@ public final class RecordingCoordinator {
         onStatusChanged?(nil)
 
         Task { @MainActor [weak self] in
-            guard let self, self.isSessionActive, self.sessionGeneration == generation else { return }
+            guard self?.isSessionActive == true, self?.sessionGeneration == generation else { return }
             do {
                 let result = try await engine.stop()
-                guard self.isSessionActive, self.sessionGeneration == generation else {
+                guard let self, self.isSessionActive, self.sessionGeneration == generation else {
                     RecordingFileSecurity.removeRegularFileIfPresent(at: result.fileURL)
                     return
                 }
@@ -221,8 +240,12 @@ public final class RecordingCoordinator {
                 self.phase = .completed(result)
                 self.refreshChrome()
             } catch {
-                guard self.isSessionActive, self.sessionGeneration == generation else { return }
+                guard let self, self.isSessionActive, self.sessionGeneration == generation else { return }
                 self.engine = nil
+                if error is CancellationError {
+                    self.tearDown(outcome: .cancelled, deleteStagedFile: true)
+                    return
+                }
                 Self.logger.error("Failed to finalize recording: \(error.localizedDescription)")
                 if Self.isPermissionDeniedError(error) {
                     PermissionManager.setScreenRecordingVerified(false)
@@ -250,6 +273,7 @@ public final class RecordingCoordinator {
         else { return }
         let generation = sessionGeneration
         isStartingRecording = true
+        removeGlobalKeyMonitor()
         borderPanel?.prepareForCapture(region: region)
         controlPanel?.setTemporarilyHidden(false)
         NSCursor.arrow.set()
@@ -319,6 +343,11 @@ public final class RecordingCoordinator {
                     "film"
                 )
                 self.stopActiveRecording()
+            }
+            newEngine.onWriterError = { [weak self] error in
+                guard let self, self.isSessionActive, self.sessionGeneration == generation else { return }
+                Self.logger.error("Recording writer error: \(error.localizedDescription)")
+                self.tearDown(outcome: .failed(Self.userFacingErrorMessage(for: error)), deleteStagedFile: true)
             }
             newEngine.onUnexpectedStop = { [weak self] error in
                 guard let self, self.isSessionActive, self.sessionGeneration == generation else { return }
@@ -433,12 +462,16 @@ public final class RecordingCoordinator {
 
     private func startElapsedTimer() {
         stopElapsedTimer()
-        let timer = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in
+        let elapsed = currentElapsedSeconds()
+        let fractional = elapsed.truncatingRemainder(dividingBy: 1.0)
+        let nextSecondDelay = max(0.05, 1.0 - fractional)
+        let fireDate = Date().addingTimeInterval(nextSecondDelay)
+        let timer = Timer(fire: fireDate, interval: 1.0, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
                 self?.handleElapsedTimerTick()
             }
         }
-        timer.tolerance = 0.05
+        timer.tolerance = 0.1
         RunLoop.main.add(timer, forMode: .common)
         elapsedTimer = timer
     }
@@ -665,7 +698,6 @@ public final class RecordingCoordinator {
                 if let updated {
                     region = updated
                     controlPanel?.updateCaptureRect(updated.screenRect)
-                    refreshChrome()
                 }
                 return true
             }
@@ -673,7 +705,6 @@ public final class RecordingCoordinator {
                 if let updated = borderPanel?.selectAll() {
                     region = updated
                     controlPanel?.updateCaptureRect(updated.screenRect)
-                    refreshChrome()
                 }
                 return true
             }
@@ -760,11 +791,15 @@ public final class RecordingCoordinator {
         }
     }
 
-    private func removeMonitors() {
+    private func removeGlobalKeyMonitor() {
         if let globalKeyMonitor {
             NSEvent.removeMonitor(globalKeyMonitor)
             self.globalKeyMonitor = nil
         }
+    }
+
+    private func removeMonitors() {
+        removeGlobalKeyMonitor()
         if let localKeyMonitor {
             NSEvent.removeMonitor(localKeyMonitor)
             self.localKeyMonitor = nil

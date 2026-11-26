@@ -12,15 +12,17 @@ public struct RecordingTimeline: Sendable {
     private var sessionStartWallTime: CMTime?
     private var totalPausedDuration: CMTime = .zero
     private var lastAdjustedVideoPTS: CMTime?
-    private var lastAdjustedAudioPTS: CMTime?
+    private var lastAdjustedSystemAudioPTS: CMTime?
+    private var lastAdjustedMicAudioPTS: CMTime?
     private var finalAdjustedDuration: TimeInterval?
 
     public init() {}
 
     public var recordedDurationSeconds: TimeInterval {
         let videoSeconds = lastAdjustedVideoPTS.flatMap { $0.isNumeric ? $0.seconds : nil } ?? 0
-        let audioSeconds = lastAdjustedAudioPTS.flatMap { $0.isNumeric ? $0.seconds : nil } ?? 0
-        let mediaMax = max(videoSeconds, audioSeconds)
+        let sysAudioSeconds = lastAdjustedSystemAudioPTS.flatMap { $0.isNumeric ? $0.seconds : nil } ?? 0
+        let micAudioSeconds = lastAdjustedMicAudioPTS.flatMap { $0.isNumeric ? $0.seconds : nil } ?? 0
+        let mediaMax = max(videoSeconds, max(sysAudioSeconds, micAudioSeconds))
         return max(0, max(mediaMax, finalAdjustedDuration ?? 0))
     }
 
@@ -113,6 +115,12 @@ public struct RecordingTimeline: Sendable {
     }
 
     public mutating func acceptAudioPTS(_ rawPTS: CMTime) -> CMTime? {
+        acceptAudioPTS(rawPTS, source: .system)
+    }
+
+    /// Rebases and validates audio PTS monotonically per `source` so independent system-audio and
+    /// microphone streams with interleaved or equal timestamps never drop each other prior to mixing.
+    public mutating func acceptAudioPTS(_ rawPTS: CMTime, source: RecordingAudioSource) -> CMTime? {
         guard rawPTS.isNumeric else { return nil }
 
         if isPaused {
@@ -137,10 +145,18 @@ public struct RecordingTimeline: Sendable {
         let rebased = CMTimeSubtract(shifted, start)
         guard rebased.isNumeric else { return nil }
 
-        if let prev = lastAdjustedAudioPTS, rebased <= prev {
-            return nil
+        switch source {
+        case .system:
+            if let prev = lastAdjustedSystemAudioPTS, rebased <= prev {
+                return nil
+            }
+            lastAdjustedSystemAudioPTS = rebased
+        case .microphone:
+            if let prev = lastAdjustedMicAudioPTS, rebased <= prev {
+                return nil
+            }
+            lastAdjustedMicAudioPTS = rebased
         }
-        lastAdjustedAudioPTS = rebased
         return rebased
     }
 }

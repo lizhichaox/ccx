@@ -1306,6 +1306,250 @@ struct CCXRecordTests {
         #expect(!fm.fileExists(atPath: cancelURL.path))
     }
 
+    @Test func timelineTracksIndependentMonotonicAudioPTSPerSource() {
+        var timeline = RecordingTimeline()
+        let v0 = timeline.acceptVideoPTS(CMTime(seconds: 100.0, preferredTimescale: 1000))
+        #expect(v0 == .zero)
+
+        // Equal timestamps from system audio and microphone must both pass into the dual mixer.
+        let t1 = CMTime(seconds: 100.5, preferredTimescale: 1000)
+        let mic1 = timeline.acceptAudioPTS(t1, source: .microphone)
+        let sys1 = timeline.acceptAudioPTS(t1, source: .system)
+        #expect(mic1 != nil && abs((mic1?.seconds ?? -1) - 0.5) < 0.001)
+        #expect(sys1 != nil && abs((sys1?.seconds ?? -1) - 0.5) < 0.001)
+
+        // Interleaved timestamps where system runs ahead and mic arrives slightly earlier must both pass.
+        let sys2 = timeline.acceptAudioPTS(CMTime(seconds: 100.70, preferredTimescale: 1000), source: .system)
+        let mic2 = timeline.acceptAudioPTS(CMTime(seconds: 100.65, preferredTimescale: 1000), source: .microphone)
+        #expect(sys2 != nil && abs((sys2?.seconds ?? -1) - 0.70) < 0.001)
+        #expect(mic2 != nil && abs((mic2?.seconds ?? -1) - 0.65) < 0.001)
+
+        // Regressing within the same source is still rejected.
+        #expect(timeline.acceptAudioPTS(CMTime(seconds: 100.68, preferredTimescale: 1000), source: .system) == nil)
+        #expect(timeline.acceptAudioPTS(CMTime(seconds: 100.60, preferredTimescale: 1000), source: .microphone) == nil)
+
+        // Duration tracks the maximum across video, system audio, and microphone streams.
+        let mic3 = timeline.acceptAudioPTS(CMTime(seconds: 102.0, preferredTimescale: 1000), source: .microphone)
+        #expect(mic3 != nil)
+        #expect(abs(timeline.recordedDurationSeconds - 2.0) < 0.001)
+    }
+
+    @Test func audioMixerHandlesExtremeStaleLagOversizedPushAndSingleSourceSanitize() {
+        var mixer = DualAudioMixer()
+        let t0 = CMTime(seconds: 0.0, preferredTimescale: 48_000)
+        #expect(mixer.pushMicrophone([Float](repeating: 0.4, count: 400), pts: t0).isEmpty)
+
+        // Extreme PTS jump (> Int.max / 2 samples) must not overflow/trap; it must clear stale mic samples.
+        let extremePTS = CMTime(seconds: 1e12, preferredTimescale: 1)
+        let sysAfterJump = mixer.pushSystem([0.25, -0.25, 0.25, -0.25], pts: extremePTS)
+        #expect(sysAfterJump.count == 1)
+        #expect(abs((sysAfterJump[0].samples.first ?? 0) - 0.25) < 0.001)
+
+        // Oversized single mic push caps cleanly to maxBufferedFloats retaining newest tail.
+        var capMixer = DualAudioMixer()
+        _ = capMixer.pushSystem([0.0, 0.0], pts: t0)
+        var hugeChunk = [Float](repeating: 0.1, count: 4_000)
+        hugeChunk.append(contentsOf: repeatElement(0.35, count: DualAudioMixer.maxBufferedFloats))
+        #expect(capMixer.pushMicrophone(hugeChunk, pts: CMTime(seconds: 0.01, preferredTimescale: 48_000)).isEmpty)
+        let mixedAfterCap = capMixer.pushSystem([Float](repeating: 0.15, count: 500), pts: CMTime(seconds: 0.02, preferredTimescale: 48_000))
+        #expect(mixedAfterCap.count == 1)
+        #expect(abs((mixedAfterCap[0].samples.first ?? 0) - 0.5) < 0.001)
+
+        // Single-source sanitize replaces NaN/Inf with 0 and trims odd length without throwing.
+        var scratch: [Float] = []
+        let dirty: [Float] = [0.5, .nan, .infinity, -.infinity, -0.25]
+        let clean = DualAudioMixer.sanitize(dirty[...], into: &scratch)
+        #expect(clean.count == 4)
+        #expect(clean[0] == 0.5 && clean[1] == 0 && clean[2] == 0 && clean[3] == 0)
+    }
+
+    @Test func gifEncoderScaledAccelerateFastPathPauseCausalOrderCancelAndErrorIdempotency() async throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("ccx-gif-opt-\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: root) }
+
+        // 1. Scaled BGRA CVPixelBuffer path fingerprints before scaling, uses Accelerate vImageScale without CGContext,
+        //    coalesces static duplicates, and writes a valid target-sized 0600 GIF.
+        let scaledURL = root.appendingPathComponent("scaled.gif")
+        let scaledEncoder = try GifRecordingEncoder(outputURL: scaledURL, pixelSize: CGSize(width: 64, height: 48), fps: 15)
+        let bigRed = try #require(makeTestBGRAPixelBuffer(width: 128, height: 96, r: 220, g: 30, b: 30))
+        let bigBlue = try #require(makeTestBGRAPixelBuffer(width: 128, height: 96, r: 30, g: 60, b: 220))
+        scaledEncoder.appendVideo(pixelBuffer: bigRed, pts: CMTime(seconds: 0.00, preferredTimescale: 1000))
+        scaledEncoder.appendVideo(pixelBuffer: bigRed, pts: CMTime(seconds: 0.10, preferredTimescale: 1000))
+        scaledEncoder.appendVideo(pixelBuffer: bigRed, pts: CMTime(seconds: 0.20, preferredTimescale: 1000))
+        scaledEncoder.appendVideo(pixelBuffer: bigBlue, pts: CMTime(seconds: 0.30, preferredTimescale: 1000))
+
+        let scaledSummary = try await scaledEncoder.finish()
+        #expect(scaledSummary.frameCount == 2)
+        #expect(await scaledEncoder.debugMaterializedFrameCount() == 2)
+        #expect(await scaledEncoder.debugHasAllocatedScaleContext() == false)
+
+        let scaledSource = try #require(CGImageSourceCreateWithURL(scaledURL as CFURL, nil))
+        #expect(CGImageSourceGetCount(scaledSource) == 2)
+        let firstCG = try #require(CGImageSourceCreateImageAtIndex(scaledSource, 0, nil))
+        #expect(firstCG.width == 64 && firstCG.height == 48)
+        var st = stat()
+        #expect(lstat(scaledURL.path, &st) == 0 && (st.st_mode & 0o777) == 0o600)
+
+        // 2. Rapid pause()/resume() followed immediately by a post-resume frame stays causally ordered
+        //    so pause duration is subtracted before the post-resume frame is timestamped.
+        let pauseURL = root.appendingPathComponent("pause-order.gif")
+        let pauseEncoder = try GifRecordingEncoder(outputURL: pauseURL, pixelSize: CGSize(width: 64, height: 48), fps: 15)
+        pauseEncoder.appendVideo(pixelBuffer: bigRed, pts: CMTime(seconds: 0.00, preferredTimescale: 1000))
+        #expect(await pauseEncoder.debugMaterializedFrameCount() == 1)
+        pauseEncoder.pause()
+        try await Task.sleep(for: .milliseconds(150))
+        pauseEncoder.resume()
+        pauseEncoder.appendVideo(pixelBuffer: bigBlue, pts: CMTime(seconds: 0.30, preferredTimescale: 1000))
+        let pauseSummary = try await pauseEncoder.finish()
+        #expect(pauseSummary.frameCount == 2)
+        #expect(pauseSummary.duration < 0.24)
+
+        // 3. Repeated finish() after an error (0 frames) re-throws instead of returning success.
+        let emptyURL = root.appendingPathComponent("empty.gif")
+        let emptyEncoder = try GifRecordingEncoder(outputURL: emptyURL, pixelSize: CGSize(width: 32, height: 32), fps: 15)
+        await #expect(throws: Error.self) {
+            _ = try await emptyEncoder.finish()
+        }
+        await #expect(throws: Error.self) {
+            _ = try await emptyEncoder.finish()
+        }
+        #expect(!fm.fileExists(atPath: emptyURL.path))
+
+        // 4. Cancel before/during finalize aborts cleanly with CancellationError and removes output file.
+        let cancelURL = root.appendingPathComponent("cancel-fin.gif")
+        let cancelEncoder = try GifRecordingEncoder(outputURL: cancelURL, pixelSize: CGSize(width: 64, height: 48), fps: 15)
+        cancelEncoder.appendVideo(pixelBuffer: bigRed, pts: CMTime(seconds: 0.00, preferredTimescale: 1000))
+        cancelEncoder.cancel()
+        await #expect(throws: CancellationError.self) {
+            _ = try await cancelEncoder.finish()
+        }
+        #expect(!fm.fileExists(atPath: cancelURL.path))
+
+        // 5. Symlink planted between init and finish is rejected before CGImageDestinationFinalize.
+        let victimFile = root.appendingPathComponent("victim.txt")
+        try Data("do-not-overwrite".utf8).write(to: victimFile)
+        let swappedURL = root.appendingPathComponent("swapped.gif")
+        let swappedEncoder = try GifRecordingEncoder(outputURL: swappedURL, pixelSize: CGSize(width: 64, height: 48), fps: 15)
+        swappedEncoder.appendVideo(pixelBuffer: bigRed, pts: CMTime(seconds: 0.00, preferredTimescale: 1000))
+        try fm.removeItem(at: swappedURL)
+        try fm.createSymbolicLink(at: swappedURL, withDestinationURL: victimFile)
+        await #expect(throws: Error.self) {
+            _ = try await swappedEncoder.finish()
+        }
+        #expect(try Data(contentsOf: victimFile) == Data("do-not-overwrite".utf8))
+    }
+
+    @Test func fdFileSecurityProtectsSymlinkTargetsAndResolvesVarPrivateVarAliasing() throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("ccx-fd-sec-\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: root) }
+
+        let stageDir = root.appendingPathComponent("CCXRecordings", isDirectory: true)
+        try RecordingFileSecurity.ensureSecureStagingDirectory(at: stageDir)
+
+        // 1. restrictFilePermissions never follows symlinks to alter victim permissions.
+        let victim = root.appendingPathComponent("victim.dat")
+        try Data("keep".utf8).write(to: victim)
+        #expect(chmod(victim.path, 0o644) == 0)
+        let symlink = stageDir.appendingPathComponent("CCX-Rec-sym.mp4")
+        try fm.createSymbolicLink(at: symlink, withDestinationURL: victim)
+        RecordingFileSecurity.restrictFilePermissions(at: symlink)
+        var st = stat()
+        #expect(lstat(victim.path, &st) == 0 && (st.st_mode & 0o777) == 0o644)
+
+        // 2. removeRegularFileIfPresent never removes directories or symlinks.
+        let nestedDir = stageDir.appendingPathComponent("CCX-Rec-dir", isDirectory: true)
+        try fm.createDirectory(at: nestedDir, withIntermediateDirectories: true)
+        RecordingFileSecurity.removeRegularFileIfPresent(at: nestedDir)
+        RecordingFileSecurity.removeRegularFileIfPresent(at: symlink)
+        #expect(fm.fileExists(atPath: nestedDir.path))
+        #expect(lstat(symlink.path, &st) == 0)
+
+        // 3. cleanupStagingDirectory matches active files across `/var` vs `/private/var` aliasing.
+        let activeFile = stageDir.appendingPathComponent("CCX-Rec-aliased.mp4")
+        let staleFile = stageDir.appendingPathComponent("CCX-Rec-stale.mp4")
+        try Data("active".utf8).write(to: activeFile)
+        try Data("stale".utf8).write(to: staleFile)
+        let resolvedActive = activeFile.resolvingSymlinksInPath()
+        let unaliasedStage = stageDir
+        RecordingFileSecurity.cleanupStagingDirectory(
+            at: unaliasedStage,
+            olderThan: 0,
+            activeFileURLs: [resolvedActive]
+        )
+        #expect(fm.fileExists(atPath: activeFile.path))
+        #expect(!fm.fileExists(atPath: staleFile.path))
+
+        // 4. createRestrictedEmptyFile enforces 0600 and rejects existing files via O_EXCL.
+        let freshFile = stageDir.appendingPathComponent("CCX-Rec-fresh.gif")
+        try RecordingFileSecurity.createRestrictedEmptyFile(at: freshFile)
+        #expect(lstat(freshFile.path, &st) == 0 && (st.st_mode & 0o777) == 0o600)
+        #expect(throws: Error.self) {
+            try RecordingFileSecurity.createRestrictedEmptyFile(at: freshFile)
+        }
+    }
+
+    @Test @MainActor func streamConfigurationUses420vForVideoAndBorderPanelDropsShapeBackingDuringCapture() {
+        let region = RecordingRegion(
+            displayID: 1,
+            displayFrame: CGRect(x: 0, y: 0, width: 1440, height: 900),
+            localRect: CGRect(x: 100, y: 100, width: 601, height: 401),
+            screenRect: CGRect(x: 100, y: 100, width: 601, height: 401),
+            scale: 2
+        )
+
+        let mp4Settings60 = RecordingSettings(format: .mp4, videoFPS: 60)
+        let mp4Config60 = ScreenRecordingEngine.makeStreamConfiguration(
+            region: region,
+            targetPixelSize: region.pixelSize(for: .mp4),
+            runSettings: mp4Settings60
+        )
+        #expect(mp4Config60.pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
+        #expect(mp4Config60.width >= 2 && mp4Config60.width.isMultiple(of: 2))
+        #expect(mp4Config60.height >= 2 && mp4Config60.height.isMultiple(of: 2))
+        #expect(mp4Config60.queueDepth == 5)
+
+        let movSettings30 = RecordingSettings(format: .mov, videoFPS: 30)
+        let movConfig30 = ScreenRecordingEngine.makeStreamConfiguration(
+            region: region,
+            targetPixelSize: region.pixelSize(for: .mov),
+            runSettings: movSettings30
+        )
+        #expect(movConfig30.pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
+        #expect(movConfig30.queueDepth == 3)
+
+        let gifSettings = RecordingSettings(format: .gif, gifFPS: 15)
+        let gifConfig = ScreenRecordingEngine.makeStreamConfiguration(
+            region: region,
+            targetPixelSize: region.pixelSize(for: .gif),
+            runSettings: gifSettings
+        )
+        #expect(gifConfig.pixelFormat == kCVPixelFormatType_32BGRA)
+        #expect(gifConfig.queueDepth == 3)
+
+        // Border panel disables mouse-moved tracking and drops all CAShapeLayer backing during capture phases.
+        let borderPanel = RecordingBorderPanel(region: region, topInset: 24, settings: mp4Settings60)
+        defer { borderPanel.tearDown() }
+        #expect(borderPanel.acceptsMouseMovedEvents)
+        #expect(borderPanel.hasActiveShapeLayerBackingForTesting)
+
+        borderPanel.prepareForCapture(region: borderPanel.currentRegion)
+        #expect(!borderPanel.acceptsMouseMovedEvents)
+
+        borderPanel.update(phase: .recording, region: borderPanel.currentRegion, settings: mp4Settings60)
+        #expect(!borderPanel.acceptsMouseMovedEvents)
+        #expect(!borderPanel.hasActiveShapeLayerBackingForTesting)
+
+        borderPanel.update(phase: .paused, region: borderPanel.currentRegion, settings: mp4Settings60)
+        #expect(!borderPanel.hasActiveShapeLayerBackingForTesting)
+
+        borderPanel.update(phase: .finalizing, region: borderPanel.currentRegion, settings: mp4Settings60)
+        #expect(!borderPanel.hasActiveShapeLayerBackingForTesting)
+    }
+
     private func makeTestBGRAPixelBuffer(width: Int, height: Int, r: UInt8, g: UInt8, b: UInt8) -> CVPixelBuffer? {
         var pixelBuffer: CVPixelBuffer?
         let status = CVPixelBufferCreate(

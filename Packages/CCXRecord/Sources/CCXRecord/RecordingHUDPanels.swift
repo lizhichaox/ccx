@@ -21,6 +21,7 @@ final class RecordingBorderPanel: NSPanel {
     var isSizeLabelHidden: Bool { borderView.isSizeLabelHidden }
     var sizeLabelText: String { borderView.sizeLabelText }
     var renderCountForTesting: Int { borderView.renderCount }
+    var hasActiveShapeLayerBackingForTesting: Bool { borderView.hasActiveShapeLayerBacking }
 
     override var canBecomeKey: Bool { isInteractive }
     override var canBecomeMain: Bool { false }
@@ -67,6 +68,7 @@ final class RecordingBorderPanel: NSPanel {
         if case .ready = phase, !lockedForCapture {
             isInteractive = true
             ignoresMouseEvents = false
+            acceptsMouseMovedEvents = true
             if frame != region.displayFrame {
                 setFrame(region.displayFrame, display: false)
             }
@@ -121,6 +123,7 @@ final class RecordingBorderPanel: NSPanel {
         let wasInteractive = isInteractive
         isInteractive = false
         ignoresMouseEvents = true
+        acceptsMouseMovedEvents = false
         let outsetRect = region.screenRect.insetBy(dx: -4, dy: -4)
         if frame != outsetRect {
             setFrame(outsetRect, display: true)
@@ -152,19 +155,42 @@ private final class RecordingBorderView: NSView {
     private var lastMousePoint: CGPoint?
     private var lastCursorKind: CursorKind?
     private var lastSizeLabelText: String?
+    private var lastRenderedBounds: CGRect = .zero
     private var trackingArea: NSTrackingArea?
     private(set) var renderCount = 0
 
-    private let dimLayer = CAShapeLayer()
-    private let contrastBorderLayer = CAShapeLayer()
-    private let borderLayer = CAShapeLayer()
-    private let handleLayer = CAShapeLayer()
+    // Four plain solid CALayers partition the dimmed exterior around the active selection
+    // with zero CABackingStore memory (replacing a full-display even-odd CAShapeLayer).
+    private let dimTopLayer = CALayer()
+    private let dimBottomLayer = CALayer()
+    private let dimLeftLayer = CALayer()
+    private let dimRightLayer = CALayer()
+    private let contrastBorderLayer = CALayer()
+    private let captureBorderLayer = CALayer()
+    // Four thin edge-strip CAShapeLayers render dashed borders during `.ready` with <1% of a full-rect backing store.
+    private let dashedTopEdge = CAShapeLayer()
+    private let dashedBottomEdge = CAShapeLayer()
+    private let dashedLeftEdge = CAShapeLayer()
+    private let dashedRightEdge = CAShapeLayer()
+    // Eight plain CALayer squares render the resize handles with zero backing-store allocation.
+    private let handleLayers: [CALayer] = (0..<RecordingResizeHandle.allCases.count).map { _ in CALayer() }
     private let sizeLabel = NonInteractiveBorderLabel(labelWithString: "")
 
     var isActivelyAdjusting: Bool { isInteractive && adjuster.isInteracting }
     var isRedrawing: Bool { isInteractive && adjuster.isRedrawing }
     var isSizeLabelHidden: Bool { sizeLabel.isHidden }
     var sizeLabelText: String { sizeLabel.stringValue }
+    var hasActiveShapeLayerBacking: Bool {
+        dashedEdges.contains { !$0.isHidden || $0.path != nil }
+    }
+
+    private var dimLayers: [CALayer] {
+        [dimTopLayer, dimBottomLayer, dimLeftLayer, dimRightLayer]
+    }
+
+    private var dashedEdges: [CAShapeLayer] {
+        [dashedTopEdge, dashedBottomEdge, dashedLeftEdge, dashedRightEdge]
+    }
 
     init(region: RecordingRegion, topInset: CGFloat, settings: RecordingSettings) {
         self.topInset = topInset
@@ -412,29 +438,46 @@ private final class RecordingBorderView: NSView {
     private func setUpLayers() {
         guard let root = layer else { return }
 
-        dimLayer.fillRule = .evenOdd
-        dimLayer.fillColor = NSColor.black.withAlphaComponent(0.32).cgColor
-        dimLayer.zPosition = 1
-        root.addSublayer(dimLayer)
+        let dimColor = NSColor.black.withAlphaComponent(0.32).cgColor
+        for dim in dimLayers {
+            dim.backgroundColor = dimColor
+            dim.zPosition = 1
+            root.addSublayer(dim)
+        }
 
-        contrastBorderLayer.fillColor = nil
-        contrastBorderLayer.strokeColor = NSColor.white.withAlphaComponent(0.7).cgColor
-        contrastBorderLayer.lineWidth = 3.0
+        contrastBorderLayer.backgroundColor = nil
+        contrastBorderLayer.borderColor = NSColor.white.withAlphaComponent(0.7).cgColor
+        contrastBorderLayer.borderWidth = 3.0
         contrastBorderLayer.zPosition = 2
         root.addSublayer(contrastBorderLayer)
 
-        borderLayer.fillColor = nil
-        borderLayer.lineWidth = 2.0
-        borderLayer.zPosition = 3
-        root.addSublayer(borderLayer)
+        captureBorderLayer.backgroundColor = nil
+        captureBorderLayer.borderWidth = 2.5
+        captureBorderLayer.zPosition = 3
+        captureBorderLayer.isHidden = true
+        root.addSublayer(captureBorderLayer)
 
-        handleLayer.fillColor = NSColor.white.cgColor
-        handleLayer.strokeColor = NSColor.systemBlue.cgColor
-        handleLayer.lineWidth = 1.5
-        handleLayer.zPosition = 4
-        root.addSublayer(handleLayer)
+        let dashColor = NSColor.systemBlue.cgColor
+        for edge in dashedEdges {
+            edge.fillColor = nil
+            edge.strokeColor = dashColor
+            edge.lineWidth = 2.0
+            edge.lineDashPattern = [6, 4]
+            edge.zPosition = 3
+            root.addSublayer(edge)
+        }
 
-        syncLayerBounds()
+        let handleFill = NSColor.white.cgColor
+        let handleStroke = NSColor.systemBlue.cgColor
+        for handleLayer in handleLayers {
+            handleLayer.backgroundColor = handleFill
+            handleLayer.borderColor = handleStroke
+            handleLayer.borderWidth = 1.5
+            handleLayer.cornerRadius = 2
+            handleLayer.zPosition = 4
+            root.addSublayer(handleLayer)
+        }
+
         updateLayerContentsScale()
     }
 
@@ -452,103 +495,156 @@ private final class RecordingBorderView: NSView {
     }
 
     private func syncLayerBounds() {
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        dimLayer.frame = bounds
-        contrastBorderLayer.frame = bounds
-        borderLayer.frame = bounds
-        handleLayer.frame = bounds
-        CATransaction.commit()
+        guard bounds != lastRenderedBounds else { return }
+        if !isInteractive {
+            render()
+        }
     }
 
     private func updateLayerContentsScale() {
         let scale = window?.backingScaleFactor ?? currentRegion.scale
         layer?.contentsScale = scale
-        dimLayer.contentsScale = scale
+        for dim in dimLayers { dim.contentsScale = scale }
         contrastBorderLayer.contentsScale = scale
-        borderLayer.contentsScale = scale
-        handleLayer.contentsScale = scale
+        captureBorderLayer.contentsScale = scale
+        for edge in dashedEdges { edge.contentsScale = scale }
+        for handle in handleLayers { handle.contentsScale = scale }
+    }
+
+    private func hideDashedEdges() {
+        for edge in dashedEdges {
+            edge.isHidden = true
+            edge.path = nil
+        }
+    }
+
+    private func updateDashedEdges(around rect: CGRect, lineWidth: CGFloat) {
+        guard !rect.isNull, rect.width > 0, rect.height > 0 else {
+            hideDashedEdges()
+            return
+        }
+        let stripThickness = max(2.0, ceil(lineWidth))
+        let halfStrip = stripThickness / 2.0
+
+        func configureHorizontal(_ edge: CAShapeLayer, y: CGFloat) {
+            edge.isHidden = false
+            edge.lineWidth = lineWidth
+            edge.frame = CGRect(x: rect.minX, y: y - halfStrip, width: rect.width, height: stripThickness)
+            let path = CGMutablePath()
+            path.move(to: CGPoint(x: 0, y: halfStrip))
+            path.addLine(to: CGPoint(x: rect.width, y: halfStrip))
+            edge.path = path
+        }
+
+        func configureVertical(_ edge: CAShapeLayer, x: CGFloat) {
+            edge.isHidden = false
+            edge.lineWidth = lineWidth
+            edge.frame = CGRect(x: x - halfStrip, y: rect.minY, width: stripThickness, height: rect.height)
+            let path = CGMutablePath()
+            path.move(to: CGPoint(x: halfStrip, y: 0))
+            path.addLine(to: CGPoint(x: halfStrip, y: rect.height))
+            edge.path = path
+        }
+
+        configureHorizontal(dashedTopEdge, y: rect.maxY)
+        configureHorizontal(dashedBottomEdge, y: rect.minY)
+        configureVertical(dashedLeftEdge, x: rect.minX)
+        configureVertical(dashedRightEdge, x: rect.maxX)
     }
 
     private func render() {
         renderCount += 1
+        lastRenderedBounds = bounds
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         defer { CATransaction.commit() }
 
-        syncLayerBounds()
-
         guard isInteractive else {
-            dimLayer.isHidden = true
-            dimLayer.path = nil
+            for dim in dimLayers { dim.isHidden = true }
             contrastBorderLayer.isHidden = true
-            contrastBorderLayer.path = nil
-            handleLayer.isHidden = true
-            handleLayer.path = nil
+            for handle in handleLayers { handle.isHidden = true }
             sizeLabel.isHidden = true
 
-            let strokeRect = bounds.insetBy(dx: 2, dy: 2)
-            if !strokeRect.isNull, strokeRect.width > 0, strokeRect.height > 0 {
-                let corner = max(0, min(5, strokeRect.width / 2, strokeRect.height / 2))
-                borderLayer.path = CGPath(roundedRect: strokeRect, cornerWidth: corner, cornerHeight: corner, transform: nil)
-            } else {
-                borderLayer.path = nil
+            if case .ready = phase {
+                captureBorderLayer.isHidden = true
+                let strokeRect = bounds.insetBy(dx: 2, dy: 2)
+                updateDashedEdges(around: strokeRect, lineWidth: 2.5)
+                return
             }
-            borderLayer.lineWidth = 2.5
+
+            hideDashedEdges()
+            // Plain CALayer border uses zero backing store memory during recording/paused/completed.
+            let outerRect = bounds.insetBy(dx: 0.75, dy: 0.75)
+            if !outerRect.isNull, outerRect.width > 0, outerRect.height > 0 {
+                captureBorderLayer.isHidden = false
+                captureBorderLayer.frame = outerRect
+                captureBorderLayer.borderWidth = 2.5
+                captureBorderLayer.cornerRadius = max(0, min(6.25, outerRect.width / 2, outerRect.height / 2))
+            } else {
+                captureBorderLayer.isHidden = true
+            }
 
             switch phase {
             case .ready:
-                borderLayer.strokeColor = NSColor.systemBlue.cgColor
-                borderLayer.lineDashPattern = [6, 4]
+                break
             case .recording:
-                borderLayer.strokeColor = NSColor.systemRed.cgColor
-                borderLayer.lineDashPattern = nil
+                captureBorderLayer.borderColor = NSColor.systemRed.cgColor
             case .paused:
-                borderLayer.strokeColor = NSColor.systemOrange.cgColor
-                borderLayer.lineDashPattern = nil
+                captureBorderLayer.borderColor = NSColor.systemOrange.cgColor
             case .finalizing:
-                borderLayer.strokeColor = NSColor.white.withAlphaComponent(0.75).cgColor
-                borderLayer.lineDashPattern = nil
+                captureBorderLayer.borderColor = NSColor.white.withAlphaComponent(0.75).cgColor
             case .completed:
-                borderLayer.strokeColor = NSColor.systemGreen.cgColor
-                borderLayer.lineDashPattern = nil
+                captureBorderLayer.borderColor = NSColor.systemGreen.cgColor
             }
             return
         }
 
+        captureBorderLayer.isHidden = true
         let rect = adjuster.activeRect
-        dimLayer.isHidden = false
-        let dimPath = CGMutablePath()
-        dimPath.addRect(bounds)
-        dimPath.addRect(rect)
-        dimLayer.path = dimPath
+
+        // Non-overlapping 4-strip exterior dimming partition of `bounds \ rect`.
+        let clampedMinX = min(max(rect.minX, bounds.minX), bounds.maxX)
+        let clampedMaxX = min(max(rect.maxX, clampedMinX), bounds.maxX)
+        let clampedMinY = min(max(rect.minY, bounds.minY), bounds.maxY)
+        let clampedMaxY = min(max(rect.maxY, clampedMinY), bounds.maxY)
+        let middleHeight = max(0, clampedMaxY - clampedMinY)
+
+        let topRect = CGRect(x: bounds.minX, y: clampedMaxY, width: bounds.width, height: max(0, bounds.maxY - clampedMaxY))
+        let bottomRect = CGRect(x: bounds.minX, y: bounds.minY, width: bounds.width, height: max(0, clampedMinY - bounds.minY))
+        let leftRect = CGRect(x: bounds.minX, y: clampedMinY, width: max(0, clampedMinX - bounds.minX), height: middleHeight)
+        let rightRect = CGRect(x: clampedMaxX, y: clampedMinY, width: max(0, bounds.maxX - clampedMaxX), height: middleHeight)
+
+        let dimRects = [topRect, bottomRect, leftRect, rightRect]
+        for (dimLayer, strip) in zip(dimLayers, dimRects) {
+            let empty = strip.width <= 0 || strip.height <= 0
+            dimLayer.isHidden = empty
+            if !empty {
+                dimLayer.frame = strip
+            }
+        }
 
         let inset = min(1.0, min(rect.width, rect.height) / 2)
         let borderRect = rect.insetBy(dx: inset, dy: inset)
-        let borderPath = borderRect.isNull ? nil : CGPath(rect: borderRect, transform: nil)
+        if !borderRect.isNull, borderRect.width > 0, borderRect.height > 0 {
+            contrastBorderLayer.isHidden = false
+            contrastBorderLayer.frame = borderRect.insetBy(dx: -1.5, dy: -1.5)
+            updateDashedEdges(around: borderRect, lineWidth: 2.0)
+        } else {
+            contrastBorderLayer.isHidden = true
+            hideDashedEdges()
+        }
 
-        contrastBorderLayer.isHidden = false
-        contrastBorderLayer.path = borderPath
-
-        borderLayer.path = borderPath
-        borderLayer.strokeColor = NSColor.systemBlue.cgColor
-        borderLayer.lineWidth = 2.0
-        borderLayer.lineDashPattern = [6, 4]
-
-        handleLayer.isHidden = false
-        let handlesPath = CGMutablePath()
         let minCenterX = bounds.minX + 5
         let maxCenterX = max(minCenterX, bounds.maxX - 5)
         let minCenterY = bounds.minY + 5
         let maxCenterY = max(minCenterY, bounds.maxY - 5)
-        for handle in RecordingResizeHandle.allCases {
+        for (handle, handleLayer) in zip(RecordingResizeHandle.allCases, handleLayers) {
             let rawCenter = RecordingFrameAdjuster.handlePoint(handle, for: rect)
             let cx = min(max(rawCenter.x, minCenterX), maxCenterX)
             let cy = min(max(rawCenter.y, minCenterY), maxCenterY)
-            let handleRect = CGRect(x: cx - 4, y: cy - 4, width: 8, height: 8)
-            handlesPath.addRoundedRect(in: handleRect, cornerWidth: 2, cornerHeight: 2)
+            handleLayer.isHidden = false
+            handleLayer.frame = CGRect(x: cx - 4.75, y: cy - 4.75, width: 9.5, height: 9.5)
         }
-        handleLayer.path = handlesPath
 
         updateSizeLabel(for: rect)
     }

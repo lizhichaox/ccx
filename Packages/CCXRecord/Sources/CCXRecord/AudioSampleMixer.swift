@@ -1,5 +1,6 @@
 import AVFoundation
 import CoreMedia
+import Darwin
 import Foundation
 
 /// Identifies the originating audio stream in `ScreenRecordingEngine`.
@@ -18,12 +19,19 @@ public final class AudioSampleNormalizer {
     private static let maxSupportedSampleRate: Double = 384_000
     private static let maxSupportedChannels: AVAudioChannelCount = 64
 
+    private final class InputProviderState: @unchecked Sendable {
+        var buffer: AVAudioPCMBuffer?
+        var consumed = false
+    }
+
     public let targetFormat: AVAudioFormat
 
     private var cachedSourceFormat: AVAudioFormat?
     private var cachedConverter: AVAudioConverter?
     private var cachedInputBuffer: AVAudioPCMBuffer?
     private var cachedOutputBuffer: AVAudioPCMBuffer?
+    private let inputProviderState = InputProviderState()
+    private var scratchOutput: [Float] = []
 
     public init() {
         guard let format = AVAudioFormat(
@@ -40,21 +48,36 @@ public final class AudioSampleNormalizer {
     /// Resets cached resampler filter state across discontinuities such as pause/resume.
     public func reset() {
         cachedConverter?.reset()
+        if scratchOutput.capacity > 65_536 {
+            scratchOutput.removeAll(keepingCapacity: false)
+        }
     }
 
     public func normalize(_ sampleBuffer: CMSampleBuffer) -> [Float] {
+        let slice = normalizeSlice(sampleBuffer)
+        return slice.isEmpty ? [] : Array(slice)
+    }
+
+    public func normalize(pcmBuffer inputBuffer: AVAudioPCMBuffer) -> [Float] {
+        let slice = normalizeSlice(pcmBuffer: inputBuffer)
+        return slice.isEmpty ? [] : Array(slice)
+    }
+
+    /// Normalizes `sampleBuffer` into the internal reusable scratch buffer, returning a slice
+    /// valid until the next `normalize*` or `reset()` call on this normalizer.
+    func normalizeSlice(_ sampleBuffer: CMSampleBuffer) -> ArraySlice<Float> {
         guard let formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer),
               let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc),
               asbd.pointee.mFormatID == kAudioFormatLinearPCM
         else {
-            return []
+            return [][...]
         }
 
         let frameCount = CMSampleBufferGetNumSamples(sampleBuffer)
-        guard frameCount > 0, frameCount <= Self.maxFramesPerBuffer else { return [] }
+        guard frameCount > 0, frameCount <= Self.maxFramesPerBuffer else { return [][...] }
 
         let sourceFormat = AVAudioFormat(cmAudioFormatDescription: formatDesc)
-        guard Self.isValidPCMFormat(sourceFormat) else { return [] }
+        guard Self.isValidPCMFormat(sourceFormat) else { return [][...] }
 
         let requestedFrames = AVAudioFrameCount(frameCount)
         let inputBuffer: AVAudioPCMBuffer
@@ -67,7 +90,7 @@ public final class AudioSampleNormalizer {
                 pcmFormat: sourceFormat,
                 frameCapacity: requestedFrames
             ) else {
-                return []
+                return [][...]
             }
             cachedInputBuffer = created
             inputBuffer = created
@@ -80,12 +103,18 @@ public final class AudioSampleNormalizer {
             frameCount: Int32(frameCount),
             into: inputBuffer.mutableAudioBufferList
         )
-        guard copyStatus == noErr else { return [] }
+        guard copyStatus == noErr else { return [][...] }
 
-        return normalize(pcmBuffer: inputBuffer)
+        return normalizeSlice(pcmBuffer: inputBuffer)
     }
 
-    public func normalize(pcmBuffer inputBuffer: AVAudioPCMBuffer) -> [Float] {
+    private func ensureScratchCount(_ sampleCount: Int) {
+        if scratchOutput.count < sampleCount {
+            scratchOutput = [Float](repeating: 0, count: sampleCount)
+        }
+    }
+
+    func normalizeSlice(pcmBuffer inputBuffer: AVAudioPCMBuffer) -> ArraySlice<Float> {
         let format = inputBuffer.format
         let frames = Int(inputBuffer.frameLength)
         guard frames > 0,
@@ -93,18 +122,24 @@ public final class AudioSampleNormalizer {
               frames <= Self.maxFramesPerBuffer,
               Self.isValidPCMFormat(format)
         else {
-            return []
+            return [][...]
         }
 
         // Fast paths avoid AVAudioConverter allocation when sample rate and Float32 already match.
         if format.sampleRate == Self.sampleRate, format.commonFormat == .pcmFormatFloat32 {
             let list = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inputBuffer.audioBufferList))
+            let sampleCount = frames * 2
             if format.channelCount == 2, format.isInterleaved {
-                guard let buf = list.first, let mData = buf.mData else { return [] }
-                let requiredBytes = frames * 2 * MemoryLayout<Float>.stride
-                guard Int(buf.mDataByteSize) >= requiredBytes else { return [] }
-                let ptr = mData.assumingMemoryBound(to: Float.self)
-                return Array(UnsafeBufferPointer(start: ptr, count: frames * 2))
+                guard let buf = list.first, let mData = buf.mData else { return [][...] }
+                let requiredBytes = sampleCount * MemoryLayout<Float>.stride
+                guard Int(buf.mDataByteSize) >= requiredBytes else { return [][...] }
+                ensureScratchCount(sampleCount)
+                scratchOutput.withUnsafeMutableBytes { dst in
+                    if let base = dst.baseAddress {
+                        memcpy(base, mData, requiredBytes)
+                    }
+                }
+                return scratchOutput[0..<sampleCount]
             } else if format.channelCount == 2, !format.isInterleaved {
                 let requiredPerChannel = frames * MemoryLayout<Float>.stride
                 guard list.count >= 2,
@@ -112,43 +147,45 @@ public final class AudioSampleNormalizer {
                       Int(list[1].mDataByteSize) >= requiredPerChannel,
                       let channels = inputBuffer.floatChannelData
                 else {
-                    return []
+                    return [][...]
                 }
                 let left = channels[0]
                 let right = channels[1]
-                return [Float](unsafeUninitializedCapacity: frames * 2) { buffer, initializedCount in
+                ensureScratchCount(sampleCount)
+                scratchOutput.withUnsafeMutableBufferPointer { buffer in
                     for idx in 0..<frames {
                         buffer[idx * 2] = left[idx]
                         buffer[idx * 2 + 1] = right[idx]
                     }
-                    initializedCount = frames * 2
                 }
+                return scratchOutput[0..<sampleCount]
             } else if format.channelCount == 1 {
                 let requiredPerChannel = frames * MemoryLayout<Float>.stride
                 guard let first = list.first,
                       Int(first.mDataByteSize) >= requiredPerChannel,
                       let channels = inputBuffer.floatChannelData
                 else {
-                    return []
+                    return [][...]
                 }
                 let mono = channels[0]
-                return [Float](unsafeUninitializedCapacity: frames * 2) { buffer, initializedCount in
+                ensureScratchCount(sampleCount)
+                scratchOutput.withUnsafeMutableBufferPointer { buffer in
                     for idx in 0..<frames {
                         let sample = mono[idx]
                         buffer[idx * 2] = sample
                         buffer[idx * 2 + 1] = sample
                     }
-                    initializedCount = frames * 2
                 }
+                return scratchOutput[0..<sampleCount]
             }
         }
 
-        guard let converter = resolveConverter(for: format) else { return [] }
+        guard let converter = resolveConverter(for: format) else { return [][...] }
         let ratio = Self.sampleRate / format.sampleRate
         let scaledFrames = ceil(Double(frames) * ratio)
-        guard scaledFrames.isFinite, scaledFrames >= 1 else { return [] }
+        guard scaledFrames.isFinite, scaledFrames >= 1 else { return [][...] }
         let maxConvertedFrames = Double(Self.maxFramesPerBuffer) * 6.0
-        guard scaledFrames <= maxConvertedFrames else { return [] }
+        guard scaledFrames <= maxConvertedFrames else { return [][...] }
         let capacity = AVAudioFrameCount(Int(scaledFrames) + 32)
 
         let outputBuffer: AVAudioPCMBuffer
@@ -157,18 +194,17 @@ public final class AudioSampleNormalizer {
             outputBuffer = cached
         } else {
             guard let created = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: capacity) else {
-                return []
+                return [][...]
             }
             cachedOutputBuffer = created
             outputBuffer = created
         }
 
-        final class InputProviderState: @unchecked Sendable {
-            let buffer: AVAudioPCMBuffer
-            var consumed = false
-            init(buffer: AVAudioPCMBuffer) { self.buffer = buffer }
-        }
-        let state = InputProviderState(buffer: inputBuffer)
+        let state = inputProviderState
+        state.buffer = inputBuffer
+        state.consumed = false
+        defer { state.buffer = nil }
+
         var convertError: NSError?
         let status = converter.convert(to: outputBuffer, error: &convertError) { _, outStatus in
             if state.consumed {
@@ -182,17 +218,23 @@ public final class AudioSampleNormalizer {
         guard status == .haveData || status == .inputRanDry || status == .endOfStream,
               convertError == nil
         else {
-            return []
+            return [][...]
         }
 
         let outFrames = Int(outputBuffer.frameLength)
-        guard outFrames > 0, outFrames <= Int(outputBuffer.frameCapacity) else { return [] }
+        guard outFrames > 0, outFrames <= Int(outputBuffer.frameCapacity) else { return [][...] }
         let outList = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: outputBuffer.audioBufferList))
-        guard let outBuf = outList.first, let mData = outBuf.mData else { return [] }
-        let requiredBytes = outFrames * 2 * MemoryLayout<Float>.stride
-        guard Int(outBuf.mDataByteSize) >= requiredBytes else { return [] }
-        let ptr = mData.assumingMemoryBound(to: Float.self)
-        return Array(UnsafeBufferPointer(start: ptr, count: outFrames * 2))
+        guard let outBuf = outList.first, let mData = outBuf.mData else { return [][...] }
+        let sampleCount = outFrames * 2
+        let requiredBytes = sampleCount * MemoryLayout<Float>.stride
+        guard Int(outBuf.mDataByteSize) >= requiredBytes else { return [][...] }
+        ensureScratchCount(sampleCount)
+        scratchOutput.withUnsafeMutableBytes { dst in
+            if let base = dst.baseAddress {
+                memcpy(base, mData, requiredBytes)
+            }
+        }
+        return scratchOutput[0..<sampleCount]
     }
 
     private static func isValidPCMFormat(_ format: AVAudioFormat) -> Bool {
@@ -250,6 +292,7 @@ public struct DualAudioMixer: Sendable {
     private var micQueuePTS: CMTime?
     private var lastMixPTS: CMTime?
     private var lastEmittedEndPTS: CMTime?
+    private var outputScratch: [Float] = []
 
     private var unreadMicCount: Int {
         micQueue.count - micReadOffset
@@ -263,6 +306,9 @@ public struct DualAudioMixer: Sendable {
         micQueuePTS = nil
         lastMixPTS = nil
         lastEmittedEndPTS = nil
+        if outputScratch.capacity > 65_536 {
+            outputScratch.removeAll(keepingCapacity: false)
+        }
     }
 
     private mutating func compactMicQueueIfNeeded() {
@@ -275,56 +321,123 @@ public struct DualAudioMixer: Sendable {
         }
     }
 
+    @inline(__always)
+    private static func softClip(_ raw: Float) -> Float {
+        let value = raw.isFinite ? raw : 0
+        let absVal = abs(value)
+        if absVal <= softClipKnee {
+            return value
+        }
+        let excess = (absVal - softClipKnee) / softClipHeadroom
+        let shaped = softClipKnee + softClipHeadroom * Darwin.tanhf(excess)
+        return value >= 0 ? shaped : -shaped
+    }
+
     /// Mixes two Float32 buffers sample-wise with C1-continuous tanh soft clipping above 0.85
     /// and non-finite sample sanitization.
     public static func mix(system: [Float], microphone: [Float]) -> [Float] {
-        mix(system: system, microphone: microphone[...])
+        mix(system: system[...], microphone: microphone[...])
     }
 
-    private static func mix(system: [Float], microphone: ArraySlice<Float>) -> [Float] {
-        let micCount = microphone.count
-        let micStart = microphone.startIndex
-        let count = max(system.count, micCount)
+    private static func mix(system: ArraySlice<Float>, microphone: ArraySlice<Float>) -> [Float] {
+        let count = max(system.count, microphone.count)
         guard count > 0 else { return [] }
         return [Float](unsafeUninitializedCapacity: count) { output, initializedCount in
-            let knee = Self.softClipKnee
-            let headroom = Self.softClipHeadroom
-            for idx in 0..<count {
-                let rawS = idx < system.count ? system[idx] : 0
-                let rawM = idx < micCount ? microphone[micStart + idx] : 0
-                let s = rawS.isFinite ? rawS : 0
-                let m = rawM.isFinite ? rawM : 0
-                let sum = s + m
-                let absSum = abs(sum)
-                if absSum <= knee {
-                    output[idx] = sum
-                } else {
-                    let excess = (absSum - knee) / headroom
-                    let shaped = knee + headroom * Float(tanh(Double(excess)))
-                    output[idx] = sum >= 0 ? shaped : -shaped
-                }
-            }
+            mix(system: system, microphone: microphone, into: output)
             initializedCount = count
         }
     }
 
+    private static func mix(
+        system: ArraySlice<Float>,
+        microphone: ArraySlice<Float>,
+        into output: UnsafeMutableBufferPointer<Float>
+    ) {
+        let sysCount = system.count
+        let micCount = microphone.count
+        let commonCount = min(sysCount, micCount)
+        let count = max(sysCount, micCount)
+        guard count > 0, output.count >= count else { return }
+
+        system.withUnsafeBufferPointer { sysBuf in
+            microphone.withUnsafeBufferPointer { micBuf in
+                if let sysBase = sysBuf.baseAddress, let micBase = micBuf.baseAddress {
+                    for idx in 0..<commonCount {
+                        let rawS = sysBase[idx]
+                        let rawM = micBase[idx]
+                        let s = rawS.isFinite ? rawS : 0
+                        let m = rawM.isFinite ? rawM : 0
+                        output[idx] = softClip(s + m)
+                    }
+                }
+                if sysCount > commonCount, let sysBase = sysBuf.baseAddress {
+                    for idx in commonCount..<sysCount {
+                        output[idx] = softClip(sysBase[idx])
+                    }
+                } else if micCount > commonCount, let micBase = micBuf.baseAddress {
+                    for idx in commonCount..<micCount {
+                        output[idx] = softClip(micBase[idx])
+                    }
+                }
+            }
+        }
+    }
+
+    /// Sanitizes non-finite samples and applies soft-clipping into `output` (single-source safety).
+    static func sanitize(_ samples: ArraySlice<Float>, into scratch: inout [Float]) -> ArraySlice<Float> {
+        let usableCount = samples.count - (samples.count % 2)
+        guard usableCount > 0 else { return [][...] }
+        if scratch.count < usableCount {
+            scratch = [Float](repeating: 0, count: usableCount)
+        }
+        let aligned = samples.prefix(usableCount)
+        scratch.withUnsafeMutableBufferPointer { dst in
+            aligned.withUnsafeBufferPointer { src in
+                guard let srcBase = src.baseAddress else { return }
+                for idx in 0..<usableCount {
+                    let raw = srcBase[idx]
+                    dst[idx] = raw.isFinite ? raw : 0
+                }
+            }
+        }
+        return scratch[0..<usableCount]
+    }
+
+    private mutating func mixIntoScratch(system: ArraySlice<Float>, microphone: ArraySlice<Float>) -> ArraySlice<Float> {
+        let count = max(system.count, microphone.count)
+        guard count > 0 else { return [][...] }
+        if outputScratch.count < count {
+            outputScratch = [Float](repeating: 0, count: count)
+        }
+        outputScratch.withUnsafeMutableBufferPointer { dst in
+            Self.mix(system: system, microphone: microphone, into: dst)
+        }
+        return outputScratch[0..<count]
+    }
+
     public mutating func pushSystem(_ samples: [Float], pts: CMTime) -> [(samples: [Float], pts: CMTime)] {
-        guard pts.isNumeric else { return [] }
+        guard let chunk = pushSystemSlice(samples[...], pts: pts) else { return [] }
+        return [(Array(chunk.samples), chunk.pts)]
+    }
+
+    mutating func pushSystemSlice(_ samples: ArraySlice<Float>, pts: CMTime) -> (samples: ArraySlice<Float>, pts: CMTime)? {
+        guard pts.isNumeric else { return nil }
         let usableSystemCount = samples.count - (samples.count % 2)
-        guard usableSystemCount > 0 else { return [] }
-        let alignedSystem = usableSystemCount == samples.count ? samples : Array(samples.prefix(usableSystemCount))
+        guard usableSystemCount > 0 else { return nil }
+        let alignedSystem = samples.prefix(usableSystemCount)
 
         // Discard stale queued microphone samples when mic timestamps lag far behind system audio.
         if unreadMicCount > 0, let headPTS = micQueuePTS, headPTS.isNumeric {
             let lag = CMTimeSubtract(pts, headPTS).seconds
             if lag.isFinite, lag > Self.maxMicLagSeconds {
-                let staleFrames = Int((lag * Self.sampleRate).rounded(.down))
-                let staleFloats = min(unreadMicCount, max(0, staleFrames) * 2)
-                if staleFloats >= unreadMicCount {
+                let unreadFrames = Double(unreadMicCount / 2)
+                let rawStaleFrames = (lag * Self.sampleRate).rounded(.down)
+                if !rawStaleFrames.isFinite || rawStaleFrames >= unreadFrames {
                     micQueue.removeAll(keepingCapacity: true)
                     micReadOffset = 0
                     micQueuePTS = nil
-                } else if staleFloats > 0 {
+                } else if rawStaleFrames >= 1 {
+                    let staleFloats = min(unreadMicCount, Int(rawStaleFrames) * 2)
                     micReadOffset += staleFloats
                     let advance = CMTime(value: CMTimeValue(staleFloats / 2), timescale: CMTimeScale(Self.sampleRate))
                     micQueuePTS = CMTimeAdd(headPTS, advance)
@@ -334,7 +447,7 @@ public struct DualAudioMixer: Sendable {
         }
 
         lastMixPTS = pts
-        let frameDuration = CMTime(value: CMTimeValue(alignedSystem.count / 2), timescale: CMTimeScale(Self.sampleRate))
+        let frameDuration = CMTime(value: CMTimeValue(usableSystemCount / 2), timescale: CMTimeScale(Self.sampleRate))
         let systemEnd = CMTimeAdd(pts, frameDuration)
         if let prevEnd = lastEmittedEndPTS, prevEnd.isNumeric {
             lastEmittedEndPTS = systemEnd > prevEnd ? systemEnd : prevEnd
@@ -344,17 +457,19 @@ public struct DualAudioMixer: Sendable {
 
         let availableMic = unreadMicCount
         if availableMic == 0 {
-            return [(Self.mix(system: alignedSystem, microphone: [][...]), pts)]
+            let mixed = mixIntoScratch(system: alignedSystem, microphone: [][...])
+            return (mixed, pts)
         }
 
-        let takeCount = min(alignedSystem.count, availableMic)
+        let takeCount = min(usableSystemCount, availableMic)
         let alignedCount = takeCount - (takeCount % 2)
         guard alignedCount > 0 else {
-            return [(Self.mix(system: alignedSystem, microphone: [][...]), pts)]
+            let mixed = mixIntoScratch(system: alignedSystem, microphone: [][...])
+            return (mixed, pts)
         }
 
         let micSlice = micQueue[micReadOffset..<(micReadOffset + alignedCount)]
-        let mixed = Self.mix(system: alignedSystem, microphone: micSlice)
+        let mixed = mixIntoScratch(system: alignedSystem, microphone: micSlice)
         micReadOffset += alignedCount
         compactMicQueueIfNeeded()
 
@@ -365,35 +480,49 @@ public struct DualAudioMixer: Sendable {
             micQueuePTS = CMTimeAdd(head, advance)
         }
 
-        return [(mixed, pts)]
+        return (mixed, pts)
     }
 
     public mutating func pushMicrophone(_ samples: [Float], pts: CMTime) -> [(samples: [Float], pts: CMTime)] {
-        guard pts.isNumeric else { return [] }
+        guard let chunk = pushMicrophoneSlice(samples[...], pts: pts) else { return [] }
+        return [(Array(chunk.samples), chunk.pts)]
+    }
+
+    mutating func pushMicrophoneSlice(_ samples: ArraySlice<Float>, pts: CMTime) -> (samples: ArraySlice<Float>, pts: CMTime)? {
+        guard pts.isNumeric else { return nil }
         let usableCount = samples.count - (samples.count % 2)
-        guard usableCount > 0 else { return [] }
+        guard usableCount > 0 else { return nil }
 
-        if unreadMicCount == 0 {
-            micQueuePTS = pts
-        }
-        if usableCount == samples.count {
-            micQueue.append(contentsOf: samples)
+        let maxEvenBuffered = Self.maxBufferedFloats - (Self.maxBufferedFloats % 2)
+        if usableCount >= maxEvenBuffered {
+            // Bound peak allocation: retain only the newest `maxEvenBuffered` floats from an oversized chunk.
+            let skipCount = usableCount - maxEvenBuffered
+            let startIdx = samples.index(samples.startIndex, offsetBy: skipCount)
+            let endIdx = samples.index(startIdx, offsetBy: maxEvenBuffered)
+            micQueue.removeAll(keepingCapacity: true)
+            micReadOffset = 0
+            micQueue.append(contentsOf: samples[startIdx..<endIdx])
+            let advance = CMTime(value: CMTimeValue(skipCount / 2), timescale: CMTimeScale(Self.sampleRate))
+            micQueuePTS = CMTimeAdd(pts, advance)
         } else {
-            micQueue.append(contentsOf: samples.prefix(usableCount))
-        }
-
-        if unreadMicCount > Self.maxBufferedFloats {
-            let rawDrop = unreadMicCount - Self.maxBufferedFloats
-            let drop = rawDrop + (rawDrop % 2)
-            let actualDrop = min(drop, unreadMicCount)
-            micReadOffset += actualDrop
             if unreadMicCount == 0 {
-                micQueuePTS = nil
-            } else if let head = micQueuePTS {
-                let advance = CMTime(value: CMTimeValue(actualDrop / 2), timescale: CMTimeScale(Self.sampleRate))
-                micQueuePTS = CMTimeAdd(head, advance)
+                micQueuePTS = pts
             }
-            compactMicQueueIfNeeded()
+            micQueue.append(contentsOf: samples.prefix(usableCount))
+
+            if unreadMicCount > Self.maxBufferedFloats {
+                let rawDrop = unreadMicCount - Self.maxBufferedFloats
+                let drop = rawDrop + (rawDrop % 2)
+                let actualDrop = min(drop, unreadMicCount)
+                micReadOffset += actualDrop
+                if unreadMicCount == 0 {
+                    micQueuePTS = nil
+                } else if let head = micQueuePTS {
+                    let advance = CMTime(value: CMTimeValue(actualDrop / 2), timescale: CMTimeScale(Self.sampleRate))
+                    micQueuePTS = CMTimeAdd(head, advance)
+                }
+                compactMicQueueIfNeeded()
+            }
         }
 
         let systemStalled: Bool = if let lastMixPTS, lastMixPTS.isNumeric {
@@ -402,24 +531,28 @@ public struct DualAudioMixer: Sendable {
             true
         }
         let shouldFlushStalledMic = unreadMicCount > Self.micStallThresholdFloats && systemStalled
-        guard shouldFlushStalledMic else { return [] }
+        guard shouldFlushStalledMic else { return nil }
 
-        guard let flushed = drainMicQueue(fallbackPTS: pts) else { return [] }
-        return [flushed]
+        return drainMicQueueSlice(fallbackPTS: pts)
     }
 
     /// Flushes any remaining buffered microphone tail (for clean end-of-stream finalization).
     public mutating func flush() -> (samples: [Float], pts: CMTime)? {
+        guard let tail = flushSlice() else { return nil }
+        return (Array(tail.samples), tail.pts)
+    }
+
+    mutating func flushSlice() -> (samples: ArraySlice<Float>, pts: CMTime)? {
         guard let fallbackPTS = micQueuePTS ?? lastEmittedEndPTS ?? lastMixPTS else {
             micQueue.removeAll(keepingCapacity: true)
             micReadOffset = 0
             micQueuePTS = nil
             return nil
         }
-        return drainMicQueue(fallbackPTS: fallbackPTS)
+        return drainMicQueueSlice(fallbackPTS: fallbackPTS)
     }
 
-    private mutating func drainMicQueue(fallbackPTS: CMTime) -> (samples: [Float], pts: CMTime)? {
+    private mutating func drainMicQueueSlice(fallbackPTS: CMTime) -> (samples: ArraySlice<Float>, pts: CMTime)? {
         let usableCount = unreadMicCount - (unreadMicCount % 2)
         guard usableCount > 0 else {
             micQueue.removeAll(keepingCapacity: true)
@@ -428,7 +561,7 @@ public struct DualAudioMixer: Sendable {
             return nil
         }
         let slice = micQueue[micReadOffset..<(micReadOffset + usableCount)]
-        let sanitized = Self.mix(system: [], microphone: slice)
+        let sanitized = mixIntoScratch(system: [][...], microphone: slice)
         var flushPTS = micQueuePTS ?? fallbackPTS
         if let minNextPTS = lastEmittedEndPTS, minNextPTS.isNumeric, flushPTS < minNextPTS {
             flushPTS = minNextPTS
@@ -475,6 +608,14 @@ public struct DualAudioMixer: Sendable {
     /// Packages interleaved 48 kHz stereo Float32 samples into an owned CoreMedia `CMSampleBuffer`.
     public static func makePCMSampleBuffer(
         interleavedStereoFloat32 samples: [Float],
+        pts: CMTime,
+        sampleRate: Double = DualAudioMixer.sampleRate
+    ) -> CMSampleBuffer? {
+        makePCMSampleBuffer(interleavedStereoFloat32: samples[...], pts: pts, sampleRate: sampleRate)
+    }
+
+    static func makePCMSampleBuffer(
+        interleavedStereoFloat32 samples: ArraySlice<Float>,
         pts: CMTime,
         sampleRate: Double = DualAudioMixer.sampleRate
     ) -> CMSampleBuffer? {
