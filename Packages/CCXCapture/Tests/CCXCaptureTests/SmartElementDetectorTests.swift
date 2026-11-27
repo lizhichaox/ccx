@@ -1294,7 +1294,7 @@ struct OverlayGeometryTests {
         let above = SnipActionToolbar.frame(for: CGRect(x: 400, y: 0, width: 300, height: 200), in: bounds, topInset: 32)
         #expect(above.minY >= 200 && above.midX == 550)
         let inside = SnipActionToolbar.frame(for: bounds, in: bounds, topInset: 32)
-        #expect(bounds.contains(inside) && inside.size == size && inside.midX == bounds.midX)
+        #expect(bounds.contains(inside) && inside.size == size && inside.maxX == bounds.maxX - 8 && inside.minY == 8)
         let leftEdge = SnipActionToolbar.frame(for: CGRect(x: 0, y: 400, width: 20, height: 20), in: bounds, topInset: 32)
         #expect(leftEdge.minX == 0)
         let rightEdge = SnipActionToolbar.frame(for: CGRect(x: 1492, y: 400, width: 20, height: 20), in: bounds, topInset: 32)
@@ -1303,6 +1303,21 @@ struct OverlayGeometryTests {
         let expanded = SnipActionToolbar.frame(for: CGRect(x: 400, y: 400, width: 300, height: 200), in: bounds, topInset: 32, showsStyleBar: true)
         #expect(bounds.contains(expanded) && expanded.size == SnipActionToolbar.expandedSize)
         #expect(expanded.maxY <= 400 && expanded.midX == 550)
+    }
+
+    @Test @MainActor func toolbarRightAlignsWideSelectionsAndCentersNarrowSelections() {
+        let width = SnipActionToolbar.preferredSize.width
+
+        let wideBelow = SnipActionToolbar.frame(for: CGRect(x: 200, y: 400, width: 900, height: 200), in: bounds, topInset: 32)
+        #expect(wideBelow.maxY <= 400 && wideBelow.maxX == 1100)
+
+        let wideAbove = SnipActionToolbar.frame(for: CGRect(x: 200, y: 0, width: 900, height: 200), in: bounds, topInset: 32)
+        #expect(wideAbove.minY >= 200 && wideAbove.maxX == 1100)
+
+        let atThreshold = SnipActionToolbar.frame(for: CGRect(x: 200, y: 400, width: width, height: 200), in: bounds, topInset: 32)
+        let justOver = SnipActionToolbar.frame(for: CGRect(x: 200, y: 400, width: width + 1, height: 200), in: bounds, topInset: 32)
+        #expect(atThreshold.minX == 200 && atThreshold.maxX == 200 + width)
+        #expect(justOver.minX - atThreshold.minX == 1)
     }
 
     @Test @MainActor func toolbarClampedFramePreservesPrimaryTopAndRespectsBoundsAndTopInset() {

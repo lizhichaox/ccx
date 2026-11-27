@@ -508,7 +508,8 @@ public final class AnnotationActionToolbar: NSView {
 
     // MARK: - Placement & Chrome Helpers
 
-    /// Anchors the toolbar centered horizontally below the selection, else above, else inside; clamped to `bounds`.
+    /// Anchors the toolbar below the selection (else above, else inside), right-aligned when the
+    /// selection is wider than the toolbar and centered otherwise, clamped to `bounds`.
     public static func frame(for selection: CGRect, in bounds: CGRect, topInset: CGFloat) -> CGRect {
         frame(for: selection, in: bounds, topInset: topInset, showsStyleBar: false, preset: .snip)
     }
@@ -534,18 +535,31 @@ public final class AnnotationActionToolbar: NSView {
         let usableMaxY = safeBounds.maxY - safeTopInset
         let maxX = max(safeBounds.minX, safeBounds.maxX - size.width)
         let maxY = max(safeBounds.minY, usableMaxY - size.height)
-        var origin = CGPoint(
-            x: (safeSelection.midX - size.width / 2).rounded(),
-            y: safeSelection.minY - gap - size.height
-        )
-        if origin.y < safeBounds.minY {
-            origin.y = safeSelection.maxY + gap
-            if origin.y + size.height > usableMaxY {
-                origin.y = safeSelection.minY + gap
+
+        var y = safeSelection.minY - gap - size.height
+        var placedInside = false
+        if y < safeBounds.minY {
+            y = safeSelection.maxY + gap
+            if y + size.height > usableMaxY {
+                y = safeSelection.minY + gap
+                placedInside = true
             }
         }
-        origin.x = min(max(origin.x, safeBounds.minX), maxX)
-        origin.y = min(max(origin.y, safeBounds.minY), maxY)
+
+        // Keep an inner right margin when placed inside so the toolbar avoids resize handles and screen corners,
+        // while staying continuous across the centering-to-right-alignment threshold.
+        let rightInset: CGFloat = placedInside ? gap : 0
+        let rawX: CGFloat
+        if safeSelection.width > size.width + 2 * rightInset {
+            rawX = safeSelection.maxX - size.width - rightInset
+        } else {
+            rawX = safeSelection.midX - size.width / 2
+        }
+
+        let origin = CGPoint(
+            x: min(max(rawX.rounded(), safeBounds.minX), maxX),
+            y: min(max(y, safeBounds.minY), maxY)
+        )
         return CGRect(origin: origin, size: size)
     }
 

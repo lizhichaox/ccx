@@ -1620,4 +1620,181 @@ struct CCXAnnotateTests {
         let centerPx = try sampleRGBA(in: rendered, x: 50, y: 50)
         #expect(centerPx.a == 255)
     }
+
+    @Test func toolbarRightAlignsForWideSelectionsAndCentersForNarrowSelections() {
+        let bounds = CGRect(x: 0, y: 0, width: 1512, height: 982)
+        let topInset: CGFloat = 32
+
+        for preset in [AnnotationToolbarPreset.snip, .pin] {
+            let width = AnnotationActionToolbar.preferredSize(for: preset).width
+
+            // 1. Narrow selection stays horizontally centered (compact and expanded).
+            let narrow = CGRect(x: 400, y: 400, width: width - 120, height: 200)
+            let narrowCompact = AnnotationActionToolbar.frame(
+                for: narrow,
+                in: bounds,
+                topInset: topInset,
+                showsStyleBar: false,
+                preset: preset
+            )
+            let narrowExpanded = AnnotationActionToolbar.frame(
+                for: narrow,
+                in: bounds,
+                topInset: topInset,
+                showsStyleBar: true,
+                preset: preset
+            )
+            #expect(narrowCompact.midX == narrow.midX)
+            #expect(narrowCompact.maxY <= narrow.minY)
+            #expect(narrowExpanded.midX == narrow.midX)
+            #expect(narrowExpanded.maxY <= narrow.minY)
+
+            // 2. Exact width threshold matches both centered and right-aligned coordinates.
+            let threshold = CGRect(x: 300, y: 400, width: width, height: 200)
+            let thresholdFrame = AnnotationActionToolbar.frame(
+                for: threshold,
+                in: bounds,
+                topInset: topInset,
+                showsStyleBar: false,
+                preset: preset
+            )
+            #expect(thresholdFrame.minX == threshold.minX && thresholdFrame.maxX == threshold.maxX)
+
+            // 3. Wide selection right-aligns below, above, and when style bar is visible.
+            let wideBelow = CGRect(x: 200, y: 400, width: width + 240, height: 200)
+            let wideBelowFrame = AnnotationActionToolbar.frame(
+                for: wideBelow,
+                in: bounds,
+                topInset: topInset,
+                showsStyleBar: false,
+                preset: preset
+            )
+            let wideExpandedFrame = AnnotationActionToolbar.frame(
+                for: wideBelow,
+                in: bounds,
+                topInset: topInset,
+                showsStyleBar: true,
+                preset: preset
+            )
+            #expect(wideBelowFrame.maxX == wideBelow.maxX && wideBelowFrame.maxY <= wideBelow.minY)
+            #expect(wideExpandedFrame.maxX == wideBelow.maxX && wideExpandedFrame.maxY <= wideBelow.minY)
+
+            let wideAbove = CGRect(x: 200, y: 0, width: width + 240, height: 200)
+            let wideAboveFrame = AnnotationActionToolbar.frame(
+                for: wideAbove,
+                in: bounds,
+                topInset: topInset,
+                showsStyleBar: false,
+                preset: preset
+            )
+            #expect(wideAboveFrame.maxX == wideAbove.maxX && wideAboveFrame.minY >= wideAbove.maxY)
+
+            // 4. Continuity across the threshold outside the selection.
+            let atThreshold = AnnotationActionToolbar.frame(
+                for: CGRect(x: 200, y: 400, width: width, height: 200),
+                in: bounds,
+                topInset: topInset,
+                showsStyleBar: false,
+                preset: preset
+            )
+            let justOver = AnnotationActionToolbar.frame(
+                for: CGRect(x: 200, y: 400, width: width + 1, height: 200),
+                in: bounds,
+                topInset: topInset,
+                showsStyleBar: false,
+                preset: preset
+            )
+            #expect(justOver.minX - atThreshold.minX == 1)
+
+            // 5. Full-screen / full-height wide selection falls back inside with an 8pt right inset.
+            let fullScreen = AnnotationActionToolbar.frame(
+                for: bounds,
+                in: bounds,
+                topInset: topInset,
+                showsStyleBar: false,
+                preset: preset
+            )
+            #expect(fullScreen.maxX == bounds.maxX - 8 && fullScreen.minY == bounds.minY + 8)
+
+            let fullHeightWide = CGRect(x: 200, y: 0, width: width + 200, height: bounds.height)
+            let fullHeightWideFrame = AnnotationActionToolbar.frame(
+                for: fullHeightWide,
+                in: bounds,
+                topInset: topInset,
+                showsStyleBar: false,
+                preset: preset
+            )
+            #expect(fullHeightWideFrame.maxX == fullHeightWide.maxX - 8 && fullHeightWideFrame.minY == 8)
+
+            // 6. Full-height narrow or slightly wider (<= width + 16) inside selection stays centered without overhanging left.
+            let fullHeightNarrow = CGRect(x: 300, y: 0, width: width - 100, height: bounds.height)
+            let fullHeightNarrowFrame = AnnotationActionToolbar.frame(
+                for: fullHeightNarrow,
+                in: bounds,
+                topInset: topInset,
+                showsStyleBar: false,
+                preset: preset
+            )
+            #expect(fullHeightNarrowFrame.midX == fullHeightNarrow.midX && fullHeightNarrowFrame.minY == 8)
+
+            let fullHeightSlightlyWider = CGRect(x: 300, y: 0, width: width + 8, height: bounds.height)
+            let fullHeightSlightlyWiderFrame = AnnotationActionToolbar.frame(
+                for: fullHeightSlightlyWider,
+                in: bounds,
+                topInset: topInset,
+                showsStyleBar: false,
+                preset: preset
+            )
+            #expect(fullHeightSlightlyWiderFrame.midX == fullHeightSlightlyWider.midX)
+            #expect(fullHeightSlightlyWiderFrame.minX >= fullHeightSlightlyWider.minX)
+
+            // 7. Continuity across the inside threshold (width + 16 -> width + 17).
+            let insideThreshold = AnnotationActionToolbar.frame(
+                for: CGRect(x: 200, y: 0, width: width + 16, height: bounds.height),
+                in: bounds,
+                topInset: topInset,
+                showsStyleBar: false,
+                preset: preset
+            )
+            let insideJustOver = AnnotationActionToolbar.frame(
+                for: CGRect(x: 200, y: 0, width: width + 17, height: bounds.height),
+                in: bounds,
+                topInset: topInset,
+                showsStyleBar: false,
+                preset: preset
+            )
+            #expect(insideJustOver.minX - insideThreshold.minX == 1)
+
+            // 8. Screen-edge clamping on right/left overflow and bounds narrower than toolbar.
+            let overflowRight = CGRect(x: 1100, y: 400, width: width + 200, height: 200)
+            let clampedRight = AnnotationActionToolbar.frame(
+                for: overflowRight,
+                in: bounds,
+                topInset: topInset,
+                showsStyleBar: false,
+                preset: preset
+            )
+            #expect(clampedRight.maxX == bounds.maxX)
+
+            let overflowLeft = CGRect(x: -500, y: 400, width: width + 100, height: 200)
+            let clampedLeft = AnnotationActionToolbar.frame(
+                for: overflowLeft,
+                in: bounds,
+                topInset: topInset,
+                showsStyleBar: false,
+                preset: preset
+            )
+            #expect(clampedLeft.minX == bounds.minX)
+
+            let smallBounds = CGRect(x: 0, y: 0, width: width - 100, height: 400)
+            let smallBoundsFrame = AnnotationActionToolbar.frame(
+                for: CGRect(x: 10, y: 100, width: width - 120, height: 100),
+                in: smallBounds,
+                topInset: 0,
+                showsStyleBar: false,
+                preset: preset
+            )
+            #expect(smallBoundsFrame.minX == smallBounds.minX)
+        }
+    }
 }
