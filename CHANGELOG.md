@@ -2,6 +2,11 @@
 
 All notable changes to **CCX (Control · Command · X)** are documented in this file.
 
+## [0.10.1] - 2026-11-27
+
+### Improved
+- **Adaptive Floating Toolbar Alignment (`CCXAnnotate`, `CCXCapture`, `CCXPin`)**: Updated `AnnotationActionToolbar.frame(...)` so selections wider than the floating toolbar (`600pt` for snip, `536pt` for pin) right-align the toolbar to the selection's right edge—placing primary finish actions directly under the cursor after top-left-to-bottom-right drags and beneath the pin's bottom-right edit button—while narrower selections stay horizontally centered with smooth, jump-free continuity across the width threshold. When the toolbar falls back inside a full-screen or full-height wide selection, it reserves an `8pt` right inner inset to stay clear of the bottom-right resize handle, screen bezel, and hot corner.
+
 ## [0.10.0] - 2026-11-26
 
 ### Added
