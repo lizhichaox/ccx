@@ -10,6 +10,25 @@ public enum AnnotationRenderer {
         screenBounds: CGRect,
         mosaicImage: ((MosaicMode, StrokeSize) -> CGImage?)?
     ) {
+        let surfaceProvider: ((MosaicMode, StrokeSize) -> MosaicFilteredSurface?)? = mosaicImage.map { imageFn in
+            { mode, size in
+                guard let filtered = imageFn(mode, size) else { return nil }
+                return MosaicFilteredSurface(
+                    image: filtered,
+                    pixelOrigin: .zero,
+                    fullImageSize: CGSize(width: filtered.width, height: filtered.height)
+                )
+            }
+        }
+        draw(item, in: context, screenBounds: screenBounds, mosaicSurface: surfaceProvider)
+    }
+
+    public static func draw(
+        _ item: AnnotationItem,
+        in context: CGContext,
+        screenBounds: CGRect,
+        mosaicSurface: ((MosaicMode, StrokeSize) -> MosaicFilteredSurface?)?
+    ) {
         context.saveGState()
         defer { context.restoreGState() }
 
@@ -65,35 +84,48 @@ public enum AnnotationRenderer {
             if mode == .pixelate {
                 context.interpolationQuality = .none
             }
-            if let filtered = mosaicImage?(mode, item.style.size) {
+            if let surface = mosaicSurface?(mode, item.style.size) {
                 guard isFiniteRect(screenBounds) else {
                     context.restoreGState()
                     return
                 }
                 let visible = rect.intersection(screenBounds)
+                let filtered = surface.image
+                let fullW = surface.fullImageSize.width
+                let fullH = surface.fullImageSize.height
                 if !visible.isNull, !visible.isEmpty,
-                   screenBounds.width > 0, screenBounds.height > 0 {
-                    let scaleX = CGFloat(filtered.width) / screenBounds.width
-                    let scaleY = CGFloat(filtered.height) / screenBounds.height
+                   screenBounds.width > 0, screenBounds.height > 0,
+                   fullW.isFinite, fullH.isFinite, fullW > 0, fullH > 0,
+                   surface.pixelOrigin.x.isFinite, surface.pixelOrigin.y.isFinite,
+                   abs(surface.pixelOrigin.x) <= fullW,
+                   abs(surface.pixelOrigin.y) <= fullH {
+                    let scaleX = fullW / screenBounds.width
+                    let scaleY = fullH / screenBounds.height
                     let rawMinX = floor((visible.minX - screenBounds.minX) * scaleX)
                     let rawMaxX = ceil((visible.maxX - screenBounds.minX) * scaleX)
                     let rawMinY = floor((screenBounds.maxY - visible.maxY) * scaleY)
                     let rawMaxY = ceil((screenBounds.maxY - visible.minY) * scaleY)
+                    let surfMinX = Int(surface.pixelOrigin.x.rounded())
+                    let surfMinY = Int(surface.pixelOrigin.y.rounded())
+                    let surfMaxX = surfMinX + filtered.width
+                    let surfMaxY = surfMinY + filtered.height
                     if scaleX.isFinite, scaleY.isFinite, scaleX > 0, scaleY > 0,
                        rawMinX.isFinite, rawMaxX.isFinite, rawMinY.isFinite, rawMaxY.isFinite {
-                        let maxW = CGFloat(filtered.width)
-                        let maxH = CGFloat(filtered.height)
-                        let pxMinX = Int(min(max(rawMinX, 0), maxW))
-                        let pxMaxX = Int(min(max(rawMaxX, 0), maxW))
-                        let pxMinY = Int(min(max(rawMinY, 0), maxH))
-                        let pxMaxY = Int(min(max(rawMaxY, 0), maxH))
-                        let pixelRect = CGRect(
-                            x: pxMinX,
-                            y: pxMinY,
+                        let clampedMinX = min(max(rawMinX, CGFloat(surfMinX)), CGFloat(surfMaxX))
+                        let clampedMaxX = min(max(rawMaxX, CGFloat(surfMinX)), CGFloat(surfMaxX))
+                        let clampedMinY = min(max(rawMinY, CGFloat(surfMinY)), CGFloat(surfMaxY))
+                        let clampedMaxY = min(max(rawMaxY, CGFloat(surfMinY)), CGFloat(surfMaxY))
+                        let pxMinX = Int(clampedMinX)
+                        let pxMaxX = Int(clampedMaxX)
+                        let pxMinY = Int(clampedMinY)
+                        let pxMaxY = Int(clampedMaxY)
+                        let localCropRect = CGRect(
+                            x: pxMinX - surfMinX,
+                            y: pxMinY - surfMinY,
                             width: max(0, pxMaxX - pxMinX),
                             height: max(0, pxMaxY - pxMinY)
                         )
-                        if !pixelRect.isEmpty, let cropped = filtered.cropping(to: pixelRect) {
+                        if !localCropRect.isEmpty, let cropped = filtered.cropping(to: localCropRect) {
                             let drawRect = CGRect(
                                 x: screenBounds.minX + CGFloat(pxMinX) / scaleX,
                                 y: screenBounds.maxY - CGFloat(pxMaxY) / scaleY,
@@ -102,11 +134,17 @@ public enum AnnotationRenderer {
                             )
                             context.draw(cropped, in: drawRect)
                         } else {
-                            context.draw(filtered, in: screenBounds)
+                            // Opaque privacy-preserving fallback so disjoint ROIs never leak unredacted pixels.
+                            context.setFillColor(CGColor(srgbRed: 0.18, green: 0.18, blue: 0.20, alpha: 1.0))
+                            context.fill(rect)
                         }
                     } else {
-                        context.draw(filtered, in: screenBounds)
+                        context.setFillColor(CGColor(srgbRed: 0.18, green: 0.18, blue: 0.20, alpha: 1.0))
+                        context.fill(rect)
                     }
+                } else {
+                    context.setFillColor(CGColor(srgbRed: 0.18, green: 0.18, blue: 0.20, alpha: 1.0))
+                    context.fill(rect)
                 }
             } else {
                 // Opaque privacy-preserving fallback so failed filtering never leaks redacted pixels beneath.
@@ -293,10 +331,18 @@ public enum AnnotationRenderer {
             interiorPath.addPath(cornerMask.path)
         }
 
-        func drawInSelection(_ item: AnnotationItem, filtered: CGImage? = nil) {
+        let hasMosaicItems = document.items.contains {
+            if case .mosaic = $0.kind { return true }
+            return false
+        }
+        if hasMosaicItems {
+            mosaicCache?.setActiveRegion(localRect: localSelectionRect, screenSize: screenSize)
+        }
+
+        func drawInSelection(_ item: AnnotationItem, surface: MosaicFilteredSurface? = nil) {
             context.scaleBy(x: sx, y: sy)
             context.translateBy(x: -cropOriginX, y: -cropOriginY)
-            draw(item, in: context, screenBounds: screenBounds) { _, _ in filtered }
+            draw(item, in: context, screenBounds: screenBounds, mosaicSurface: { _, _ in surface })
         }
 
         func itemIntersectsProtectedCorners(_ item: AnnotationItem, cornerBounds: [CGRect]) -> Bool {
@@ -322,11 +368,11 @@ public enum AnnotationRenderer {
         for item in document.items {
             context.saveGState()
             if case let .mosaic(_, mode) = item.kind {
-                let filtered = mosaicCache?.filteredImage(mode: mode, size: item.style.size, backingScale: scale)
-                // The filtered image already carries the backing alpha. Copy it so no unfiltered
+                let surface = mosaicCache?.filteredSurface(mode: mode, size: item.style.size, backingScale: scale)
+                // The filtered surface already carries the backing alpha. Copy it so no unfiltered
                 // pixels are blended back in. The opaque fallback uses the destination alpha once.
-                context.setBlendMode(filtered == nil ? .sourceAtop : .copy)
-                drawInSelection(item, filtered: filtered)
+                context.setBlendMode(surface == nil ? .sourceAtop : .copy)
+                drawInSelection(item, surface: surface)
             } else if let cornerMask, itemIntersectsProtectedCorners(item, cornerBounds: cornerMask.cornerBounds) {
                 context.saveGState()
                 context.addPath(interiorPath)

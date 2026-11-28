@@ -87,12 +87,12 @@ final class AnnotationCanvasView: NSView {
                 continue
             }
             AnnotationRenderer.draw(item, in: context, screenBounds: screenBounds) { mode, size in
-                cache.filteredImage(mode: mode, size: size, backingScale: scale)
+                cache.filteredSurface(mode: mode, size: size, backingScale: scale)
             }
         }
         if let draft = document.draft {
             AnnotationRenderer.draw(draft, in: context, screenBounds: screenBounds) { mode, size in
-                cache.filteredImage(mode: mode, size: size, backingScale: scale)
+                cache.filteredSurface(mode: mode, size: size, backingScale: scale)
             }
         }
         for item in document.items where item.id != editingTextItemID && item.id != document.selectedID {

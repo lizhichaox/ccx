@@ -58,7 +58,9 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
     private static let axRequeryDistance: CGFloat = 2
 
     private enum CursorKind: Equatable {
-        case crosshair, openHand, closedHand, arrow, iBeam, resize(ResizeHandle), annotationResize(AnnotationHandle)
+        case crosshair, openHand, closedHand, arrow, iBeam
+        case brush(Int, BrushCursorCache.Kind)
+        case resize(ResizeHandle), annotationResize(AnnotationHandle)
     }
 
     private enum DragInteraction {
@@ -92,6 +94,11 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
     private var editingTextOrigin: CGPoint?
     private var editingOriginalItem: AnnotationItem?
     private var editingOriginalStyle: AnnotationStyle?
+    private var cheatSheetView: ShortcutCheatSheetView?
+    private var lastAppliedCursor: NSCursor?
+
+    internal var isCheatSheetVisibleForTesting: Bool { cheatSheetView != nil }
+    internal var currentCursorForTesting: NSCursor? { lastAppliedCursor }
 
     private var lastTier1LocalRect: CGRect?
     private var lastRefinedLocalRect: CGRect?
@@ -125,6 +132,8 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
     private let sizeHUD = StrokeSizeHUDView(frame: .zero)
     let toolbar = SnipActionToolbar(frame: CGRect(origin: .zero, size: SnipActionToolbar.preferredSize))
     private(set) var customToolbarTopLeft: CGPoint?
+    private(set) var toolbarAnchorPoint: CGPoint?
+    private var selectionBeforeMachineDrag: CGRect?
     private var trackingArea: NSTrackingArea?
 
     var sizeLabelFrame: CGRect { sizeLabel.frame }
@@ -186,6 +195,14 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
 
     // MARK: - Setup
 
+    private var modeAccentColor: NSColor {
+        switch selectionMode {
+        case .snip: .systemBlue
+        case .ocr: .systemTeal
+        case .record: .systemRed
+        }
+    }
+
     private func setUpLayers() {
         guard let root = layer else { return }
         imageLayer.contents = snapshot.image
@@ -202,7 +219,7 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
         root.addSublayer(dimLayer)
 
         borderLayer.fillColor = nil
-        borderLayer.strokeColor = (selectionMode == .record ? NSColor.systemRed : NSColor.systemBlue).cgColor
+        borderLayer.strokeColor = modeAccentColor.cgColor
         borderLayer.lineWidth = 1.5
         borderLayer.frame = bounds
         borderLayer.zPosition = 2
@@ -210,7 +227,7 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
         root.addSublayer(borderLayer)
 
         handleLayer.fillColor = NSColor.white.cgColor
-        handleLayer.strokeColor = (selectionMode == .record ? NSColor.systemRed : NSColor.systemBlue).cgColor
+        handleLayer.strokeColor = modeAccentColor.cgColor
         handleLayer.lineWidth = 1
         handleLayer.frame = bounds
         handleLayer.zPosition = 3
@@ -249,9 +266,9 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
         sizeLabel.layer?.cornerRadius = 5
         sizeLabel.layer?.cornerCurve = .continuous
         sizeLabel.layer?.borderWidth = 0.5
-        sizeLabel.layer?.borderColor = (selectionMode == .record
-            ? NSColor.systemRed.withAlphaComponent(0.55)
-            : NSColor.white.withAlphaComponent(0.18)).cgColor
+        sizeLabel.layer?.borderColor = (selectionMode == .snip
+            ? NSColor.white.withAlphaComponent(0.18)
+            : modeAccentColor.withAlphaComponent(0.55)).cgColor
         sizeLabel.layer?.masksToBounds = true
         sizeLabel.layer?.zPosition = 10
         sizeLabel.isHidden = true
@@ -309,6 +326,7 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
 
     /// Releases all snapshot references, mosaic caches, active editors, timers, and callbacks.
     func tearDown() {
+        dismissCheatSheet()
         cancelInlineTextEditor()
         sizeHUD.hideImmediately()
         toolbar.cancelDragging()
@@ -320,6 +338,9 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
         toolbar.onDragMoved = nil
         toolbar.onDragStateChanged = nil
         toolbar.onResetPosition = nil
+        customToolbarTopLeft = nil
+        toolbarAnchorPoint = nil
+        selectionBeforeMachineDrag = nil
         onSelectionChanged = nil
         adaptiveCornerRadii = .zero
         lastNotifiedSelectedRect = nil
@@ -342,6 +363,7 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
 
     /// Resets to hovering (used when the user starts interacting on another screen).
     func resetSelection() {
+        dismissCheatSheet()
         cancelInlineTextEditor()
         toolbar.cancelDragging()
         let hadAnnotations = !annotations.items.isEmpty || annotations.draft != nil || hasRenderedAnnotations
@@ -361,6 +383,8 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
         resetScrollUndoCoalescing()
         sizeHUD.hideImmediately()
         customToolbarTopLeft = nil
+        toolbarAnchorPoint = nil
+        selectionBeforeMachineDrag = nil
         lastMousePoint = nil
         lastTier1LocalRect = nil
         lastRefinedLocalRect = nil
@@ -694,6 +718,10 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
     }
 
     override func mouseDown(with event: NSEvent) {
+        if cheatSheetView != nil {
+            dismissCheatSheet()
+            return
+        }
         resetScrollUndoCoalescing()
         sizeHUD.hideImmediately()
         window?.makeKey()
@@ -725,6 +753,7 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
             lastRefinedIsOverlayElement = false
             lastAXQueryPoint = nil
             onBeginInteraction?()
+            selectionBeforeMachineDrag = selectedRect
             activeDrag = .selectionMachine
             machine.mouseDown(at: point)
             refresh()
@@ -732,6 +761,7 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
         }
 
         guard let selection = selectedRect else {
+            selectionBeforeMachineDrag = selectedRect
             activeDrag = .selectionMachine
             machine.mouseDown(at: point)
             refresh()
@@ -752,6 +782,7 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
 
         if SelectionStateMachine.hitTestHandle(at: point, rect: selection, radius: machine.handleHitRadius) != nil {
             setSelectedAnnotationID(nil)
+            selectionBeforeMachineDrag = selectedRect
             activeDrag = .selectionMachine
             machine.mouseDown(at: point)
             refresh()
@@ -778,6 +809,7 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
                 finish(.copy(selection))
                 return
             }
+            selectionBeforeMachineDrag = selectedRect
             activeDrag = .selectionMachine
             machine.mouseDown(at: point)
             refresh()
@@ -903,6 +935,7 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
         let point = convert(event.locationInWindow, from: nil)
         guard point.x.isFinite, point.y.isFinite else {
             activeDrag = .none
+            selectionBeforeMachineDrag = nil
             isSpaceDown = false
             refresh()
             return
@@ -913,12 +946,24 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
         case .none:
             break
         case .selectionMachine:
+            let priorSelection = selectionBeforeMachineDrag
+            selectionBeforeMachineDrag = nil
+            let wasFreshDrag: Bool
+            if case .dragging = machine.state, machine.selectionRect != nil {
+                wasFreshDrag = true
+            } else {
+                wasFreshDrag = false
+            }
             machine.mouseUp(at: point)
-            if selectionMode == .record, let rect = selectedRect {
+            if selectionMode != .snip, let rect = selectedRect {
                 activeDrag = .none
                 isSpaceDown = false
-                finish(.record(rect))
+                finish(selectionMode == .record ? .record(rect) : .ocr(rect))
                 return
+            }
+            if let rect = selectedRect,
+               wasFreshDrag || priorSelection == nil || !rectsNearlyEqual(rect, priorSelection) {
+                toolbarAnchorPoint = point
             }
         case let .drawing(tool, _):
             let rect = annotations.draft?.boundingBox
@@ -938,6 +983,10 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
     }
 
     override func rightMouseDown(with event: NSEvent) {
+        if cheatSheetView != nil {
+            dismissCheatSheet()
+            return
+        }
         if isEditingText {
             cancelInlineTextEditor()
             refresh()
@@ -1405,6 +1454,10 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
     /// 4. Exit an active drawing tool or clear an annotation selection back to `.select`.
     /// 5. Otherwise cancel the snip session immediately.
     private func handleEscapeAction() {
+        if cheatSheetView != nil {
+            dismissCheatSheet()
+            return
+        }
         if isEditingText {
             cancelInlineTextEditor()
             refresh()
@@ -1532,11 +1585,12 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
                 bumpAXEpoch(cancelPending: hasInFlightAXQuery)
                 onBeginInteraction?()
                 machine.select(bounds)
+                toolbarAnchorPoint = lastMousePoint
                 lastRefinedLocalRect = nil
                 lastRefinedIsOverlayElement = false
                 lastAXQueryPoint = nil
-                if selectionMode == .record {
-                    finish(.record(bounds))
+                if selectionMode != .snip {
+                    finish(selectionMode == .record ? .record(bounds) : .ocr(bounds))
                     return true
                 }
                 refresh()
@@ -1608,6 +1662,16 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
         case 53: // Escape
             handleEscapeAction()
             return
+        default:
+            break
+        }
+
+        if Self.isQuestionMarkKeyEvent(event) {
+            toggleCheatSheet()
+            return
+        }
+
+        switch event.keyCode {
         case 49: // Space (moves in-flight selection origin while dragging)
             if case .dragging = machine.state {
                 isSpaceDown = true
@@ -1649,11 +1713,12 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
             bumpAXEpoch(cancelPending: hasInFlightAXQuery)
             onBeginInteraction?()
             machine.select(prev)
+            toolbarAnchorPoint = lastMousePoint
             lastRefinedLocalRect = nil
             lastRefinedIsOverlayElement = false
             lastAXQueryPoint = nil
-            if selectionMode == .record {
-                finish(.record(prev))
+            if selectionMode != .snip {
+                finish(selectionMode == .record ? .record(prev) : .ocr(prev))
                 return
             }
             refresh()
@@ -1675,6 +1740,15 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
             }
             if characters == "v" {
                 setActiveTool(.select)
+                return
+            }
+            if (characters == "[" || characters == "]"),
+               (activeTool.showsStyleBar || annotations.selectedItem != nil || isEditingText) {
+                let delta: CGFloat = (characters == "]") ? 0.08 : -0.08
+                let baseSize = annotations.selectedItem?.style.size ?? currentStyle.size
+                let nextSize = baseSize.adjusted(byProgressDelta: delta)
+                resetScrollUndoCoalescing()
+                _ = applyStrokeSize(nextSize, recordUndo: true, showHUD: true)
                 return
             }
             if let tool = AnnotationTool.forNumberKey(characters) {
@@ -1746,7 +1820,16 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
     }
 
     private func nudge(dx: CGFloat, dy: CGFloat) {
-        if machine.nudge(dx: dx, dy: dy) { refresh() }
+        let before = selectedRect
+        if machine.nudge(dx: dx, dy: dy) {
+            if let before, let after = selectedRect, let anchor = toolbarAnchorPoint {
+                toolbarAnchorPoint = CGPoint(
+                    x: anchor.x + (after.minX - before.minX),
+                    y: anchor.y + (after.minY - before.minY)
+                )
+            }
+            refresh()
+        }
     }
 
     private func resizeSelection(dw: CGFloat, dh: CGFloat) {
@@ -1840,7 +1923,45 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
         }
     }
 
+    private static func isQuestionMarkKeyEvent(_ event: NSEvent) -> Bool {
+        let disallowed = event.modifierFlags
+            .intersection(.deviceIndependentFlagsMask)
+            .intersection([.command, .control, .option])
+        guard disallowed.isEmpty else { return false }
+        if event.characters == "?" { return true }
+        return event.modifierFlags.contains(.shift) && event.charactersIgnoringModifiers == "/"
+    }
+
+    private func toggleCheatSheet() {
+        if cheatSheetView != nil {
+            dismissCheatSheet()
+        } else {
+            presentCheatSheet()
+        }
+    }
+
+    private func presentCheatSheet() {
+        guard cheatSheetView == nil else { return }
+        let hud = ShortcutCheatSheetView(entries: ShortcutCheatSheetView.snipOverlayEntries)
+        hud.wantsLayer = true
+        hud.layer?.zPosition = 40
+        hud.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(hud)
+        NSLayoutConstraint.activate([
+            hud.centerXAnchor.constraint(equalTo: centerXAnchor),
+            hud.centerYAnchor.constraint(equalTo: centerYAnchor),
+        ])
+        hud.layoutSubtreeIfNeeded()
+        cheatSheetView = hud
+    }
+
+    private func dismissCheatSheet() {
+        cheatSheetView?.removeFromSuperview()
+        cheatSheetView = nil
+    }
+
     private func finish(_ action: OverlayAction) {
+        dismissCheatSheet()
         commitInlineTextEditor()
         onFinish?(action)
     }
@@ -1882,6 +2003,8 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
 
     private func refresh() {
         let currentSelected = selectedRect
+        let roiRect: CGRect? = machine.isHovering ? nil : machine.selectionRect
+        mosaicCache.setActiveRegion(localRect: roiRect, screenSize: bounds.size)
         if !rectsNearlyEqual(currentSelected, lastNotifiedSelectedRect) {
             lastNotifiedSelectedRect = currentSelected
             adaptiveCornerRadii = .zero
@@ -1935,9 +2058,12 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
                     }
                     borderLayer.isHidden = false
                 }
-                let strokeNSColor: NSColor = if selectionMode == .record {
+                let strokeNSColor: NSColor = switch selectionMode {
+                case .record:
                     .systemRed
-                } else {
+                case .ocr:
+                    .systemTeal
+                case .snip:
                     isHovering ? .systemCyan : .systemBlue
                 }
                 borderLayer.strokeColor = strokeNSColor.cgColor
@@ -2009,9 +2135,15 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
 
     private func formattedSizeLabelText(for sizeText: String) -> String {
         var display = sizeText
-        if selectionMode == .record {
+        switch selectionMode {
+        case .record:
             let prefix = CCXL10n.text("REC", zh: "录制")
             display = "\(prefix) · \(display)"
+        case .ocr:
+            let prefix = CCXL10n.text("OCR", zh: "识字")
+            display = "\(prefix) · \(display)"
+        case .snip:
+            break
         }
         switch machine.state {
         case .dragging:
@@ -2173,8 +2305,10 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
 
     private func resetToolbarPosition() {
         customToolbarTopLeft = nil
+        toolbarAnchorPoint = nil
         lastCursorKind = nil
         updateToolbar()
+        updateSizeLabel(for: machine.highlightedRect, sizeText: cachedHighlightSizeText)
         updateCursor()
     }
 
@@ -2183,9 +2317,11 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
             switch machine.state {
             case .hovering:
                 customToolbarTopLeft = nil
+                toolbarAnchorPoint = nil
             case .dragging:
                 if machine.selectionRect != nil {
                     customToolbarTopLeft = nil
+                    toolbarAnchorPoint = nil
                 }
             case .selected, .moving, .resizing:
                 break
@@ -2221,7 +2357,8 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
                 for: rect,
                 in: bounds,
                 topInset: topInset,
-                showsStyleBar: showStyleBar
+                showsStyleBar: showStyleBar,
+                anchorPoint: toolbarAnchorPoint
             )
         }
         if toolbar.isHidden || toolbar.frame != nextFrame {
@@ -2261,8 +2398,13 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
                 kind = .annotationResize(handle)
                 cursor = Self.cursor(for: handle)
             } else if case let .drawing(tool, _) = activeDrag {
-                kind = tool == .text ? .iBeam : .crosshair
-                cursor = tool == .text ? .iBeam : .crosshair
+                if let brushSpec = brushCursorSpec(for: tool) {
+                    kind = brushSpec.kind
+                    cursor = brushSpec.cursor
+                } else {
+                    kind = tool == .text ? .iBeam : .crosshair
+                    cursor = tool == .text ? .iBeam : .crosshair
+                }
             } else if !toolbar.isHidden && toolbar.isDragging {
                 kind = .closedHand
                 cursor = .closedHand
@@ -2289,6 +2431,9 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
                     if activeTool == .text {
                         kind = .iBeam
                         cursor = .iBeam
+                    } else if let brushSpec = brushCursorSpec(for: activeTool) {
+                        kind = brushSpec.kind
+                        cursor = brushSpec.cursor
                     } else {
                         kind = .crosshair
                         cursor = .crosshair
@@ -2305,7 +2450,29 @@ final class SnipOverlayView: NSView, NSTextFieldDelegate {
         applyCursor(kind, cursor: cursor)
     }
 
+    private func brushCursorSpec(for tool: AnnotationTool) -> (kind: CursorKind, cursor: NSCursor)? {
+        let diameter: CGFloat
+        let style: BrushCursorCache.Kind
+        switch tool {
+        case .pen:
+            diameter = currentStyle.size.lineWidth
+            style = .freehand
+        case .highlighter:
+            diameter = currentStyle.size.highlighterWidth
+            style = .freehand
+        case .mosaic:
+            diameter = currentStyle.size.mosaicBlockSize
+            style = .mosaic
+        default:
+            return nil
+        }
+        let cursor = BrushCursorCache.shared.cursor(diameter: diameter, kind: style)
+        let quantized = Int(max(BrushCursorCache.minimumDiameter, min(BrushCursorCache.maximumDiameter, diameter)).rounded())
+        return (.brush(quantized, style), cursor)
+    }
+
     private func applyCursor(_ kind: CursorKind, cursor: NSCursor) {
+        lastAppliedCursor = cursor
         guard kind != lastCursorKind || NSCursor.current != cursor else { return }
         lastCursorKind = kind
         cursor.set()

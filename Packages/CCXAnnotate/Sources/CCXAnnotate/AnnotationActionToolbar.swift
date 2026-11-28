@@ -508,6 +508,18 @@ public final class AnnotationActionToolbar: NSView {
 
     // MARK: - Placement & Chrome Helpers
 
+    /// Horizontal offset from the toolbar's left edge (`minX`) to the center of the Copy button.
+    public static func copyButtonCenterXOffset(for preset: AnnotationToolbarPreset) -> CGFloat {
+        switch preset {
+        case .snip:
+            // Trailing layout: Copy (32pt) + 2pt spacing + Cancel (32pt) + 8pt right inset => 58pt from maxX.
+            snipToolbarWidth - 58
+        case .pin:
+            // Trailing layout: Copy (32pt) + 2pt + Done (32pt) + 2pt + Cancel (32pt) + 8pt inset => 92pt from maxX.
+            pinToolbarWidth - 92
+        }
+    }
+
     /// Anchors the toolbar below the selection (else above, else inside), right-aligned when the
     /// selection is wider than the toolbar and centered otherwise, clamped to `bounds`.
     public static func frame(for selection: CGRect, in bounds: CGRect, topInset: CGFloat) -> CGRect {
@@ -520,12 +532,16 @@ public final class AnnotationActionToolbar: NSView {
             && rect.size.width.isFinite && rect.size.height.isFinite
     }
 
+    /// Places the toolbar relative to `selection`, or near `anchorPoint` (aligning the Copy action
+    /// horizontally near `anchorPoint.x` while choosing the nearest exterior edge or an interior spot)
+    /// when `anchorPoint` is provided.
     public static func frame(
         for selection: CGRect,
         in bounds: CGRect,
         topInset: CGFloat,
         showsStyleBar: Bool,
-        preset: AnnotationToolbarPreset = .snip
+        preset: AnnotationToolbarPreset = .snip,
+        anchorPoint: CGPoint? = nil
     ) -> CGRect {
         let size = showsStyleBar ? expandedSize(for: preset) : preferredSize(for: preset)
         let safeBounds = isFiniteRect(bounds) ? bounds.standardized : CGRect(origin: .zero, size: size)
@@ -535,6 +551,62 @@ public final class AnnotationActionToolbar: NSView {
         let usableMaxY = safeBounds.maxY - safeTopInset
         let maxX = max(safeBounds.minX, safeBounds.maxX - size.width)
         let maxY = max(safeBounds.minY, usableMaxY - size.height)
+
+        let validAnchor: CGPoint? = if let p = anchorPoint, p.x.isFinite, p.y.isFinite {
+            CGPoint(
+                x: min(max(p.x, safeBounds.minX), safeBounds.maxX),
+                y: min(max(p.y, safeBounds.minY), usableMaxY)
+            )
+        } else {
+            nil
+        }
+
+        if let anchor = validAnchor {
+            let cursorGap: CGFloat = 14
+            let interiorShortcutDistance: CGFloat = 200
+            let belowY = safeSelection.minY - gap - size.height
+            let belowFits = belowY >= safeBounds.minY
+            let aboveY = safeSelection.maxY + gap
+            let aboveFits = aboveY + size.height <= usableMaxY
+            let distToBottom = abs(anchor.y - safeSelection.minY)
+            let distToTop = abs(safeSelection.maxY - anchor.y)
+            let preferAbove = anchor.y > safeSelection.midY
+
+            let candidates: [(fits: Bool, y: CGFloat, distance: CGFloat)] = preferAbove
+                ? [(aboveFits, aboveY, distToTop), (belowFits, belowY, distToBottom)]
+                : [(belowFits, belowY, distToBottom), (aboveFits, aboveY, distToTop)]
+
+            let y: CGFloat
+            let placedInside: Bool
+            if let exterior = candidates.first(where: { $0.fits && $0.distance <= interiorShortcutDistance }) {
+                y = exterior.y
+                placedInside = false
+            } else {
+                placedInside = true
+                let compactHeight = preferredSize(for: preset).height
+                let edgePadY = min(gap, max(0, (usableMaxY - safeBounds.minY - size.height) / 2))
+                let minInsideY = safeBounds.minY + edgePadY
+                let maxInsideY = max(minInsideY, usableMaxY - edgePadY - size.height)
+                let fitsBelowCursor = anchor.y - cursorGap - compactHeight >= safeBounds.minY + edgePadY
+                let primaryTopY = fitsBelowCursor
+                    ? (anchor.y - cursorGap)
+                    : (anchor.y + cursorGap + compactHeight)
+                y = min(max((primaryTopY - size.height).rounded(), minInsideY), maxInsideY)
+            }
+
+            let rawX = (anchor.x - copyButtonCenterXOffset(for: preset)).rounded()
+            let x: CGFloat
+            if placedInside {
+                let edgePadX = min(gap, max(0, (safeBounds.width - size.width) / 2))
+                let minInsideX = safeBounds.minX + edgePadX
+                let maxInsideX = max(minInsideX, safeBounds.maxX - edgePadX - size.width)
+                x = min(max(rawX, minInsideX), maxInsideX)
+            } else {
+                x = min(max(rawX, safeBounds.minX), maxX)
+            }
+            let clampedY = placedInside ? y : min(max(y, safeBounds.minY), maxY)
+            return CGRect(origin: CGPoint(x: x, y: clampedY), size: size)
+        }
 
         var y = safeSelection.minY - gap - size.height
         var placedInside = false

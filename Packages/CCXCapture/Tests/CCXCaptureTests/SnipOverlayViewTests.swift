@@ -1908,4 +1908,164 @@ struct SnipOverlayViewTests {
         #expect(nanHUD.frame.origin.x.isFinite && nanHUD.frame.origin.y.isFinite)
         #expect(nanHUD.frame.width > 0 && nanHUD.frame.height == 44)
     }
+
+    @Test func ocrSelectionModeFinishesImmediatelyOnDragReleaseAndCommandA() throws {
+        let size = CGSize(width: 480, height: 320)
+        let ocrView = SnipOverlayView(
+            snapshot: try makeSnapshot(size: size),
+            topInset: 0,
+            selectionMode: .ocr
+        )
+        var actions: [OverlayAction] = []
+        ocrView.onFinish = { actions.append($0) }
+
+        try selectRect(CGRect(x: 40, y: 50, width: 180, height: 90), on: ocrView)
+        #expect(actions.count == 1)
+        guard case let .ocr(dragRect)? = actions.first else {
+            Issue.record("Expected immediate .ocr completion on drag release, got \(actions)")
+            return
+        }
+        #expect(abs(dragRect.width - 180) < 1)
+        #expect(abs(dragRect.height - 90) < 1)
+
+        // Cmd+A in idle hover also triggers immediate full-screen .ocr.
+        let fullView = SnipOverlayView(
+            snapshot: try makeSnapshot(size: size),
+            topInset: 0,
+            selectionMode: .ocr
+        )
+        var fullActions: [OverlayAction] = []
+        fullView.onFinish = { fullActions.append($0) }
+        #expect(fullView.performKeyEquivalent(with: try makeKeyEvent(characters: "a", modifiers: [.command], keyCode: 0)))
+        guard case let .ocr(fullRect)? = fullActions.first else {
+            Issue.record("Expected immediate .ocr on Cmd+A, got \(fullActions)")
+            return
+        }
+        #expect(fullRect == CGRect(origin: .zero, size: size))
+    }
+
+    @Test func cheatSheetTogglesWithQuestionMarkDismissesFirstOnEscapeAndAppliesBrushCursors() throws {
+        let size = CGSize(width: 600, height: 420)
+        let view = SnipOverlayView(snapshot: try makeSnapshot(size: size), topInset: 0)
+        var actions: [OverlayAction] = []
+        view.onFinish = { actions.append($0) }
+
+        #expect(!view.isCheatSheetVisibleForTesting)
+        let qKey = try makeKeyEvent(characters: "?", modifiers: [.shift], keyCode: 44)
+        let escKey = try makeKeyEvent(characters: "\u{1b}", modifiers: [], keyCode: 53)
+
+        view.keyDown(with: qKey)
+        #expect(view.isCheatSheetVisibleForTesting)
+
+        // First Escape dismisses the modal cheat sheet without cancelling the snip session.
+        view.keyDown(with: escKey)
+        #expect(!view.isCheatSheetVisibleForTesting)
+        #expect(actions.isEmpty)
+
+        // Question mark toggles on and off, and pointer click dismisses an open cheat sheet safely.
+        view.keyDown(with: qKey)
+        #expect(view.isCheatSheetVisibleForTesting)
+        view.keyDown(with: qKey)
+        #expect(!view.isCheatSheetVisibleForTesting)
+
+        view.keyDown(with: qKey)
+        #expect(view.isCheatSheetVisibleForTesting)
+        view.mouseDown(with: try makeMouseEvent(type: .leftMouseDown, at: CGPoint(x: 300, y: 210)))
+        #expect(!view.isCheatSheetVisibleForTesting)
+        #expect(actions.isEmpty)
+
+        // Select a region, pick Pen ('4'), resize stroke via ']', and verify updated cached cursor.
+        let rect = CGRect(x: 80, y: 80, width: 260, height: 180)
+        try selectRect(rect, on: view)
+        view.keyDown(with: try makeKeyEvent(characters: "4", modifiers: [], keyCode: 21)) // .pen
+        let initialWidth = view.currentStyle.size.lineWidth
+        view.keyDown(with: try makeKeyEvent(characters: "]", modifiers: [], keyCode: 30))
+        #expect(view.currentStyle.size.lineWidth > initialWidth)
+        view.mouseMoved(with: try makeMouseEvent(type: .mouseMoved, at: CGPoint(x: rect.midX, y: rect.midY)))
+        let expectedPen = BrushCursorCache.shared.cursor(diameter: view.currentStyle.size.lineWidth, kind: .freehand)
+        #expect(view.currentCursorForTesting === expectedPen)
+
+        view.keyDown(with: try makeKeyEvent(characters: "6", modifiers: [], keyCode: 22)) // .mosaic
+        view.mouseMoved(with: try makeMouseEvent(type: .mouseMoved, at: CGPoint(x: rect.midX + 2, y: rect.midY)))
+        let expectedMosaic = BrushCursorCache.shared.cursor(diameter: view.currentStyle.size.mosaicBlockSize, kind: .mosaic)
+        #expect(view.currentCursorForTesting === expectedMosaic)
+
+        // Escape cancels after clearing tool cleanly.
+        view.keyDown(with: escKey) // exits tool
+        #expect(view.activeTool == .select)
+        view.keyDown(with: escKey) // cancels session
+        #expect(actions.last == .cancel)
+    }
+
+    @Test func snipToolbarAppearsNearFinalMousePositionAndStaysStationaryDuringAnnotation() throws {
+        let size = CGSize(width: 1400, height: 900)
+        let topInset: CGFloat = 32
+        let view = SnipOverlayView(snapshot: try makeSnapshot(size: size), topInset: topInset)
+        let copyOffset = SnipActionToolbar.copyButtonCenterXOffset(for: .snip)
+
+        // 1. Drag from bottom-right (1000, 300) -> top-left (200, 600): places toolbar above selection near final point.
+        view.mouseDown(with: try makeMouseEvent(type: .leftMouseDown, at: CGPoint(x: 1000, y: 300)))
+        view.mouseDragged(with: try makeMouseEvent(type: .leftMouseDragged, at: CGPoint(x: 200, y: 600)))
+        view.mouseUp(with: try makeMouseEvent(type: .leftMouseUp, at: CGPoint(x: 200, y: 600)))
+        #expect(view.toolbarAnchorPoint == CGPoint(x: 200, y: 600))
+        #expect(view.toolbar.frame.minY >= 600)
+        #expect(view.toolbar.frame.minX == 0)
+
+        // 2. Drag from top-left (200, 600) -> bottom-right (1000, 300): places toolbar below with Copy aligned at 1000.
+        view.resetSelection()
+        view.mouseDown(with: try makeMouseEvent(type: .leftMouseDown, at: CGPoint(x: 200, y: 600)))
+        view.mouseDragged(with: try makeMouseEvent(type: .leftMouseDragged, at: CGPoint(x: 1000, y: 300)))
+        view.mouseUp(with: try makeMouseEvent(type: .leftMouseUp, at: CGPoint(x: 1000, y: 300)))
+        #expect(view.toolbarAnchorPoint == CGPoint(x: 1000, y: 300))
+        let anchoredFrame = view.toolbar.frame
+        #expect(anchoredFrame.maxY <= 300)
+        #expect(abs((anchoredFrame.minX + copyOffset) - 1000) <= 1)
+
+        // 3. Moving cursor afterward keeps toolbar stationary.
+        view.mouseMoved(with: try makeMouseEvent(type: .mouseMoved, at: CGPoint(x: 420, y: 450)))
+        #expect(view.toolbarAnchorPoint == CGPoint(x: 1000, y: 300))
+        #expect(view.toolbar.frame == anchoredFrame)
+
+        // 4. Choosing rectangle tool and drawing a shape keeps primary toolbar top-left stationary.
+        view.keyDown(with: try makeKeyEvent(characters: "1", modifiers: [], keyCode: 18))
+        #expect(view.activeTool == .rectangle)
+        #expect(view.toolbar.frame.minX == anchoredFrame.minX)
+        #expect(view.toolbar.frame.maxY == anchoredFrame.maxY)
+
+        view.mouseDown(with: try makeMouseEvent(type: .leftMouseDown, at: CGPoint(x: 320, y: 380)))
+        view.mouseDragged(with: try makeMouseEvent(type: .leftMouseDragged, at: CGPoint(x: 480, y: 480)))
+        view.mouseUp(with: try makeMouseEvent(type: .leftMouseUp, at: CGPoint(x: 480, y: 480)))
+        #expect(view.toolbarAnchorPoint == CGPoint(x: 1000, y: 300))
+        #expect(view.toolbar.frame.minX == anchoredFrame.minX)
+        #expect(view.toolbar.frame.maxY == anchoredFrame.maxY)
+
+        // 5. Undo drawn shape cleanly, return to .select, then single-click outside without dragging: toolbar stays stationary.
+        #expect(view.performKeyEquivalent(with: try makeKeyEvent(characters: "z", modifiers: [.command], keyCode: 6)))
+        view.keyDown(with: try makeKeyEvent(characters: "v", modifiers: [], keyCode: 9))
+        view.mouseDown(with: try makeMouseEvent(type: .leftMouseDown, at: CGPoint(x: 90, y: 120)))
+        view.mouseUp(with: try makeMouseEvent(type: .leftMouseUp, at: CGPoint(x: 90, y: 120)))
+        #expect(view.toolbarAnchorPoint == CGPoint(x: 1000, y: 300))
+        #expect(view.toolbar.frame == anchoredFrame)
+
+        // 6. Arrow-key nudge shifts toolbarAnchorPoint with the selection.
+        view.keyDown(with: try makeKeyEvent(characters: "", modifiers: [], keyCode: 124))
+        #expect(view.toolbarAnchorPoint == CGPoint(x: 1001, y: 300))
+        #expect(view.toolbar.frame.minX == anchoredFrame.minX + 1)
+
+        // 7. Double-clicking grip clears both customToolbarTopLeft and toolbarAnchorPoint.
+        let grip = view.toolbar.dragHandleView
+        let gripCenter = grip.convert(CGPoint(x: grip.bounds.midX, y: grip.bounds.midY), to: view)
+        grip.mouseDown(with: try makeMouseEvent(type: .leftMouseDown, at: gripCenter, clickCount: 2))
+        #expect(view.customToolbarTopLeft == nil)
+        #expect(view.toolbarAnchorPoint == nil)
+
+        // 8. Cmd+A full-screen selection anchors near lastMousePoint instead of bottom-right screen corner.
+        view.resetSelection()
+        view.mouseMoved(with: try makeMouseEvent(type: .mouseMoved, at: CGPoint(x: 780, y: 520)))
+        #expect(view.performKeyEquivalent(with: try makeKeyEvent(characters: "a", modifiers: [.command], keyCode: 0)))
+        #expect(view.machine.selectionRect == view.bounds)
+        #expect(view.toolbarAnchorPoint == CGPoint(x: 780, y: 520))
+        #expect(abs((view.toolbar.frame.minX + copyOffset) - 780) <= 1)
+        #expect(view.toolbar.frame.maxY == 506)
+    }
 }

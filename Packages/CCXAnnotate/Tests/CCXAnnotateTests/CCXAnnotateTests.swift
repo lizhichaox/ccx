@@ -1797,4 +1797,332 @@ struct CCXAnnotateTests {
             #expect(smallBoundsFrame.minX == smallBounds.minX)
         }
     }
+
+    @Test func mosaicCacheROICropCutsMemoryMovesCleanlyAndMatchesFullImageBake() throws {
+        // Large 1600x1000 image (800x500pt @ 2x) with striped colored quadrants for strict spatial verification.
+        let fullW = 1600
+        let fullH = 1000
+        let screenSize = CGSize(width: 800, height: 500)
+        let ctx = try #require(CGContext(
+            data: nil,
+            width: fullW,
+            height: fullH,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue
+        ))
+        ctx.setFillColor(red: 0.12, green: 0.20, blue: 0.48, alpha: 1)
+        ctx.fill(CGRect(x: 0, y: 0, width: fullW, height: fullH))
+        // Upper-half (AppKit Y >= 250) bright orange-white vertical stripes; bottom-right green band.
+        ctx.setFillColor(red: 0.96, green: 0.42, blue: 0.12, alpha: 1)
+        for x in stride(from: 80, to: 500, by: 8) {
+            ctx.fill(CGRect(x: x, y: 600, width: 4, height: 320))
+        }
+        ctx.setFillColor(red: 0.14, green: 0.78, blue: 0.35, alpha: 1)
+        ctx.fill(CGRect(x: 1100, y: 80, width: 320, height: 220))
+        let baseImage = try #require(ctx.makeImage())
+
+        let roiCache = MosaicImageCache(baseImage: baseImage)
+        let smallSelection = CGRect(x: 60, y: 320, width: 140, height: 110)
+        roiCache.setActiveRegion(localRect: smallSelection, screenSize: screenSize)
+
+        let pixSurface = try #require(roiCache.filteredSurface(mode: .pixelate, size: .medium, backingScale: 2))
+        let blurSurface = try #require(roiCache.filteredSurface(mode: .blur, size: .medium, backingScale: 2))
+        #expect(pixSurface.image.width < fullW / 2 && pixSurface.image.height < fullH / 2)
+        #expect(blurSurface.image.width < fullW / 2 && blurSurface.image.height < fullH / 2)
+        #expect(roiCache.baseRasterizationCount == 0)
+        #expect(roiCache.cachedByteCount < (fullW * fullH * 4) / 2)
+
+        // Small nudge inside padded margin keeps existing cached ROI without invalidating.
+        let nudgedSelection = smallSelection.offsetBy(dx: 8, dy: 6)
+        roiCache.setActiveRegion(localRect: nudgedSelection, screenSize: screenSize)
+        #expect(roiCache.cachedVariantCount == 2)
+
+        // Disjoint selection updates ROI cleanly to the bottom-right green zone.
+        let farSelection = CGRect(x: 560, y: 50, width: 150, height: 100)
+        roiCache.setActiveRegion(localRect: farSelection, screenSize: screenSize)
+        #expect(roiCache.cachedVariantCount == 0)
+        let farPix = try #require(roiCache.filteredSurface(mode: .pixelate, size: .medium, backingScale: 2))
+        #expect(farPix.pixelOrigin.x > 600 && farPix.pixelOrigin.y > 400)
+
+        // Compare ROI bake vs forced full-image bake pixel-for-pixel for both blur and pixelate.
+        for mode in [MosaicMode.pixelate, .blur] {
+            let doc = AnnotationDocument()
+            let box = CGRect(x: 80, y: 330, width: 100, height: 80)
+            doc.commit(AnnotationItem(
+                kind: .mosaic(box, mode),
+                style: AnnotationStyle(size: .medium, mosaicMode: mode)
+            ))
+
+            let roiBakeCache = MosaicImageCache(baseImage: baseImage)
+            let selRect = CGRect(x: 60, y: 310, width: 160, height: 130)
+            let alignedCrop = CGRect(x: 120, y: 120, width: 320, height: 260)
+
+            let bakedROI = try #require(AnnotationRenderer.bake(
+                baseImage: baseImage,
+                localSelectionRect: selRect,
+                pixelCropRect: alignedCrop,
+                screenSize: screenSize,
+                document: doc,
+                mosaicCache: roiBakeCache
+            ))
+
+            let fullCache = MosaicImageCache(baseImage: baseImage)
+            _ = fullCache.filteredImage(mode: mode, size: .medium, backingScale: 2)
+            let contextFull = try #require(CGContext(
+                data: nil,
+                width: Int(alignedCrop.width),
+                height: Int(alignedCrop.height),
+                bitsPerComponent: 8,
+                bytesPerRow: 0,
+                space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue
+            ))
+            let baseCropped = try #require(baseImage.cropping(to: alignedCrop))
+            contextFull.draw(baseCropped, in: CGRect(origin: .zero, size: alignedCrop.size))
+            let screenBounds = CGRect(origin: .zero, size: screenSize)
+            contextFull.saveGState()
+            contextFull.setBlendMode(.copy)
+            contextFull.scaleBy(x: 2, y: 2)
+            contextFull.translateBy(x: -alignedCrop.minX / 2, y: -(CGFloat(fullH) - alignedCrop.maxY) / 2)
+            AnnotationRenderer.draw(doc.items[0], in: contextFull, screenBounds: screenBounds) { m, s in
+                fullCache.filteredImage(mode: m, size: s, backingScale: 2)
+            }
+            contextFull.restoreGState()
+            let bakedFull = try #require(contextFull.makeImage())
+
+            var maxDiff = 0
+            for py in stride(from: 20, to: 180, by: 8) {
+                for px in stride(from: 50, to: 230, by: 8) {
+                    let a = try sampleRGBA(in: bakedROI, x: px, y: py)
+                    let b = try sampleRGBA(in: bakedFull, x: px, y: py)
+                    maxDiff = max(
+                        maxDiff,
+                        abs(Int(a.r) - Int(b.r)),
+                        abs(Int(a.g) - Int(b.g)),
+                        abs(Int(a.b) - Int(b.b)),
+                        abs(Int(a.a) - Int(b.a))
+                    )
+                }
+            }
+            #expect(maxDiff <= 3, "ROI bake diverged from full-image bake for \(mode) (maxDiff=\(maxDiff))")
+        }
+    }
+
+    @Test @MainActor func brushCursorCacheAndLocalizedShortcutCheatSheetPresets() {
+        let cache = BrushCursorCache()
+        defer { cache.clear() }
+
+        let pen1 = cache.cursor(diameter: 8.2, kind: .freehand)
+        let pen2 = cache.cursor(diameter: 8.4, kind: .freehand)
+        let mosaic1 = cache.cursor(diameter: 8.2, kind: .mosaic)
+        #expect(pen1 === pen2, "Quantized freehand diameters should return identical cached NSCursor")
+        #expect(pen1 !== mosaic1, "Freehand and mosaic cursors must not collide in cache")
+        #expect(pen1.hotSpot.x > 0 && pen1.hotSpot.x == pen1.hotSpot.y)
+
+        // Clamping extreme / non-finite diameters stays bounded and caps cache at maxCachedCursors.
+        let tiny = cache.cursor(diameter: -10, kind: .freehand)
+        let huge = cache.cursor(diameter: 500, kind: .mosaic)
+        let nanCursor = cache.cursor(diameter: .nan, kind: .freehand)
+        #expect(tiny === cache.cursor(diameter: BrushCursorCache.minimumDiameter, kind: .freehand))
+        #expect(huge === cache.cursor(diameter: BrushCursorCache.maximumDiameter, kind: .mosaic))
+        #expect(nanCursor.image.size.width > 0)
+
+        for i in 1...40 {
+            _ = cache.cursor(diameter: CGFloat(6 + i * 2), kind: .freehand)
+        }
+        #expect(cache.cachedCountForTesting() <= BrushCursorCache.maxCachedCursors)
+
+        for language in CCXLanguage.allCases {
+            CCXL10n.withLanguageForTesting(language) {
+                let snipHUD = ShortcutCheatSheetView(entries: ShortcutCheatSheetView.snipOverlayEntries)
+                let pinHUD = ShortcutCheatSheetView(entries: ShortcutCheatSheetView.pinWindowEntries)
+                #expect(!snipHUD.entries.isEmpty)
+                #expect(!pinHUD.entries.isEmpty)
+                #expect(pinHUD.entries.contains { $0.keys == "R / H / V" })
+                #expect(snipHUD.hitTest(.zero) == nil)
+                #expect(snipHUD.fittingSize.width >= 310)
+                #expect(pinHUD.fittingSize.height > 120)
+                for entry in snipHUD.entries + pinHUD.entries {
+                    #expect(!entry.keys.isEmpty)
+                    #expect(!entry.description.isEmpty)
+                    #expect(!entry.description.contains("\n"))
+                }
+            }
+        }
+    }
+
+    @Test func rendererUsesOpaqueFallbackForDisjointMosaicSurface() throws {
+        func makeSolid(_ color: CGColor, size: Int) throws -> CGImage {
+            let c = try #require(CGContext(
+                data: nil,
+                width: size,
+                height: size,
+                bitsPerComponent: 8,
+                bytesPerRow: size * 4,
+                space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            ))
+            c.setFillColor(color)
+            c.fill(CGRect(x: 0, y: 0, width: size, height: size))
+            return try #require(c.makeImage())
+        }
+
+        let base = try makeSolid(CGColor(srgbRed: 0, green: 0.5, blue: 1, alpha: 1), size: 200)
+        let roiPatch = try makeSolid(CGColor(srgbRed: 0.1, green: 0.8, blue: 0.1, alpha: 1), size: 40)
+        let item = AnnotationItem(
+            kind: .mosaic(CGRect(x: 10, y: 10, width: 50, height: 50), .pixelate),
+            style: AnnotationStyle()
+        )
+
+        let ctx = try #require(CGContext(
+            data: nil,
+            width: 200,
+            height: 200,
+            bitsPerComponent: 8,
+            bytesPerRow: 200 * 4,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ))
+        ctx.draw(base, in: CGRect(x: 0, y: 0, width: 200, height: 200))
+
+        // Provide a surface whose ROI (x: 150..190) does not overlap the mosaic item (x: 10..60).
+        let disjointSurface = MosaicFilteredSurface(
+            image: roiPatch,
+            pixelOrigin: CGPoint(x: 150, y: 150),
+            fullImageSize: CGSize(width: 200, height: 200)
+        )
+        AnnotationRenderer.draw(
+            item,
+            in: ctx,
+            screenBounds: CGRect(x: 0, y: 0, width: 200, height: 200),
+            mosaicSurface: { _, _ in disjointSurface }
+        )
+
+        let out = try #require(ctx.makeImage())
+        // Pixel inside (30, 165) top-down (CGContext bottom-left y=35 -> pixel y=165) must be opaque fallback gray, not underlying blue.
+        let pixel = try samplePixel(in: out, x: 30, y: 165)
+        #expect(pixel.r < 90 && pixel.b < 90)
+    }
+
+    @Test func copyButtonCenterXOffsetMatchesLaidOutCopyButton() throws {
+        try CCXL10n.withLanguageForTesting(.en) {
+            for preset in [AnnotationToolbarPreset.snip, .pin] {
+                let toolbar = AnnotationActionToolbar(preset: preset)
+                toolbar.update(
+                    activeTool: .select,
+                    style: AnnotationStyle(),
+                    showStyleBar: false,
+                    canUndo: true,
+                    canRedo: true
+                )
+                toolbar.layoutSubtreeIfNeeded()
+                let copyButton = try #require(
+                    toolbar.primaryStack.arrangedSubviews.first { ($0 as? NSButton)?.toolTip == "Copy (⌘C)" }
+                )
+                let frameInToolbar = copyButton.convert(copyButton.bounds, to: toolbar)
+                #expect(abs(frameInToolbar.midX - AnnotationActionToolbar.copyButtonCenterXOffset(for: preset)) <= 2)
+            }
+        }
+    }
+
+    @Test func toolbarAnchorsNearPointerForCopyAcrossDirectionsAndInteriorFallback() {
+        let bounds = CGRect(x: 0, y: 0, width: 1512, height: 982)
+        let topInset: CGFloat = 32
+        let copyOffset = AnnotationActionToolbar.copyButtonCenterXOffset(for: .snip)
+
+        // 1. Drag ending at bottom-right corner -> below selection with Copy centered at anchor.x.
+        let lowerSelection = CGRect(x: 200, y: 300, width: 800, height: 300)
+        let bottomRight = AnnotationActionToolbar.frame(
+            for: lowerSelection,
+            in: bounds,
+            topInset: topInset,
+            showsStyleBar: false,
+            anchorPoint: CGPoint(x: 1000, y: 300)
+        )
+        #expect(bottomRight.maxY <= lowerSelection.minY)
+        #expect(bottomRight.minX + copyOffset == 1000)
+
+        // 2. Drag ending at top-right corner -> above selection with Copy centered at anchor.x.
+        let midSelection = CGRect(x: 200, y: 400, width: 800, height: 300)
+        let topRight = AnnotationActionToolbar.frame(
+            for: midSelection,
+            in: bounds,
+            topInset: topInset,
+            showsStyleBar: false,
+            anchorPoint: CGPoint(x: 1000, y: 700)
+        )
+        #expect(topRight.minY >= midSelection.maxY)
+        #expect(topRight.minX + copyOffset == 1000)
+
+        // 3. Drag ending at top-left corner -> above selection clamped to minX == bounds.minX.
+        let topLeft = AnnotationActionToolbar.frame(
+            for: midSelection,
+            in: bounds,
+            topInset: topInset,
+            showsStyleBar: false,
+            anchorPoint: CGPoint(x: 200, y: 700)
+        )
+        #expect(topLeft.minY >= midSelection.maxY)
+        #expect(topLeft.minX == bounds.minX)
+
+        // 4. Drag ending at bottom-left corner -> below selection near anchor.x.
+        let rightSelection = CGRect(x: 700, y: 300, width: 600, height: 300)
+        let bottomLeft = AnnotationActionToolbar.frame(
+            for: rightSelection,
+            in: bounds,
+            topInset: topInset,
+            showsStyleBar: false,
+            anchorPoint: CGPoint(x: 700, y: 300)
+        )
+        #expect(bottomLeft.maxY <= rightSelection.minY)
+        #expect(bottomLeft.minX + copyOffset == 700)
+
+        // 5. Tall bottom-edge selection with pointer at bottom-right stays inside near pointer instead of jumping 800pt up.
+        let tallBottomSelection = CGRect(x: 200, y: 0, width: 800, height: 800)
+        let tallBottom = AnnotationActionToolbar.frame(
+            for: tallBottomSelection,
+            in: bounds,
+            topInset: topInset,
+            showsStyleBar: false,
+            anchorPoint: CGPoint(x: 1000, y: 0)
+        )
+        #expect(tallBottom.minY == 14)
+        #expect(tallBottom.minX + copyOffset == 1000)
+
+        // 6. Full-screen selection near center pointer places toolbar just below pointer and keeps primary top stationary when expanded.
+        let centerCompact = AnnotationActionToolbar.frame(
+            for: bounds,
+            in: bounds,
+            topInset: topInset,
+            showsStyleBar: false,
+            anchorPoint: CGPoint(x: 800, y: 500)
+        )
+        let centerExpanded = AnnotationActionToolbar.frame(
+            for: bounds,
+            in: bounds,
+            topInset: topInset,
+            showsStyleBar: true,
+            anchorPoint: CGPoint(x: 800, y: 500)
+        )
+        #expect(centerCompact.maxY == 486)
+        #expect(centerCompact.minX + copyOffset == 800)
+        #expect(centerExpanded.maxY == 486)
+        #expect(centerExpanded.minX + copyOffset == 800)
+        #expect(centerExpanded.size == AnnotationActionToolbar.expandedSize(for: .snip))
+
+        // 7. Non-finite anchorPoint falls back cleanly to finite in-bounds frame.
+        for badAnchor in [CGPoint(x: CGFloat.nan, y: 500), CGPoint(x: 500, y: CGFloat.infinity)] {
+            let safeFrame = AnnotationActionToolbar.frame(
+                for: midSelection,
+                in: bounds,
+                topInset: topInset,
+                showsStyleBar: false,
+                anchorPoint: badAnchor
+            )
+            #expect(safeFrame.origin.x.isFinite && safeFrame.origin.y.isFinite)
+            #expect(bounds.contains(safeFrame))
+        }
+    }
 }

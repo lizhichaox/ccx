@@ -39,6 +39,7 @@ public struct SnipResult: Sendable {
 /// Selection workflow mode for a snip overlay session.
 public enum SnipSelectionMode: Equatable, Sendable {
     case snip
+    case ocr
     case record
 }
 
