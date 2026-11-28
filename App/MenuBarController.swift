@@ -24,6 +24,7 @@ protocol MenuBarControllerDelegate: AnyObject {
     func menuBarRequestedToggleAllPins()
     func menuBarRequestedUnlockClickThrough()
     func menuBarRequestedCloseAllPins()
+    func menuBarRequestedReopenClosedPin()
     func menuBarRequestedPermissionsGuide()
     func menuBarRequestedSettings()
 }
@@ -501,6 +502,10 @@ final class MenuBarController: NSObject, NSWindowDelegate {
                 onCloseAllPins: { [weak self] in
                     self?.hidePanel()
                     self?.delegate?.menuBarRequestedCloseAllPins()
+                },
+                onReopenClosedPin: { [weak self] in
+                    self?.hidePanel()
+                    self?.delegate?.menuBarRequestedReopenClosedPin()
                 },
                 onOpenPermissions: { [weak self] in
                     self?.invokePopoverAction {

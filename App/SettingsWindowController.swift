@@ -3,29 +3,52 @@ import CCXCore
 import ServiceManagement
 import SwiftUI
 
+enum SettingsDisclosureSection: Hashable, Sendable {
+    case moreShortcuts
+    case storageAndPrivacy
+    case permissions
+    case resourceUsage
+}
+
 @MainActor
 final class SettingsHotKeyState: ObservableObject {
     @Published var snipCombo: HotKeyCombo
     @Published var isSnipRegistered: Bool
-    @Published var isRecordingShortcut: Bool = false
+    @Published var recordingAction: CCXHotKeyAction?
     @Published var liveRecordingModifiers: NSEvent.ModifierFlags = []
     @Published var shortcutFeedback: String?
+    @Published var optionalBindings: [CCXHotKeyAction: HotKeyCombo]
+    @Published var unregisteredOptionalActions: Set<CCXHotKeyAction>
+    @Published var optionalFeedbackAction: CCXHotKeyAction?
+    @Published var optionalFeedbackMessage: String?
+    @Published var expandedSection: SettingsDisclosureSection? = nil
+    @Published var openedScreenRecordingSettings: Bool = false
     @Published var hasClearableHistory: Bool
     @Published var recordingsFolderPath: String
     @Published var isCustomRecordingsFolder: Bool
+    @Published var historyRetention: SnipHistoryRetention
+    @Published var concealFromClipboardManagers: Bool
 
     init(
         snipCombo: HotKeyCombo = .defaultSnip,
         isSnipRegistered: Bool = true,
+        optionalBindings: [CCXHotKeyAction: HotKeyCombo] = [:],
+        unregisteredOptionalActions: Set<CCXHotKeyAction> = [],
         hasClearableHistory: Bool = false,
         recordingsFolderPath: String = "~/Movies/CCX",
-        isCustomRecordingsFolder: Bool = false
+        isCustomRecordingsFolder: Bool = false,
+        historyRetention: SnipHistoryRetention = .keep20,
+        concealFromClipboardManagers: Bool = false
     ) {
         self.snipCombo = snipCombo
         self.isSnipRegistered = isSnipRegistered
+        self.optionalBindings = optionalBindings
+        self.unregisteredOptionalActions = unregisteredOptionalActions
         self.hasClearableHistory = hasClearableHistory
         self.recordingsFolderPath = recordingsFolderPath
         self.isCustomRecordingsFolder = isCustomRecordingsFolder
+        self.historyRetention = historyRetention
+        self.concealFromClipboardManagers = concealFromClipboardManagers
     }
 }
 
@@ -102,11 +125,11 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     private let resourceState = SettingsResourceState()
     private let updateManager: AppUpdateManager
     private let resourceMetricsProvider: () -> SettingsResourceMetricsInput
-    private let onBeginShortcutRecording: () -> Void
-    private let onEndShortcutRecording: () -> Void
-    private let onChangeSnipHotKey: (HotKeyCombo) -> HotKeyConflict?
-    private let onResetSnipHotKey: () -> HotKeyConflict?
-    private let onRetryHotKey: () -> Bool
+    private let onBeginShortcutRecording: @MainActor () -> Void
+    private let onEndShortcutRecording: @MainActor () -> Void
+    private let onChangeHotKey: @MainActor (CCXHotKeyAction, HotKeyCombo?) -> HotKeyConflict?
+    private let onResetSnipHotKey: @MainActor () -> HotKeyConflict?
+    private let onRetryHotKey: @MainActor (CCXHotKeyAction) -> Bool
     private let onOpenRecordingsFolder: () -> Void
     private let onChooseRecordingsFolder: () -> Void
     private let onResetRecordingsFolder: () -> Void
@@ -114,6 +137,8 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     private let onCopyVersion: (String) -> Void
     private let onOpenGuide: (NSRect?) -> Void
     private let onClearHistory: () -> Void
+    private let onChangeHistoryRetention: @MainActor (SnipHistoryRetention) -> Void
+    private let onToggleConcealClipboard: @MainActor (Bool) -> Void
     private let onRelaunch: () -> Void
     private let onPermissionReset: @MainActor (Bool) -> Void
     private var window: NSWindow?
@@ -130,21 +155,24 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
 
     var onWindowVisibilityChanged: ((Bool) -> Void)?
     private(set) var isWindowVisible = false
-    var windowFrame: NSRect? { window?.frame }
 
     init(
         updateManager: AppUpdateManager,
         snipCombo: HotKeyCombo = .defaultSnip,
         isSnipHotKeyRegistered: Bool = true,
+        optionalBindings: [CCXHotKeyAction: HotKeyCombo] = [:],
+        unregisteredOptionalActions: Set<CCXHotKeyAction> = [],
         hasClearableHistory: Bool = false,
         recordingsFolderPath: String = "~/Movies/CCX",
         isCustomRecordingsFolder: Bool = false,
+        historyRetention: SnipHistoryRetention = .keep20,
+        concealClipboard: Bool = false,
         resourceMetricsProvider: @escaping () -> SettingsResourceMetricsInput = { .empty },
-        onBeginShortcutRecording: @escaping () -> Void = {},
-        onEndShortcutRecording: @escaping () -> Void = {},
-        onChangeSnipHotKey: @escaping (HotKeyCombo) -> HotKeyConflict? = { _ in nil },
-        onResetSnipHotKey: @escaping () -> HotKeyConflict? = { nil },
-        onRetryHotKey: @escaping () -> Bool = { false },
+        onBeginShortcutRecording: @escaping @MainActor () -> Void = {},
+        onEndShortcutRecording: @escaping @MainActor () -> Void = {},
+        onChangeHotKey: @escaping @MainActor (CCXHotKeyAction, HotKeyCombo?) -> HotKeyConflict? = { _, _ in nil },
+        onResetSnipHotKey: @escaping @MainActor () -> HotKeyConflict? = { nil },
+        onRetryHotKey: @escaping @MainActor (CCXHotKeyAction) -> Bool = { _ in false },
         onOpenRecordingsFolder: @escaping () -> Void = {},
         onChooseRecordingsFolder: @escaping () -> Void = {},
         onResetRecordingsFolder: @escaping () -> Void = {},
@@ -152,6 +180,8 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         onCopyVersion: @escaping (String) -> Void = { _ in },
         onOpenGuide: @escaping (NSRect?) -> Void = { _ in },
         onClearHistory: @escaping () -> Void = {},
+        onChangeHistoryRetention: @escaping @MainActor (SnipHistoryRetention) -> Void = { _ in },
+        onToggleConcealClipboard: @escaping @MainActor (Bool) -> Void = { _ in },
         onRelaunch: @escaping () -> Void = { _ = AppRelauncher.relaunch() },
         onPermissionReset: @escaping @MainActor (Bool) -> Void = { _ in }
     ) {
@@ -159,14 +189,18 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         self.hotKeyState = SettingsHotKeyState(
             snipCombo: snipCombo,
             isSnipRegistered: isSnipHotKeyRegistered,
+            optionalBindings: optionalBindings,
+            unregisteredOptionalActions: unregisteredOptionalActions,
             hasClearableHistory: hasClearableHistory,
             recordingsFolderPath: recordingsFolderPath,
-            isCustomRecordingsFolder: isCustomRecordingsFolder
+            isCustomRecordingsFolder: isCustomRecordingsFolder,
+            historyRetention: historyRetention,
+            concealFromClipboardManagers: concealClipboard
         )
         self.resourceMetricsProvider = resourceMetricsProvider
         self.onBeginShortcutRecording = onBeginShortcutRecording
         self.onEndShortcutRecording = onEndShortcutRecording
-        self.onChangeSnipHotKey = onChangeSnipHotKey
+        self.onChangeHotKey = onChangeHotKey
         self.onResetSnipHotKey = onResetSnipHotKey
         self.onRetryHotKey = onRetryHotKey
         self.onOpenRecordingsFolder = onOpenRecordingsFolder
@@ -176,6 +210,8 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         self.onCopyVersion = onCopyVersion
         self.onOpenGuide = onOpenGuide
         self.onClearHistory = onClearHistory
+        self.onChangeHistoryRetention = onChangeHistoryRetention
+        self.onToggleConcealClipboard = onToggleConcealClipboard
         self.onRelaunch = onRelaunch
         self.onPermissionReset = onPermissionReset
         super.init()
@@ -204,19 +240,48 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         }
     }
 
-    func updateSnipHotKey(combo: HotKeyCombo, isRegistered: Bool) {
-        if hotKeyState.snipCombo != combo {
-            hotKeyState.snipCombo = combo
+    func updateAllHotKeys(
+        snipCombo: HotKeyCombo,
+        isSnipRegistered: Bool,
+        optionalBindings: [CCXHotKeyAction: HotKeyCombo],
+        unregisteredOptionalActions: Set<CCXHotKeyAction>
+    ) {
+        var needsHeightSync = false
+        if hotKeyState.snipCombo != snipCombo {
+            hotKeyState.snipCombo = snipCombo
         }
-        if hotKeyState.isSnipRegistered != isRegistered {
-            hotKeyState.isSnipRegistered = isRegistered
+        if hotKeyState.isSnipRegistered != isSnipRegistered {
+            hotKeyState.isSnipRegistered = isSnipRegistered
+            needsHeightSync = true
+        }
+        if hotKeyState.optionalBindings != optionalBindings {
+            hotKeyState.optionalBindings = optionalBindings
+            needsHeightSync = true
+        }
+        if hotKeyState.unregisteredOptionalActions != unregisteredOptionalActions {
+            hotKeyState.unregisteredOptionalActions = unregisteredOptionalActions
+            needsHeightSync = true
+        }
+        if needsHeightSync {
             scheduleWindowHeightSync()
         }
     }
 
-    func updateHotKeyRegistered(_ registered: Bool) {
-        if hotKeyState.isSnipRegistered != registered {
-            hotKeyState.isSnipRegistered = registered
+    func updateHotKeyRegistered(_ registered: Bool, for action: CCXHotKeyAction = .snip) {
+        if action == .snip {
+            if hotKeyState.isSnipRegistered != registered {
+                hotKeyState.isSnipRegistered = registered
+                scheduleWindowHeightSync()
+            }
+            return
+        }
+        let changed: Bool
+        if registered {
+            changed = hotKeyState.unregisteredOptionalActions.remove(action) != nil
+        } else {
+            changed = hotKeyState.unregisteredOptionalActions.insert(action).inserted
+        }
+        if changed {
             scheduleWindowHeightSync()
         }
     }
@@ -233,6 +298,15 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         }
         if let isCustom, hotKeyState.isCustomRecordingsFolder != isCustom {
             hotKeyState.isCustomRecordingsFolder = isCustom
+        }
+    }
+
+    func updateHistoryPrivacy(retention: SnipHistoryRetention, concealClipboard: Bool) {
+        if hotKeyState.historyRetention != retention {
+            hotKeyState.historyRetention = retention
+        }
+        if hotKeyState.concealFromClipboardManagers != concealClipboard {
+            hotKeyState.concealFromClipboardManagers = concealClipboard
         }
     }
 
@@ -322,10 +396,17 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         }
     }
 
-    private func toggleResourceUsageExpanded() {
+    private func toggleDisclosureSection(_ section: SettingsDisclosureSection) {
         stopRecordingShortcut()
-        resourceState.isExpanded.toggle()
-        if resourceState.isExpanded {
+        let next: SettingsDisclosureSection? = (hotKeyState.expandedSection == section) ? nil : section
+        let isResourceExpanded = (next == .resourceUsage)
+        var tx = Transaction()
+        tx.disablesAnimations = true
+        withTransaction(tx) {
+            hotKeyState.expandedSection = next
+            resourceState.isExpanded = isResourceExpanded
+        }
+        if isResourceExpanded {
             refreshResourceUsage()
         } else {
             resourceSampleGeneration &+= 1
@@ -335,7 +416,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             resourceFollowUpTask = nil
         }
         syncResourcePolling()
-        scheduleWindowHeightSync()
+        syncWindowHeightToFit(preserveTopEdge: true)
     }
 
     private func syncResourcePolling() {
@@ -421,12 +502,30 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     func show(anchoredTo anchorRect: NSRect? = nil) {
         let window = self.window ?? makeWindow()
         self.window = window
-        if !hotKeyState.isRecordingShortcut {
+        if hotKeyState.recordingAction == nil {
             hotKeyState.shortcutFeedback = nil
+            hotKeyState.optionalFeedbackAction = nil
+            hotKeyState.optionalFeedbackMessage = nil
         }
         launchAtLoginState.syncStatus()
         permissions.refresh()
         permissions.startPolling()
+
+        if !window.isVisible {
+            let initialSection: SettingsDisclosureSection? = permissions.status.screenRecording ? nil : .permissions
+            hotKeyState.expandedSection = initialSection
+            let isResourceExpanded = (initialSection == .resourceUsage)
+            if resourceState.isExpanded != isResourceExpanded {
+                resourceState.isExpanded = isResourceExpanded
+            }
+            if !isResourceExpanded {
+                resourceSampleGeneration &+= 1
+                resourceSampleTask?.cancel()
+                resourceSampleTask = nil
+                resourceFollowUpTask?.cancel()
+                resourceFollowUpTask = nil
+            }
+        }
 
         let targetScreen = anchorRect.flatMap { WindowScreenLocator.screen(for: $0) }
             ?? WindowScreenLocator.activeCursorScreen()
@@ -448,6 +547,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         }
         NSApp.activate()
         window.makeKeyAndOrderFront(nil)
+        window.makeFirstResponder(nil)
         isWindowMiniaturized = window.isMiniaturized
         isWindowOccluded = false
         installWindowObservers(for: window)
@@ -466,22 +566,30 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             launchAtLoginState: launchAtLoginState,
             resourceState: resourceState,
             updateManager: updateManager,
-            onStartRecordingShortcut: { [weak self] in
-                self?.startRecordingShortcut()
+            onStartRecordingShortcut: { [weak self] action in
+                self?.startRecordingShortcut(for: action)
             },
             onCancelRecordingShortcut: { [weak self] in
                 self?.stopRecordingShortcut()
             },
+            onClearOptionalHotKey: { [weak self] action in
+                self?.clearOptionalShortcut(for: action)
+            },
             onResetSnipHotKey: { [weak self] in
                 self?.resetSnipShortcut()
             },
-            onRetryHotKey: { [weak self] in
+            onRetryHotKey: { [weak self] action in
                 guard let self else { return }
                 self.stopRecordingShortcut()
-                let registered = self.onRetryHotKey()
-                self.updateHotKeyRegistered(registered)
+                let registered = self.onRetryHotKey(action)
+                self.updateHotKeyRegistered(registered, for: action)
                 if registered {
-                    self.hotKeyState.shortcutFeedback = nil
+                    if action == .snip {
+                        self.hotKeyState.shortcutFeedback = nil
+                    } else if self.hotKeyState.optionalFeedbackAction == action {
+                        self.hotKeyState.optionalFeedbackAction = nil
+                        self.hotKeyState.optionalFeedbackMessage = nil
+                    }
                     self.scheduleWindowHeightSync()
                 }
             },
@@ -503,8 +611,8 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             onCopyVersion: { [weak self] version in
                 self?.onCopyVersion(version)
             },
-            onToggleResourceUsage: { [weak self] in
-                self?.toggleResourceUsageExpanded()
+            onToggleSection: { [weak self] section in
+                self?.toggleDisclosureSection(section)
             },
             onOpenGuide: { [weak self] in
                 self?.stopRecordingShortcut()
@@ -513,6 +621,14 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             onClearHistory: { [weak self] in
                 self?.stopRecordingShortcut()
                 self?.onClearHistory()
+            },
+            onChangeHistoryRetention: { [weak self] policy in
+                self?.hotKeyState.historyRetention = policy
+                self?.onChangeHistoryRetention(policy)
+            },
+            onToggleConcealClipboard: { [weak self] concealed in
+                self?.hotKeyState.concealFromClipboardManagers = concealed
+                self?.onToggleConcealClipboard(concealed)
             },
             onRelaunch: { [weak self] in
                 self?.onRelaunch()
@@ -526,29 +642,44 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
                 }
             }
         )
-        let hosting = NSHostingController(rootView: view)
-        hosting.safeAreaRegions = []
-        hosting.sizingOptions = [.intrinsicContentSize]
-        let window = DismissibleWindow(contentViewController: hosting)
+        let hostingView = NSHostingView(rootView: view)
+        hostingView.safeAreaRegions = []
+        hostingView.sizingOptions = [.intrinsicContentSize]
+        hostingView.translatesAutoresizingMaskIntoConstraints = true
+        hostingView.autoresizingMask = [.width, .height]
+        hostingView.layoutSubtreeIfNeeded()
+        let initialSize = hostingView.fittingSize
+        let window = DismissibleWindow(
+            contentRect: NSRect(origin: .zero, size: initialSize),
+            styleMask: [.titled, .closable, .fullSizeContentView],
+            backing: .buffered,
+            defer: false
+        )
         window.title = CCXL10n.text("CCX Settings", zh: "CCX 设置")
         window.titleVisibility = .hidden
         window.titlebarAppearsTransparent = true
         window.isMovableByWindowBackground = true
-        window.styleMask = [.titled, .closable, .fullSizeContentView]
         window.isReleasedWhenClosed = false
         window.delegate = self
-        hosting.view.layoutSubtreeIfNeeded()
-        window.setContentSize(hosting.view.fittingSize)
+        window.contentView = hostingView
         return window
     }
 
     // MARK: - Shortcut Recording
 
-    private func startRecordingShortcut() {
-        guard !hotKeyState.isRecordingShortcut else { return }
-        hotKeyState.isRecordingShortcut = true
+    private func startRecordingShortcut(for action: CCXHotKeyAction = .snip) {
+        if hotKeyState.recordingAction == action { return }
+        if hotKeyState.recordingAction != nil {
+            stopRecordingShortcut()
+        }
+        hotKeyState.recordingAction = action
         hotKeyState.liveRecordingModifiers = []
-        hotKeyState.shortcutFeedback = nil
+        if action == .snip {
+            hotKeyState.shortcutFeedback = nil
+        } else {
+            hotKeyState.optionalFeedbackAction = nil
+            hotKeyState.optionalFeedbackMessage = nil
+        }
         (window as? DismissibleWindow)?.suppressDismissKeyEquivalents = true
         onBeginShortcutRecording()
         installShortcutMonitor()
@@ -556,21 +687,34 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     }
 
     private func stopRecordingShortcut(clearFeedback: Bool = true) {
-        let wasRecording = hotKeyState.isRecordingShortcut
-        let hadFeedback = hotKeyState.shortcutFeedback != nil
+        let wasRecording = hotKeyState.recordingAction != nil
+        let hadFeedback = hotKeyState.shortcutFeedback != nil || hotKeyState.optionalFeedbackMessage != nil
         removeShortcutMonitor()
         (window as? DismissibleWindow)?.suppressDismissKeyEquivalents = false
         hotKeyState.liveRecordingModifiers = []
         if clearFeedback {
             hotKeyState.shortcutFeedback = nil
+            hotKeyState.optionalFeedbackAction = nil
+            hotKeyState.optionalFeedbackMessage = nil
         }
         if wasRecording {
-            hotKeyState.isRecordingShortcut = false
+            hotKeyState.recordingAction = nil
             onEndShortcutRecording()
         }
         if wasRecording || (clearFeedback && hadFeedback) {
             scheduleWindowHeightSync()
         }
+    }
+
+    private func clearOptionalShortcut(for action: CCXHotKeyAction) {
+        guard action != .snip else { return }
+        stopRecordingShortcut()
+        _ = onChangeHotKey(action, nil)
+        hotKeyState.optionalBindings.removeValue(forKey: action)
+        hotKeyState.unregisteredOptionalActions.remove(action)
+        hotKeyState.optionalFeedbackAction = nil
+        hotKeyState.optionalFeedbackMessage = nil
+        scheduleWindowHeightSync()
     }
 
     private func resetSnipShortcut() {
@@ -598,7 +742,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
 
             let consumed = MainActor.assumeIsolated {
                 guard let self,
-                      self.hotKeyState.isRecordingShortcut,
+                      self.hotKeyState.recordingAction != nil,
                       let window = self.window,
                       window.isVisible,
                       window.isKeyWindow
@@ -632,6 +776,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         modifierFlags: NSEvent.ModifierFlags,
         isARepeat: Bool
     ) -> Bool {
+        guard let targetAction = hotKeyState.recordingAction else { return false }
         let cleanFlags = modifierFlags.intersection([.control, .option, .shift, .command])
 
         if type == .flagsChanged {
@@ -642,8 +787,12 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         guard type == .keyDown else { return false }
         if isARepeat { return true }
 
-        // Pure Esc (53) or pure Delete/ForwardDelete (51 / 117) cancels recording cleanly.
+        // Pure Esc (53) or pure Delete/ForwardDelete (51 / 117) cancels or clears.
         if cleanFlags.isEmpty && (keyCode == 53 || keyCode == 51 || keyCode == 117) {
+            if targetAction != .snip && (keyCode == 51 || keyCode == 117) && hotKeyState.optionalBindings[targetAction] != nil {
+                clearOptionalShortcut(for: targetAction)
+                return true
+            }
             stopRecordingShortcut()
             return true
         }
@@ -653,21 +802,40 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             return true
         }
 
-        if candidate == hotKeyState.snipCombo && hotKeyState.isSnipRegistered {
+        if targetAction == .snip {
+            if candidate == hotKeyState.snipCombo && hotKeyState.isSnipRegistered {
+                stopRecordingShortcut()
+                return true
+            }
+        } else if hotKeyState.optionalBindings[targetAction] == candidate,
+                  !hotKeyState.unregisteredOptionalActions.contains(targetAction)
+        {
             stopRecordingShortcut()
             return true
         }
 
-        if let conflict = onChangeSnipHotKey(candidate) {
-            hotKeyState.shortcutFeedback = conflict.localizedDescription
+        if let conflict = onChangeHotKey(targetAction, candidate) {
+            if targetAction == .snip {
+                hotKeyState.shortcutFeedback = conflict.localizedDescription
+            } else {
+                hotKeyState.optionalFeedbackAction = targetAction
+                hotKeyState.optionalFeedbackMessage = conflict.localizedDescription
+            }
             scheduleWindowHeightSync()
             NSSound.beep()
             return true
         }
 
-        hotKeyState.snipCombo = candidate
-        hotKeyState.isSnipRegistered = true
-        hotKeyState.shortcutFeedback = nil
+        if targetAction == .snip {
+            hotKeyState.snipCombo = candidate
+            hotKeyState.isSnipRegistered = true
+            hotKeyState.shortcutFeedback = nil
+        } else {
+            hotKeyState.optionalBindings[targetAction] = candidate
+            hotKeyState.unregisteredOptionalActions.remove(targetAction)
+            hotKeyState.optionalFeedbackAction = nil
+            hotKeyState.optionalFeedbackMessage = nil
+        }
         stopRecordingShortcut()
         return true
     }
@@ -680,6 +848,16 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
 
     private func syncWindowHeightToFit(preserveTopEdge: Bool) {
         guard let window, let contentView = window.contentView else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        NSAnimationContext.beginGrouping()
+        NSAnimationContext.current.duration = 0
+        NSAnimationContext.current.allowsImplicitAnimation = false
+        defer {
+            NSAnimationContext.endGrouping()
+            CATransaction.commit()
+        }
+
         contentView.layoutSubtreeIfNeeded()
         let fitting = contentView.fittingSize
         guard fitting.width > 0, fitting.height > 0 else { return }
@@ -698,10 +876,11 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
                 let maxY = max(minY, visibleFrame.maxY - frame.height - 6)
                 frame.origin.y = min(max(frame.origin.y, minY), maxY)
             }
-            window.setFrame(frame, display: true)
+            window.setFrame(frame, display: false)
         } else {
             window.setContentSize(fitting)
         }
+        contentView.layoutSubtreeIfNeeded()
     }
 
     private func position(window: NSWindow, anchoredTo anchorRect: NSRect?, targetScreen: NSScreen?) {
@@ -734,7 +913,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     }
 
     func windowDidResignKey(_ notification: Notification) {
-        if hotKeyState.isRecordingShortcut {
+        if hotKeyState.recordingAction != nil {
             stopRecordingShortcut()
         }
     }
@@ -753,7 +932,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     }
 
     func windowWillClose(_ notification: Notification) {
-        if hotKeyState.isRecordingShortcut {
+        if hotKeyState.recordingAction != nil {
             stopRecordingShortcut()
         }
         removeWindowObservers()
@@ -781,18 +960,21 @@ private struct SettingsView: View {
     let launchAtLoginState: SettingsLaunchAtLoginState
     let resourceState: SettingsResourceState
     let updateManager: AppUpdateManager
-    let onStartRecordingShortcut: () -> Void
-    let onCancelRecordingShortcut: () -> Void
-    let onResetSnipHotKey: () -> Void
-    let onRetryHotKey: () -> Void
+    let onStartRecordingShortcut: @MainActor (CCXHotKeyAction) -> Void
+    let onCancelRecordingShortcut: @MainActor () -> Void
+    let onClearOptionalHotKey: @MainActor (CCXHotKeyAction) -> Void
+    let onResetSnipHotKey: @MainActor () -> Void
+    let onRetryHotKey: @MainActor (CCXHotKeyAction) -> Void
     let onOpenRecordingsFolder: () -> Void
     let onChooseRecordingsFolder: () -> Void
     let onResetRecordingsFolder: () -> Void
     let onCopyRecordingsFolderPath: () -> Void
     let onCopyVersion: (String) -> Void
-    let onToggleResourceUsage: () -> Void
+    let onToggleSection: @MainActor (SettingsDisclosureSection) -> Void
     let onOpenGuide: () -> Void
     let onClearHistory: () -> Void
+    let onChangeHistoryRetention: @MainActor (SnipHistoryRetention) -> Void
+    let onToggleConcealClipboard: @MainActor (Bool) -> Void
     let onRelaunch: () -> Void
     let onPermissionReset: @MainActor (Bool) -> Void
     let onContentHeightChange: () -> Void
@@ -800,7 +982,121 @@ private struct SettingsView: View {
     @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
-        ZStack(alignment: .top) {
+        VStack(alignment: .center, spacing: 12) {
+            SettingsIdentityHeader(onCopyVersion: onCopyVersion)
+
+            VStack(spacing: 10) {
+                // Card 1 — Core General & Primary Shortcut
+                VStack(spacing: 0) {
+                    UpdatesSettingRow(updateManager: updateManager)
+                    Divider().padding(.leading, 42)
+                    LaunchAtLoginRow(state: launchAtLoginState)
+                    Divider().padding(.leading, 42)
+                    SnipShortcutRow(
+                        combo: hotKeyState.snipCombo,
+                        isRegistered: hotKeyState.isSnipRegistered,
+                        isRecording: hotKeyState.recordingAction == .snip,
+                        liveModifiers: hotKeyState.liveRecordingModifiers,
+                        feedback: hotKeyState.shortcutFeedback,
+                        onStartRecording: { onStartRecordingShortcut(.snip) },
+                        onCancelRecording: onCancelRecordingShortcut,
+                        onReset: onResetSnipHotKey,
+                        onRetry: { onRetryHotKey(.snip) }
+                    )
+                }
+                .ccxSettingsCard(cornerRadius: 12)
+
+                // Card 2 — Collapsible Accordion Sections
+                VStack(spacing: 0) {
+                    MoreShortcutsDisclosureSection(
+                        hotKeyState: hotKeyState,
+                        isExpanded: hotKeyState.expandedSection == .moreShortcuts,
+                        onToggleExpand: { onToggleSection(.moreShortcuts) },
+                        onStartRecording: onStartRecordingShortcut,
+                        onCancelRecording: onCancelRecordingShortcut,
+                        onClear: onClearOptionalHotKey,
+                        onRetry: onRetryHotKey
+                    )
+                    Divider().padding(.leading, 42)
+                    StorageAndPrivacyDisclosureSection(
+                        hotKeyState: hotKeyState,
+                        isExpanded: hotKeyState.expandedSection == .storageAndPrivacy,
+                        onToggleExpand: { onToggleSection(.storageAndPrivacy) },
+                        onChooseFolder: onChooseRecordingsFolder,
+                        onOpenFolder: onOpenRecordingsFolder,
+                        onResetFolder: onResetRecordingsFolder,
+                        onCopyFolderPath: onCopyRecordingsFolderPath,
+                        onChangeHistoryRetention: onChangeHistoryRetention,
+                        onToggleConcealClipboard: onToggleConcealClipboard
+                    )
+                    Divider().padding(.leading, 42)
+                    PermissionsDisclosureSection(
+                        permissions: permissions,
+                        openedScreenRecordingSettings: $hotKeyState.openedScreenRecordingSettings,
+                        isExpanded: hotKeyState.expandedSection == .permissions,
+                        onToggleExpand: { onToggleSection(.permissions) },
+                        onRelaunch: onRelaunch,
+                        onPermissionReset: onPermissionReset
+                    )
+                    Divider().padding(.leading, 42)
+                    ResourceUsageDisclosureSection(
+                        resourceState: resourceState,
+                        updateManager: updateManager,
+                        isExpanded: hotKeyState.expandedSection == .resourceUsage,
+                        onToggleExpand: { onToggleSection(.resourceUsage) }
+                    )
+                }
+                .ccxSettingsCard(cornerRadius: 12)
+            }
+
+            HStack(spacing: 8) {
+                Button {
+                    onOpenGuide()
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: "book.closed.fill")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(CCXBadgePalette.blue.labelColor(for: colorScheme))
+                        Text(CCXL10n.text("Setup Guide", zh: "使用指南"))
+                            .font(.system(size: 11.5, weight: .medium))
+                            .lineLimit(1)
+                    }
+                    .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+
+                Button {
+                    onClearHistory()
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: "trash.fill")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(
+                                hotKeyState.hasClearableHistory
+                                    ? CCXBadgePalette.red.labelColor(for: colorScheme)
+                                    : Color.secondary
+                            )
+                        Text(CCXL10n.text("Clear Snip History", zh: "清空记录"))
+                            .font(.system(size: 11.5, weight: .medium))
+                            .lineLimit(1)
+                    }
+                    .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(!hotKeyState.hasClearableHistory)
+            }
+
+            SettingsFooter()
+                .frame(maxWidth: .infinity, alignment: .center)
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, 28)
+        .padding(.bottom, 16)
+        .frame(width: 368, alignment: .top)
+        .fixedSize(horizontal: false, vertical: true)
+        .background {
             LinearGradient(
                 colors: [
                     CCXBadgePalette.blue.topColor.opacity(0.14),
@@ -811,165 +1107,287 @@ private struct SettingsView: View {
                 endPoint: .center
             )
             .ignoresSafeArea()
-
-            VStack(alignment: .center, spacing: 12) {
-                SettingsIdentityHeader(onCopyVersion: onCopyVersion)
-
-                VStack(spacing: 10) {
-                    // Card 1 — Preferences
-                    VStack(spacing: 0) {
-                        UpdatesSettingRow(updateManager: updateManager)
-                        Divider().padding(.leading, 42)
-                        LaunchAtLoginRow(state: launchAtLoginState)
-                        Divider().padding(.leading, 42)
-                        RecordingsFolderRow(
-                            folderPath: hotKeyState.recordingsFolderPath,
-                            isCustom: hotKeyState.isCustomRecordingsFolder,
-                            onChoose: onChooseRecordingsFolder,
-                            onOpen: onOpenRecordingsFolder,
-                            onReset: onResetRecordingsFolder,
-                            onCopyPath: onCopyRecordingsFolderPath
-                        )
-                        Divider().padding(.leading, 42)
-                        SnipShortcutRow(
-                            combo: hotKeyState.snipCombo,
-                            isRegistered: hotKeyState.isSnipRegistered,
-                            isRecording: hotKeyState.isRecordingShortcut,
-                            liveModifiers: hotKeyState.liveRecordingModifiers,
-                            feedback: hotKeyState.shortcutFeedback,
-                            onStartRecording: onStartRecordingShortcut,
-                            onCancelRecording: onCancelRecordingShortcut,
-                            onReset: onResetSnipHotKey,
-                            onRetry: onRetryHotKey
-                        )
-                    }
-                    .ccxSettingsCard(cornerRadius: 12)
-
-                    // Card 2 — Permissions
-                    PermissionsSettingsCard(
-                        permissions: permissions,
-                        onRelaunch: onRelaunch,
-                        onPermissionReset: onPermissionReset
-                    )
-                    .ccxSettingsCard(cornerRadius: 12)
-
-                    // Card 3 — Resource Usage
-                    ResourceUsageCard(
-                        resourceState: resourceState,
-                        updateManager: updateManager,
-                        onToggle: onToggleResourceUsage
-                    )
-                    .ccxSettingsCard(cornerRadius: 12)
-                }
-
-                HStack(spacing: 8) {
-                    Button {
-                        onOpenGuide()
-                    } label: {
-                        HStack(spacing: 5) {
-                            Image(systemName: "book.closed.fill")
-                                .font(.system(size: 11, weight: .semibold))
-                                .foregroundStyle(CCXBadgePalette.blue.labelColor(for: colorScheme))
-                            Text(CCXL10n.text("Setup Guide", zh: "使用指南"))
-                                .font(.system(size: 11.5, weight: .medium))
-                                .lineLimit(1)
-                        }
-                        .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-
-                    Button {
-                        onClearHistory()
-                    } label: {
-                        HStack(spacing: 5) {
-                            Image(systemName: "trash.fill")
-                                .font(.system(size: 11, weight: .semibold))
-                                .foregroundStyle(
-                                    hotKeyState.hasClearableHistory
-                                        ? CCXBadgePalette.red.labelColor(for: colorScheme)
-                                        : Color.secondary
-                                )
-                            Text(CCXL10n.text("Clear Snip History", zh: "清空记录"))
-                                .font(.system(size: 11.5, weight: .medium))
-                                .lineLimit(1)
-                        }
-                        .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .disabled(!hotKeyState.hasClearableHistory)
-                }
-
-                SettingsFooter()
-                    .frame(maxWidth: .infinity, alignment: .center)
-            }
-            .padding(.horizontal, 16)
-            .padding(.top, 28)
-            .padding(.bottom, 16)
-            .fixedSize(horizontal: false, vertical: true)
-            .onGeometryChange(for: CGFloat.self) { proxy in
-                proxy.size.height
-            } action: { oldHeight, newHeight in
-                if abs(oldHeight - newHeight) > 0.5 {
-                    onContentHeightChange()
-                }
-            }
-            .onChange(of: hotKeyState.isRecordingShortcut) { _, _ in
-                onContentHeightChange()
-            }
-            .onChange(of: hotKeyState.shortcutFeedback) { _, _ in
+        }
+        .onGeometryChange(for: CGFloat.self) { proxy in
+            proxy.size.height
+        } action: { oldHeight, newHeight in
+            if abs(oldHeight - newHeight) > 0.5 {
                 onContentHeightChange()
             }
         }
-        .frame(width: 368)
-        .fixedSize(horizontal: false, vertical: true)
+        .onChange(of: hotKeyState.recordingAction) { _, _ in
+            onContentHeightChange()
+        }
+        .onChange(of: hotKeyState.shortcutFeedback) { _, _ in
+            onContentHeightChange()
+        }
+        .onChange(of: hotKeyState.optionalFeedbackMessage) { _, _ in
+            onContentHeightChange()
+        }
     }
 }
 
-private struct PermissionsSettingsCard: View {
-    @ObservedObject var permissions: PermissionStatusModel
-    let onRelaunch: () -> Void
-    let onPermissionReset: @MainActor (Bool) -> Void
-    @State private var openedScreenRecordingSettings = false
+private struct SettingsDisclosureHeader<Trailing: View>: View {
+    let symbol: String
+    let palette: CCXBadgePalette
+    let title: String
+    let subtitle: String
+    var subtitleColor: Color = .secondary
+    let isExpanded: Bool
+    var tooltip: String? = nil
+    let accessibilityLabel: String
+    let onToggle: () -> Void
+    @ViewBuilder let trailing: () -> Trailing
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var isHovering = false
+
+    var body: some View {
+        let button = Button(action: onToggle) {
+            HStack(spacing: 9) {
+                CCXIconBadge(
+                    symbol: symbol,
+                    palette: palette,
+                    size: 24,
+                    cornerRadius: 6.5,
+                    symbolSize: 12
+                )
+
+                VStack(alignment: .leading, spacing: 1.5) {
+                    Text(title)
+                        .font(.system(size: 12.5, weight: .medium))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+
+                    Text(subtitle)
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(subtitleColor)
+                        .lineLimit(1)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+                HStack(spacing: 6) {
+                    trailing()
+
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                        .animation(reduceMotion ? nil : .easeInOut(duration: 0.16), value: isExpanded)
+                        .frame(width: 12, height: 12)
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 7.5)
+            .background(isHovering ? Color.primary.opacity(0.045) : Color.clear)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(accessibilityLabel)
+        .accessibilityValue(
+            isExpanded
+                ? CCXL10n.text("Expanded", zh: "已展开")
+                : CCXL10n.text("Collapsed", zh: "已收起")
+        )
+        .onHover { isHovering = $0 }
+
+        if let tooltip {
+            button.help(tooltip)
+        } else {
+            button
+        }
+    }
+}
+
+private struct SettingsDisclosureBadge: View {
+    let text: String
+    let palette: CCXBadgePalette
+
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        Text(text)
+            .font(.system(size: 10.5, weight: .semibold).monospacedDigit())
+            .foregroundStyle(palette.labelColor(for: colorScheme))
+            .padding(.horizontal, 7)
+            .padding(.vertical, 2.5)
+            .background(palette.accentColor.opacity(0.12), in: Capsule())
+            .overlay(
+                Capsule()
+                    .strokeBorder(palette.accentColor.opacity(0.24), lineWidth: 0.75)
+            )
+            .fixedSize()
+    }
+}
+
+private struct StorageAndPrivacyDisclosureSection: View {
+    @ObservedObject var hotKeyState: SettingsHotKeyState
+    let isExpanded: Bool
+    let onToggleExpand: () -> Void
+    let onChooseFolder: () -> Void
+    let onOpenFolder: () -> Void
+    let onResetFolder: () -> Void
+    let onCopyFolderPath: () -> Void
+    let onChangeHistoryRetention: @MainActor (SnipHistoryRetention) -> Void
+    let onToggleConcealClipboard: @MainActor (Bool) -> Void
+
+    @Environment(\.colorScheme) private var colorScheme
+
+    private var subtitle: String {
+        let retention = hotKeyState.historyRetention.localizedTitle
+        if hotKeyState.concealFromClipboardManagers {
+            return CCXL10n.text("\(retention) · Private", zh: "\(retention) · 隐私剪贴板")
+        }
+        return CCXL10n.text("Recordings · \(retention)", zh: "录屏目录 · \(retention)")
+    }
 
     var body: some View {
         VStack(spacing: 0) {
-            ScreenRecordingSettingRow(
-                granted: permissions.status.screenRecording,
-                isChecking: permissions.isCheckingScreenRecording,
-                isResetting: permissions.isResettingScreenRecording,
-                showRelaunch: openedScreenRecordingSettings && !permissions.status.screenRecording,
-                showReset: permissions.mayHaveStaleScreenRecordingGrant && !permissions.status.screenRecording,
-                onOpen: {
-                    openedScreenRecordingSettings = true
-                    permissions.openScreenRecordingSettings()
-                },
-                onReset: {
-                    openedScreenRecordingSettings = true
-                    permissions.resetAndReopenScreenRecording(onComplete: onPermissionReset)
-                },
-                onVerify: {
-                    permissions.verifyScreenRecordingLive()
-                },
-                onRelaunch: onRelaunch
-            )
-            Divider().padding(.leading, 42)
-            PermissionSettingRow(
-                symbol: "accessibility",
-                palette: .indigo,
-                title: CCXL10n.text("Accessibility", zh: "辅助功能"),
-                granted: permissions.status.accessibility,
-                openAction: permissions.openAccessibilitySettings
-            )
-            Divider().padding(.leading, 42)
-            PermissionSettingRow(
-                symbol: "mic.fill",
-                palette: .pink,
-                title: CCXL10n.text("Microphone", zh: "麦克风"),
-                granted: permissions.status.microphone,
-                openAction: permissions.openMicrophoneSettings
-            )
+            SettingsDisclosureHeader(
+                symbol: "folder.badge.gearshape",
+                palette: .orange,
+                title: CCXL10n.text("Storage & Privacy", zh: "存储与隐私"),
+                subtitle: subtitle,
+                isExpanded: isExpanded,
+                accessibilityLabel: CCXL10n.text("Storage & Privacy, \(subtitle)", zh: "存储与隐私，\(subtitle)"),
+                onToggle: onToggleExpand
+            ) {
+                EmptyView()
+            }
+
+            if isExpanded {
+                VStack(spacing: 0) {
+                    Divider().padding(.horizontal, 10)
+                    RecordingsFolderRow(
+                        folderPath: hotKeyState.recordingsFolderPath,
+                        isCustom: hotKeyState.isCustomRecordingsFolder,
+                        onChoose: onChooseFolder,
+                        onOpen: onOpenFolder,
+                        onReset: onResetFolder,
+                        onCopyPath: onCopyFolderPath
+                    )
+                    Divider().padding(.leading, 42)
+                    HistoryRetentionRow(
+                        retention: hotKeyState.historyRetention,
+                        onChange: onChangeHistoryRetention
+                    )
+                    Divider().padding(.leading, 42)
+                    ClipboardPrivacyRow(
+                        isConcealed: hotKeyState.concealFromClipboardManagers,
+                        onToggle: onToggleConcealClipboard
+                    )
+                }
+                .background(colorScheme == .dark ? Color.white.opacity(0.028) : Color.black.opacity(0.018))
+                .transition(.identity)
+            }
+        }
+    }
+}
+
+private struct PermissionsDisclosureSection: View {
+    @ObservedObject var permissions: PermissionStatusModel
+    @Binding var openedScreenRecordingSettings: Bool
+    let isExpanded: Bool
+    let onToggleExpand: () -> Void
+    let onRelaunch: () -> Void
+    let onPermissionReset: @MainActor (Bool) -> Void
+
+    @Environment(\.colorScheme) private var colorScheme
+
+    private var grantedCount: Int {
+        (permissions.status.screenRecording ? 1 : 0)
+            + (permissions.status.accessibility ? 1 : 0)
+            + (permissions.status.microphone ? 1 : 0)
+    }
+
+    private var iconSymbol: String {
+        permissions.status.screenRecording ? "checkmark.shield.fill" : "exclamationmark.shield.fill"
+    }
+
+    private var palette: CCXBadgePalette {
+        if !permissions.status.screenRecording {
+            return .orange
+        }
+        return grantedCount == 3 ? .green : .blue
+    }
+
+    private var subtitle: String {
+        if !permissions.status.screenRecording {
+            return CCXL10n.text("Screen Recording required", zh: "需要开启屏幕录制权限")
+        }
+        if grantedCount == 3 {
+            return CCXL10n.text("Screen, Accessibility & Mic", zh: "录屏、辅助功能与麦克风")
+        }
+        return CCXL10n.text("Optional permissions available", zh: "可选权限按需开启")
+    }
+
+    private var badgeText: String {
+        if !permissions.status.screenRecording {
+            return CCXL10n.text("Required", zh: "待授权")
+        }
+        if grantedCount == 3 {
+            return CCXL10n.text("All Granted", zh: "全部已授权")
+        }
+        return "\(grantedCount)/3"
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            SettingsDisclosureHeader(
+                symbol: iconSymbol,
+                palette: palette,
+                title: CCXL10n.text("Permissions", zh: "系统权限"),
+                subtitle: subtitle,
+                subtitleColor: permissions.status.screenRecording ? .secondary : .orange,
+                isExpanded: isExpanded,
+                accessibilityLabel: CCXL10n.text("Permissions, \(badgeText)", zh: "系统权限，\(badgeText)"),
+                onToggle: onToggleExpand
+            ) {
+                SettingsDisclosureBadge(text: badgeText, palette: palette)
+            }
+
+            if isExpanded {
+                VStack(spacing: 0) {
+                    Divider().padding(.horizontal, 10)
+                    ScreenRecordingSettingRow(
+                        granted: permissions.status.screenRecording,
+                        isChecking: permissions.isCheckingScreenRecording,
+                        isResetting: permissions.isResettingScreenRecording,
+                        showRelaunch: openedScreenRecordingSettings && !permissions.status.screenRecording,
+                        showReset: permissions.mayHaveStaleScreenRecordingGrant && !permissions.status.screenRecording,
+                        onOpen: {
+                            openedScreenRecordingSettings = true
+                            permissions.openScreenRecordingSettings()
+                        },
+                        onReset: {
+                            openedScreenRecordingSettings = true
+                            permissions.resetAndReopenScreenRecording(onComplete: onPermissionReset)
+                        },
+                        onVerify: {
+                            permissions.verifyScreenRecordingLive()
+                        },
+                        onRelaunch: onRelaunch
+                    )
+                    Divider().padding(.leading, 42)
+                    PermissionSettingRow(
+                        symbol: "accessibility",
+                        palette: .indigo,
+                        title: CCXL10n.text("Accessibility", zh: "辅助功能"),
+                        granted: permissions.status.accessibility,
+                        openAction: permissions.openAccessibilitySettings
+                    )
+                    Divider().padding(.leading, 42)
+                    PermissionSettingRow(
+                        symbol: "mic.fill",
+                        palette: .pink,
+                        title: CCXL10n.text("Microphone", zh: "麦克风"),
+                        granted: permissions.status.microphone,
+                        openAction: permissions.openMicrophoneSettings
+                    )
+                }
+                .background(colorScheme == .dark ? Color.white.opacity(0.028) : Color.black.opacity(0.018))
+                .transition(.identity)
+            }
         }
     }
 }
@@ -1260,6 +1678,320 @@ private struct SnipShortcutRow: View {
                 .padding(.bottom, 7)
             }
         }
+    }
+}
+
+private struct MoreShortcutsDisclosureSection: View {
+    @ObservedObject var hotKeyState: SettingsHotKeyState
+    let isExpanded: Bool
+    let onToggleExpand: () -> Void
+    let onStartRecording: @MainActor (CCXHotKeyAction) -> Void
+    let onCancelRecording: @MainActor () -> Void
+    let onClear: @MainActor (CCXHotKeyAction) -> Void
+    let onRetry: @MainActor (CCXHotKeyAction) -> Void
+
+    @Environment(\.colorScheme) private var colorScheme
+
+    private var activeCount: Int {
+        CCXHotKeyAction.optionalActions.reduce(into: 0) { count, action in
+            if hotKeyState.optionalBindings[action] != nil {
+                count += 1
+            }
+        }
+    }
+
+    private var hasConflict: Bool {
+        !hotKeyState.unregisteredOptionalActions.isEmpty
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            SettingsDisclosureHeader(
+                symbol: "command",
+                palette: hasConflict ? .orange : .indigo,
+                title: CCXL10n.text("More Shortcuts", zh: "更多快捷键"),
+                subtitle: CCXL10n.text("Quick OCR, Pin, Record & more", zh: "快速识字、贴图、录屏等"),
+                isExpanded: isExpanded,
+                accessibilityLabel: CCXL10n.text("More Shortcuts", zh: "更多快捷键"),
+                onToggle: onToggleExpand
+            ) {
+                if hasConflict {
+                    SettingsDisclosureBadge(
+                        text: CCXL10n.text("Conflict", zh: "有冲突"),
+                        palette: .orange
+                    )
+                } else if activeCount > 0 {
+                    SettingsDisclosureBadge(
+                        text: "\(activeCount)",
+                        palette: .indigo
+                    )
+                }
+            }
+
+            if isExpanded {
+                VStack(spacing: 0) {
+                    Divider().padding(.horizontal, 10)
+                    ForEach(CCXHotKeyAction.optionalActions, id: \.self) { action in
+                        if action != CCXHotKeyAction.optionalActions.first {
+                            Divider().padding(.leading, 43)
+                        }
+                        OptionalShortcutRow(
+                            action: action,
+                            combo: hotKeyState.optionalBindings[action],
+                            isRegistered: !hotKeyState.unregisteredOptionalActions.contains(action),
+                            isRecording: hotKeyState.recordingAction == action,
+                            liveModifiers: hotKeyState.liveRecordingModifiers,
+                            feedback: hotKeyState.optionalFeedbackAction == action ? hotKeyState.optionalFeedbackMessage : nil,
+                            onStartRecording: { onStartRecording(action) },
+                            onCancelRecording: onCancelRecording,
+                            onClear: { onClear(action) },
+                            onRetry: { onRetry(action) }
+                        )
+                    }
+                }
+                .padding(.bottom, 4)
+                .background(colorScheme == .dark ? Color.white.opacity(0.028) : Color.black.opacity(0.018))
+                .transition(.identity)
+            }
+        }
+    }
+}
+
+private struct OptionalShortcutRow: View {
+    let action: CCXHotKeyAction
+    let combo: HotKeyCombo?
+    let isRegistered: Bool
+    let isRecording: Bool
+    let liveModifiers: NSEvent.ModifierFlags
+    let feedback: String?
+    let onStartRecording: @MainActor () -> Void
+    let onCancelRecording: @MainActor () -> Void
+    let onClear: @MainActor () -> Void
+    let onRetry: @MainActor () -> Void
+
+    @State private var isHoveringPill = false
+    @State private var isHoveringClear = false
+    @State private var isHoveringCancel = false
+
+    private var liveRecordingLabel: String {
+        var parts: [String] = []
+        if liveModifiers.contains(.control) { parts.append("⌃") }
+        if liveModifiers.contains(.option) { parts.append("⌥") }
+        if liveModifiers.contains(.shift) { parts.append("⇧") }
+        if liveModifiers.contains(.command) { parts.append("⌘") }
+        if parts.isEmpty {
+            return CCXL10n.text("Press Keys", zh: "按下快捷键")
+        }
+        return parts.joined(separator: " ") + CCXL10n.text(" + Key", zh: " + 按键")
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                Text(action.displayName)
+                    .font(.system(size: 12))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                    .layoutPriority(1)
+
+                Spacer(minLength: 8)
+
+                if isRecording {
+                    HStack(spacing: 4) {
+                        Text(liveRecordingLabel)
+                            .font(.system(size: 11, weight: .semibold, design: .rounded))
+                            .foregroundStyle(Color.accentColor)
+                            .lineLimit(1)
+                            .padding(.horizontal, 8)
+                            .frame(minHeight: 22)
+                            .background(
+                                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                    .fill(Color.accentColor.opacity(0.12))
+                            )
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                    .strokeBorder(Color.accentColor.opacity(0.55), lineWidth: 1.2)
+                            )
+                            .fixedSize()
+
+                        Button(action: onCancelRecording) {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 9.5, weight: .semibold))
+                                .foregroundStyle(isHoveringCancel ? Color.primary : Color.secondary)
+                                .frame(width: 20, height: 20)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 5.5, style: .continuous)
+                                        .fill(isHoveringCancel ? Color.primary.opacity(0.10) : Color.primary.opacity(0.05))
+                                )
+                                .contentShape(RoundedRectangle(cornerRadius: 5.5, style: .continuous))
+                        }
+                        .buttonStyle(.plain)
+                        .onHover { isHoveringCancel = $0 }
+                        .help(CCXL10n.text("Cancel recording (Esc)", zh: "取消录制 (Esc)"))
+                    }
+                } else if let combo {
+                    HStack(spacing: 4) {
+                        Button(action: onClear) {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 9.5, weight: .semibold))
+                                .foregroundStyle(isHoveringClear ? Color.primary : Color.secondary)
+                                .frame(width: 20, height: 20)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 5.5, style: .continuous)
+                                        .fill(isHoveringClear ? Color.primary.opacity(0.10) : Color.primary.opacity(0.05))
+                                )
+                                .contentShape(RoundedRectangle(cornerRadius: 5.5, style: .continuous))
+                        }
+                        .buttonStyle(.plain)
+                        .onHover { isHoveringClear = $0 }
+                        .help(CCXL10n.text("Clear shortcut", zh: "清除快捷键"))
+                        .accessibilityLabel(CCXL10n.text("Clear shortcut for \(action.displayName)", zh: "清除「\(action.displayName)」快捷键"))
+
+                        Button(action: onStartRecording) {
+                            KeycapComboView(combo: combo)
+                                .padding(1.5)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 7.5, style: .continuous)
+                                        .fill(isHoveringPill ? Color.accentColor.opacity(0.08) : Color.clear)
+                                )
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 7.5, style: .continuous)
+                                        .strokeBorder(
+                                            isHoveringPill
+                                                ? Color.accentColor.opacity(0.50)
+                                                : (!isRegistered ? Color.orange.opacity(0.65) : Color.clear),
+                                            lineWidth: 1
+                                        )
+                                )
+                                .contentShape(RoundedRectangle(cornerRadius: 7.5, style: .continuous))
+                        }
+                        .buttonStyle(.plain)
+                        .onHover { isHoveringPill = $0 }
+                        .help(CCXL10n.text("Click to customize shortcut", zh: "点击自定义快捷键"))
+                    }
+                } else {
+                    Button(action: onStartRecording) {
+                        Text(CCXL10n.text("Not Set", zh: "未设置"))
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(isHoveringPill ? Color.primary : Color.secondary)
+                            .padding(.horizontal, 8)
+                            .frame(minHeight: 22)
+                            .background(
+                                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                    .fill(isHoveringPill ? Color.primary.opacity(0.09) : Color.primary.opacity(0.045))
+                            )
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                    .strokeBorder(Color.primary.opacity(isHoveringPill ? 0.20 : 0.10), lineWidth: 0.75)
+                            )
+                            .contentShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    }
+                    .buttonStyle(.plain)
+                    .onHover { isHoveringPill = $0 }
+                    .help(CCXL10n.text("Click to assign shortcut", zh: "点击设置快捷键"))
+                }
+            }
+            .padding(.leading, 43)
+            .padding(.trailing, 10)
+            .padding(.vertical, 5.5)
+
+            if let feedback {
+                Text(feedback)
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.orange)
+                    .lineLimit(1)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.leading, 43)
+                    .padding(.trailing, 10)
+                    .padding(.bottom, 5)
+            } else if let combo, !isRegistered {
+                HStack(spacing: 6) {
+                    Text(CCXL10n.text(
+                        "\(combo.displayString) in use by another app.",
+                        zh: "\(combo.displayString) 已被其他应用占用"
+                    ))
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.orange)
+                        .lineLimit(1)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 4)
+                    Button(CCXL10n.text("Retry", zh: "重试"), action: onRetry)
+                        .buttonStyle(.bordered)
+                        .controlSize(.mini)
+                        .fixedSize()
+                }
+                .padding(.leading, 43)
+                .padding(.trailing, 10)
+                .padding(.bottom, 5)
+            }
+        }
+    }
+}
+
+private struct HistoryRetentionRow: View {
+    let retention: SnipHistoryRetention
+    let onChange: @MainActor (SnipHistoryRetention) -> Void
+
+    var body: some View {
+        SettingsRow(symbol: "clock.arrow.circlepath", palette: .indigo, title: CCXL10n.text("History", zh: "截屏记录")) {
+            Picker("", selection: Binding(
+                get: { retention },
+                set: { newValue in
+                    Task { @MainActor in onChange(newValue) }
+                }
+            )) {
+                ForEach(SnipHistoryRetention.allCases, id: \.self) { option in
+                    Text(option.localizedTitle).tag(option)
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.menu)
+            .controlSize(.small)
+            .fixedSize()
+            .accessibilityLabel(CCXL10n.text("History", zh: "截屏记录"))
+        }
+    }
+}
+
+private struct ClipboardPrivacyRow: View {
+    let isConcealed: Bool
+    let onToggle: @MainActor (Bool) -> Void
+
+    var body: some View {
+        HStack(spacing: 9) {
+            CCXIconBadge(
+                symbol: "eye.slash.fill",
+                palette: .pink,
+                size: 24,
+                cornerRadius: 6.5,
+                symbolSize: 12
+            )
+
+            VStack(alignment: .leading, spacing: 1.5) {
+                Text(CCXL10n.text("Private Clipboard", zh: "隐私剪贴板"))
+                    .font(.system(size: 12.5, weight: .medium))
+                    .lineLimit(1)
+
+                Text(CCXL10n.text("Skip 3rd-party history apps", zh: "对第三方剪贴板工具隐身"))
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            Toggle("", isOn: Binding(
+                get: { isConcealed },
+                set: { newValue in
+                    Task { @MainActor in onToggle(newValue) }
+                }
+            ))
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .accessibilityLabel(CCXL10n.text("Private Clipboard", zh: "隐私剪贴板"))
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7.5)
     }
 }
 
@@ -1758,86 +2490,42 @@ private struct PermissionSettingRow: View {
     }
 }
 
-private struct ResourceUsageCard: View {
+private struct ResourceUsageDisclosureSection: View {
     @ObservedObject var resourceState: SettingsResourceState
     let updateManager: AppUpdateManager
-    let onToggle: () -> Void
+    let isExpanded: Bool
+    let onToggleExpand: () -> Void
 
     @Environment(\.colorScheme) private var colorScheme
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var isHoveringHeader = false
 
     var body: some View {
         let snapshot = resourceState.snapshot
         VStack(alignment: .leading, spacing: 0) {
-            Button(action: onToggle) {
-                HStack(spacing: 9) {
-                    CCXIconBadge(
-                        symbol: "cpu.fill",
-                        palette: .teal,
-                        size: 24,
-                        cornerRadius: 6.5,
-                        symbolSize: 12
-                    )
-
-                    VStack(alignment: .leading, spacing: 1.5) {
-                        Text(ResourceUsageSnapshot.headerTitle)
-                            .font(.system(size: 12.5, weight: .medium))
-                            .foregroundStyle(.primary)
-                            .lineLimit(1)
-
-                        Text(ResourceUsageSnapshot.headerSubtitle)
-                            .font(.system(size: 10.5))
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-
-                    HStack(spacing: 6) {
-                        Text(snapshot.formattedMemory)
-                            .font(.system(size: 10.5, weight: .semibold).monospacedDigit())
-                            .foregroundStyle(CCXBadgePalette.teal.labelColor(for: colorScheme))
-                            .padding(.horizontal, 7)
-                            .padding(.vertical, 2.5)
-                            .background(CCXBadgePalette.teal.accentColor.opacity(0.12), in: Capsule())
-                            .overlay(
-                                Capsule()
-                                    .strokeBorder(CCXBadgePalette.teal.accentColor.opacity(0.24), lineWidth: 0.75)
-                            )
-                            .fixedSize()
-
-                        Image(systemName: "chevron.right")
-                            .font(.system(size: 10, weight: .semibold))
-                            .foregroundStyle(.secondary)
-                            .rotationEffect(.degrees(resourceState.isExpanded ? 90 : 0))
-                            .animation(reduceMotion ? nil : .easeInOut(duration: 0.16), value: resourceState.isExpanded)
-                            .frame(width: 12, height: 12)
-                    }
-                }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 7.5)
-                .background(isHoveringHeader ? Color.primary.opacity(0.045) : Color.clear)
-                .contentShape(Rectangle())
+            SettingsDisclosureHeader(
+                symbol: "cpu.fill",
+                palette: .teal,
+                title: ResourceUsageSnapshot.headerTitle,
+                subtitle: ResourceUsageSnapshot.headerSubtitle,
+                isExpanded: isExpanded,
+                tooltip: ResourceUsageSnapshot.headerTooltip(isExpanded: isExpanded),
+                accessibilityLabel: CCXL10n.text(
+                    "Resource Usage, \(snapshot.formattedMemory)",
+                    zh: "资源占用，当前内存 \(snapshot.formattedMemory)"
+                ),
+                onToggle: onToggleExpand
+            ) {
+                SettingsDisclosureBadge(text: snapshot.formattedMemory, palette: .teal)
             }
-            .buttonStyle(.plain)
-            .help(ResourceUsageSnapshot.headerTooltip(isExpanded: resourceState.isExpanded))
-            .accessibilityLabel(CCXL10n.text(
-                "Resource Usage, \(snapshot.formattedMemory)",
-                zh: "资源占用，当前内存 \(snapshot.formattedMemory)"
-            ))
-            .accessibilityValue(
-                resourceState.isExpanded
-                    ? CCXL10n.text("Expanded", zh: "已展开")
-                    : CCXL10n.text("Collapsed", zh: "已收起")
-            )
-            .onHover { isHoveringHeader = $0 }
 
-            if resourceState.isExpanded {
-                Divider().padding(.horizontal, 10)
-                ResourceUsageExpandedDetails(snapshot: snapshot, updateManager: updateManager)
+            if isExpanded {
+                VStack(spacing: 0) {
+                    Divider().padding(.horizontal, 10)
+                    ResourceUsageExpandedDetails(snapshot: snapshot, updateManager: updateManager)
+                }
+                .background(colorScheme == .dark ? Color.white.opacity(0.028) : Color.black.opacity(0.018))
+                .transition(.identity)
             }
         }
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
     }
 }
 
@@ -1897,29 +2585,47 @@ private struct ResourceUsageExpandedDetails: View {
 
 // MARK: - Surface & Version
 
-private extension View {
-    @ViewBuilder
-    func ccxSettingsCard(cornerRadius: CGFloat = 12) -> some View {
+private struct CCXSettingsCardModifier: ViewModifier {
+    let cornerRadius: CGFloat
+    @Environment(\.colorScheme) private var colorScheme
+
+    func body(content: Content) -> some View {
         let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-        if #available(macOS 26.0, *) {
-            self
-                .glassEffect(.regular, in: shape)
-                .overlay(
-                    shape
-                        .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
-                        .allowsHitTesting(false)
-                )
-                .clipShape(shape)
-        } else {
-            self
-                .background(.regularMaterial, in: shape)
-                .overlay(
-                    shape
-                        .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
-                        .allowsHitTesting(false)
-                )
-                .clipShape(shape)
-        }
+        let fillGradient = LinearGradient(
+            colors: colorScheme == .dark
+                ? [Color.white.opacity(0.085), Color.white.opacity(0.055)]
+                : [Color.white.opacity(0.92), Color.white.opacity(0.78)],
+            startPoint: .top,
+            endPoint: .bottom
+        )
+        let rimGradient = LinearGradient(
+            colors: colorScheme == .dark
+                ? [Color.white.opacity(0.18), Color.white.opacity(0.07)]
+                : [Color.white.opacity(0.95), Color.black.opacity(0.085)],
+            startPoint: .top,
+            endPoint: .bottom
+        )
+        let shadowColor = colorScheme == .dark ? Color.black.opacity(0.24) : Color.black.opacity(0.035)
+        let shadowRadius: CGFloat = colorScheme == .dark ? 8 : 6
+
+        content
+            .clipShape(shape)
+            .background(
+                shape
+                    .fill(fillGradient)
+                    .shadow(color: shadowColor, radius: shadowRadius, x: 0, y: 2)
+            )
+            .overlay(
+                shape
+                    .strokeBorder(rimGradient, lineWidth: 0.75)
+                    .allowsHitTesting(false)
+            )
+    }
+}
+
+private extension View {
+    func ccxSettingsCard(cornerRadius: CGFloat = 12) -> some View {
+        modifier(CCXSettingsCardModifier(cornerRadius: cornerRadius))
     }
 }
 
@@ -1929,10 +2635,6 @@ enum AppVersion {
         let version = info?["CFBundleShortVersionString"] as? String ?? "0.1.0"
         let build = info?["CFBundleVersion"] as? String ?? "1"
         return "\(version) (\(build))"
-    }
-
-    static var display: String {
-        CCXL10n.text("Version \(shortDisplay)", zh: "版本 \(shortDisplay)")
     }
 }
 

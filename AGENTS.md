@@ -6,9 +6,9 @@ Instructions for agents working in this repository.
 
 **CCX (Control · Command · X)** is a native Swift 6 macOS menu bar utility focused strictly on three core workflows, plus a verified in-app updater and automatic `en`/`zh-Hans` localization:
 
-- **Capture**: Smart Snip (`⌃⌘X`, customizable in Settings with conflict detection), Scroll Capture (`L`) with live preview, sticky header/sidebar detection, and memory-bounded stitching, non-destructive annotations (rectangle, ellipse, arrow, freehand pen, highlighter, inline text, auto-incrementing step counters, live GPU blur/mosaic, undo/redo), 120Hz GPU pixel magnifier & color picker (`HEX` / `RGB` / `HSL`, Retina HiDPI / Display P3), and on-device Apple Vision OCR (`T`).
-- **Pin**: Always-on-top floating `NSPanel` windows across Spaces and full-screen apps with GPU-accelerated zoom, 90° rotation, horizontal/vertical flip, opacity control, click-through mode, thumbnail collapse, inline re-editable annotation toolbar (entered via bottom-right hover button, double-click, right-click menu, `E`, `Space`, or `1`–`8`), on-device OCR, and persisted `RecentSnips` history (`0700`/`0600` user-only cache).
-- **Record**: Hardware-accelerated region and full-display screen recording (`MP4` H.264 / `MOV` HEVC via VideoToolbox, memory-bounded `GIF`) with optional system audio and microphone mixing, true pause/resume timeline offsetting, a dedicated recordings folder (`~/Movies/CCX`, configurable independently from PNG save paths), and non-destructive output actions.
+- **Capture**: Smart Snip (`⌃⌘X` + optional Quick OCR, Pin from Clipboard, Start/Stop Recording, Toggle All Pins, and Unlock Click-Through global hotkeys in Settings with conflict detection), Scroll Capture (`L`) with live preview, sticky header/sidebar detection, and memory-bounded stitching, non-destructive annotations (rectangle, ellipse, arrow, freehand pen, highlighter, inline text, auto-incrementing step counters, active-ROI live GPU blur/mosaic, undo/redo, cached zoom-scaled brush cursors, modal `?` Liquid Glass cheat sheet), 120Hz GPU pixel magnifier & color picker (`HEX` / `RGB` / `HSL`, Retina HiDPI / Display P3), and on-device Apple Vision OCR (`T`) with spatial layout reconstruction and QR/2D barcode fallback.
+- **Pin**: Always-on-top floating `NSPanel` windows across Spaces and full-screen apps with GPU-accelerated zoom, 90° rotation, horizontal/vertical flip, opacity control (`⌥+Scroll`), click-through mode, thumbnail collapse, inline re-editable annotation toolbar (entered via bottom-right hover button, double-click, right-click menu, `E`, `Space`, or `1`–`8`), read-only selectable text copy mode on text pins (`E`/`T`/menu), modal `?` cheat sheet, 5-item FIFO recently-closed pin reopen (`⇧⌘T`/menu/popover), display-disconnect rescue, on-device OCR, lazy-loaded `RecentSnips` history (`0700`/`0600` user-only cache) with configurable retention policy (`keep20`/`clearAfter24Hours`/`clearOnQuit`/`disabled`), and optional `org.nspasteboard.TransientType` clipboard concealment.
+- **Record**: Hardware-accelerated region and full-display screen recording (`MP4` H.264 / `MOV` HEVC via VideoToolbox, `0600` disk-spooled memory-bounded `GIF`) with optional 3-second countdown, live microphone RMS level meter (`Accelerate`/`vDSP_rmsqv`), optional system audio and microphone mixing, true pause/resume timeline offsetting, mid-recording display-disconnect salvage, a dedicated recordings folder (`~/Movies/CCX`, configurable independently from PNG save paths), and non-destructive output actions.
 - **Verified In-App Updater & Localization**: Zero-dependency updater checking GitHub Releases over HTTPS with streaming SHA-256 verification against `SHA256SUMS.txt`, pre-extraction ZIP validation, and Apple `Security` framework code-signature validation (`SecStaticCodeCheckValidity`) before idle auto-install or quit-time replacement; automatic `en`/`zh-Hans` localization following macOS Language & Region (English default/fallback).
 
 ## Target Environment & Toolchain
@@ -73,7 +73,7 @@ Full `.app` generation, `MetalToolchain` shader compilation (`~/Library/Develope
 
 - `project.yml` is the single source of truth for `MARKETING_VERSION` (`MAJOR.MINOR.PATCH`) and `CURRENT_PROJECT_VERSION` (integer build number), injected into `App/Info.plist` via `$(MARKETING_VERSION)` and `$(CURRENT_PROJECT_VERSION)`.
 - Bump `MARKETING_VERSION` according to change size using `./scripts/bump-version.sh <patch|minor|major|X.Y.Z>`:
-  - Use **`./scripts/bump-version.sh patch`** (`0.8.x`) for small fixes, UI polish, performance tweaks, and security hardening.
+  - Use **`./scripts/bump-version.sh patch`** (`0.10.x`) for small fixes, UI polish, performance tweaks, and security hardening.
   - Reserve **`minor`** for new user-facing features or capability expansions, and **`major`** for major milestones or breaking changes.
 - `./scripts/build-and-run.sh` automatically increments `CURRENT_PROJECT_VERSION` by `+1` on every build (pass `--no-bump` only for dry rebuilds that should not advance the build number).
 
@@ -87,21 +87,26 @@ App/                   CCXApp target (Info.plist, CCX.entitlements, Assets.xcass
                        OnboardingWindowController, PermissionStatusModel, DismissibleWindow, ToastHUD)
 Packages/
   CCXCore/             CoordinateConverter (Quartz <-> AppKit, HiDPI/Notch/multi-display), ColorSample,
-                       HotKeys (Carbon + conflict detection), Localization (CCXL10n), PermissionManager,
-                       ClipboardStore, SnipHistoryPersistence (0700/0600), ImageFingerprint,
-                       TextRecognizer (Vision OCR), AppUpdater (verified GitHub Releases updater)
+                       HotKeys (Carbon multi-action + conflict detection), Localization (CCXL10n), PermissionManager,
+                       ClipboardStore (retention policies + transient concealment), SnipHistoryPersistence (0700/0600,
+                       lazy thumbnail startup), ImageFingerprint, TextRecognizer (Vision spatial OCR + QR fallback),
+                       ActivityArbiter, AtomicFileWriter, AppUpdater (verified GitHub Releases updater)
   CCXAnnotate/         Non-destructive AnnotationDocument & AnnotationModels, AnnotationRenderer,
-                       MosaicImageCache (live GPU blur/mosaic), shared AnnotationActionToolbar
+                       MosaicImageCache (active-ROI GPU blur/mosaic), BrushCursorCache,
+                       ShortcutCheatSheetView (modal '?' Liquid Glass panel), shared AnnotationActionToolbar
   CCXCapture/          ScreenSnapshotEngine (ScreenCaptureKit 15.0 + 26.0 HDR), SmartElementDetector
-                       (CGWindowList + async AXUIElement), SelectionStateMachine, SnipCoordinator,
-                       SnipOverlayController/View, AnnotationCanvasView, PixelMagnifierView,
-                       SnipActionToolbar, ScrollCaptureEngine/Controller & ScrollImageStitcher
-  CCXPin/              Floating PinPanel (.nonactivatingPanel, multi-Space/full-screen), PinManager,
+                       (CGWindowList + async AXUIElement), WindowCornerMaskExtractor,
+                       SelectionStateMachine, SnipCoordinator, SnipOverlayController/View (Snip + OCR modes),
+                       AnnotationCanvasView, PixelMagnifierView, SnipActionToolbar,
+                       ScrollCaptureEngine/Controller & ScrollImageStitcher
+  CCXPin/              Floating PinPanel (.nonactivatingPanel, multi-Space/full-screen, selectable text mode,
+                       '?' cheat sheet), PinManager (screen rescue + 5-item closed-pin FIFO history),
                        PinModel, PinLayout, PinAnnotationController (inline re-editable annotations)
   CCXRecord/           ScreenRecordingEngine (SCStream), VideoRecordingWriter (AVAssetWriter/VideoToolbox),
-                       GifRecordingEncoder (memory-bounded ImageIO), AudioSampleMixer (system audio + mic),
-                       RecordingTimeline (true pause/resume PTS shifting), RecordingFrameAdjuster,
-                       RecordingHUDPanels, RecordingCoordinator, RecordingFileSecurity
+                       GifRecordingEncoder (0600 disk-spooled ImageIO), AudioSampleMixer (system audio + mic +
+                       vDSP RMS meter), RecordingTimeline (true pause/resume PTS shifting),
+                       RecordingFrameAdjuster, RecordingHUDPanels (3s countdown + live mic meter),
+                       RecordingCoordinator (display-disconnect salvage), RecordingFileSecurity
 scripts/
   build-and-run.sh     Generates CCX.xcodeproj, signs, builds, installs /Applications/CCX.app, launches
   bump-version.sh      Updates MARKETING_VERSION (patch|minor|major|X.Y.Z) in project.yml (0644)

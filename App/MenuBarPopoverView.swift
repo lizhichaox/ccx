@@ -10,6 +10,7 @@ final class MenuBarPanelModel: ObservableObject {
     @Published private(set) var pinCount = 0
     @Published private(set) var arePinsHidden = false
     @Published private(set) var hasClickThroughPins = false
+    @Published private(set) var canReopenClosedPin = false
     @Published private(set) var permissions: CCXPermissionStatus = PermissionManager.currentStatus()
     @Published private(set) var recentSnips: [SnipHistoryEntry] = []
     @Published private(set) var recordingStatus: RecordingMenuBarStatus?
@@ -33,7 +34,14 @@ final class MenuBarPanelModel: ObservableObject {
 
     func syncRecentSnipsOnly(clipboardStore: ClipboardStore) {
         let nextRecent = clipboardStore.history
-        if !recentSnips.elementsEqual(nextRecent, by: { $0.id == $1.id && $0.image === $1.image }) {
+        let matches = recentSnips.elementsEqual(nextRecent) { lhs, rhs in
+            lhs.id == rhs.id
+                && lhs.timestamp == rhs.timestamp
+                && lhs.pixelWidth == rhs.pixelWidth
+                && lhs.pixelHeight == rhs.pixelHeight
+                && lhs.hasInMemoryFullImage == rhs.hasInMemoryFullImage
+        }
+        if !matches {
             recentSnips = nextRecent
         }
     }
@@ -53,6 +61,9 @@ final class MenuBarPanelModel: ObservableObject {
 
         let nextClickThrough = pinManager.hasClickThroughPins
         if hasClickThroughPins != nextClickThrough { hasClickThroughPins = nextClickThrough }
+
+        let nextCanReopen = pinManager.canReopenClosedPin
+        if canReopenClosedPin != nextCanReopen { canReopenClosedPin = nextCanReopen }
 
         let nextPermissions = PermissionManager.currentStatus()
         if permissions != nextPermissions { permissions = nextPermissions }
@@ -117,6 +128,7 @@ struct MenuBarPopoverActions {
     let onToggleAllPins: () -> Void
     let onUnlockClickThrough: () -> Void
     let onCloseAllPins: () -> Void
+    let onReopenClosedPin: () -> Void
     let onOpenPermissions: () -> Void
     let onOpenSettings: () -> Void
     let onQuit: () -> Void
@@ -199,14 +211,16 @@ struct MenuBarPopoverView: View {
                 )
             }
 
-            if model.pinCount > 0 {
+            if model.pinCount > 0 || model.canReopenClosedPin {
                 FloatingPinsSection(
                     pinCount: model.pinCount,
                     arePinsHidden: model.arePinsHidden,
                     hasClickThroughPins: model.hasClickThroughPins,
+                    canReopenClosedPin: model.canReopenClosedPin,
                     onToggleAllPins: actions.onToggleAllPins,
                     onUnlockClickThrough: actions.onUnlockClickThrough,
-                    onCloseAllPins: actions.onCloseAllPins
+                    onCloseAllPins: actions.onCloseAllPins,
+                    onReopenClosedPin: actions.onReopenClosedPin
                 )
             }
 
@@ -832,12 +846,12 @@ private struct RecentSnipThumbnail: View {
         .frame(width: 60.5, height: 38)
         .contentShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
         .help(CCXL10n.text(
-            "\(entry.image.width) × \(entry.image.height) · \(ageLabel) · \(isPinned ? "Already pinned" : "Click to pin · Right-click for more")",
-            zh: "\(entry.image.width) × \(entry.image.height) · \(ageLabel) · \(isPinned ? "已贴图" : "点击贴图 · 右键更多操作")"
+            "\(entry.pixelWidth) × \(entry.pixelHeight) · \(ageLabel) · \(isPinned ? "Already pinned" : "Click to pin · Right-click for more")",
+            zh: "\(entry.pixelWidth) × \(entry.pixelHeight) · \(ageLabel) · \(isPinned ? "已贴图" : "点击贴图 · 右键更多操作")"
         ))
         .accessibilityLabel(CCXL10n.text(
-            "Recent snip \(entry.image.width) by \(entry.image.height), \(ageLabel), \(isPinned ? "already pinned" : "not pinned")",
-            zh: "最近截屏 \(entry.image.width) × \(entry.image.height)，\(ageLabel)，\(isPinned ? "已贴图" : "未贴图")"
+            "Recent snip \(entry.pixelWidth) by \(entry.pixelHeight), \(ageLabel), \(isPinned ? "already pinned" : "not pinned")",
+            zh: "最近截屏 \(entry.pixelWidth) × \(entry.pixelHeight)，\(ageLabel)，\(isPinned ? "已贴图" : "未贴图")"
         ))
         .accessibilityHint(CCXL10n.text(
             "Activate to pin to screen. Open context menu to copy, recognize text, or save PNG.",
@@ -872,9 +886,11 @@ private struct FloatingPinsSection: View {
     let pinCount: Int
     let arePinsHidden: Bool
     let hasClickThroughPins: Bool
+    let canReopenClosedPin: Bool
     let onToggleAllPins: () -> Void
     let onUnlockClickThrough: () -> Void
     let onCloseAllPins: () -> Void
+    let onReopenClosedPin: () -> Void
 
     @Environment(\.colorScheme) private var colorScheme
 
@@ -882,10 +898,16 @@ private struct FloatingPinsSection: View {
         VStack(alignment: .center, spacing: 6) {
             Divider().opacity(0.45)
 
-            let badgePalette: CCXBadgePalette = arePinsHidden ? .orange : .indigo
-            let statusText = arePinsHidden
-                ? CCXL10n.text("\(pinCount) hidden", zh: "\(pinCount) 个已隐藏")
-                : CCXL10n.text("\(pinCount) active", zh: "\(pinCount) 个显示")
+            let badgePalette: CCXBadgePalette = pinCount == 0
+                ? .teal
+                : (arePinsHidden ? .orange : .indigo)
+            let statusText: String = if pinCount == 0 {
+                CCXL10n.text("Recently Closed", zh: "可恢复")
+            } else if arePinsHidden {
+                CCXL10n.text("\(pinCount) hidden", zh: "\(pinCount) 个已隐藏")
+            } else {
+                CCXL10n.text("\(pinCount) active", zh: "\(pinCount) 个显示")
+            }
 
             HStack(spacing: 6) {
                 Text(CCXL10n.text("FLOATING PINS", zh: "悬浮贴图"))
@@ -912,31 +934,42 @@ private struct FloatingPinsSection: View {
             ))
 
             VStack(spacing: 6) {
-                HStack(spacing: 8) {
-                    PinControlPill(
-                        title: arePinsHidden ? CCXL10n.text("Show All", zh: "显示全部") : CCXL10n.text("Hide All", zh: "隐藏全部"),
-                        symbol: arePinsHidden ? "eye" : "eye.slash",
-                        tint: CCXBadgePalette.indigo.labelColor(for: colorScheme),
-                        isActive: arePinsHidden,
-                        action: onToggleAllPins
-                    )
+                if pinCount > 0 {
+                    HStack(spacing: 8) {
+                        PinControlPill(
+                            title: arePinsHidden ? CCXL10n.text("Show All", zh: "显示全部") : CCXL10n.text("Hide All", zh: "隐藏全部"),
+                            symbol: arePinsHidden ? "eye" : "eye.slash",
+                            tint: CCXBadgePalette.indigo.labelColor(for: colorScheme),
+                            isActive: arePinsHidden,
+                            action: onToggleAllPins
+                        )
 
-                    PinControlPill(
-                        title: CCXL10n.text("Close All", zh: "关闭全部"),
-                        symbol: "xmark.circle",
-                        tint: CCXBadgePalette.red.labelColor(for: colorScheme),
-                        isDestructive: true,
-                        action: onCloseAllPins
-                    )
+                        PinControlPill(
+                            title: CCXL10n.text("Close All", zh: "关闭全部"),
+                            symbol: "xmark.circle",
+                            tint: CCXBadgePalette.red.labelColor(for: colorScheme),
+                            isDestructive: true,
+                            action: onCloseAllPins
+                        )
+                    }
+
+                    if hasClickThroughPins {
+                        PinControlPill(
+                            title: CCXL10n.text("Unlock Click-Through", zh: "解除穿透"),
+                            symbol: "cursorarrow.click",
+                            tint: CCXBadgePalette.teal.labelColor(for: colorScheme),
+                            isActive: true,
+                            action: onUnlockClickThrough
+                        )
+                    }
                 }
 
-                if hasClickThroughPins {
+                if canReopenClosedPin {
                     PinControlPill(
-                        title: CCXL10n.text("Unlock Click-Through", zh: "解除穿透"),
-                        symbol: "cursorarrow.click",
+                        title: CCXL10n.text("Reopen Closed Pin", zh: "恢复刚关闭的贴图"),
+                        symbol: "arrow.uturn.backward.circle",
                         tint: CCXBadgePalette.teal.labelColor(for: colorScheme),
-                        isActive: true,
-                        action: onUnlockClickThrough
+                        action: onReopenClosedPin
                     )
                 }
             }

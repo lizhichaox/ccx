@@ -29,11 +29,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let hotKeyManager: GlobalHotKeyManager
     private let toast: ToastHUD
     private let updateManager = AppUpdateManager()
+    private let activityArbiter = ActivityArbiter()
 
     private var menuBarController: MenuBarController?
     private var onboardingController: OnboardingWindowController?
     private var settingsController: SettingsWindowController?
-    private var currentSnipCombo: HotKeyCombo = HotKeyPreferences.loadCombo(for: .snip)
+    private var hotKeyBindings: [CCXHotKeyAction: HotKeyCombo] = {
+        var bindings: [CCXHotKeyAction: HotKeyCombo] = [:]
+        for action in CCXHotKeyAction.allCases {
+            if let combo = HotKeyPreferences.loadBinding(for: action) {
+                bindings[action] = combo
+            }
+        }
+        return bindings
+    }()
+    private var currentSnipCombo: HotKeyCombo {
+        hotKeyBindings[.snip] ?? .defaultSnip
+    }
     private var isRecordingShortcut = false
     private var hadClickThroughPins = false
     private var pendingLaunchTask: Task<Void, Never>?
@@ -48,7 +60,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var didBecomeActiveObserver: NSObjectProtocol?
 
     override init() {
-        let clipboardStore = ClipboardStore(historyDirectoryURL: ClipboardStore.defaultHistoryDirectoryURL())
+        let clipboardStore = ClipboardStore(
+            historyDirectoryURL: ClipboardStore.defaultHistoryDirectoryURL(),
+            userDefaults: .standard
+        )
         self.clipboardStore = clipboardStore
         self.pinManager = PinManager(clipboardStore: clipboardStore)
         self.snipCoordinator = SnipCoordinator()
@@ -75,7 +90,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.hadClickThroughPins = hasClickThrough
             self.menuBarController?.refresh()
             self.settingsController?.refreshResourceUsage()
-            self.updateManager.notifyActivityStateChanged()
+            self.activityArbiter.setCondition(.pin, active: self.pinManager.pinCount > 0)
+        }
+        pinManager.onClosedPinHistoryChanged = { [weak self] in
+            self?.menuBarController?.refresh()
         }
         pinManager.onRequestSavePNG = { [weak self] image in
             self?.presentSavePanel(for: image)
@@ -93,7 +111,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hotKeyManager.onAction = { [weak self] action in
             self?.perform(action)
         }
-        let snipHotKeyRegistered = hotKeyManager.register(.snip, combo: currentSnipCombo)
+        var snipHotKeyRegistered = false
+        for action in CCXHotKeyAction.allCases {
+            guard let combo = hotKeyBindings[action] else { continue }
+            let ok = hotKeyManager.register(action, combo: combo)
+            if action == .snip {
+                snipHotKeyRegistered = ok
+            }
+        }
 
         RecordingCoordinator.cleanupTemporaryRecordings()
         DispatchQueue.global(qos: .utility).async {
@@ -101,26 +126,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             AppUpdateInstaller.cleanupStaleStagingDirectories()
         }
 
+        activityArbiter.onStateChanged = { [weak self] in
+            self?.updateManager.notifyActivityStateChanged()
+        }
         updateManager.canTerminateNow = { [weak self] in
-            guard let self else { return false }
-            return !self.recordingCoordinator.isSessionActive && !self.isPresentingSavePanel
+            self?.activityArbiter.canTerminateNow ?? false
         }
         updateManager.canInstallSilentlyNow = { [weak self] in
-            guard let self else { return false }
-            return !self.recordingCoordinator.isSessionActive
-                && !self.snipCoordinator.isSessionActive
-                && !self.isPresentingSavePanel
-                && self.pinManager.pinCount == 0
-                && self.ocrTask == nil
-                && self.menuBarController?.isPanelVisible != true
-                && self.settingsController?.isWindowVisible != true
-                && self.onboardingController?.isWindowVisible != true
+            self?.activityArbiter.canInstallSilentlyNow ?? false
         }
         updateManager.onBlockedByActiveSession = { [weak self] in
-            self?.toast.show(
-                CCXL10n.text("Finish Active Recording First", zh: "请先结束当前录屏"),
-                symbolName: "record.circle.fill"
-            )
+            guard let self else { return }
+            if self.activityArbiter.isActive(.recordingSession) {
+                self.toast.show(
+                    CCXL10n.text("Finish Active Recording First", zh: "请先结束当前录屏"),
+                    symbolName: "record.circle.fill"
+                )
+            } else if self.activityArbiter.isActive(.savePanel) {
+                self.toast.show(
+                    CCXL10n.text("Finish Save Dialog First", zh: "请先完成当前保存窗口"),
+                    symbolName: "square.and.arrow.down"
+                )
+            } else {
+                self.toast.show(
+                    CCXL10n.text("Saving File — Please Wait", zh: "正在保存文件，请稍候"),
+                    symbolName: "square.and.arrow.down"
+                )
+            }
         }
         updateManager.onUserFacingError = { [weak self] message in
             self?.toast.show(message, symbolName: "exclamationmark.triangle")
@@ -135,8 +167,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             updateManager: updateManager
         )
         menuBarController.delegate = self
-        menuBarController.onPanelVisibilityChanged = { [weak self] _ in
-            self?.updateManager.notifyActivityStateChanged()
+        menuBarController.onPanelVisibilityChanged = { [weak self] visible in
+            self?.activityArbiter.setCondition(.menuBarPopover, active: visible)
+            if visible {
+                self?.clipboardStore.pruneExpiredHistoryIfNeeded()
+            }
         }
         menuBarController.updateSnipHotKey(combo: currentSnipCombo, isRegistered: snipHotKeyRegistered)
         self.menuBarController = menuBarController
@@ -149,9 +184,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         recordingCoordinator.onStatusChanged = { [weak self] status in
             self?.menuBarController?.updateRecordingStatus(status)
-            if status == nil {
-                self?.updateManager.notifyActivityStateChanged()
-            }
         }
         recordingCoordinator.onNotice = { [weak self] message, symbol in
             self?.toast.show(message, symbolName: symbol)
@@ -270,10 +302,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             try? FileManager.default.removeItem(at: pending.fileURL)
         }
         pendingRecordingSaves.removeAll()
+        syncPendingRecordingSaveCondition()
         snipCoordinator.cancelActiveSnip()
         recordingCoordinator.cancelActiveSession()
         hotKeyManager.unregisterAll()
-        clipboardStore.flushPendingPersistence()
+        clipboardStore.handleApplicationWillTerminate()
         if isRelaunching {
             if !updateManager.applyPreparedUpdateOnQuitIfReady(relaunch: true) {
                 _ = AppRelauncher.spawnRelaunchHelper()
@@ -312,31 +345,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         switch action {
         case .snip:
             startSnip()
+        case .quickOCR:
+            startQuickOCR()
+        case .pinClipboard:
+            pinFromClipboard()
+        case .record:
+            if recordingCoordinator.isRecordingOrPaused {
+                recordingCoordinator.stopActiveRecording()
+            } else if case .countdown = recordingCoordinator.phase {
+                recordingCoordinator.cancelActiveSession()
+            } else {
+                startRecordSelection()
+            }
+        case .togglePins:
+            toggleAllPins()
+        case .unlockClickThrough:
+            unlockClickThroughPins()
         }
     }
 
     private func retrySnipHotKeySilentlyIfNeeded() {
-        guard !isRecordingShortcut, !hotKeyManager.isRegistered(.snip) else { return }
-        let registered = hotKeyManager.register(.snip, combo: currentSnipCombo)
-        syncHotKeyState(registered: registered)
+        guard !isRecordingShortcut else { return }
+        var changed = false
+        for (action, combo) in hotKeyBindings where !hotKeyManager.isRegistered(action) {
+            if hotKeyManager.register(action, combo: combo) {
+                changed = true
+            }
+        }
+        if changed {
+            syncHotKeyState()
+        }
     }
 
-    private func retrySnipHotKeyRegistration() -> Bool {
-        let registered = hotKeyManager.register(.snip, combo: currentSnipCombo)
-        syncHotKeyState(registered: registered)
+    private func retryHotKeyRegistration(for action: CCXHotKeyAction) -> Bool {
+        guard let combo = hotKeyBindings[action] else { return false }
+        let registered = hotKeyManager.register(action, combo: combo)
+        syncHotKeyState()
         if registered {
             toast.show(
                 CCXL10n.text(
-                    "\(currentSnipCombo.displayString) Restored",
-                    zh: "已恢复快捷键 \(currentSnipCombo.displayString)"
+                    "\(combo.displayString) Restored",
+                    zh: "已恢复快捷键 \(combo.displayString)"
                 ),
                 symbolName: "checkmark.circle.fill"
             )
         } else {
             toast.show(
                 CCXL10n.text(
-                    "\(currentSnipCombo.displayString) Still In Use",
-                    zh: "\(currentSnipCombo.displayString) 仍被其他应用占用"
+                    "\(combo.displayString) Still In Use",
+                    zh: "\(combo.displayString) 仍被其他应用占用"
                 ),
                 symbolName: "exclamationmark.triangle"
             )
@@ -346,31 +403,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func beginShortcutRecording() {
         isRecordingShortcut = true
-        hotKeyManager.unregister(.snip)
+        hotKeyManager.unregisterAll()
     }
 
     private func endShortcutRecording() {
         isRecordingShortcut = false
-        ensureCurrentSnipHotKeyRegistered()
+        ensureCurrentHotKeysRegistered()
     }
 
-    private func ensureCurrentSnipHotKeyRegistered() {
-        let registered: Bool
-        if hotKeyManager.isRegistered(.snip),
-           hotKeyManager.currentCombo(for: .snip) == currentSnipCombo {
-            registered = true
-        } else {
-            registered = hotKeyManager.register(.snip, combo: currentSnipCombo)
+    private func ensureCurrentHotKeysRegistered() {
+        for (action, combo) in hotKeyBindings {
+            if hotKeyManager.isRegistered(action), hotKeyManager.currentCombo(for: action) == combo {
+                continue
+            }
+            _ = hotKeyManager.register(action, combo: combo)
         }
-        syncHotKeyState(registered: registered)
+        syncHotKeyState()
     }
 
-    private func changeSnipHotKey(to candidate: HotKeyCombo) -> HotKeyConflict? {
-        switch hotKeyManager.registerChecked(.snip, combo: candidate) {
+    private func changeHotKey(to candidate: HotKeyCombo?, for action: CCXHotKeyAction) -> HotKeyConflict? {
+        guard let candidate else {
+            guard action != .snip else { return nil }
+            hotKeyManager.unregister(action)
+            hotKeyBindings.removeValue(forKey: action)
+            HotKeyPreferences.saveBinding(nil, for: action)
+            if !isRecordingShortcut {
+                syncHotKeyState()
+            }
+            return nil
+        }
+
+        let normalized = candidate.normalized
+        // Check against saved bindings directly because active hotkeys are temporarily unregistered during recording.
+        if let conflictingAction = hotKeyBindings.first(where: { $0.key != action && $0.value == normalized })?.key {
+            return .internalConflict(normalized, action: conflictingAction)
+        }
+
+        switch hotKeyManager.registerChecked(action, combo: normalized) {
         case .registered(let combo):
-            currentSnipCombo = combo
-            HotKeyPreferences.saveCombo(combo, for: .snip)
-            syncHotKeyState(registered: true)
+            hotKeyBindings[action] = combo
+            HotKeyPreferences.saveBinding(combo, for: action)
+            if !isRecordingShortcut {
+                syncHotKeyState()
+            }
             toast.show(
                 CCXL10n.text("Shortcut Set to \(combo.displayString)", zh: "快捷键已设为 \(combo.displayString)"),
                 symbolName: "keyboard"
@@ -382,11 +457,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func resetSnipHotKey() -> HotKeyConflict? {
+        if let conflictingAction = hotKeyBindings.first(where: { $0.key != .snip && $0.value == .defaultSnip })?.key {
+            return .internalConflict(.defaultSnip, action: conflictingAction)
+        }
         switch hotKeyManager.registerChecked(.snip, combo: .defaultSnip) {
         case .registered(let combo):
-            currentSnipCombo = combo
-            HotKeyPreferences.saveCombo(combo, for: .snip)
-            syncHotKeyState(registered: true)
+            hotKeyBindings[.snip] = combo
+            HotKeyPreferences.saveBinding(combo, for: .snip)
+            syncHotKeyState()
             toast.show(
                 CCXL10n.text(
                     "Shortcut Reset to \(HotKeyCombo.defaultSnip.displayString)",
@@ -400,10 +478,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func syncHotKeyState(registered: Bool) {
-        menuBarController?.updateSnipHotKey(combo: currentSnipCombo, isRegistered: registered)
-        settingsController?.updateSnipHotKey(combo: currentSnipCombo, isRegistered: registered)
+    private func syncHotKeyState() {
+        let snipRegistered = hotKeyManager.isRegistered(.snip)
+        let optionalBindings = currentOptionalBindings()
+        let unregisteredOptional = currentUnregisteredOptionalActions()
+        menuBarController?.updateSnipHotKey(combo: currentSnipCombo, isRegistered: snipRegistered)
+        settingsController?.updateAllHotKeys(
+            snipCombo: currentSnipCombo,
+            isSnipRegistered: snipRegistered,
+            optionalBindings: optionalBindings,
+            unregisteredOptionalActions: unregisteredOptional
+        )
         onboardingController?.updateSnipCombo(currentSnipCombo)
+    }
+
+    private func currentOptionalBindings() -> [CCXHotKeyAction: HotKeyCombo] {
+        var result: [CCXHotKeyAction: HotKeyCombo] = [:]
+        for action in CCXHotKeyAction.optionalActions {
+            if let combo = hotKeyBindings[action] {
+                result[action] = combo
+            }
+        }
+        return result
+    }
+
+    private func currentUnregisteredOptionalActions() -> Set<CCXHotKeyAction> {
+        var result: Set<CCXHotKeyAction> = []
+        for action in CCXHotKeyAction.optionalActions {
+            if hotKeyBindings[action] != nil, !hotKeyManager.isRegistered(action) {
+                result.insert(action)
+            }
+        }
+        return result
     }
 
     private func scheduleDelayedLaunch(milliseconds: Int, action: @escaping @MainActor () -> Void) {
@@ -443,18 +549,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func startSnip() {
         guard prepareForCaptureSession() else { return }
+        let snipToken = activityArbiter.begin(.snipSession)
         snipCoordinator.startSnip(mode: .snip) { [weak self] outcome in
+            defer { snipToken.end() }
             self?.handle(outcome)
         }
-        updateManager.notifyActivityStateChanged()
+    }
+
+    private func startQuickOCR() {
+        guard prepareForCaptureSession() else { return }
+        let snipToken = activityArbiter.begin(.snipSession)
+        snipCoordinator.startSnip(mode: .ocr) { [weak self] outcome in
+            defer { snipToken.end() }
+            self?.handle(outcome)
+        }
     }
 
     private func startRecordSelection() {
         guard prepareForCaptureSession() else { return }
+        let snipToken = activityArbiter.begin(.snipSession)
         snipCoordinator.startSnip(mode: .record) { [weak self] outcome in
+            defer { snipToken.end() }
             self?.handle(outcome)
         }
-        updateManager.notifyActivityStateChanged()
     }
 
     private func pinFromClipboard() {
@@ -532,7 +649,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             break
         }
         menuBarController?.refresh()
-        updateManager.notifyActivityStateChanged()
     }
 
     @discardableResult
@@ -544,8 +660,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ocrTask?.cancel()
         let taskID = UUID()
         ocrTaskID = taskID
+        let ocrToken = activityArbiter.begin(.ocrTask)
         ocrTask = Task { @MainActor [weak self] in
-            guard let self else { return }
             let progressTask = Task { @MainActor [weak self] in
                 try? await Task.sleep(for: .milliseconds(180))
                 guard !Task.isCancelled else { return }
@@ -553,21 +669,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             defer {
                 progressTask.cancel()
-                if self.ocrTaskID == taskID {
+                if let self, self.ocrTaskID == taskID {
                     self.ocrTask = nil
-                    self.updateManager.notifyActivityStateChanged()
                 }
+                ocrToken.end()
             }
+            guard let self else { return }
 
             do {
-                let text = try await TextRecognizer.recognizeText(in: image)
+                let result = try await TextRecognizer.recognize(in: image)
                 guard !Task.isCancelled else { return }
                 progressTask.cancel()
-                if text.isEmpty {
+                if result.text.isEmpty {
                     self.toast.show(CCXL10n.text("No Text Found", zh: "未识别到文字"), symbolName: "exclamationmark.circle")
                 } else {
-                    self.clipboardStore.copyText(text)
-                    self.toast.show(CCXL10n.text("Copied Text (OCR)", zh: "已拷贝识别文字 (OCR)"), symbolName: "text.viewfinder")
+                    self.clipboardStore.copyText(result.text)
+                    switch result.kind {
+                    case .qrCode:
+                        self.toast.show(CCXL10n.text("QR Copied", zh: "已拷贝二维码内容"), symbolName: "qrcode.viewfinder")
+                    case .text:
+                        self.toast.show(CCXL10n.text("Copied Text (OCR)", zh: "已拷贝识别文字 (OCR)"), symbolName: "text.viewfinder")
+                    }
                     self.menuBarController?.refresh()
                 }
             } catch is CancellationError {
@@ -578,7 +700,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.toast.show(CCXL10n.text("OCR Failed", zh: "文字识别失败"), symbolName: "exclamationmark.triangle")
             }
         }
-        updateManager.notifyActivityStateChanged()
     }
 
     // MARK: - Saving
@@ -602,23 +723,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         isPresentingSavePanel = true
         activeSavePanel = panel
-        updateManager.notifyActivityStateChanged()
+        let panelToken = activityArbiter.begin(.savePanel)
         NSApp.activate()
 
         panel.begin { [weak self] response in
             Task { @MainActor [weak self] in
-                guard let self else { return }
+                guard let self else {
+                    panelToken.end()
+                    return
+                }
                 self.isPresentingSavePanel = false
                 self.activeSavePanel = nil
-                defer {
-                    self.drainPendingRecordingSavesIfIdle()
-                    self.updateManager.notifyActivityStateChanged()
-                }
 
-                guard response == .OK, let url = panel.url else { return }
+                guard response == .OK, let url = panel.url else {
+                    panelToken.end()
+                    self.drainPendingRecordingSavesIfIdle()
+                    return
+                }
                 UserDefaults.standard.set(url.deletingLastPathComponent().path, forKey: Self.lastSaveDirectoryKey)
 
+                let exportToken = self.activityArbiter.begin(.backgroundExport)
+                panelToken.end()
+                self.drainPendingRecordingSavesIfIdle()
+
                 Task.detached(priority: .userInitiated) {
+                    defer { exportToken.end() }
                     do {
                         try autoreleasepool {
                             guard let pngData = ClipboardStore.encodePNG(image, scale: 1) else {
@@ -647,31 +776,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func preferredSaveDirectoryURL() -> URL {
         if let savedPath = UserDefaults.standard.string(forKey: Self.lastSaveDirectoryKey),
-           Self.isWritableRealDirectory(atPath: savedPath) {
-            return URL(fileURLWithPath: Self.normalizedDirectoryPath(savedPath), isDirectory: true)
+           AtomicFileWriter.isWritableRealDirectory(atPath: savedPath) {
+            return URL(fileURLWithPath: AtomicFileWriter.normalizedPath(savedPath), isDirectory: true)
         }
         return FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Desktop", isDirectory: true)
-    }
-
-    private nonisolated static func normalizedDirectoryPath(_ path: String) -> String {
-        var normalized = path
-        while normalized.count > 1 && normalized.hasSuffix("/") {
-            normalized.removeLast()
-        }
-        return normalized
-    }
-
-    private nonisolated static func isRealDirectory(atPath path: String) -> Bool {
-        let normalized = normalizedDirectoryPath(path)
-        guard !normalized.isEmpty else { return false }
-        var st = stat()
-        return Darwin.lstat(normalized, &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR
-    }
-
-    private nonisolated static func isWritableRealDirectory(atPath path: String) -> Bool {
-        let normalized = normalizedDirectoryPath(path)
-        return isRealDirectory(atPath: normalized) && FileManager.default.isWritableFile(atPath: normalized)
     }
 
     private func defaultRecordingsDirectoryURL() -> URL {
@@ -682,15 +791,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func preferredRecordingsDirectoryURL(createIfNeeded: Bool = false) -> URL {
         if let savedPath = UserDefaults.standard.string(forKey: Self.recordingsDirectoryKey) {
-            let normalized = Self.normalizedDirectoryPath(savedPath)
-            if Self.isWritableRealDirectory(atPath: normalized) {
+            let normalized = AtomicFileWriter.normalizedPath(savedPath)
+            if AtomicFileWriter.isWritableRealDirectory(atPath: normalized) {
                 return URL(fileURLWithPath: normalized, isDirectory: true)
             }
         }
 
         let defaultURL = defaultRecordingsDirectoryURL()
         if createIfNeeded {
-            let normalized = Self.normalizedDirectoryPath(defaultURL.path)
+            let normalized = AtomicFileWriter.normalizedPath(defaultURL.path)
             var st = stat()
             if Darwin.lstat(normalized, &st) != 0, errno == ENOENT {
                 try? FileManager.default.createDirectory(at: defaultURL, withIntermediateDirectories: true)
@@ -700,8 +809,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func displayPathForDirectory(_ url: URL) -> String {
-        let path = Self.normalizedDirectoryPath(url.path)
-        let home = Self.normalizedDirectoryPath(NSHomeDirectory())
+        let path = AtomicFileWriter.normalizedPath(url.path)
+        let home = AtomicFileWriter.normalizedPath(NSHomeDirectory())
         if path == home {
             return "~"
         }
@@ -716,11 +825,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let savedPath = UserDefaults.standard.string(forKey: Self.recordingsDirectoryKey) else {
             return false
         }
-        let normalizedSaved = Self.normalizedDirectoryPath(savedPath)
-        guard Self.isWritableRealDirectory(atPath: normalizedSaved) else {
+        let normalizedSaved = AtomicFileWriter.normalizedPath(savedPath)
+        guard AtomicFileWriter.isWritableRealDirectory(atPath: normalizedSaved) else {
             return false
         }
-        let defaultPath = Self.normalizedDirectoryPath(defaultRecordingsDirectoryURL().path)
+        let defaultPath = AtomicFileWriter.normalizedPath(defaultRecordingsDirectoryURL().path)
         return normalizedSaved != defaultPath
     }
 
@@ -730,7 +839,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             displayPathForDirectory(directory),
             isCustom: isUsingCustomRecordingsFolder
         )
-        guard Self.isRealDirectory(atPath: directory.path),
+        guard AtomicFileWriter.isRealDirectory(atPath: directory.path),
               NSWorkspace.shared.open(directory)
         else {
             toast.show(CCXL10n.text("Couldn't Open Recordings Folder", zh: "无法打开录屏目录"), symbolName: "exclamationmark.triangle")
@@ -780,29 +889,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.allowsMultipleSelection = false
         panel.prompt = CCXL10n.text("Choose", zh: "选择")
         let currentDirectory = preferredRecordingsDirectoryURL(createIfNeeded: true)
-        if Self.isRealDirectory(atPath: currentDirectory.path) {
+        if AtomicFileWriter.isRealDirectory(atPath: currentDirectory.path) {
             panel.directoryURL = currentDirectory
         }
         panel.level = .modalPanel
 
         isPresentingSavePanel = true
         activeSavePanel = panel
-        updateManager.notifyActivityStateChanged()
+        let panelToken = activityArbiter.begin(.savePanel)
         NSApp.activate()
 
         panel.begin { [weak self] response in
             Task { @MainActor [weak self] in
-                guard let self else { return }
+                guard let self else {
+                    panelToken.end()
+                    return
+                }
                 self.isPresentingSavePanel = false
                 self.activeSavePanel = nil
                 defer {
                     self.drainPendingRecordingSavesIfIdle()
-                    self.updateManager.notifyActivityStateChanged()
+                    panelToken.end()
                 }
 
                 guard response == .OK, let url = panel.url else { return }
-                let normalizedPath = Self.normalizedDirectoryPath(url.path)
-                guard Self.isWritableRealDirectory(atPath: normalizedPath) else {
+                let normalizedPath = AtomicFileWriter.normalizedPath(url.path)
+                guard AtomicFileWriter.isWritableRealDirectory(atPath: normalizedPath) else {
                     self.toast.show(
                         CCXL10n.text("Selected Folder Cannot Be Used", zh: "无法使用所选文件夹"),
                         symbolName: "exclamationmark.triangle"
@@ -811,7 +923,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
 
                 let validatedURL = URL(fileURLWithPath: normalizedPath, isDirectory: true)
-                let defaultPath = Self.normalizedDirectoryPath(self.defaultRecordingsDirectoryURL().path)
+                let defaultPath = AtomicFileWriter.normalizedPath(self.defaultRecordingsDirectoryURL().path)
                 if normalizedPath == defaultPath {
                     UserDefaults.standard.removeObject(forKey: Self.recordingsDirectoryKey)
                 } else {
@@ -829,11 +941,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func quickSavePNG(_ image: CGImage) {
         let directory = preferredSaveDirectoryURL()
         let stem = Self.defaultFileStem(for: Date())
+        let exportToken = activityArbiter.begin(.backgroundExport)
 
         Task.detached(priority: .userInitiated) {
+            defer { exportToken.end() }
             do {
                 try autoreleasepool {
-                    guard Self.isWritableRealDirectory(atPath: directory.path) else {
+                    guard AtomicFileWriter.isWritableRealDirectory(atPath: directory.path) else {
                         throw ClipboardStoreError.writeFailed
                     }
                     guard let pngData = ClipboardStore.encodePNG(image, scale: 1) else {
@@ -879,37 +993,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         "CCX-\(fileTimestampFormatter.string(from: date))"
     }
 
-    private nonisolated static func entryExistsOrSymlink(atPath path: String) -> Bool {
-        let normalized = normalizedDirectoryPath(path)
-        guard !normalized.isEmpty else { return false }
-        var st = stat()
-        return Darwin.lstat(normalized, &st) == 0 || FileManager.default.fileExists(atPath: normalized)
-    }
-
-    private nonisolated static func nextUniqueURL(
-        in directory: URL,
-        stem: String,
-        fileExtension: String
-    ) -> URL? {
-        var candidate = directory.appendingPathComponent("\(stem).\(fileExtension)")
-        var suffix = 2
-        while entryExistsOrSymlink(atPath: candidate.path) {
-            if suffix > maxQuickSaveSuffixAttempts {
-                return directory.appendingPathComponent("\(stem)-\(UUID().uuidString.prefix(8)).\(fileExtension)")
-            }
-            candidate = directory.appendingPathComponent("\(stem)-\(suffix).\(fileExtension)")
-            suffix += 1
-        }
-        return candidate
-    }
-
     // MARK: - Recording Outcomes
 
     private func startRecordingSession(region: RecordingRegion) {
+        let recordingToken = activityArbiter.begin(.recordingSession)
         recordingCoordinator.startSession(region: region) { [weak self] outcome in
+            defer { recordingToken.end() }
             self?.handleRecordingOutcome(outcome)
         }
-        updateManager.notifyActivityStateChanged()
     }
 
     private func handleRecordingOutcome(_ outcome: RecordingOutcome) {
@@ -936,26 +1027,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             break
         }
         menuBarController?.refresh()
-        updateManager.notifyActivityStateChanged()
     }
 
     private func copyRecordingToPasteboard(_ result: RecordingResult) {
         let stem = Self.defaultFileStem(for: Date())
         let ext = result.format.fileExtension
         let label = result.format.label
+        let exportToken = activityArbiter.begin(.backgroundExport)
 
         Task.detached(priority: .userInitiated) {
+            defer { exportToken.end() }
             do {
                 let pasteDir = Self.pasteboardRecordingsDirectoryURL()
-                guard Self.ensurePrivateDirectory(at: pasteDir),
-                      let destURL = Self.nextUniqueURL(in: pasteDir, stem: stem, fileExtension: ext)
-                else {
+                guard AtomicFileWriter.ensurePrivateDirectory(at: pasteDir) else {
                     throw CocoaError(.fileWriteNoPermission)
                 }
 
-                try Self.moveRecordingAtomically(from: result.fileURL, to: destURL)
+                let destURL = try AtomicFileWriter.moveFileExclusively(
+                    from: result.fileURL,
+                    in: pasteDir,
+                    stem: stem,
+                    fileExtension: ext,
+                    maxSuffixAttempts: Self.maxQuickSaveSuffixAttempts
+                )
                 _ = Darwin.chmod(destURL.path, 0o600)
-                Self.prunePasteboardRecordings(keepingLatest: Self.maxRetainedPasteboardRecordings)
+                AtomicFileWriter.prunePrivateEntries(in: pasteDir, keepingLatest: Self.maxRetainedPasteboardRecordings)
 
                 await MainActor.run { [weak self] in
                     guard let self else { return }
@@ -978,19 +1074,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func syncPendingRecordingSaveCondition() {
+        activityArbiter.setCondition(.savePanel, active: !pendingRecordingSaves.isEmpty)
+    }
+
     private func drainPendingRecordingSavesIfIdle() {
         guard !isPresentingSavePanel else { return }
         if !pendingRecordingSaves.isEmpty {
             let next = pendingRecordingSaves.removeFirst()
+            syncPendingRecordingSaveCondition()
             presentSavePanel(for: next)
         } else {
-            updateManager.notifyActivityStateChanged()
+            syncPendingRecordingSaveCondition()
         }
     }
 
     private func presentSavePanel(for result: RecordingResult) {
         if isPresentingSavePanel {
             pendingRecordingSaves.append(result)
+            syncPendingRecordingSaveCondition()
             NSApp.activate()
             activeSavePanel?.makeKeyAndOrderFront(nil)
             return
@@ -999,7 +1101,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let panel = NSSavePanel()
         panel.title = CCXL10n.text("Save \(result.format.label)", zh: "保存 \(result.format.label)")
         let recordingsDirectory = preferredRecordingsDirectoryURL(createIfNeeded: true)
-        if Self.isRealDirectory(atPath: recordingsDirectory.path) {
+        if AtomicFileWriter.isRealDirectory(atPath: recordingsDirectory.path) {
             panel.directoryURL = recordingsDirectory
         }
         panel.allowedContentTypes = [result.format.utType]
@@ -1011,12 +1113,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         isPresentingSavePanel = true
         activeSavePanel = panel
         activeRecordingSave = result
-        updateManager.notifyActivityStateChanged()
+        let panelToken = activityArbiter.begin(.savePanel)
         NSApp.activate()
 
         panel.begin { [weak self] response in
             Task { @MainActor [weak self] in
-                guard let self else { return }
+                guard let self else {
+                    panelToken.end()
+                    return
+                }
                 self.isPresentingSavePanel = false
                 self.activeSavePanel = nil
 
@@ -1026,13 +1131,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     }
                     try? FileManager.default.removeItem(at: result.fileURL)
                     self.drainPendingRecordingSavesIfIdle()
+                    panelToken.end()
                     return
                 }
 
                 let label = result.format.label
+                let exportToken = self.activityArbiter.begin(.backgroundExport)
+                panelToken.end()
+
                 Task.detached(priority: .userInitiated) {
+                    defer { exportToken.end() }
                     do {
-                        try Self.moveRecordingAtomically(from: result.fileURL, to: url)
+                        try AtomicFileWriter.moveFileAtomically(from: result.fileURL, to: url)
                         await MainActor.run { [weak self] in
                             if self?.activeRecordingSave?.fileURL == result.fileURL {
                                 self?.activeRecordingSave = nil
@@ -1076,17 +1186,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let stem = Self.defaultFileStem(for: Date())
         let label = result.format.label
         let folderName = directory.lastPathComponent
+        let exportToken = activityArbiter.begin(.backgroundExport)
 
         Task.detached(priority: .userInitiated) {
+            defer { exportToken.end() }
             do {
-                guard Self.isWritableRealDirectory(atPath: directory.path) else {
+                guard AtomicFileWriter.isWritableRealDirectory(atPath: directory.path) else {
                     throw CocoaError(.fileWriteNoPermission)
                 }
-                let targetURL = try Self.moveRecordingExclusively(
+                let targetURL = try AtomicFileWriter.moveFileExclusively(
                     from: result.fileURL,
                     in: directory,
                     stem: stem,
-                    fileExtension: ext
+                    fileExtension: ext,
+                    maxSuffixAttempts: Self.maxQuickSaveSuffixAttempts
                 )
                 await MainActor.run { [weak self] in
                     self?.toast.show(
@@ -1110,277 +1223,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Atomically moves `sourceURL` into a new unique file inside `directory` without ever overwriting
-    /// existing files or following symlinks, even across concurrent saves or separate volumes.
-    private nonisolated static func moveRecordingExclusively(
-        from sourceURL: URL,
-        in directory: URL,
-        stem: String,
-        fileExtension: String
-    ) throws -> URL {
-        let normalizedSourcePath = normalizedDirectoryPath(sourceURL.path)
-        let normalizedDirPath = normalizedDirectoryPath(directory.path)
-        guard !normalizedSourcePath.isEmpty,
-              !normalizedDirPath.isEmpty,
-              !stem.isEmpty,
-              !stem.contains("/"),
-              !stem.contains("\0"),
-              !fileExtension.isEmpty,
-              !fileExtension.contains("/"),
-              !fileExtension.contains("\0")
-        else {
-            throw CocoaError(.fileWriteNoPermission)
-        }
-
-        var sourceStat = stat()
-        if Darwin.lstat(normalizedSourcePath, &sourceStat) != 0 {
-            throw errno == ENOENT ? CocoaError(.fileNoSuchFile) : CocoaError(.fileWriteNoPermission)
-        }
-        guard (sourceStat.st_mode & S_IFMT) == S_IFREG else {
-            throw CocoaError(.fileWriteNoPermission)
-        }
-
-        let dirURL = URL(fileURLWithPath: normalizedDirPath, isDirectory: true)
-        let fm = FileManager.default
-        var stagedSourceURL = sourceURL
-        var stagedSourcePath = normalizedSourcePath
-        var didCopyToDestVolume = false
-
-        defer {
-            if didCopyToDestVolume {
-                try? fm.removeItem(at: stagedSourceURL)
-            }
-        }
-
-        var suffix = 1
-        var usedUUIDFallback = false
-        while true {
-            let candidateName: String
-            if suffix == 1 {
-                candidateName = "\(stem).\(fileExtension)"
-            } else if suffix <= maxQuickSaveSuffixAttempts {
-                candidateName = "\(stem)-\(suffix).\(fileExtension)"
-            } else if !usedUUIDFallback {
-                usedUUIDFallback = true
-                candidateName = "\(stem)-\(UUID().uuidString.prefix(8)).\(fileExtension)"
-            } else {
-                throw CocoaError(.fileWriteNoPermission)
-            }
-
-            let candidateURL = dirURL.appendingPathComponent(candidateName, isDirectory: false)
-            let candidatePath = candidateURL.path
-
-            if Darwin.renamex_np(stagedSourcePath, candidatePath, UInt32(RENAME_EXCL)) == 0 {
-                if didCopyToDestVolume {
-                    didCopyToDestVolume = false
-                    try? fm.removeItem(at: sourceURL)
-                }
-                return candidateURL
-            }
-
-            let err = errno
-            if err == EEXIST {
-                suffix += 1
-                continue
-            }
-            if err == EXDEV && !didCopyToDestVolume {
-                let siblingTemp = dirURL.appendingPathComponent(".ccx-save-\(UUID().uuidString).tmp", isDirectory: false)
-                try fm.copyItem(at: sourceURL, to: siblingTemp)
-                stagedSourceURL = siblingTemp
-                stagedSourcePath = siblingTemp.path
-                didCopyToDestVolume = true
-                continue
-            }
-            if err == ENOTSUP || err == EOPNOTSUPP || err == EINVAL {
-                if Darwin.link(stagedSourcePath, candidatePath) == 0 {
-                    _ = Darwin.unlink(stagedSourcePath)
-                    if didCopyToDestVolume {
-                        didCopyToDestVolume = false
-                        try? fm.removeItem(at: sourceURL)
-                    }
-                    return candidateURL
-                }
-                if errno == EEXIST {
-                    suffix += 1
-                    continue
-                }
-                // Volumes without hard-link support (e.g. FAT32/exFAT): check lstat and move if vacant.
-                if entryExistsOrSymlink(atPath: candidatePath) {
-                    suffix += 1
-                    continue
-                }
-                try fm.moveItem(at: stagedSourceURL, to: candidateURL)
-                if didCopyToDestVolume {
-                    didCopyToDestVolume = false
-                    try? fm.removeItem(at: sourceURL)
-                }
-                return candidateURL
-            }
-            throw CocoaError(.fileWriteNoPermission)
-        }
-    }
-
-    private nonisolated static func destinationExistsRejectingSymlink(atPath path: String) throws -> Bool {
-        var destStat = stat()
-        if Darwin.lstat(path, &destStat) == 0 {
-            guard (destStat.st_mode & S_IFMT) != S_IFLNK else {
-                throw CocoaError(.fileWriteNoPermission)
-            }
-            return true
-        }
-        if errno == ENOENT {
-            return false
-        }
-        throw CocoaError(.fileWriteNoPermission)
-    }
-
-    /// Moves `sourceURL` to `destinationURL` without ever deleting an existing file before replacement
-    /// and without losing `sourceURL` if the copy/move fails (including across volumes).
-    private nonisolated static func moveRecordingAtomically(from sourceURL: URL, to destinationURL: URL) throws {
-        let normalizedSourcePath = normalizedDirectoryPath(sourceURL.path)
-        let normalizedDestPath = normalizedDirectoryPath(destinationURL.path)
-        guard !normalizedSourcePath.isEmpty, !normalizedDestPath.isEmpty else {
-            throw CocoaError(.fileWriteNoPermission)
-        }
-
-        var sourceStat = stat()
-        if Darwin.lstat(normalizedSourcePath, &sourceStat) != 0 {
-            throw errno == ENOENT ? CocoaError(.fileNoSuchFile) : CocoaError(.fileWriteNoPermission)
-        }
-        guard (sourceStat.st_mode & S_IFMT) == S_IFREG else {
-            throw CocoaError(.fileWriteNoPermission)
-        }
-
-        let fm = FileManager.default
-        let destinationExists = try destinationExistsRejectingSymlink(atPath: normalizedDestPath)
-
-        if destinationExists {
-            do {
-                _ = try fm.replaceItemAt(destinationURL, withItemAt: sourceURL)
-                return
-            } catch {
-                // Cross-volume replace falls back to staging a sibling temp file in the
-                // destination directory and swapping atomically on the destination volume.
-            }
-        } else if Darwin.rename(normalizedSourcePath, normalizedDestPath) == 0 {
-            return
-        }
-
-        let siblingTemp = destinationURL
-            .deletingLastPathComponent()
-            .appendingPathComponent(".ccx-save-\(UUID().uuidString)")
-        do {
-            try fm.copyItem(at: sourceURL, to: siblingTemp)
-            if try destinationExistsRejectingSymlink(atPath: normalizedDestPath) {
-                _ = try fm.replaceItemAt(destinationURL, withItemAt: siblingTemp)
-            } else {
-                try fm.moveItem(at: siblingTemp, to: destinationURL)
-            }
-            try? fm.removeItem(at: sourceURL)
-        } catch {
-            try? fm.removeItem(at: siblingTemp)
-            throw error
-        }
-    }
-
     private nonisolated static func pasteboardRecordingsDirectoryURL() -> URL {
         FileManager.default.temporaryDirectory.appendingPathComponent("CCXPasteboard", isDirectory: true)
     }
 
-    private nonisolated static func ensurePrivateDirectory(at url: URL) -> Bool {
-        var st = stat()
-        if Darwin.lstat(url.path, &st) == 0 {
-            guard (st.st_mode & S_IFMT) == S_IFDIR, st.st_uid == Darwin.getuid() else { return false }
-            return Darwin.chmod(url.path, 0o700) == 0
-        }
-        guard errno == ENOENT else { return false }
-        if Darwin.mkdir(url.path, 0o700) != 0 && errno != EEXIST {
-            guard errno == ENOENT else { return false }
-            do {
-                try FileManager.default.createDirectory(
-                    at: url,
-                    withIntermediateDirectories: true,
-                    attributes: [.posixPermissions: 0o700]
-                )
-            } catch {
-                return false
-            }
-        }
-        guard Darwin.lstat(url.path, &st) == 0,
-              (st.st_mode & S_IFMT) == S_IFDIR,
-              st.st_uid == Darwin.getuid()
-        else { return false }
-        return Darwin.chmod(url.path, 0o700) == 0
-    }
-
-    private nonisolated static func isPrivateExistingDirectory(at url: URL) -> Bool {
-        var st = stat()
-        return Darwin.lstat(url.path, &st) == 0
-            && (st.st_mode & S_IFMT) == S_IFDIR
-            && st.st_uid == Darwin.getuid()
-    }
-
-    private nonisolated static func unlinkOwnedPasteboardEntry(at url: URL) {
-        let path = normalizedDirectoryPath(url.path)
-        guard !path.isEmpty else { return }
-        var st = stat()
-        guard Darwin.lstat(path, &st) == 0,
-              st.st_uid == Darwin.getuid(),
-              (st.st_mode & S_IFMT) == S_IFREG || (st.st_mode & S_IFMT) == S_IFLNK
-        else { return }
-        _ = Darwin.unlink(path)
-    }
-
-    private nonisolated static func prunePasteboardRecordings(keepingLatest maxKeep: Int) {
-        let dir = pasteboardRecordingsDirectoryURL()
-        guard isPrivateExistingDirectory(at: dir) else { return }
-        let fm = FileManager.default
-        guard let urls = try? fm.contentsOfDirectory(
-            at: dir,
-            includingPropertiesForKeys: [.creationDateKey],
-            options: []
-        ) else { return }
-
-        let sorted = urls.sorted { lhs, rhs in
-            let lDate = (try? lhs.resourceValues(forKeys: [.creationDateKey]))?.creationDate ?? .distantPast
-            let rDate = (try? rhs.resourceValues(forKeys: [.creationDateKey]))?.creationDate ?? .distantPast
-            return lDate > rDate
-        }
-        for url in sorted.dropFirst(max(0, maxKeep)) {
-            unlinkOwnedPasteboardEntry(at: url)
-        }
-    }
-
     private nonisolated static func clearPasteboardRecordings() {
-        let dir = pasteboardRecordingsDirectoryURL()
-        guard isPrivateExistingDirectory(at: dir) else { return }
-        let fm = FileManager.default
-        guard let urls = try? fm.contentsOfDirectory(
-            at: dir,
-            includingPropertiesForKeys: nil,
-            options: []
-        ) else { return }
-        for url in urls {
-            unlinkOwnedPasteboardEntry(at: url)
-        }
+        AtomicFileWriter.clearPrivateEntries(in: pasteboardRecordingsDirectoryURL())
     }
 
     private nonisolated static func cleanupPasteboardRecordings(olderThan maxAge: TimeInterval = 86_400) {
         let dir = pasteboardRecordingsDirectoryURL()
-        guard isPrivateExistingDirectory(at: dir) else { return }
-        let fm = FileManager.default
-        guard let urls = try? fm.contentsOfDirectory(
-            at: dir,
-            includingPropertiesForKeys: [.creationDateKey],
-            options: []
-        ) else { return }
-        let cutoff = Date().addingTimeInterval(-maxAge)
-        for url in urls {
-            if let created = (try? url.resourceValues(forKeys: [.creationDateKey]))?.creationDate, created < cutoff {
-                unlinkOwnedPasteboardEntry(at: url)
-            }
-        }
-        prunePasteboardRecordings(keepingLatest: maxRetainedPasteboardRecordings)
+        AtomicFileWriter.cleanupPrivateEntries(in: dir, olderThan: maxAge)
+        AtomicFileWriter.prunePrivateEntries(in: dir, keepingLatest: maxRetainedPasteboardRecordings)
     }
 
     private nonisolated static func userFriendlySaveError(_ error: Error) -> String {
@@ -1493,8 +1347,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     self?.handlePermissionResetResult(succeeded)
                 }
             )
-            controller.onWindowVisibilityChanged = { [weak self] _ in
-                self?.updateManager.notifyActivityStateChanged()
+            controller.onWindowVisibilityChanged = { [weak self] visible in
+                self?.activityArbiter.setCondition(.onboardingWindow, active: visible)
             }
             onboardingController = controller
         } else {
@@ -1517,9 +1371,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 updateManager: updateManager,
                 snipCombo: currentSnipCombo,
                 isSnipHotKeyRegistered: hotKeyManager.isRegistered(.snip),
+                optionalBindings: currentOptionalBindings(),
+                unregisteredOptionalActions: currentUnregisteredOptionalActions(),
                 hasClearableHistory: hasClearable,
                 recordingsFolderPath: recordingsFolderPath,
                 isCustomRecordingsFolder: isCustomRecordingsFolder,
+                historyRetention: clipboardStore.retentionPolicy,
+                concealClipboard: clipboardStore.concealFromClipboardManagers,
                 resourceMetricsProvider: { [weak self] in
                     guard let self else { return .empty }
                     return SettingsResourceMetricsInput(
@@ -1538,14 +1396,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 onEndShortcutRecording: { [weak self] in
                     self?.endShortcutRecording()
                 },
-                onChangeSnipHotKey: { [weak self] candidate in
-                    self?.changeSnipHotKey(to: candidate)
+                onChangeHotKey: { [weak self] action, candidate in
+                    self?.changeHotKey(to: candidate, for: action)
                 },
                 onResetSnipHotKey: { [weak self] in
                     self?.resetSnipHotKey()
                 },
-                onRetryHotKey: { [weak self] in
-                    self?.retrySnipHotKeyRegistration() ?? false
+                onRetryHotKey: { [weak self] action in
+                    self?.retryHotKeyRegistration(for: action) ?? false
                 },
                 onOpenRecordingsFolder: { [weak self] in
                     self?.openRecordingsFolder()
@@ -1580,6 +1438,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         symbolName: "trash"
                     )
                 },
+                onChangeHistoryRetention: { [weak self] policy in
+                    guard let self else { return }
+                    self.clipboardStore.retentionPolicy = policy
+                    self.settingsController?.updateHasClearableHistory(
+                        !self.clipboardStore.history.isEmpty || self.clipboardStore.hasPasteboardContent
+                    )
+                    self.settingsController?.refreshResourceUsage(scheduleFollowUp: true)
+                },
+                onToggleConcealClipboard: { [weak self] concealed in
+                    self?.clipboardStore.concealFromClipboardManagers = concealed
+                },
                 onRelaunch: { [weak self] in
                     self?.relaunchApplication(forPermissionRetry: true)
                 },
@@ -1587,17 +1456,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     self?.handlePermissionResetResult(succeeded)
                 }
             )
-            controller.onWindowVisibilityChanged = { [weak self] _ in
-                self?.updateManager.notifyActivityStateChanged()
+            controller.onWindowVisibilityChanged = { [weak self] visible in
+                self?.activityArbiter.setCondition(.settingsWindow, active: visible)
             }
             settingsController = controller
         } else {
-            settingsController?.updateSnipHotKey(
-                combo: currentSnipCombo,
-                isRegistered: hotKeyManager.isRegistered(.snip)
+            settingsController?.updateAllHotKeys(
+                snipCombo: currentSnipCombo,
+                isSnipRegistered: hotKeyManager.isRegistered(.snip),
+                optionalBindings: currentOptionalBindings(),
+                unregisteredOptionalActions: currentUnregisteredOptionalActions()
             )
             settingsController?.updateHasClearableHistory(hasClearable)
             settingsController?.updateRecordingsFolder(recordingsFolderPath, isCustom: isCustomRecordingsFolder)
+            settingsController?.updateHistoryPrivacy(
+                retention: clipboardStore.retentionPolicy,
+                concealClipboard: clipboardStore.concealFromClipboardManagers
+            )
         }
         settingsController?.show(anchoredTo: anchorRect)
     }
@@ -1674,8 +1549,12 @@ extension AppDelegate: MenuBarControllerDelegate {
 
     func menuBarRequestedClearHistory() {
         clipboardStore.clearHistoryAndClipboard()
+        pinManager.clearClosedPinHistory()
         snipCoordinator.clearLastSelections()
-        if !recordingCoordinator.isSessionActive {
+        let hasActiveRecordingOrExport = activityArbiter.isActive(.recordingSession)
+            || activityArbiter.isActive(.savePanel)
+            || activityArbiter.isActive(.backgroundExport)
+        if !recordingCoordinator.isSessionActive && !hasActiveRecordingOrExport {
             RecordingCoordinator.cleanupTemporaryRecordings(olderThan: 0)
         }
         DispatchQueue.global(qos: .utility).async {
@@ -1696,6 +1575,10 @@ extension AppDelegate: MenuBarControllerDelegate {
 
     func menuBarRequestedCloseAllPins() {
         pinManager.closeAllPins()
+    }
+
+    func menuBarRequestedReopenClosedPin() {
+        _ = pinManager.reopenLastClosedPin()
     }
 
     func menuBarRequestedPermissionsGuide() {
