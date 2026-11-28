@@ -12,28 +12,28 @@
 ## Core Features
 
 ### 1. Capture (Smart Snip, Scroll Capture & Annotations)
-- **Instant Smart Auto-Detection (`⌃⌘X`, customizable in Settings)**: Freezes all displays via ScreenCaptureKit and automatically highlights windows and UI elements with non-blocking Accessibility queries. Customize your global Snip shortcut anytime in **Settings** with real-time macOS system, reserved-shortcut, and running-app conflict detection plus one-click reset.
+- **Instant Smart Auto-Detection (`⌃⌘X` & Optional Hotkeys)**: Freezes all displays via ScreenCaptureKit and automatically highlights windows and UI elements with non-blocking Accessibility queries. Customize your global Snip shortcut and optional global shortcuts (**Quick OCR**, **Pin from Clipboard**, **Start/Stop Recording**, **Toggle All Pins**, **Unlock Click-Through**) anytime in **Settings** with real-time macOS system, reserved-shortcut, and internal conflict detection.
 - **GPU Pixel Magnifier & Color Picker**: 120Hz GPU-composited pixel loupe with Retina HiDPI / Display P3 support and one-key color copy (`HEX`, `RGB`, `HSL`).
-- **Non-Destructive Annotations**: Rectangle, ellipse, arrow, freehand pen, highlighter, inline text, auto-incrementing step counters, and live GPU mosaic/blur with continuous stroke sizing and undo/redo.
+- **Non-Destructive Annotations**: Rectangle, ellipse, arrow, freehand pen, highlighter, inline text, auto-incrementing step counters, and active-ROI live GPU mosaic/blur with a cursor-anchored floating toolbar, cached zoom-scaled brush cursors (`[` / `]`), undo/redo, and a `?` Liquid Glass shortcut cheat sheet.
 - **Scrolling Capture (`L`)**: Captures tall pages and documents with live preview, sticky header/sidebar detection, manual or auto-scroll, and memory-bounded stitching.
-- **Local OCR (`T`)**: On-device Apple Vision text recognition supporting Simplified Chinese, Traditional Chinese, and English.
+- **Local OCR & QR Fallback (`T`)**: On-device Apple Vision text recognition (Simplified Chinese, Traditional Chinese, and English) reconstructing columns, paragraphs, and tight CJK spacing, with automatic QR/barcode payload fallback when no text is detected.
 
 ### 2. Pin (Always-on-Top Floating Windows)
-- **Float Across Spaces & Full-Screen Apps**: Pin snips, clipboard images, HEX color swatches, or text snippets as crisp floating `NSPanel`s.
-- **Interactive Controls**: Smooth GPU-accelerated zoom, 90° rotation, horizontal/vertical flip, opacity adjustment, thumbnail collapse, click-through mode (unlockable from the menu bar or context menu), and inline re-editable annotations on image pins.
-- **Recent Snips History**: Instant access to recent captures from the menu bar popover, persisted locally in a private user-only cache (`0700`/`0600`) with bounded memory usage and one-click clear.
+- **Float Across Spaces & Full-Screen Apps**: Pin snips, clipboard images, HEX color swatches, or text snippets as crisp floating `NSPanel`s with automatic screen rescue if a monitor disconnects.
+- **Interactive Controls & Selectable Text**: Smooth GPU-accelerated zoom, 90° rotation, horizontal/vertical flip, opacity adjustment (`⌥+Scroll`), thumbnail collapse, click-through mode, inline re-editable annotations on image pins, read-only text selection mode on text pins (`E` / `T` / context menu), a `?` shortcut cheat sheet, and quick reopening of recently closed pins (`⇧⌘T` / menu / popover, 5-item FIFO history).
+- **Recent Snips & Privacy**: Instant menu bar access to recent captures via lazy thumbnail startup loading in a private user-only cache (`0700`/`0600`), configurable retention (`Keep Last 20`, `Clear After 24h`, `Clear on Quit`, or `Don't Save`), and an optional **Private Clipboard** toggle marking copies with `org.nspasteboard.TransientType`.
 
 ### 3. Record (Screen Recording — MP4, MOV & GIF)
-- **Hardware-Accelerated Video & GIF**: Record any region or full display to `MP4` (H.264), `MOV` (HEVC), or memory-bounded `GIF` with adjustable recording border and live menu bar timer.
-- **Dual Audio & Pause/Resume**: Optional system audio and microphone narration with real-time mixing, true pause/resume timeline offsetting, graceful microphone fallback, and stream-interruption salvage.
+- **Hardware-Accelerated Video & Disk-Spooled GIF**: Record any region or full display to `MP4` (H.264), `MOV` (HEVC), or `0600` disk-spooled memory-bounded `GIF` with an optional 3-second countdown timer, adjustable recording border, and live menu bar timer.
+- **Dual Audio, Live Mic Meter & Pause/Resume**: Optional system audio and microphone narration with real-time mixing, live HUD microphone RMS meter, true pause/resume timeline offsetting, graceful microphone fallback, and partial-recording salvage on display disconnect.
 - **Dedicated Recordings Folder**: Saves recordings by default to `~/Movies/CCX` (configurable in **Settings** and independent from PNG save locations), with quick-open access from the menu bar popover's **Record** tile and Settings.
-- **Non-Destructive Output**: Atomic Copy, Save, Quick Save, and Reveal in Finder actions that preserve your recording if a destination write fails.
+- **Non-Destructive Output**: Completed recording toolbar with one-click Save, Reveal in Finder, Quick Save, and right-aligned Copy File actions—preserving your recording atomically if a destination write fails.
 
 ---
 
 ## Installation
 
-1. Download the latest `CCX-0.10.1-macOS-universal.dmg` (or `.zip`).
+1. Download the latest `CCX-0.11.0-macOS-universal.dmg` (or `.zip`).
 2. Open the disk image and drag **CCX.app** into **Applications**.
 3. Launch **CCX** from `/Applications` or Spotlight.
 
@@ -67,7 +67,7 @@ CCX requests only the macOS permissions required for its three core features:
 ### Global & Menu Bar
 | Shortcut | Action |
 | --- | --- |
-| `⌃⌘X` | Start Smart Snip (customizable in **Settings → Snip Shortcut** with conflict detection) |
+| `⌃⌘X` | Start Smart Snip (customizable in **Settings → Snip Shortcut**, plus optional global hotkeys under **More Shortcuts**) |
 | Click menu bar icon | Open / close CCX popover (left or right click) |
 | `⌘V` | Pin from clipboard (when popover is open) |
 | `⌘,` | Open Settings (when popover is open) |
@@ -77,6 +77,7 @@ CCX requests only the macOS permissions required for its three core features:
 ### Smart Snip Overlay
 | Shortcut | Action |
 | --- | --- |
+| `?` | Toggle Liquid Glass keyboard shortcut cheat sheet |
 | `Shift` (while hovering) | Cycle magnifier color format (`HEX` → `RGB` → `HSL`) |
 | `C` (while hovering) | Copy pixel color under cursor |
 | `R` (while hovering) | Recall previous selection on this display |
@@ -84,16 +85,16 @@ CCX requests only the macOS permissions required for its three core features:
 | `← ↑ → ↓` (`Shift` = 10pt) | Nudge selection or selected annotation |
 | `⌥` + `← ↑ → ↓` (`Shift` = 10pt) | Resize selection edges |
 | `⌘A` | Select entire display |
-| `1`–`8` / `V` | Select annotation tool / select-move tool |
+| `1`–`8` / `V` | Select annotation tool / select-move tool (`[` / `]` adjusts brush/stroke or text size) |
 | `⌘Z` / `⇧⌘Z` | Undo / redo annotation |
 | `⌘D` / `Delete` | Duplicate / delete selected annotation |
 | `Return` | Finish and Pin |
 | `⌘C` | Copy to clipboard |
 | `⌘S` / `⇧⌘S` | Save PNG dialog / Quick Save PNG |
-| `T` | Extract and copy text (OCR) |
+| `T` | Extract and copy text / QR code (OCR) |
 | `L` | Start Scrolling Capture for selected region |
 | `R` (with selection) | Start Screen Recording for selected region |
-| `Esc` / `⌘W` | Cancel (or cancel inline text edit first) |
+| `Esc` / `⌘W` | Dismiss cheat sheet → cancel inline text → cancel overlay |
 
 ### Scrolling Capture
 | Shortcut | Action |
@@ -102,32 +103,35 @@ CCX requests only the macOS permissions required for its three core features:
 | `Return` | Finish and Pin |
 | `⌘C` | Finish and Copy |
 | `⌘S` / `⇧⌘S` | Save PNG dialog / Quick Save PNG |
-| `T` | Extract and copy text (OCR) |
+| `T` | Extract and copy text / QR code (OCR) |
 | `Esc` / `⌘W` | Cancel scrolling capture (when HUD is focused) |
 
 ### Floating Pins
 | Shortcut | Action |
 | --- | --- |
+| `?` | Toggle Liquid Glass keyboard shortcut cheat sheet |
 | `E` / `Space` / Double-click | Open inline annotation toolbar on image pins (`E` or Double-click also closes; also via bottom-right hover button or **Show Toolbar** at top of right-click menu) |
+| `E` / `T` (text pin) | Toggle read-only selectable text copy mode (`⌘A` / `⌘C` copies selection; `Esc` exits selection before closing) |
 | `1`–`8` | Open inline annotation toolbar directly with that drawing tool (`[` / `]` adjusts stroke or font size while annotating) |
-| `T` | Extract and copy text from image pin (OCR) |
-| Scroll wheel / trackpad | Zoom in / out (`⌥` + Scroll adjusts opacity) |
+| `T` (image pin) | Extract and copy text / QR code (OCR) |
+| `⇧⌘T` | Reopen most recently closed pin (5-item FIFO buffer) |
+| Scroll wheel / trackpad | Zoom in / out (`⌥` or `⌃` + Scroll adjusts opacity) |
 | `+` / `-` (`⌘+` / `⌘-`) | Zoom in / out |
 | `0` / `⌘0` | Reset zoom to 100% |
 | `⇧0` / `⇧⌘0` | Reset all transforms (zoom, rotation, flip, opacity) |
 | `R` / `⇧R` | Rotate 90° clockwise / counter-clockwise |
 | `H` / `V` | Flip horizontal / vertical |
 | `← ↑ → ↓` (`Shift` = 10pt) | Nudge floating pin |
-| `⌘C` | Copy pin content |
+| `⌘C` | Copy pin content (or selected text when text selection mode is active) |
 | `⌘D` | Duplicate pin (or duplicate selected annotation while annotating) |
 | `⌘S` / `⇧⌘S` | Save PNG dialog / Quick Save PNG |
-| `Esc` | Cancel inline text → cancel annotation session → close pin |
+| `Esc` | Dismiss cheat sheet → exit text selection / inline text → cancel annotation session → close pin |
 | `⌘W` | Close pin |
 
 ### Screen Recording
 | Phase | Shortcuts |
 | --- | --- |
-| **Ready** | `Return` or `Space`: Start · `← ↑ → ↓` / `⌥` + Arrows: Nudge / resize · `⌘A`: Full display · `Esc` / `⌘W`: Cancel |
+| **Ready / Countdown** | `Return` or `Space`: Start (`0s` or `3s` countdown) · `← ↑ → ↓` / `⌥` + Arrows: Nudge / resize · `⌘A`: Full display · `Esc` / `⌘W`: Cancel |
 | **Recording / Paused** | `Space`: Pause / resume · `Return`: Stop & finalize · `Esc` / `⌘W`: Discard (when HUD is focused) |
 | **Completed** | `Return` or `⇧⌘S`: Quick Save · `⌘C`: Copy file · `⌘S`: Save dialog · `⌘R`: Save & Reveal in Finder · `Esc` / `⌘W`: Discard |
 
@@ -136,7 +140,7 @@ CCX requests only the macOS permissions required for its three core features:
 ## Building from Source
 
 ### Requirements
-- macOS 15.0+ with Xcode 16+ (Swift 6.0) and [XcodeGen](https://github.com/yonaskolb/XcodeGen) (`brew install xcodegen`).
+- macOS 15.0+ runtime; **Xcode 26+** (Swift 6, macOS 26+ SDK) and [XcodeGen](https://github.com/yonaskolb/XcodeGen) (`brew install xcodegen`) to build from source.
 
 ### Local Development Build & Launch
 ```bash
@@ -167,7 +171,7 @@ See [SECURITY.md](SECURITY.md) for details on what the hooks verify and how to r
 ### Public Release Packaging (Universal Binary + Hardened Runtime)
 ```bash
 # Bump version in project.yml when preparing a release:
-./scripts/bump-version.sh 0.10.1
+./scripts/bump-version.sh 0.11.0
 
 # Build signed Universal Binary (arm64 + x86_64), verify dylibs/codesign/entitlements,
 # and emit dist/CCX-<version>-macOS-universal.{dmg,zip} + dist/SHA256SUMS.txt:

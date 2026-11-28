@@ -2,6 +2,33 @@
 
 All notable changes to **CCX (Control · Command · X)** are documented in this file.
 
+## [0.11.0] - 2026-11-28
+
+### Added
+- **Optional Multi-Action Global Hotkeys & Direct Quick OCR (`CCXCore`, `CCXCapture`, `App`)**:
+  - Added configurable optional global shortcuts in **Settings → More Shortcuts** for **Quick OCR**, **Pin from Clipboard**, **Start/Stop Recording**, **Toggle All Pins**, and **Unlock Click-Through** (`CCXHotKeyAction.optionalActions`), backed by live macOS system, reserved-shortcut, internal duplicate, and running-app conflict detection.
+  - Added a direct **Quick OCR** capture mode (`.ocr`, teal highlight & `OCR ·` dimension badge in `SnipOverlayView`) that immediately extracts and copies text or QR/2D barcode payloads upon selection.
+- **Spatial OCR Layout Reconstruction & QR/2D Barcode Fallback (`CCXCore`)**: Upgraded on-device Apple Vision `TextRecognizer` (`assembleLayout(from:)`) to reconstruct visual rows, tabular column gaps (`\t`), paragraph breaks (`\n\n`), and tight CJK spacing from normalized bounding boxes, automatically falling back to QR, Aztec, DataMatrix, and PDF417 barcode payload decoding when no readable text is detected.
+- **Configurable History Retention & Private Clipboard (`CCXCore`, `App`)**: Added `SnipHistoryRetention` policies (`keep20`, `clearAfter24Hours`, `clearOnQuit`, `disabled`) under **Settings → Storage & Privacy**, plus a **Private Clipboard** toggle marking CCX copies (images, text, and recording files) with `org.nspasteboard.TransientType` so third-party clipboard managers skip indexing them.
+- **Selectable Text Mode & Recently-Closed Pin Reopen (`CCXPin`, `App`)**:
+  - Added read-only selectable text copy mode on text pins (`E`, `T`, or context menu) with `⌘A` / `⌘C` selection copying that honors **Private Clipboard** and exits cleanly on `Esc`.
+  - Added a 5-item FIFO recently-closed pin history buffer (`PinManager.reopenLastClosedPin`) accessible via `⇧⌘T`, the pin context menu, and a **Reopen Closed Pin** control in the menu bar popover, clamping restored frames onto visible screens and clearing click-through.
+- **Modal `?` Shortcut Cheat Sheet & Cached Brush Cursors (`CCXAnnotate`, `CCXCapture`, `CCXPin`)**: Added a Liquid Glass `?` keyboard shortcut cheat sheet (`ShortcutCheatSheetView`) across the Smart Snip overlay and floating pins, cached zoom-scaled circular brush cursors (`BrushCursorCache`, `6–96pt` for Pen, Highlighter, and Mosaic), and `[` / `]` stroke-size adjustment shortcuts in `SnipOverlayView`.
+- **Recording Countdown & Live Microphone Level Meter (`CCXRecord`)**: Added an optional 3-second pre-record countdown (`RecordingPhase.countdown`, `Esc`-cancellable before capture staging) and a 4-bar live microphone RMS level meter (`MicLevelMeterView` powered by `Accelerate`/`vDSP_rmsqv` in `AudioSampleNormalizer`, throttled during recording and zeroed on pause).
+
+### Improved
+- **Redesigned Compact Two-Card Settings UI (`App`)**: Reorganized **Settings** into a compact 2-card layout with refined Light/Dark card styling (`CCXSettingsCardModifier`), keeping core preferences and the primary Snip Shortcut on top while consolidating **More Shortcuts**, **Storage & Privacy**, **Permissions**, and **Resource Usage** into flicker-free accordion sections (`.transition(.identity)`).
+- **Cursor-Anchored Snip Toolbar Positioning (`CCXAnnotate`, `CCXCapture`)**: Updated `AnnotationActionToolbar.frame(...)` with cursor-anchored placement (`anchorPoint` + `copyButtonCenterXOffset`) that aligns **Copy** horizontally near the final mouse position on the nearest exterior edge (falling back inside near the cursor when the edge is blocked or distant), tracks arrow-key selection nudges, and remains stationary while annotating.
+- **Active-ROI GPU Blur/Mosaic (`CCXAnnotate`, `CCXCapture`)**: Scoped `MosaicImageCache` GPU/CPU blur and pixelation to an active-selection ROI (`setActiveRegion`, automatically falling back to full-image caching above 75% coverage) to lower Retina memory and latency while keeping full-image pixel alignment and an opaque disjoint-ROI fallback.
+- **Lazy Disk-Backed Recent Snips Startup (`CCXCore`, `App`)**: Switched persisted `RecentSnips` entries to lazy disk-backed loading (`pixelWidth` / `pixelHeight` metadata and ImageIO thumbnails without decoding full PNG bitmaps into RAM at launch).
+- **Disk-Spooled GIF Encoding & Completed Recording Toolbar (`CCXRecord`)**: Upgraded `GifRecordingEncoder` to stream fingerprinted frames sequentially to a private `0600` disk spool file (`4 GiB` spool budget, `O(1)` resident RAM) before assembling the final GIF, and repositioned the **Copy** file button to the trailing right edge of the completed recording toolbar next to **Discard**.
+
+### Security
+- **Workflow Arbitration & Hardened Atomic File Operations (`CCXCore`, `App`, `CCXAnnotate`, `CCXRecord`, `scripts`)**:
+  - Introduced `ActivityArbiter` (reference-counted RAII `ActivityToken`s and level-triggered conditions) to gate quit and idle silent-update installation consistently across active recordings, save panels, background exports, snips, OCR, pins, and CCX windows.
+  - Consolidated POSIX-hardened file operations into `AtomicFileWriter` with trailing-slash normalization, `lstat` / `S_IFREG` source and destination checks, same-file `(st_dev, st_ino)` no-op guards in `moveFileAtomically`, and user-owned symlink-safe private directory pruning.
+  - Added active-session guards preventing temporary recording or `.CCX-Rec-*.spool` cleanup while a recording, save dialog, or background export is in flight; added an opaque privacy-preserving fallback in `AnnotationRenderer` so disjoint mosaic ROIs never leak unredacted pixels; hardened `AppUpdater` ZIP extraction (`--norsrc --noextattr --noqtn`, rejecting `__MACOSX/` entries) and `scripts/package-release.sh` (`--norsrc --noextattr`); and added `core.hooksPath` reminders to `scripts/build-and-run.sh` and `scripts/verify-all.sh`.
+
 ## [0.10.1] - 2026-11-27
 
 ### Improved
