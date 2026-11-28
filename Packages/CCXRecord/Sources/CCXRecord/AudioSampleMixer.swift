@@ -1,3 +1,4 @@
+import Accelerate
 import AVFoundation
 import CoreMedia
 import Darwin
@@ -25,6 +26,7 @@ public final class AudioSampleNormalizer {
     }
 
     public let targetFormat: AVAudioFormat
+    public private(set) var lastNormalizedRMSLevel: Float = 0
 
     private var cachedSourceFormat: AVAudioFormat?
     private var cachedConverter: AVAudioConverter?
@@ -48,9 +50,22 @@ public final class AudioSampleNormalizer {
     /// Resets cached resampler filter state across discontinuities such as pause/resume.
     public func reset() {
         cachedConverter?.reset()
+        lastNormalizedRMSLevel = 0
         if scratchOutput.capacity > 65_536 {
             scratchOutput.removeAll(keepingCapacity: false)
         }
+    }
+
+    /// Computes a smooth perceptual `[0, 1]` RMS level from `Float32` PCM samples using `Accelerate`.
+    public static func normalizedRMSLevel(from samples: UnsafePointer<Float>?, count: Int) -> Float {
+        guard let samples, count > 0 else { return 0 }
+        var rms: Float = 0
+        vDSP_rmsqv(samples, 1, &rms, vDSP_Length(count))
+        guard rms.isFinite, rms > 1e-6 else { return 0 }
+        let db = 20 * log10f(rms)
+        guard db.isFinite else { return 0 }
+        let normalized = (db + 50) / 47
+        return min(max(normalized, 0), 1)
     }
 
     public func normalize(_ sampleBuffer: CMSampleBuffer) -> [Float] {
@@ -70,14 +85,21 @@ public final class AudioSampleNormalizer {
               let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc),
               asbd.pointee.mFormatID == kAudioFormatLinearPCM
         else {
+            lastNormalizedRMSLevel = 0
             return [][...]
         }
 
         let frameCount = CMSampleBufferGetNumSamples(sampleBuffer)
-        guard frameCount > 0, frameCount <= Self.maxFramesPerBuffer else { return [][...] }
+        guard frameCount > 0, frameCount <= Self.maxFramesPerBuffer else {
+            lastNormalizedRMSLevel = 0
+            return [][...]
+        }
 
         let sourceFormat = AVAudioFormat(cmAudioFormatDescription: formatDesc)
-        guard Self.isValidPCMFormat(sourceFormat) else { return [][...] }
+        guard Self.isValidPCMFormat(sourceFormat) else {
+            lastNormalizedRMSLevel = 0
+            return [][...]
+        }
 
         let requestedFrames = AVAudioFrameCount(frameCount)
         let inputBuffer: AVAudioPCMBuffer
@@ -90,6 +112,7 @@ public final class AudioSampleNormalizer {
                 pcmFormat: sourceFormat,
                 frameCapacity: requestedFrames
             ) else {
+                lastNormalizedRMSLevel = 0
                 return [][...]
             }
             cachedInputBuffer = created
@@ -103,7 +126,10 @@ public final class AudioSampleNormalizer {
             frameCount: Int32(frameCount),
             into: inputBuffer.mutableAudioBufferList
         )
-        guard copyStatus == noErr else { return [][...] }
+        guard copyStatus == noErr else {
+            lastNormalizedRMSLevel = 0
+            return [][...]
+        }
 
         return normalizeSlice(pcmBuffer: inputBuffer)
     }
@@ -115,6 +141,16 @@ public final class AudioSampleNormalizer {
     }
 
     func normalizeSlice(pcmBuffer inputBuffer: AVAudioPCMBuffer) -> ArraySlice<Float> {
+        let slice = extractNormalizedSlice(pcmBuffer: inputBuffer)
+        lastNormalizedRMSLevel = slice.isEmpty
+            ? 0
+            : slice.withUnsafeBufferPointer { buffer in
+                Self.normalizedRMSLevel(from: buffer.baseAddress, count: buffer.count)
+            }
+        return slice
+    }
+
+    private func extractNormalizedSlice(pcmBuffer inputBuffer: AVAudioPCMBuffer) -> ArraySlice<Float> {
         let format = inputBuffer.format
         let frames = Int(inputBuffer.frameLength)
         guard frames > 0,

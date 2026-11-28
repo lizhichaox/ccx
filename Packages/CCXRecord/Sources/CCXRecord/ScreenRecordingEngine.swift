@@ -16,6 +16,7 @@ public final class ScreenRecordingEngine {
     public var onWriterError: ((Error) -> Void)?
     public var onNotice: ((String, String) -> Void)?
     public var onLimitReached: (() -> Void)?
+    public var onMicrophoneLevel: ((Float) -> Void)?
 
     public let region: RecordingRegion
     public let settings: RecordingSettings
@@ -177,6 +178,7 @@ public final class ScreenRecordingEngine {
         if let videoWriter {
             self.videoWriter = nil
             self.activeFinalizingWriter = videoWriter
+            videoWriter.onMicrophoneLevel = nil
             summary = try await videoWriter.finish()
         } else if let gifEncoder {
             self.gifEncoder = nil
@@ -250,6 +252,9 @@ public final class ScreenRecordingEngine {
         onWriterError = nil
         onNotice = nil
         onLimitReached = nil
+        onMicrophoneLevel = nil
+        videoWriter?.onMicrophoneLevel = nil
+        activeFinalizingWriter?.onMicrophoneLevel = nil
     }
 
     private func scheduleStreamThrottleUpdate(paused: Bool) {
@@ -320,6 +325,15 @@ public final class ScreenRecordingEngine {
                         onWriterError(error)
                     } else {
                         self.onUnexpectedStop?(error)
+                    }
+                }
+            }
+            if runSettings.effectiveMicrophone {
+                writer.onMicrophoneLevel = { [weak self] level in
+                    guard let self else { return }
+                    Task { @MainActor [weak self] in
+                        guard let self, !self.isStopped else { return }
+                        self.onMicrophoneLevel?(level)
                     }
                 }
             }

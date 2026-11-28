@@ -5,7 +5,7 @@ import CCXCore
 /// Always-on-top, non-activating floating window showing one pinned image, text, or color.
 ///
 /// Interactions: drag to move, scroll to zoom (0.1x-10x, around the cursor),
-/// Ctrl+scroll to change opacity, double-click an image pin to toggle its annotation toolbar
+/// Option+scroll (or Ctrl+scroll) to change opacity, double-click an image pin to toggle its annotation toolbar
 /// (or restore from a 72x72 thumbnail), Esc to close, Cmd+C to copy, Cmd+S to save,
 /// right-click for the context menu.
 public final class PinPanel: NSPanel, NSWindowDelegate {
@@ -17,6 +17,7 @@ public final class PinPanel: NSPanel, NSWindowDelegate {
 
     var onClose: ((PinPanel) -> Void)?
     var onCopy: ((PinPanel) -> Void)?
+    var onCopyText: ((String) -> Void)?
     var onSave: ((PinPanel) -> Void)?
     var onQuickSave: ((PinPanel) -> Void)?
     var onDuplicate: ((PinPanel) -> Void)?
@@ -26,10 +27,17 @@ public final class PinPanel: NSPanel, NSWindowDelegate {
     var onCloseAll: (() -> Void)?
     var onUnlockAllClickThrough: (() -> Void)?
     var clickThroughCountProvider: (() -> Int)?
+    var onReopenClosedPin: (() -> Void)?
+    var canReopenClosedPinProvider: (() -> Bool)?
     var onStateChanged: ((PinPanel) -> Void)?
     var onToolbarWillOpen: ((PinPanel) -> Void)?
     var onAnnotationStyleChanged: ((AnnotationStyle) -> Void)?
 
+    public private(set) var isTextSelectionActive = false
+    public var canSelectText: Bool {
+        if case .text = content { return true }
+        return false
+    }
     public var isToolbarVisible: Bool { annotationController?.isToolbarVisible ?? false }
     public var canShowAnnotationToolbar: Bool {
         if case .image = content { return true }
@@ -50,6 +58,9 @@ public final class PinPanel: NSPanel, NSWindowDelegate {
     internal var annotationBakeCountForTesting: Int { annotationController?.bakeCountForTesting ?? 0 }
     internal var hasAnnotationControllerForTesting: Bool { annotationController != nil }
     internal var activeAnnotationToolForTesting: AnnotationTool? { annotationController?.activeTool }
+    internal var currentAnnotationCursorForTesting: NSCursor? { annotationController?.lastCursorForTesting }
+    internal var isCheatSheetVisibleForTesting: Bool { cheatSheetPanel != nil }
+    internal var textSelectionViewForTesting: NSTextView? { pinView.textSelectionViewForTesting }
     internal var hoverToolbarButtonForTesting: NSButton? { pinView.hoverToolbarButton }
     internal var borderLayerForTesting: CALayer { pinView.borderLayerForTesting }
     internal var annotationOverlayViewForTesting: NSView { pinView.annotationOverlayViewForTesting }
@@ -65,6 +76,7 @@ public final class PinPanel: NSPanel, NSWindowDelegate {
 
     private let pinView: PinContentView
     private var annotationController: PinAnnotationController?
+    private var cheatSheetPanel: NSPanel?
     private var pendingAnnotationStyle = AnnotationStyle()
     private let originalHistoryEntryID: UUID?
     fileprivate var isApplyingFrameProgrammatically = false
@@ -295,6 +307,7 @@ public final class PinPanel: NSPanel, NSWindowDelegate {
     }
 
     public func windowDidResignKey(_ notification: Notification) {
+        dismissCheatSheet()
         pinView.cancelPendingDragAndClicks()
         annotationController?.handleParentWindowDidResignKey(for: self)
     }
@@ -426,21 +439,25 @@ public final class PinPanel: NSPanel, NSWindowDelegate {
     }
 
     public func rotateClockwise() {
+        if isTextSelectionActive { setTextSelectionActive(false) }
         if isToolbarVisible { closeToolbar(commit: true) }
         mutateState(anchor: frameCenter) { $0.rotateClockwise() }
     }
 
     public func rotateCounterClockwise() {
+        if isTextSelectionActive { setTextSelectionActive(false) }
         if isToolbarVisible { closeToolbar(commit: true) }
         mutateState(anchor: frameCenter) { $0.rotateCounterClockwise() }
     }
 
     public func toggleFlipHorizontal() {
+        if isTextSelectionActive { setTextSelectionActive(false) }
         if isToolbarVisible { closeToolbar(commit: true) }
         mutateState(anchor: frameCenter) { $0.toggleFlipHorizontal() }
     }
 
     public func toggleFlipVertical() {
+        if isTextSelectionActive { setTextSelectionActive(false) }
         if isToolbarVisible { closeToolbar(commit: true) }
         mutateState(anchor: frameCenter) { $0.toggleFlipVertical() }
     }
@@ -454,21 +471,60 @@ public final class PinPanel: NSPanel, NSWindowDelegate {
     }
 
     public func setClickThrough(_ enabled: Bool) {
+        if enabled {
+            dismissCheatSheet()
+            if isTextSelectionActive { setTextSelectionActive(false) }
+        }
         if enabled && isToolbarVisible { closeToolbar(commit: true) }
         mutateState { $0.isClickThrough = enabled }
     }
 
     /// Collapses to / restores from the 72x72 thumbnail, keeping the top-left corner fixed.
     public func toggleThumbnail() {
+        dismissCheatSheet()
+        if isTextSelectionActive { setTextSelectionActive(false) }
         if isToolbarVisible { closeToolbar(commit: true) }
         mutateState(anchor: frameTopLeft) { $0.toggleThumbnail() }
     }
 
     /// Resets zoom, opacity, rotation, flip, and thumbnail mode back to defaults.
     public func resetAllTransforms() {
+        if isTextSelectionActive { setTextSelectionActive(false) }
         if isToolbarVisible { closeToolbar(commit: true) }
         mutateState(anchor: frameCenter) { $0.resetAll() }
         pinView.showHUD(CCXL10n.text("Reset", zh: "已重置"))
+    }
+
+    /// Enters or exits read-only selectable text mode on `.text` pins.
+    public func setTextSelectionActive(_ active: Bool) {
+        guard case let .text(text) = content else { return }
+        if active {
+            guard !state.isThumbnail && !state.isClickThrough else { return }
+            if state.rotationDegrees != 0 || state.isFlippedHorizontally || state.isFlippedVertically {
+                pinView.showHUD(CCXL10n.text("Reset transforms to select text", zh: "请先重置变换再选择文本"))
+                return
+            }
+            guard !isTextSelectionActive else { return }
+            isTextSelectionActive = true
+            isMovableByWindowBackground = false
+            pinView.cancelPendingDragAndClicks()
+            pinView.mountTextSelectionView(text: PinLayout.displayText(for: text))
+            pinView.syncVisualState()
+            pinView.needsDisplay = true
+            makeKey()
+            if let textView = pinView.textSelectionViewForTesting {
+                makeFirstResponder(textView)
+            }
+            pinView.showHUD(CCXL10n.text("Select Text · Esc to exit", zh: "选择文本 · Esc 退出"))
+        } else {
+            guard isTextSelectionActive else { return }
+            isTextSelectionActive = false
+            isMovableByWindowBackground = true
+            pinView.unmountTextSelectionView()
+            makeFirstResponder(pinView)
+            pinView.syncVisualState()
+            pinView.needsDisplay = true
+        }
     }
 
     /// Displays a transient centered HUD pill over the pin (no-op in compact thumbnail mode).
@@ -520,9 +576,10 @@ public final class PinPanel: NSPanel, NSWindowDelegate {
     }
 
     override public func scrollWheel(with event: NSEvent) {
+        let isOpacityModifier = event.modifierFlags.contains(.option) || event.modifierFlags.contains(.control)
         if let controller = annotationController,
            controller.isToolbarVisible,
-           !event.modifierFlags.contains(.control),
+           !isOpacityModifier,
            controller.handleScrollThickness(event, on: self) {
             return
         }
@@ -531,7 +588,7 @@ public final class PinPanel: NSPanel, NSWindowDelegate {
         let deltaX = event.scrollingDeltaX
         guard delta.isFinite, deltaX.isFinite, abs(delta) >= abs(deltaX), delta != 0 else { return }
         let clampedDelta = min(max(delta, -120), 120)
-        if event.modifierFlags.contains(.control) {
+        if isOpacityModifier {
             let step = event.hasPreciseScrollingDeltas ? clampedDelta * 0.005 : (clampedDelta > 0 ? 0.05 : -0.05)
             adjustInteractiveOpacity(by: step)
         } else if !state.isThumbnail {
@@ -542,11 +599,24 @@ public final class PinPanel: NSPanel, NSWindowDelegate {
     }
 
     override public func keyDown(with event: NSEvent) {
+        let isEditingAnnotationText = annotationController?.isEditingText == true
+        if !isEditingAnnotationText && Self.isQuestionMarkKeyEvent(event) {
+            toggleCheatSheet()
+            return
+        }
+        if event.keyCode == 53, cheatSheetPanel != nil {
+            dismissCheatSheet()
+            return
+        }
         if let controller = annotationController, controller.isToolbarVisible {
             if controller.handleKeyDown(event, on: self) {
                 return
             }
             super.keyDown(with: event)
+            return
+        }
+        if event.keyCode == 53, isTextSelectionActive {
+            setTextSelectionActive(false)
             return
         }
         if event.keyCode == 53 { // Escape
@@ -568,17 +638,22 @@ public final class PinPanel: NSPanel, NSWindowDelegate {
 
         let char = event.charactersIgnoringModifiers?.lowercased() ?? ""
         if !flags.contains(.command) && !flags.contains(.control) && !flags.contains(.option) {
-            if !flags.contains(.shift), canShowAnnotationToolbar, !state.isThumbnail {
-                if char == "e" || char == " " || event.keyCode == 49 {
-                    showAnnotationToolbar()
-                    return
-                }
-                if char == "t" {
-                    recognizeTextFromMenu(nil)
-                    return
-                }
-                if let tool = AnnotationTool.forNumberKey(char) {
-                    showAnnotationToolbar(initialTool: tool)
+            if !flags.contains(.shift), !state.isThumbnail {
+                if canShowAnnotationToolbar {
+                    if char == "e" || char == " " || event.keyCode == 49 {
+                        showAnnotationToolbar()
+                        return
+                    }
+                    if char == "t" {
+                        recognizeTextFromMenu(nil)
+                        return
+                    }
+                    if let tool = AnnotationTool.forNumberKey(char) {
+                        showAnnotationToolbar(initialTool: tool)
+                        return
+                    }
+                } else if canSelectText, char == "e" || char == "t" {
+                    setTextSelectionActive(!isTextSelectionActive)
                     return
                 }
             }
@@ -626,12 +701,20 @@ public final class PinPanel: NSPanel, NSWindowDelegate {
     }
 
     override public func cancelOperation(_ sender: Any?) {
+        if cheatSheetPanel != nil {
+            dismissCheatSheet()
+            return
+        }
         if let controller = annotationController, controller.isToolbarVisible {
             if controller.isEditingText {
                 _ = controller.handleRightMouseDown(on: self)
                 return
             }
             closeToolbar(commit: false)
+            return
+        }
+        if isTextSelectionActive {
+            setTextSelectionActive(false)
             return
         }
         close()
@@ -672,6 +755,19 @@ public final class PinPanel: NSPanel, NSWindowDelegate {
             return super.performKeyEquivalent(with: event)
         }
 
+        if isTextSelectionActive {
+            if flags == .command, key == "a" {
+                pinView.textSelectionViewForTesting?.selectAll(nil)
+                return true
+            }
+            if flags == .command, key == "c",
+               let textView = pinView.textSelectionViewForTesting,
+               textView.selectedRange().length > 0 {
+                copySelectedRange(from: textView)
+                return true
+            }
+        }
+
         if let controller = annotationController, controller.isToolbarVisible {
             if flags == .command, key == "z" {
                 controller.performUndo(on: self)
@@ -690,6 +786,10 @@ public final class PinPanel: NSPanel, NSWindowDelegate {
         }
         if flags == [.command, .shift], key == "s" {
             quickSavePin(nil)
+            return true
+        }
+        if flags == [.command, .shift], key == "t", canReopenClosedPinProvider?() == true {
+            onReopenClosedPin?()
             return true
         }
         if flags == [.command, .shift], key == "0" || key == ")" {
@@ -728,9 +828,91 @@ public final class PinPanel: NSPanel, NSWindowDelegate {
         closeHandler?(self)
     }
 
+    fileprivate static func isQuestionMarkKeyEvent(_ event: NSEvent) -> Bool {
+        let disallowed = event.modifierFlags
+            .intersection(.deviceIndependentFlagsMask)
+            .intersection([.command, .control, .option])
+        guard disallowed.isEmpty else { return false }
+        if event.characters == "?" { return true }
+        return event.modifierFlags.contains(.shift) && event.charactersIgnoringModifiers == "/"
+    }
+
+    public func toggleCheatSheet() {
+        if cheatSheetPanel != nil {
+            dismissCheatSheet()
+        } else {
+            presentCheatSheet()
+        }
+    }
+
+    public func dismissCheatSheet() {
+        guard let panel = cheatSheetPanel else { return }
+        cheatSheetPanel = nil
+        removeChildWindow(panel)
+        panel.close()
+    }
+
+    private func presentCheatSheet() {
+        guard cheatSheetPanel == nil, !didClose else { return }
+        let hudView = ShortcutCheatSheetView(entries: ShortcutCheatSheetView.pinWindowEntries)
+        hudView.translatesAutoresizingMaskIntoConstraints = false
+
+        let wrapper = NSView()
+        wrapper.wantsLayer = true
+        wrapper.addSubview(hudView)
+        NSLayoutConstraint.activate([
+            hudView.leadingAnchor.constraint(equalTo: wrapper.leadingAnchor),
+            hudView.trailingAnchor.constraint(equalTo: wrapper.trailingAnchor),
+            hudView.topAnchor.constraint(equalTo: wrapper.topAnchor),
+            hudView.bottomAnchor.constraint(equalTo: wrapper.bottomAnchor),
+        ])
+        wrapper.layoutSubtreeIfNeeded()
+        let size = wrapper.fittingSize
+
+        let visibleBounds = NSScreen.screens
+            .first(where: { $0.visibleFrame.intersects(frame) })?.visibleFrame
+            ?? NSScreen.main?.visibleFrame
+            ?? CGRect(x: 0, y: 0, width: 1440, height: 900)
+        var origin = CGPoint(
+            x: frame.midX - size.width / 2,
+            y: frame.midY - size.height / 2
+        )
+        let minX = visibleBounds.minX + 8
+        let maxX = max(minX, visibleBounds.maxX - size.width - 8)
+        let minY = visibleBounds.minY + 8
+        let maxY = max(minY, visibleBounds.maxY - size.height - 8)
+        origin.x = min(max(origin.x, minX), maxX)
+        origin.y = min(max(origin.y, minY), maxY)
+
+        let child = NSPanel(
+            contentRect: CGRect(origin: origin, size: size),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        child.isFloatingPanel = true
+        child.hidesOnDeactivate = false
+        child.level = .popUpMenu
+        child.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle, .transient]
+        child.isOpaque = false
+        child.backgroundColor = .clear
+        child.hasShadow = true
+        child.ignoresMouseEvents = true
+        child.isReleasedWhenClosed = false
+        child.contentView = wrapper
+        child.setContentSize(size)
+        addChildWindow(child, ordered: .above)
+        child.orderFrontRegardless()
+        cheatSheetPanel = child
+    }
+
     private func prepareCloseTeardown() -> ((PinPanel) -> Void)? {
         guard !didClose else { return nil }
         didClose = true
+        dismissCheatSheet()
+        if isTextSelectionActive {
+            isTextSelectionActive = false
+        }
         shadowInvalidationTask?.cancel()
         shadowInvalidationTask = nil
         if let controller = annotationController {
@@ -745,6 +927,7 @@ public final class PinPanel: NSPanel, NSWindowDelegate {
         let closeHandler = onClose
         onClose = nil
         onCopy = nil
+        onCopyText = nil
         onSave = nil
         onQuickSave = nil
         onDuplicate = nil
@@ -754,6 +937,8 @@ public final class PinPanel: NSPanel, NSWindowDelegate {
         onCloseAll = nil
         onUnlockAllClickThrough = nil
         clickThroughCountProvider = nil
+        onReopenClosedPin = nil
+        canReopenClosedPinProvider = nil
         onStateChanged = nil
         onToolbarWillOpen = nil
         onAnnotationStyleChanged = nil
@@ -778,7 +963,21 @@ public final class PinPanel: NSPanel, NSWindowDelegate {
             menu.addItem(toolbarItem)
             menu.addItem(.separator())
         }
-        menu.addItem(menuItem(CCXL10n.text("Copy", zh: "拷贝"), #selector(copyPin(_:)), key: "c", symbol: "doc.on.doc"))
+        let hasTextSelection = isTextSelectionActive && (pinView.textSelectionViewForTesting?.selectedRange().length ?? 0) > 0
+        if hasTextSelection {
+            menu.addItem(menuItem(
+                CCXL10n.text("Copy Selection", zh: "拷贝选中文本"),
+                #selector(copySelectedTextFromMenu(_:)),
+                key: "c",
+                symbol: "doc.on.doc"
+            ))
+        }
+        menu.addItem(menuItem(
+            CCXL10n.text("Copy", zh: "拷贝"),
+            #selector(copyPin(_:)),
+            key: hasTextSelection ? "" : "c",
+            symbol: "doc.on.doc"
+        ))
         switch content {
         case .image:
             let ocrItem = menuItem(
@@ -794,7 +993,17 @@ public final class PinPanel: NSPanel, NSWindowDelegate {
             menu.addItem(menuItem(CCXL10n.text("Copy RGB", zh: "拷贝 RGB"), #selector(copyRGBColor(_:)), symbol: "paintpalette"))
             menu.addItem(menuItem(CCXL10n.text("Copy HSL", zh: "拷贝 HSL"), #selector(copyHSLColor(_:)), symbol: "dial.medium"))
         case .text:
-            break
+            let selectItem = menuItem(
+                isTextSelectionActive
+                    ? CCXL10n.text("Done Selecting", zh: "完成选择")
+                    : CCXL10n.text("Select Text", zh: "选择文本"),
+                #selector(toggleTextSelectionFromMenu(_:)),
+                key: "e",
+                symbol: isTextSelectionActive ? "checkmark.circle" : "text.cursor"
+            )
+            selectItem.keyEquivalentModifierMask = []
+            selectItem.isEnabled = !state.isThumbnail && !state.isClickThrough
+            menu.addItem(selectItem)
         }
         menu.addItem(menuItem(CCXL10n.text("Save PNG", zh: "保存 PNG"), #selector(savePin(_:)), key: "s", symbol: "square.and.arrow.down"))
         let quickSave = menuItem(CCXL10n.text("Quick Save PNG", zh: "快速保存 PNG"), #selector(quickSavePin(_:)), key: "s", symbol: "arrow.down.circle")
@@ -870,6 +1079,16 @@ public final class PinPanel: NSPanel, NSWindowDelegate {
         menu.addItem(showShadow)
         menu.addItem(.separator())
         menu.addItem(menuItem(CCXL10n.text("Close Pin", zh: "关闭贴图"), #selector(closePin(_:)), key: "w", symbol: "xmark.circle"))
+        if canReopenClosedPinProvider?() == true {
+            let reopenItem = menuItem(
+                CCXL10n.text("Reopen Closed Pin", zh: "恢复刚关闭的贴图"),
+                #selector(reopenClosedPinFromMenu(_:)),
+                key: "t",
+                symbol: "arrow.uturn.backward.circle"
+            )
+            reopenItem.keyEquivalentModifierMask = [.command, .shift]
+            menu.addItem(reopenItem)
+        }
         let clickThroughCount = clickThroughCountProvider?() ?? 0
         if clickThroughCount > 0 {
             menu.addItem(menuItem(
@@ -907,6 +1126,26 @@ public final class PinPanel: NSPanel, NSWindowDelegate {
     @objc func savePin(_ sender: Any?) { onSave?(self) }
     @objc func quickSavePin(_ sender: Any?) { onQuickSave?(self) }
     @objc func duplicatePin(_ sender: Any?) { onDuplicate?(self) }
+    @objc func toggleTextSelectionFromMenu(_ sender: Any?) { setTextSelectionActive(!isTextSelectionActive) }
+    @objc func copySelectedTextFromMenu(_ sender: Any?) {
+        guard let textView = pinView.textSelectionViewForTesting, textView.selectedRange().length > 0 else { return }
+        copySelectedRange(from: textView)
+    }
+
+    private func copySelectedRange(from textView: NSTextView) {
+        let range = textView.selectedRange()
+        guard range.length > 0 else { return }
+        let nsText = textView.string as NSString
+        guard range.location + range.length <= nsText.length else { return }
+        let selected = nsText.substring(with: range)
+        if let onCopyText {
+            onCopyText(selected)
+        } else {
+            textView.copy(nil)
+        }
+        flashHUD(CCXL10n.text("Copied Selection", zh: "已拷贝选中文本"))
+    }
+    @objc func reopenClosedPinFromMenu(_ sender: Any?) { onReopenClosedPin?() }
     @objc func toggleAnnotationToolbarFromMenu(_ sender: Any?) {
         if isToolbarVisible {
             closeToolbar(commit: true)
@@ -1020,6 +1259,7 @@ final class PinContentView: NSView {
     weak var panel: PinPanel?
     var mouseLocationProvider: () -> CGPoint = { NSEvent.mouseLocation }
     var hoverToolbarButton: NSButton { hoverToolbarControl }
+    var textSelectionViewForTesting: NSTextView? { textSelectionTextView }
     var borderLayerForTesting: CALayer { borderLayer }
     var annotationOverlayViewForTesting: NSView { annotationOverlayView }
     var clickThroughBadgeForTesting: NSView { clickThroughBadge }
@@ -1030,6 +1270,8 @@ final class PinContentView: NSView {
     private let imageLayer = CALayer()
     private let borderLayer = CALayer()
     private let annotationOverlayView = PinAnnotationOverlayView(frame: .zero)
+    private var textSelectionScrollView: NSScrollView?
+    private var textSelectionTextView: PinSelectableTextView?
     private let hoverToolbarControl = PinHoverToolbarButton(frame: CGRect(
         x: 0,
         y: 0,
@@ -1131,6 +1373,9 @@ final class PinContentView: NSView {
         super.layout()
         if !annotationOverlayView.isHidden, annotationOverlayView.frame != bounds {
             annotationOverlayView.frame = bounds
+        }
+        if textSelectionScrollView != nil {
+            layoutTextSelectionView()
         }
         if panel?.isApplyingFrameProgrammatically != true {
             syncVisualState()
@@ -1315,6 +1560,9 @@ final class PinContentView: NSView {
             } else if isAnnotating {
                 borderLayer.borderWidth = 1.5
                 borderLayer.borderColor = NSColor.systemBlue.withAlphaComponent(0.92).cgColor
+            } else if panel.isTextSelectionActive {
+                borderLayer.borderWidth = 1.5
+                borderLayer.borderColor = NSColor.controlAccentColor.withAlphaComponent(0.75).cgColor
             } else if state.showsBorder && (state.isThumbnail || !hasTransparentCorners) {
                 // Suppress the resting 1pt rectangular border on transparent-corner images so
                 // WindowServer casts a crisp shadow matching the true rounded alpha silhouette.
@@ -1341,6 +1589,9 @@ final class PinContentView: NSView {
         }
 
         CATransaction.commit()
+        if textSelectionScrollView != nil {
+            layoutTextSelectionView()
+        }
         positionHoverToolbarButton()
         updateHoverToolbarButtonVisibility()
         updateClickThroughBadge()
@@ -1399,6 +1650,7 @@ final class PinContentView: NSView {
         if panel.state.isClickThrough { qualifiers.append(CCXL10n.text("click-through", zh: "鼠标穿透")) }
         if panel.state.isThumbnail { qualifiers.append(CCXL10n.text("thumbnail", zh: "缩略图")) }
         if panel.activeAnnotationController != nil { qualifiers.append(CCXL10n.text("annotating", zh: "标注中")) }
+        if panel.isTextSelectionActive { qualifiers.append(CCXL10n.text("selecting text", zh: "文本选择中")) }
         let separator = CCXL10n.text(", ", zh: "，")
         let fullLabel = qualifiers.isEmpty ? baseLabel : "\(baseLabel)\(separator)\(qualifiers.joined(separator: separator))"
         if accessibilityLabel() != fullLabel {
@@ -1513,12 +1765,85 @@ final class PinContentView: NSView {
 
     func prepareForClose() {
         resetInteractionState()
+        unmountTextSelectionView()
         imageLayer.contents = nil
         annotationOverlayView.isHidden = true
         annotationOverlayView.frame = .zero
         annotationOverlayView.layer?.contents = nil
         cachedAttributedText = nil
         cachedTextAccessibilityPreview = nil
+    }
+
+    func mountTextSelectionView(text: String) {
+        unmountTextSelectionView()
+        let scrollView = NSScrollView(frame: bounds)
+        scrollView.drawsBackground = false
+        scrollView.backgroundColor = .clear
+        scrollView.borderType = .noBorder
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = false
+        scrollView.autohidesScrollers = true
+        scrollView.scrollerStyle = .overlay
+
+        let textView = PinSelectableTextView(frame: CGRect(origin: .zero, size: bounds.size))
+        textView.hostPanel = panel
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.drawsBackground = false
+        textView.backgroundColor = .clear
+        textView.isRichText = false
+        textView.allowsUndo = false
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = false
+        textView.autoresizingMask = [.width]
+        textView.textContainer?.lineFragmentPadding = 0
+        textView.textContainer?.widthTracksTextView = true
+        textView.string = text
+        textView.textColor = .textColor
+
+        scrollView.documentView = textView
+        addSubview(scrollView, positioned: .below, relativeTo: clickThroughBadge)
+        self.textSelectionScrollView = scrollView
+        self.textSelectionTextView = textView
+        layoutTextSelectionView()
+    }
+
+    func unmountTextSelectionView() {
+        textSelectionTextView?.hostPanel = nil
+        textSelectionTextView = nil
+        textSelectionScrollView?.removeFromSuperview()
+        textSelectionScrollView = nil
+    }
+
+    private func layoutTextSelectionView() {
+        guard let panel,
+              let scrollView = textSelectionScrollView,
+              let textView = textSelectionTextView
+        else { return }
+        if scrollView.frame != bounds {
+            scrollView.frame = bounds
+        }
+        let zoom = PinLayout.effectiveZoom(for: panel.baseSize, state: panel.state)
+        let inset = PinLayout.textPadding * zoom
+        let fontSize = max(6, 14 * zoom)
+        if let currentFont = textView.font, abs(currentFont.pointSize - fontSize) > 0.05 {
+            textView.font = .systemFont(ofSize: fontSize)
+        } else if textView.font == nil {
+            textView.font = .systemFont(ofSize: fontSize)
+        }
+        textView.textColor = .textColor
+        let desiredInset = NSSize(width: inset, height: inset)
+        if textView.textContainerInset != desiredInset {
+            textView.textContainerInset = desiredInset
+        }
+        let contentWidth = max(1, bounds.width)
+        textView.minSize = NSSize(width: contentWidth, height: max(1, bounds.height))
+        textView.maxSize = NSSize(width: contentWidth, height: .greatestFiniteMagnitude)
+        textView.frame = CGRect(x: 0, y: 0, width: contentWidth, height: max(1, bounds.height))
+        textView.sizeToFit()
+        if textView.frame.height < bounds.height {
+            textView.frame = CGRect(x: 0, y: 0, width: contentWidth, height: bounds.height)
+        }
     }
 
     private var canShowHoverToolbarButton: Bool {
@@ -1843,11 +2168,16 @@ final class PinContentView: NSView {
         context.scaleBy(x: unrotated.width / base.width, y: unrotated.height / base.height)
         let rect = CGRect(x: -base.width / 2, y: -base.height / 2, width: base.width, height: base.height)
         let cachedText: NSAttributedString? = if case let .text(string) = panel.content {
-            attributedText(for: string)
+            panel.isTextSelectionActive ? nil : attributedText(for: string)
         } else {
             nil
         }
-        PinRenderer.draw(panel.content, in: rect, zoom: state.zoom, context: context, cachedAttributedText: cachedText)
+        if panel.isTextSelectionActive, case .text = panel.content {
+            NSColor.textBackgroundColor.setFill()
+            rect.fill()
+        } else {
+            PinRenderer.draw(panel.content, in: rect, zoom: state.zoom, context: context, cachedAttributedText: cachedText)
+        }
         context.restoreGState()
     }
 
@@ -2180,5 +2510,34 @@ private final class PinHUDView: NSView {
             width: width,
             height: label.frame.height
         )
+    }
+}
+
+/// Read-only selectable text view mounted over `.text` pins during text selection mode.
+private final class PinSelectableTextView: NSTextView {
+    weak var hostPanel: PinPanel?
+
+    override func cancelOperation(_ sender: Any?) {
+        if let hostPanel {
+            hostPanel.cancelOperation(sender)
+        }
+    }
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        hostPanel?.makeContextMenu()
+    }
+
+    override func keyDown(with event: NSEvent) {
+        let flags = event.modifierFlags
+            .intersection(.deviceIndependentFlagsMask)
+            .subtracting([.capsLock, .numericPad, .function])
+        let char = event.charactersIgnoringModifiers?.lowercased() ?? ""
+        if event.keyCode == 53
+            || PinPanel.isQuestionMarkKeyEvent(event)
+            || (!flags.contains(.command) && !flags.contains(.control) && !flags.contains(.option) && !flags.contains(.shift) && (char == "e" || char == "t")) {
+            hostPanel?.keyDown(with: event)
+            return
+        }
+        super.keyDown(with: event)
     }
 }

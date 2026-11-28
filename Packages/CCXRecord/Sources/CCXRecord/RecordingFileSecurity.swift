@@ -92,7 +92,8 @@ enum RecordingFileSecurity {
         }
     }
 
-    /// Opens the parent directory of `url` and extracts its validated leaf filename.
+    /// Opens the parent directory of `url` and extracts its validated leaf filename, rejecting
+    /// symlinks along the leaf path.
     private static func openParentDirectory(for url: URL) throws -> (parentFD: Int32, fileName: String) {
         guard url.isFileURL, !url.path.isEmpty else {
             throw RecordingError.writerInitializationFailed(
@@ -188,6 +189,27 @@ enum RecordingFileSecurity {
         }
         defer { Darwin.close(fd) }
         _ = fchmod(fd, 0o600)
+    }
+
+    /// Atomically creates a private `0600` read/write spool file at `url` (replacing any stale
+    /// regular file at that path) and returns the open descriptor.
+    static func createRestrictedSpoolFile(at url: URL) throws -> Int32 {
+        try validateOutputURLForWriting(url)
+        let (parentFD, fileName) = try openParentDirectory(for: url)
+        defer { Darwin.close(parentFD) }
+
+        let fd = openat(parentFD, fileName, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        guard fd >= 0 else {
+            let reason = String(cString: strerror(errno))
+            throw RecordingError.writerInitializationFailed(
+                CCXL10n.text(
+                    "Could not create recording spool file: \(reason)",
+                    zh: "无法创建录屏缓存文件：\(reason)"
+                )
+            )
+        }
+        _ = fchmod(fd, 0o600)
+        return fd
     }
 
     /// Re-validates `url` immediately before encoder finalization so a symlink or foreign file
@@ -315,8 +337,15 @@ enum RecordingFileSecurity {
                 guard let base = bound.baseAddress else { return "" }
                 return String(cString: base)
             }
-            guard name.hasPrefix(stagedFilePrefix) else { continue }
-            guard !activeNames.contains(name) else { continue }
+            let activeLookupName: String
+            if name.hasPrefix(stagedFilePrefix) {
+                activeLookupName = name
+            } else if name.hasPrefix(".\(stagedFilePrefix)"), name.hasSuffix(".spool") {
+                activeLookupName = String(name.dropFirst().dropLast(".spool".count))
+            } else {
+                continue
+            }
+            guard !activeNames.contains(activeLookupName) else { continue }
 
             var itemStat = stat()
             guard fstatat(dirFD, name, &itemStat, AT_SYMLINK_NOFOLLOW) == 0,

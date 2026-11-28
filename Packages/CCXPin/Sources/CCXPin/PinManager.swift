@@ -21,11 +21,23 @@ public enum PinTileStatus: Equatable, Sendable {
 public final class PinManager {
     public static let maxActivePins = 64
 
+    private struct ClosedPinSnapshot {
+        let content: PinContent
+        let frame: CGRect
+        let state: PinState
+        let contentIdentity: PinContentIdentity
+    }
+
+    public static let maxClosedPinHistory = 5
+
     public private(set) var panels: [PinPanel] = []
     public private(set) var arePinsHidden = false
     public private(set) var lastAnnotationStyle = AnnotationStyle()
+    private var closedPins: [ClosedPinSnapshot] = []
 
     public var pinCount: Int { panels.count }
+    public var closedPinCount: Int { closedPins.count }
+    public var canReopenClosedPin: Bool { !closedPins.isEmpty }
     public var clickThroughPinCount: Int {
         panels.reduce(0) { $0 + ($1.state.isClickThrough ? 1 : 0) }
     }
@@ -33,6 +45,8 @@ public final class PinManager {
 
     /// Called whenever pins are added, removed, hidden/shown, or change state.
     public var onPinsChanged: (() -> Void)?
+    /// Called whenever the recently-closed pin ring buffer changes.
+    public var onClosedPinHistoryChanged: (() -> Void)?
     /// Called when the user asks to save a pin (Cmd+S or "Save PNG"); the host shows the
     /// save panel and typically calls `ClipboardStore.savePNG(_:to:)`.
     public var onRequestSavePNG: ((CGImage) -> Void)?
@@ -134,6 +148,7 @@ public final class PinManager {
     private func attachHandlers(to panel: PinPanel) {
         panel.onClose = { [weak self] panel in self?.panelDidClose(panel) }
         panel.onCopy = { [weak self] panel in self?.copy(panel) }
+        panel.onCopyText = { [weak self] text in self?.clipboardStore.copyText(text) }
         panel.onSave = { [weak self] panel in self?.save(panel) }
         panel.onQuickSave = { [weak self] panel in self?.quickSave(panel) }
         panel.onDuplicate = { [weak self] panel in self?.duplicate(panel) }
@@ -145,6 +160,8 @@ public final class PinManager {
         panel.onCloseAll = { [weak self] in self?.closeAllPins() }
         panel.onUnlockAllClickThrough = { [weak self] in self?.disableClickThroughForAllPins() }
         panel.clickThroughCountProvider = { [weak self] in self?.clickThroughPinCount ?? 0 }
+        panel.onReopenClosedPin = { [weak self] in _ = self?.reopenLastClosedPin() }
+        panel.canReopenClosedPinProvider = { [weak self] in self?.canReopenClosedPin ?? false }
         panel.onStateChanged = { [weak self] _ in
             guard let self, !self.isBatchUpdatingState else { return }
             self.onPinsChanged?()
@@ -176,35 +193,52 @@ public final class PinManager {
     /// Pins the next unpinned item in newest-to-oldest order across recent snips and the
     /// clipboard without creating duplicate pins for the same image/content.
     public func pinNextAvailable() -> PinNextOutcome {
-        let historyCandidates: [(content: PinContent, identity: PinContentIdentity)] = clipboardStore.history.map { entry in
-            (.image(entry.image, scale: entry.scale), entry.pinIdentity)
+        enum LazyCandidate {
+            case history(SnipHistoryEntry)
+            case clipboard(content: PinContent, identity: PinContentIdentity)
+
+            var identity: PinContentIdentity {
+                switch self {
+                case let .history(entry): entry.pinIdentity
+                case let .clipboard(_, identity): identity
+                }
+            }
+
+            func resolveContent() -> PinContent {
+                switch self {
+                case let .history(entry): .image(entry.image, scale: entry.scale)
+                case let .clipboard(content, _): content
+                }
+            }
         }
 
+        let historyCandidates: [LazyCandidate] = clipboardStore.history.map { .history($0) }
+
         // Fast path: when history takes priority over clipboard, avoid decoding large clipboard
-        // payloads if an unpinned history entry is already available.
+        // or disk-backed PNG payloads unless an unpinned candidate is actually chosen.
         if !clipboardStore.hasClipboardChangedSinceLatestSnip {
             for candidate in historyCandidates where !isPinned(candidate.identity) {
-                if pin(content: candidate.content, at: nil, contentIdentity: candidate.identity) {
+                if pin(content: candidate.resolveContent(), at: nil, contentIdentity: candidate.identity) {
                     return .pinned
                 }
             }
         }
 
-        var clipboardCandidate: (content: PinContent, identity: PinContentIdentity)?
+        var clipboardCandidate: LazyCandidate?
         if let resolved = clipboardStore.readPinPayloadWithIdentity() {
             let content: PinContent = switch resolved.payload {
             case let .image(image, scale): .image(image, scale: scale)
             case let .color(color): .color(color)
             case let .text(text): .text(text)
             }
-            clipboardCandidate = (content, resolved.identity)
+            clipboardCandidate = .clipboard(content: content, identity: resolved.identity)
         }
 
         let matchesHistory = clipboardCandidate.map { clip in
             clipboardStore.history.contains { $0.pinIdentity.matches(clip.identity) }
         } ?? false
 
-        var candidates: [(content: PinContent, identity: PinContentIdentity)] = []
+        var candidates: [LazyCandidate] = []
         if let clipboardCandidate, !matchesHistory {
             if clipboardStore.hasClipboardChangedSinceLatestSnip {
                 candidates.append(clipboardCandidate)
@@ -220,7 +254,7 @@ public final class PinManager {
         guard !candidates.isEmpty else { return .nothingAvailable }
 
         for candidate in candidates where !isPinned(candidate.identity) {
-            if pin(content: candidate.content, at: nil, contentIdentity: candidate.identity) {
+            if pin(content: candidate.resolveContent(), at: nil, contentIdentity: candidate.identity) {
                 return .pinned
             }
         }
@@ -301,11 +335,64 @@ public final class PinManager {
     public func closeAllPins() {
         let closing = panels
         panels.removeAll()
+        var recordedAny = false
         for panel in closing {
+            if recordClosedSnapshot(from: panel) {
+                recordedAny = true
+            }
             panel.onClose = nil
             panel.close()
         }
         arePinsHidden = false
+        if recordedAny {
+            onClosedPinHistoryChanged?()
+        }
+        onPinsChanged?()
+    }
+
+    /// Reopens the most recently closed pin from the 5-item FIFO history buffer,
+    /// clamping its restored frame onto active visible screens and clearing click-through.
+    @discardableResult
+    public func reopenLastClosedPin() -> Bool {
+        guard panels.count < Self.maxActivePins else { return false }
+        let screens = NSScreen.screens.map(\.visibleFrame)
+        var droppedInvalid = false
+        while let snapshot = closedPins.popLast() {
+            guard let safeContent = Self.sanitize(snapshot.content) else {
+                droppedInvalid = true
+                continue
+            }
+            var restoredState = snapshot.state
+            restoredState.isClickThrough = false
+            let clampedFrame = screens.isEmpty
+                ? snapshot.frame
+                : PinLayout.clampedOriginToScreens(
+                    snapshot.frame,
+                    screens: screens,
+                    keepFullyVisible: restoredState.isThumbnail
+                )
+            let panel = PinPanel(
+                content: safeContent,
+                frame: clampedFrame,
+                state: restoredState,
+                contentIdentity: snapshot.contentIdentity
+            )
+            attachHandlers(to: panel)
+            presentNewPanel(panel)
+            onClosedPinHistoryChanged?()
+            return true
+        }
+        if droppedInvalid {
+            onClosedPinHistoryChanged?()
+        }
+        return false
+    }
+
+    /// Clears all snapshots stored for reopening closed pins.
+    public func clearClosedPinHistory() {
+        guard !closedPins.isEmpty else { return }
+        closedPins.removeAll()
+        onClosedPinHistoryChanged?()
         onPinsChanged?()
     }
 
@@ -338,9 +425,31 @@ public final class PinManager {
         }
     }
 
+    @discardableResult
+    private func recordClosedSnapshot(from panel: PinPanel) -> Bool {
+        guard let safeContent = Self.sanitize(panel.content) else { return false }
+        var savedState = panel.state
+        savedState.isClickThrough = false
+        let snapshot = ClosedPinSnapshot(
+            content: safeContent,
+            frame: panel.frame,
+            state: savedState,
+            contentIdentity: panel.contentIdentity
+        )
+        closedPins.append(snapshot)
+        if closedPins.count > Self.maxClosedPinHistory {
+            closedPins.removeFirst(closedPins.count - Self.maxClosedPinHistory)
+        }
+        return true
+    }
+
     private func panelDidClose(_ panel: PinPanel) {
+        let recorded = recordClosedSnapshot(from: panel)
         panels.removeAll { $0 === panel }
         if panels.isEmpty { arePinsHidden = false }
+        if recorded {
+            onClosedPinHistoryChanged?()
+        }
         onPinsChanged?()
     }
 

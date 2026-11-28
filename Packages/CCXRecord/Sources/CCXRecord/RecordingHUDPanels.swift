@@ -65,6 +65,9 @@ final class RecordingBorderPanel: NSPanel {
         setFrame(region.displayFrame, display: true)
     }
 
+    var isCountdownBadgeVisible: Bool { borderView.isCountdownBadgeVisible }
+    var countdownBadgeText: String { borderView.countdownBadgeText }
+
     func update(phase: RecordingPhase, region: RecordingRegion, settings: RecordingSettings) {
         if case .ready = phase, !lockedForCapture {
             isInteractive = true
@@ -183,12 +186,16 @@ private final class RecordingBorderView: NSView {
     // Eight plain CALayer squares render the resize handles with zero backing-store allocation.
     private let handleLayers: [CALayer] = (0..<RecordingResizeHandle.allCases.count).map { _ in CALayer() }
     private let sizeLabel = NonInteractiveBorderLabel(labelWithString: "")
+    private let countdownBadgeView = NSView()
+    private let countdownBadgeLabel = NonInteractiveBorderLabel(labelWithString: "")
 
     var isActivelyAdjusting: Bool { isInteractive && adjuster.isInteracting }
     var isRedrawing: Bool { isInteractive && adjuster.isRedrawing }
     var isSizeLabelHidden: Bool { sizeLabel.isHidden }
     var sizeLabelText: String { sizeLabel.stringValue }
     var sizeLabelCornerCurve: CALayerCornerCurve? { sizeLabel.layer?.cornerCurve }
+    var isCountdownBadgeVisible: Bool { !countdownBadgeView.isHidden }
+    var countdownBadgeText: String { countdownBadgeLabel.stringValue }
     var hasActiveShapeLayerBacking: Bool {
         dashedEdges.contains { !$0.isHidden || $0.path != nil }
     }
@@ -519,6 +526,21 @@ private final class RecordingBorderView: NSView {
         sizeLabel.layer?.zPosition = 10
         sizeLabel.isHidden = true
         addSubview(sizeLabel)
+
+        countdownBadgeView.wantsLayer = true
+        countdownBadgeView.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.72).cgColor
+        countdownBadgeView.layer?.cornerRadius = 18
+        countdownBadgeView.layer?.cornerCurve = .continuous
+        countdownBadgeView.layer?.borderWidth = 0.75
+        countdownBadgeView.layer?.borderColor = NSColor.white.withAlphaComponent(0.22).cgColor
+        countdownBadgeView.layer?.zPosition = 12
+        countdownBadgeView.isHidden = true
+        countdownBadgeLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 38, weight: .bold)
+        countdownBadgeLabel.textColor = .white
+        countdownBadgeLabel.alignment = .center
+        countdownBadgeLabel.drawsBackground = false
+        countdownBadgeView.addSubview(countdownBadgeLabel)
+        addSubview(countdownBadgeView)
     }
 
     private func syncLayerBounds() {
@@ -593,6 +615,7 @@ private final class RecordingBorderView: NSView {
             sizeLabel.isHidden = true
 
             if case .ready = phase {
+                countdownBadgeView.isHidden = true
                 captureBorderLayer.isHidden = true
                 let strokeRect = bounds.insetBy(dx: 2, dy: 2)
                 updateDashedEdges(around: strokeRect, lineWidth: 2.5)
@@ -613,19 +636,47 @@ private final class RecordingBorderView: NSView {
 
             switch phase {
             case .ready:
-                break
+                countdownBadgeView.isHidden = true
+            case .countdown(let remaining):
+                captureBorderLayer.borderColor = NSColor.systemYellow.withAlphaComponent(0.92).cgColor
+                let minSide = min(bounds.width, bounds.height)
+                if minSide >= 48 {
+                    let badgeSide = min(72, max(36, floor(minSide * 0.55)))
+                    let fontSize = max(18, floor(badgeSide * 0.54))
+                    countdownBadgeLabel.font = NSFont.monospacedDigitSystemFont(ofSize: fontSize, weight: .bold)
+                    countdownBadgeLabel.stringValue = "\(max(1, remaining))"
+                    countdownBadgeLabel.sizeToFit()
+                    let origin = CGPoint(x: (bounds.width - badgeSide) / 2, y: (bounds.height - badgeSide) / 2)
+                    countdownBadgeView.frame = CGRect(origin: origin, size: CGSize(width: badgeSide, height: badgeSide))
+                    countdownBadgeView.layer?.cornerRadius = min(18, badgeSide * 0.25)
+                    let labelSize = countdownBadgeLabel.bounds.size
+                    countdownBadgeLabel.frame = CGRect(
+                        x: (badgeSide - labelSize.width) / 2,
+                        y: (badgeSide - labelSize.height) / 2,
+                        width: labelSize.width,
+                        height: labelSize.height
+                    )
+                    countdownBadgeView.isHidden = false
+                } else {
+                    countdownBadgeView.isHidden = true
+                }
             case .recording:
+                countdownBadgeView.isHidden = true
                 captureBorderLayer.borderColor = NSColor.systemRed.cgColor
             case .paused:
+                countdownBadgeView.isHidden = true
                 captureBorderLayer.borderColor = NSColor.systemOrange.cgColor
             case .finalizing:
+                countdownBadgeView.isHidden = true
                 captureBorderLayer.borderColor = NSColor.white.withAlphaComponent(0.75).cgColor
             case .completed:
+                countdownBadgeView.isHidden = true
                 captureBorderLayer.borderColor = NSColor.systemGreen.cgColor
             }
             return
         }
 
+        countdownBadgeView.isHidden = true
         captureBorderLayer.isHidden = true
         let rect = adjuster.activeRect
 
@@ -801,6 +852,7 @@ final class RecordingControlPanel: NSPanel, NSWindowDelegate {
 
     private let contentContainer = ArrowCursorContainerView(frame: .zero)
     private let readyRow = NSStackView()
+    private let countdownRow = NSStackView()
     private let recordingRow = NSStackView()
     private let finalizingRow = NSStackView()
     private let completedRow = NSStackView()
@@ -823,10 +875,19 @@ final class RecordingControlPanel: NSPanel, NSWindowDelegate {
         inactiveSymbol: "cursorarrow",
         activeTint: .white
     )
+    private let countdownButton = HUDIconToggleButton(
+        activeSymbol: "timer",
+        inactiveSymbol: "timer",
+        activeTint: .systemYellow
+    )
+
+    private let countdownDot = NSView()
+    private let countdownLabel = NSTextField(labelWithString: "")
 
     private let statusDot = NSView()
     private let timerLabel = NSTextField(labelWithString: "00:00")
     private let recordingBadgeLabel = NSTextField(labelWithString: "")
+    private let micLevelMeter = MicLevelMeterView()
     private let pauseResumeButton = HUDIconToggleButton(
         activeSymbol: "pause.fill",
         inactiveSymbol: "pause.fill",
@@ -843,9 +904,13 @@ final class RecordingControlPanel: NSPanel, NSWindowDelegate {
     }
 
     var isReadyContainerVisible: Bool { activeRow === readyRow }
+    var isCountdownContainerVisible: Bool { activeRow === countdownRow }
     var isRecordingContainerVisible: Bool { activeRow === recordingRow }
     var isFinalizingContainerVisible: Bool { activeRow === finalizingRow }
     var isCompletedContainerVisible: Bool { activeRow === completedRow }
+    var countdownTextForTesting: String { countdownLabel.stringValue }
+    var isMicLevelMeterVisible: Bool { !micLevelMeter.isHidden && activeRow === recordingRow }
+    var micLevelForTesting: Float { micLevelMeter.level }
     var timerText: String { timerLabel.stringValue }
     var summaryText: String { summaryLabel.stringValue }
     var summaryToolTipForTesting: String? { summaryLabel.toolTip }
@@ -933,6 +998,7 @@ final class RecordingControlPanel: NSPanel, NSWindowDelegate {
     func tearDown() {
         stopRecordingPulse()
         spinner.stopAnimation(nil)
+        micLevelMeter.setLevel(0)
         delegate = nil
         onSettingsChanged = nil
         onStart = nil
@@ -965,6 +1031,14 @@ final class RecordingControlPanel: NSPanel, NSWindowDelegate {
         }
     }
 
+    func updateMicrophoneLevel(_ level: Float) {
+        guard renderedPhase == .recording, settings.effectiveMicrophone else {
+            micLevelMeter.setLevel(0)
+            return
+        }
+        micLevelMeter.setLevel(level)
+    }
+
     func update(phase: RecordingPhase, settings: RecordingSettings, elapsedSeconds: TimeInterval) {
         self.settings = settings
         let phaseChanged = renderedPhase != phase
@@ -972,7 +1046,7 @@ final class RecordingControlPanel: NSPanel, NSWindowDelegate {
             switch phase {
             case .recording, .paused:
                 updateElapsedSeconds(elapsedSeconds)
-            case .ready, .finalizing, .completed:
+            case .ready, .countdown, .finalizing, .completed:
                 break
             }
             return
@@ -1013,8 +1087,22 @@ final class RecordingControlPanel: NSPanel, NSWindowDelegate {
             cursorButton.toolTip = settings.showsCursor
                 ? CCXL10n.text("Mouse Cursor: Shown", zh: "鼠标指针：显示")
                 : CCXL10n.text("Mouse Cursor: Hidden", zh: "鼠标指针：隐藏")
+
+            countdownButton.isActive = settings.countdownSeconds > 0
+            countdownButton.toolTip = settings.countdownSeconds > 0
+                ? CCXL10n.text("Countdown: 3s", zh: "倒计时：3 秒")
+                : CCXL10n.text("Countdown: Off", zh: "倒计时：关闭")
+            micLevelMeter.setLevel(0)
             stopRecordingPulse()
             spinner.stopAnimation(nil)
+
+        case .countdown(let remaining):
+            mountActiveRow(countdownRow)
+            stopRecordingPulse()
+            spinner.stopAnimation(nil)
+            micLevelMeter.setLevel(0)
+            let secs = max(1, remaining)
+            countdownLabel.stringValue = CCXL10n.text("Starting in \(secs)…", zh: "\(secs) 秒后开始…")
 
         case .recording:
             mountActiveRow(recordingRow)
@@ -1025,6 +1113,10 @@ final class RecordingControlPanel: NSPanel, NSWindowDelegate {
             timerLabel.stringValue = formatted
             recordingBadgeLabel.stringValue = badgeSummary(for: settings, paused: false)
             recordingBadgeLabel.textColor = NSColor.white.withAlphaComponent(0.76)
+            micLevelMeter.isHidden = !settings.effectiveMicrophone
+            if !settings.effectiveMicrophone {
+                micLevelMeter.setLevel(0)
+            }
             pauseResumeButton.configure(
                 symbol: "pause.fill",
                 tint: .white,
@@ -1042,6 +1134,8 @@ final class RecordingControlPanel: NSPanel, NSWindowDelegate {
             timerLabel.stringValue = formatted
             recordingBadgeLabel.stringValue = badgeSummary(for: settings, paused: true)
             recordingBadgeLabel.textColor = NSColor.systemOrange
+            micLevelMeter.isHidden = !settings.effectiveMicrophone
+            micLevelMeter.setLevel(0)
             pauseResumeButton.configure(
                 symbol: "play.fill",
                 tint: .systemCyan,
@@ -1053,6 +1147,7 @@ final class RecordingControlPanel: NSPanel, NSWindowDelegate {
         case .finalizing:
             mountActiveRow(finalizingRow)
             stopRecordingPulse()
+            micLevelMeter.setLevel(0)
             finalizingLabel.stringValue = settings.format == .gif
                 ? CCXL10n.text("Encoding GIF...", zh: "正在生成 GIF…")
                 : CCXL10n.text("Saving \(settings.format.label)...", zh: "正在保存 \(settings.format.label)…")
@@ -1061,6 +1156,7 @@ final class RecordingControlPanel: NSPanel, NSWindowDelegate {
         case .completed(let result):
             mountActiveRow(completedRow)
             stopRecordingPulse()
+            micLevelMeter.setLevel(0)
             summaryLabel.stringValue = "\(result.format.label) · \(result.formattedDuration) · \(result.formattedFileSize)"
             let pxW = max(1, Int(result.pixelSize.width.rounded()))
             let pxH = max(1, Int(result.pixelSize.height.rounded()))
@@ -1144,6 +1240,13 @@ final class RecordingControlPanel: NSPanel, NSWindowDelegate {
         onSettingsChanged?(updated)
     }
 
+    func toggleCountdown() {
+        var updated = settings
+        updated.countdownSeconds = (updated.countdownSeconds == 3) ? 0 : 3
+        settings = updated
+        onSettingsChanged?(updated)
+    }
+
     private func badgeSummary(for settings: RecordingSettings, paused: Bool) -> String {
         if paused {
             return CCXL10n.text("\(settings.format.label) · Paused", zh: "\(settings.format.label) · 已暂停")
@@ -1166,6 +1269,7 @@ final class RecordingControlPanel: NSPanel, NSWindowDelegate {
 
     private func buildHierarchy() {
         buildReadyRow()
+        buildCountdownRow()
         buildRecordingRow()
         buildFinalizingRow()
         buildCompletedRow()
@@ -1232,8 +1336,9 @@ final class RecordingControlPanel: NSPanel, NSWindowDelegate {
         systemAudioButton.onTap = { [weak self] in self?.toggleSystemAudio() }
         micButton.onTap = { [weak self] in self?.toggleMicrophone() }
         cursorButton.onTap = { [weak self] in self?.toggleCursor() }
+        countdownButton.onTap = { [weak self] in self?.toggleCountdown() }
 
-        let audioTogglesStack = NSStackView(views: [systemAudioButton, micButton, cursorButton])
+        let audioTogglesStack = NSStackView(views: [systemAudioButton, micButton, cursorButton, countdownButton])
         audioTogglesStack.orientation = .horizontal
         audioTogglesStack.alignment = .centerY
         audioTogglesStack.spacing = 4
@@ -1258,6 +1363,35 @@ final class RecordingControlPanel: NSPanel, NSWindowDelegate {
         readyRow.addArrangedSubview(Self.makeDivider())
         readyRow.addArrangedSubview(startButton)
         readyRow.addArrangedSubview(cancelButton)
+    }
+
+    private func buildCountdownRow() {
+        countdownRow.orientation = .horizontal
+        countdownRow.alignment = .centerY
+        countdownRow.spacing = 8
+        countdownRow.edgeInsets = NSEdgeInsets(top: 7, left: 14, bottom: 7, right: 10)
+
+        countdownDot.wantsLayer = true
+        countdownDot.layer?.cornerRadius = 4
+        countdownDot.layer?.backgroundColor = NSColor.systemYellow.cgColor
+        countdownDot.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            countdownDot.widthAnchor.constraint(equalToConstant: 8),
+            countdownDot.heightAnchor.constraint(equalToConstant: 8),
+        ])
+
+        countdownLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
+        countdownLabel.textColor = .white
+        countdownLabel.setContentHuggingPriority(.required, for: .horizontal)
+        countdownLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        let cancelButton = CloseIconButton(tooltip: CCXL10n.text("Cancel (Esc)", zh: "取消 (Esc)")) { [weak self] in
+            self?.onCancel?()
+        }
+
+        countdownRow.addArrangedSubview(countdownDot)
+        countdownRow.addArrangedSubview(countdownLabel)
+        countdownRow.addArrangedSubview(cancelButton)
     }
 
     private func buildRecordingRow() {
@@ -1306,6 +1440,7 @@ final class RecordingControlPanel: NSPanel, NSWindowDelegate {
 
         recordingRow.addArrangedSubview(statusDot)
         recordingRow.addArrangedSubview(infoStack)
+        recordingRow.addArrangedSubview(micLevelMeter)
         recordingRow.addArrangedSubview(Self.makeDivider())
         recordingRow.addArrangedSubview(pauseResumeButton)
         recordingRow.addArrangedSubview(stopButton)
@@ -1389,7 +1524,7 @@ final class RecordingControlPanel: NSPanel, NSWindowDelegate {
         let revealButton = HUDIconOnlyButton(symbol: "folder", tooltip: CCXL10n.text("Save & Reveal in Finder (⌘R)", zh: "保存并在访达中显示 (⌘R)")) { [weak self] in
             self?.onReveal?()
         }
-        let actionsStack = NSStackView(views: [copyButton, saveButton, revealButton])
+        let actionsStack = NSStackView(views: [saveButton, revealButton])
         actionsStack.orientation = .horizontal
         actionsStack.alignment = .centerY
         actionsStack.spacing = 4
@@ -1411,6 +1546,7 @@ final class RecordingControlPanel: NSPanel, NSWindowDelegate {
         completedRow.addArrangedSubview(Self.makeDivider())
         completedRow.addArrangedSubview(actionsStack)
         completedRow.addArrangedSubview(quickSaveButton)
+        completedRow.addArrangedSubview(copyButton)
         completedRow.addArrangedSubview(discardButton)
     }
 
@@ -2024,6 +2160,88 @@ private final class ArrowCursorContainerView: NSView {
 
     override func cursorUpdate(with event: NSEvent) {
         NSCursor.arrow.set()
+    }
+}
+
+@MainActor
+private final class MicLevelMeterView: NSView {
+    private static let barThresholds: [Float] = [0.10, 0.32, 0.58, 0.82]
+    private static let idleColor = NSColor.white.withAlphaComponent(0.22).cgColor
+    private static let activeColor = NSColor.systemGreen.cgColor
+    private static let peakColor = NSColor.systemYellow.cgColor
+
+    private var barLayers: [CALayer] = []
+    private(set) var level: Float = 0
+
+    override var intrinsicContentSize: NSSize { NSSize(width: 20, height: 16) }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        setContentHuggingPriority(.required, for: .horizontal)
+        setContentCompressionResistancePriority(.required, for: .horizontal)
+        NSLayoutConstraint.activate([
+            widthAnchor.constraint(equalToConstant: 20),
+            heightAnchor.constraint(equalToConstant: 16),
+        ])
+        for _ in 0..<4 {
+            let bar = CALayer()
+            bar.cornerRadius = 1.25
+            bar.backgroundColor = Self.idleColor
+            layer?.addSublayer(bar)
+            barLayers.append(bar)
+        }
+        updateBars()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    override func layout() {
+        super.layout()
+        updateBars()
+    }
+
+    func setLevel(_ newLevel: Float) {
+        let clamped = newLevel.isFinite ? min(max(newLevel, 0), 1) : 0
+        guard abs(clamped - level) >= 0.015 || (clamped == 0 && level != 0) else { return }
+        level = clamped
+        updateBars()
+    }
+
+    private func updateBars() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        defer { CATransaction.commit() }
+
+        let barWidth: CGFloat = 3
+        let spacing: CGFloat = 2
+        let startX: CGFloat = 1
+        let baseY: CGFloat = 2
+        let minHeight: CGFloat = 3
+        let maxHeight: CGFloat = max(4, bounds.height - 4)
+
+        for (index, bar) in barLayers.enumerated() {
+            let targetMaxHeight = minHeight + (maxHeight - minHeight) * (CGFloat(index + 1) / 4.0)
+            let threshold = Self.barThresholds[index]
+            let isLit = level >= threshold
+            let barHeight = isLit
+                ? max(minHeight, targetMaxHeight * CGFloat(min(1, max(0.35, level / max(0.01, threshold + 0.15)))))
+                : minHeight
+            bar.frame = CGRect(
+                x: startX + CGFloat(index) * (barWidth + spacing),
+                y: baseY,
+                width: barWidth,
+                height: min(targetMaxHeight, barHeight)
+            )
+            if !isLit {
+                bar.backgroundColor = Self.idleColor
+            } else if index == 3 && level >= 0.88 {
+                bar.backgroundColor = Self.peakColor
+            } else {
+                bar.backgroundColor = Self.activeColor
+            }
+        }
     }
 }
 

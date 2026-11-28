@@ -1282,7 +1282,20 @@ final class PinPanelAndManagerTests: XCTestCase {
             XCTAssertGreaterThan(panel.state.zoom, 1.05)
         }
 
-        // Ctrl+scroll adjusts opacity cleanly and flashes opacity readout even at floor/ceiling limits.
+        // Option+scroll (primary) and Ctrl+scroll (legacy) adjust opacity cleanly and flash readout at limits.
+        if let optScrollDown = makeScrollEvent(deltaY: -40, flags: .maskAlternate) {
+            panel.scrollWheel(with: optScrollDown)
+            XCTAssertLessThan(panel.state.opacity, 0.9)
+            XCTAssertTrue(panel.lastHUDTextForTesting?.hasPrefix("Opacity ") == true)
+        }
+        panel.setOpacity(0.1)
+        if let optScrollAtFloor = makeScrollEvent(deltaY: -40, flags: .maskAlternate) {
+            panel.scrollWheel(with: optScrollAtFloor)
+            XCTAssertEqual(panel.state.opacity, 0.1, accuracy: 0.001)
+            XCTAssertEqual(panel.lastHUDTextForTesting, "Opacity 10%")
+        }
+        panel.setOpacity(1.0)
+
         if let ctrlScrollDown = makeScrollEvent(deltaY: -40, flags: .maskControl) {
             panel.scrollWheel(with: ctrlScrollDown)
             XCTAssertLessThan(panel.state.opacity, 0.9)
@@ -1296,7 +1309,8 @@ final class PinPanelAndManagerTests: XCTestCase {
         }
         panel.setOpacity(1.0)
 
-        // With toolbar open & drawing tool active, momentum scroll from thickness gesture must NOT zoom the pin.
+        // With toolbar open & drawing tool active, Option+scroll adjusts opacity without changing thickness,
+        // and momentum scroll from thickness gesture must NOT zoom the pin.
         panel.setZoom(1.0)
         panel.showAnnotationToolbar()
         let key1 = try XCTUnwrap(NSEvent.keyEvent(
@@ -1305,6 +1319,12 @@ final class PinPanelAndManagerTests: XCTestCase {
         ))
         panel.keyDown(with: key1)
         let sizeBefore = panel.currentAnnotationStyle.size
+        if let optDuringTool = makeScrollEvent(deltaY: -40, flags: .maskAlternate) {
+            panel.scrollWheel(with: optDuringTool)
+            XCTAssertLessThan(panel.state.opacity, 0.9)
+            XCTAssertEqual(panel.currentAnnotationStyle.size, sizeBefore)
+        }
+        panel.setOpacity(1.0)
         if let momentumDuringTool = makeScrollEvent(deltaY: 40, momentumPhase: 2) {
             panel.scrollWheel(with: momentumDuringTool)
             XCTAssertEqual(panel.state.zoom, 1.0, accuracy: 0.0001)
@@ -2563,5 +2583,263 @@ final class PinPanelAndManagerTests: XCTestCase {
         let spacePanel = PinPanel(content: .text(hugeLeadingSpaces), frame: CGRect(x: 50, y: 50, width: 120, height: 48))
         defer { spacePanel.close() }
         XCTAssertEqual(spacePanel.contentView?.accessibilityLabel(), "Pinned text")
+    }
+
+    func testCheatSheetToggleEscapePrecedenceAndZoomedBrushCursor() throws {
+        let (store, _) = makeStore()
+        let manager = PinManager(clipboardStore: store)
+        defer { manager.closeAllPins() }
+
+        let img = makePinTestImage(width: 240, height: 160) { _, _ in (230, 230, 230, 255) }
+        XCTAssertTrue(manager.pin(content: .image(img, scale: 2), at: CGRect(x: 120, y: 120, width: 120, height: 80)))
+        let panel = try XCTUnwrap(manager.panels.first)
+
+        let qKey = try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: [.shift], timestamp: 0, windowNumber: 0,
+            context: nil, characters: "?", charactersIgnoringModifiers: "/", isARepeat: false, keyCode: 44
+        ))
+        let escKey = try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: 0,
+            context: nil, characters: "\u{1b}", charactersIgnoringModifiers: "\u{1b}", isARepeat: false, keyCode: 53
+        ))
+
+        XCTAssertFalse(panel.isCheatSheetVisibleForTesting)
+        panel.keyDown(with: qKey)
+        XCTAssertTrue(panel.isCheatSheetVisibleForTesting)
+
+        // Esc dismisses the cheat sheet without closing the pin.
+        panel.keyDown(with: escKey)
+        XCTAssertFalse(panel.isCheatSheetVisibleForTesting)
+        XCTAssertEqual(manager.pinCount, 1)
+
+        // While toolbar is visible on zoomed pin, '?' opens cheat sheet and first Esc preserves open toolbar.
+        panel.setZoom(2.0)
+        panel.showAnnotationToolbar(initialTool: .pen)
+        panel.keyDown(with: qKey)
+        XCTAssertTrue(panel.isCheatSheetVisibleForTesting)
+        panel.keyDown(with: escKey)
+        XCTAssertFalse(panel.isCheatSheetVisibleForTesting)
+        XCTAssertTrue(panel.isToolbarVisible)
+
+        // Moving inside zoomed pin uses cached circular brush cursor scaled by zoom.
+        let localMovePoint = CGPoint(x: panel.frame.width * 0.5, y: panel.frame.height * 0.5)
+        let moveEvent = try XCTUnwrap(NSEvent.mouseEvent(
+            with: .mouseMoved, location: localMovePoint, modifierFlags: [], timestamp: 0,
+            windowNumber: 0, context: nil, eventNumber: 0, clickCount: 0, pressure: 0
+        ))
+        panel.contentView?.mouseMoved(with: moveEvent)
+        let scaledDiameter = panel.currentAnnotationStyle.size.lineWidth * (panel.frame.width / max(1, panel.baseSize.width))
+        XCTAssertTrue(panel.currentAnnotationCursorForTesting === BrushCursorCache.shared.cursor(diameter: scaledDiameter, kind: .freehand))
+
+        // Second Esc dismisses toolbar; third Esc closes pin.
+        panel.keyDown(with: escKey)
+        XCTAssertFalse(panel.isToolbarVisible)
+        XCTAssertEqual(manager.pinCount, 1)
+        panel.keyDown(with: escKey)
+        XCTAssertEqual(manager.pinCount, 0)
+    }
+
+    func testTextPinSelectionModePreservesDoubleClickAndEscapePrecedence() throws {
+        let (store, _) = makeStore()
+        let manager = PinManager(clipboardStore: store)
+        defer { manager.closeAllPins() }
+
+        let sampleText = "Hello CCX Copy Mode\nSecond line here"
+        XCTAssertTrue(manager.pin(content: .text(sampleText), at: CGRect(x: 140, y: 140, width: 220, height: 80)))
+        let panel = try XCTUnwrap(manager.panels.first)
+
+        XCTAssertTrue(panel.canSelectText)
+        XCTAssertFalse(panel.isTextSelectionActive)
+        XCTAssertNil(panel.textSelectionViewForTesting)
+        XCTAssertTrue(panel.hoverToolbarButtonForTesting?.isHidden ?? true)
+        XCTAssertEqual(panel.makeContextMenu().items.first?.title, CCXL10n.text("Copy", zh: "拷贝"))
+        XCTAssertEqual(panel.makeContextMenu().items.dropFirst().first?.title, CCXL10n.text("Select Text", zh: "选择文本"))
+
+        // Pressing 'E' mounts read-only selectable NSTextView.
+        let eKey = try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: 0,
+            context: nil, characters: "e", charactersIgnoringModifiers: "e", isARepeat: false, keyCode: 14
+        ))
+        let tKey = try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: 0,
+            context: nil, characters: "t", charactersIgnoringModifiers: "t", isARepeat: false, keyCode: 17
+        ))
+        let escKey = try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: 0,
+            context: nil, characters: "\u{1b}", charactersIgnoringModifiers: "\u{1b}", isARepeat: false, keyCode: 53
+        ))
+
+        panel.keyDown(with: eKey)
+        XCTAssertTrue(panel.isTextSelectionActive)
+        let textView = try XCTUnwrap(panel.textSelectionViewForTesting)
+        XCTAssertFalse(textView.isEditable)
+        XCTAssertTrue(textView.isSelectable)
+        XCTAssertEqual(textView.string, sampleText)
+
+        // Cmd+A and Cmd+C inside selection mode copy selected text without destroying panel.
+        let cmdA = try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: [.command], timestamp: 0, windowNumber: 0,
+            context: nil, characters: "a", charactersIgnoringModifiers: "a", isARepeat: false, keyCode: 0
+        ))
+        XCTAssertTrue(panel.performKeyEquivalent(with: cmdA))
+        XCTAssertEqual(textView.selectedRange().length, sampleText.utf16.count)
+
+        let cmdC = try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: [.command], timestamp: 0, windowNumber: 0,
+            context: nil, characters: "c", charactersIgnoringModifiers: "c", isARepeat: false, keyCode: 8
+        ))
+        XCTAssertTrue(panel.performKeyEquivalent(with: cmdC))
+        XCTAssertEqual(panel.lastHUDTextForTesting, CCXL10n.text("Copied Selection", zh: "已拷贝选中文本"))
+        XCTAssertTrue(panel.makeContextMenu().items.contains { $0.title == CCXL10n.text("Copy Selection", zh: "拷贝选中文本") })
+
+        // First Esc exits text selection without closing pin; second Esc closes pin.
+        panel.keyDown(with: escKey)
+        XCTAssertFalse(panel.isTextSelectionActive)
+        XCTAssertNil(panel.textSelectionViewForTesting)
+        XCTAssertEqual(manager.pinCount, 1)
+
+        // Rotated text pin refuses text selection and flashes reset hint HUD.
+        panel.rotateClockwise()
+        panel.setTextSelectionActive(true)
+        XCTAssertFalse(panel.isTextSelectionActive)
+        XCTAssertEqual(panel.lastHUDTextForTesting, CCXL10n.text("Reset transforms to select text", zh: "请先重置变换再选择文本"))
+
+        panel.resetAllTransforms()
+        panel.keyDown(with: tKey)
+        XCTAssertTrue(panel.isTextSelectionActive)
+        // Collapsing to thumbnail auto-exits text selection.
+        panel.toggleThumbnail()
+        XCTAssertFalse(panel.isTextSelectionActive)
+        XCTAssertTrue(panel.state.isThumbnail)
+        panel.toggleThumbnail()
+
+        panel.keyDown(with: escKey)
+        XCTAssertEqual(manager.pinCount, 0)
+    }
+
+    func testReopenClosedPinsRingBufferAndShiftCmdT() throws {
+        let (store, _) = makeStore()
+        let manager = PinManager(clipboardStore: store)
+        defer { manager.closeAllPins() }
+
+        XCTAssertFalse(manager.canReopenClosedPin)
+        XCTAssertEqual(manager.closedPinCount, 0)
+
+        var frames: [CGRect] = []
+        for index in 1...7 {
+            let rect = CGRect(x: CGFloat(100 + index * 20), y: CGFloat(100 + index * 10), width: 160, height: 50)
+            XCTAssertTrue(manager.pin(content: .text("Note \(index)"), at: rect))
+            frames.append(try XCTUnwrap(manager.panels.last?.frame))
+        }
+        XCTAssertEqual(manager.pinCount, 7)
+
+        // Close all 7 pins one by one; only newest 5 remain in FIFO ring buffer.
+        for panel in manager.panels {
+            panel.close()
+        }
+        XCTAssertEqual(manager.pinCount, 0)
+        XCTAssertTrue(manager.canReopenClosedPin)
+        XCTAssertEqual(manager.closedPinCount, PinManager.maxClosedPinHistory)
+
+        // Reopen newest (Note 7), adjust zoom first on a fresh pin too to test state preservation.
+        XCTAssertTrue(manager.reopenLastClosedPin())
+        XCTAssertEqual(manager.pinCount, 1)
+        XCTAssertEqual(manager.closedPinCount, 4)
+        let reopened7 = try XCTUnwrap(manager.panels.first)
+        if case let .text(text) = reopened7.content {
+            XCTAssertEqual(text, "Note 7")
+        } else {
+            XCTFail("Expected text pin Note 7")
+        }
+        XCTAssertEqual(reopened7.frame.size, frames[6].size)
+
+        // Customize zoom & click-through, close it, then reopen via Shift+Cmd+T on another open pin.
+        reopened7.setZoom(1.5)
+        reopened7.setClickThrough(true)
+        let expectedSize = reopened7.frame.size
+        reopened7.close()
+        XCTAssertEqual(manager.closedPinCount, 5)
+
+        XCTAssertTrue(manager.pin(content: .text("Host Pin"), at: CGRect(x: 300, y: 300, width: 140, height: 48)))
+        let hostPin = try XCTUnwrap(manager.panels.last)
+        let shiftCmdT = try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: [.command, .shift], timestamp: 0, windowNumber: 0,
+            context: nil, characters: "T", charactersIgnoringModifiers: "t", isARepeat: false, keyCode: 17
+        ))
+        XCTAssertTrue(hostPin.performKeyEquivalent(with: shiftCmdT))
+        XCTAssertEqual(manager.pinCount, 2)
+        let restored = try XCTUnwrap(manager.panels.last)
+        XCTAssertEqual(restored.state.zoom, 1.5, accuracy: 0.01)
+        XCTAssertFalse(restored.state.isClickThrough)
+        XCTAssertEqual(restored.frame.size.width, expectedSize.width, accuracy: 1)
+
+        manager.closeAllPins()
+        XCTAssertEqual(manager.pinCount, 0)
+        XCTAssertGreaterThan(manager.closedPinCount, 0)
+        manager.clearClosedPinHistory()
+        XCTAssertEqual(manager.closedPinCount, 0)
+        XCTAssertFalse(manager.canReopenClosedPin)
+        XCTAssertFalse(manager.reopenLastClosedPin())
+    }
+
+    func testReviewFixesPrivateSelectionCopyCheatSheetCancelOrderAndCap() throws {
+        let suiteName = "com.lizhichaox.ccx.tests.pinreview.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let pb = InMemoryClipboardPasteboard()
+        let store = ClipboardStore(pasteboard: pb, userDefaults: defaults)
+        store.concealFromClipboardManagers = true
+
+        let manager = PinManager(clipboardStore: store)
+        defer { manager.closeAllPins() }
+
+        XCTAssertTrue(manager.pin(content: .text("Secret token line 1\nLine 2"), at: CGRect(x: 120, y: 120, width: 220, height: 80)))
+        let textPanel = try XCTUnwrap(manager.panels.first)
+        textPanel.setTextSelectionActive(true)
+        let textView = try XCTUnwrap(textPanel.textSelectionViewForTesting)
+        textView.setSelectedRange(NSRange(location: 0, length: 12))
+
+        // Open '?' cheat sheet over active text selection; cancelOperation must close cheat sheet first,
+        // then exit text selection on second cancel.
+        let qKey = try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: [.shift], timestamp: 0, windowNumber: 0,
+            context: nil, characters: "?", charactersIgnoringModifiers: "/", isARepeat: false, keyCode: 44
+        ))
+        textPanel.keyDown(with: qKey)
+        XCTAssertTrue(textPanel.isCheatSheetVisibleForTesting)
+        textView.cancelOperation(nil)
+        XCTAssertFalse(textPanel.isCheatSheetVisibleForTesting)
+        XCTAssertTrue(textPanel.isTextSelectionActive)
+
+        // Cmd+C selection copy honors Private Clipboard (writes TransientType to ClipboardStore pasteboard).
+        let cmdC = try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: [.command], timestamp: 0, windowNumber: 0,
+            context: nil, characters: "c", charactersIgnoringModifiers: "c", isARepeat: false, keyCode: 8
+        ))
+        XCTAssertTrue(textPanel.performKeyEquivalent(with: cmdC))
+        XCTAssertEqual(pb.string(), "Secret token")
+        XCTAssertNotNil(pb.data(forType: ClipboardStore.transientPasteboardType))
+
+        // Collapsing to thumbnail or losing key status dismisses any open cheat sheet.
+        textPanel.keyDown(with: qKey)
+        XCTAssertTrue(textPanel.isCheatSheetVisibleForTesting)
+        textPanel.toggleThumbnail()
+        XCTAssertFalse(textPanel.isCheatSheetVisibleForTesting)
+        textPanel.toggleThumbnail()
+        textPanel.keyDown(with: qKey)
+        XCTAssertTrue(textPanel.isCheatSheetVisibleForTesting)
+        textPanel.windowDidResignKey(Notification(name: NSWindow.didResignKeyNotification))
+        XCTAssertFalse(textPanel.isCheatSheetVisibleForTesting)
+
+        // reopenLastClosedPin() respects PinManager.maxActivePins cap.
+        textPanel.close()
+        XCTAssertTrue(manager.canReopenClosedPin)
+        for idx in 1...PinManager.maxActivePins {
+            XCTAssertTrue(manager.pin(content: .text("Cap \(idx)"), at: CGRect(x: 60, y: 60, width: 100, height: 48)))
+        }
+        XCTAssertEqual(manager.pinCount, PinManager.maxActivePins)
+        XCTAssertFalse(manager.reopenLastClosedPin())
+        XCTAssertEqual(manager.pinCount, PinManager.maxActivePins)
     }
 }

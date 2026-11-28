@@ -287,6 +287,7 @@ final class PinAnnotationController: NSObject, NSTextFieldDelegate {
     func handleParentFrameDidChange(for panel: PinPanel) {
         guard isToolbarVisible else { return }
         repositionToolbar(for: panel)
+        refreshCursorAtLastMousePoint(for: panel)
         if let field = inlineEditor, let hostContentView {
             syncInlineEditorAppearance(field, in: hostContentView, baseSize: panel.baseSize)
         }
@@ -1124,11 +1125,14 @@ final class PinAnnotationController: NSObject, NSTextFieldDelegate {
         onNeedRedraw?(nil)
         if let panel {
             repositionToolbar(for: panel)
-            if let hostContentView, let last = lastMouseCanvasPoint {
-                let viewPt = toView(last, in: hostContentView.bounds, baseSize: panel.baseSize)
-                updateCursor(at: viewPt, in: hostContentView.bounds, baseSize: panel.baseSize)
-            }
+            refreshCursorAtLastMousePoint(for: panel)
         }
+    }
+
+    private func refreshCursorAtLastMousePoint(for panel: PinPanel) {
+        guard let hostContentView, let last = lastMouseCanvasPoint else { return }
+        let viewPt = toView(last, in: hostContentView.bounds, baseSize: panel.baseSize)
+        updateCursor(at: viewPt, in: hostContentView.bounds, baseSize: panel.baseSize)
     }
 
     private func applyStyle(_ style: AnnotationStyle, on panel: PinPanel?) {
@@ -1143,6 +1147,7 @@ final class PinAnnotationController: NSObject, NSTextFieldDelegate {
         onNeedRedraw?(nil)
         if let panel {
             repositionToolbar(for: panel)
+            refreshCursorAtLastMousePoint(for: panel)
         }
     }
 
@@ -1201,6 +1206,7 @@ final class PinAnnotationController: NSObject, NSTextFieldDelegate {
         onNeedRedraw?(nil)
         if let panel {
             syncToolbar(on: panel)
+            refreshCursorAtLastMousePoint(for: panel)
         }
         return mutatedSelected
     }
@@ -1385,14 +1391,15 @@ final class PinAnnotationController: NSObject, NSTextFieldDelegate {
         let canvasPoint = toCanvas(viewPoint, in: bounds, baseSize: baseSize)
         let tolerance = hitTolerance(in: bounds, baseSize: baseSize)
 
+        let zoomScale = bounds.width / max(1, baseSize.width)
         let desired: NSCursor
         switch activeDrag {
         case .movingAnnotation:
             desired = .closedHand
         case let .resizingAnnotation(_, handle, _):
             desired = Self.cursor(for: handle)
-        case .drawing:
-            desired = .crosshair
+        case let .drawing(tool, _):
+            desired = Self.drawingCursor(for: tool, style: currentStyle, zoomScale: zoomScale)
         case .none:
             if let selected = document.selectedItem, let handle = selected.hitTestHandle(at: canvasPoint, radius: tolerance) {
                 desired = Self.cursor(for: handle)
@@ -1401,13 +1408,35 @@ final class PinAnnotationController: NSObject, NSTextFieldDelegate {
             } else if activeTool == .text {
                 desired = .iBeam
             } else if activeTool.isDrawingTool {
-                desired = .crosshair
+                desired = Self.drawingCursor(for: activeTool, style: currentStyle, zoomScale: zoomScale)
             } else {
                 desired = .arrow
             }
         }
         setCursor(desired)
     }
+
+    private static func drawingCursor(
+        for tool: AnnotationTool,
+        style: AnnotationStyle,
+        zoomScale: CGFloat
+    ) -> NSCursor {
+        let safeZoom = (zoomScale.isFinite && zoomScale > 0) ? zoomScale : 1
+        switch tool {
+        case .pen:
+            return BrushCursorCache.shared.cursor(diameter: style.size.lineWidth * safeZoom, kind: .freehand)
+        case .highlighter:
+            return BrushCursorCache.shared.cursor(diameter: style.size.highlighterWidth * safeZoom, kind: .freehand)
+        case .mosaic:
+            return BrushCursorCache.shared.cursor(diameter: style.size.mosaicBlockSize * safeZoom, kind: .mosaic)
+        case .text:
+            return .iBeam
+        case .select, .rectangle, .ellipse, .arrow, .counter:
+            return .crosshair
+        }
+    }
+
+    internal var lastCursorForTesting: NSCursor? { lastCursor }
 
     private func setCursor(_ cursor: NSCursor) {
         guard lastCursor !== cursor || NSCursor.current != cursor else { return }

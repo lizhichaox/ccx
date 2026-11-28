@@ -253,9 +253,10 @@ public struct RecordingSettings: Codable, Equatable, Sendable {
     public var capturesSystemAudio: Bool
     public var capturesMicrophone: Bool
     public var showsCursor: Bool
+    public var countdownSeconds: Int
 
     private enum CodingKeys: String, CodingKey {
-        case format, videoFPS, gifFPS, capturesSystemAudio, capturesMicrophone, showsCursor
+        case format, videoFPS, gifFPS, capturesSystemAudio, capturesMicrophone, showsCursor, countdownSeconds
     }
 
     public init(
@@ -264,7 +265,8 @@ public struct RecordingSettings: Codable, Equatable, Sendable {
         gifFPS: Int = RecordingFormat.gif.targetFPS,
         capturesSystemAudio: Bool = true,
         capturesMicrophone: Bool = false,
-        showsCursor: Bool = true
+        showsCursor: Bool = true,
+        countdownSeconds: Int = 0
     ) {
         self.format = format
         self.videoFPS = RecordingFormat.mp4.availableFPSOptions.contains(videoFPS)
@@ -276,6 +278,7 @@ public struct RecordingSettings: Codable, Equatable, Sendable {
         self.capturesSystemAudio = capturesSystemAudio
         self.capturesMicrophone = capturesMicrophone
         self.showsCursor = showsCursor
+        self.countdownSeconds = (countdownSeconds == 3) ? 3 : 0
     }
 
     public init(from decoder: Decoder) throws {
@@ -286,13 +289,15 @@ public struct RecordingSettings: Codable, Equatable, Sendable {
         let capturesSystemAudio = (try? container.decodeIfPresent(Bool.self, forKey: .capturesSystemAudio)) ?? true
         let capturesMicrophone = (try? container.decodeIfPresent(Bool.self, forKey: .capturesMicrophone)) ?? false
         let showsCursor = (try? container.decodeIfPresent(Bool.self, forKey: .showsCursor)) ?? true
+        let countdownSeconds = (try? container.decodeIfPresent(Int.self, forKey: .countdownSeconds)) ?? 0
         self.init(
             format: format,
             videoFPS: videoFPS,
             gifFPS: gifFPS,
             capturesSystemAudio: capturesSystemAudio,
             capturesMicrophone: capturesMicrophone,
-            showsCursor: showsCursor
+            showsCursor: showsCursor,
+            countdownSeconds: countdownSeconds
         )
     }
 
@@ -397,6 +402,7 @@ public struct RecordingResult: Equatable, Sendable {
 /// Interactive states of the floating recording HUD.
 public enum RecordingPhase: Equatable, Sendable {
     case ready
+    case countdown(remaining: Int)
     case recording
     case paused
     case finalizing

@@ -1774,6 +1774,372 @@ struct CCXRecordTests {
         ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
         return try #require(ctx.makeImage())
     }
+
+    @Test @MainActor func displayDisconnectRescuesActiveRecordingAndPreservesCompleted() throws {
+        let suiteName = "CCXRecordDisconnect-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let region = RecordingRegion(
+            displayID: 999_999,
+            displayFrame: CGRect(x: 0, y: 0, width: 1440, height: 900),
+            localRect: CGRect(x: 100, y: 100, width: 640, height: 480),
+            screenRect: CGRect(x: 100, y: 100, width: 640, height: 480),
+            scale: 2
+        )
+
+        // 1. Disconnecting in .ready cancels cleanly with a notice.
+        do {
+            let coordinator = RecordingCoordinator(settingsStore: RecordingSettingsStore(defaults: defaults))
+            var notices: [String] = []
+            var outcomes: [RecordingOutcome] = []
+            var stopCalls = 0
+            coordinator.screenLookupForTesting = { _ in nil }
+            coordinator.stopHandlerForTesting = { stopCalls += 1 }
+            coordinator.onNotice = { message, _ in notices.append(message) }
+
+            coordinator.startSession(region: region) { outcomes.append($0) }
+            coordinator.triggerScreenParametersChangedForTesting()
+
+            #expect(stopCalls == 0)
+            #expect(!coordinator.isSessionActive)
+            #expect(notices.count == 1)
+            if case .cancelled? = outcomes.last {} else {
+                Issue.record("Expected .cancelled outcome when display disconnects in .ready")
+            }
+        }
+
+        // 2. Disconnecting in .recording proactively stops and saves in both en and zh-Hans.
+        for language in CCXLanguage.allCases {
+            CCXL10n.withLanguageForTesting(language) {
+                let coordinator = RecordingCoordinator(settingsStore: RecordingSettingsStore(defaults: defaults))
+                var notices: [String] = []
+                var outcomes: [RecordingOutcome] = []
+                var stopCalls = 0
+                coordinator.screenLookupForTesting = { _ in nil }
+                coordinator.stopHandlerForTesting = { stopCalls += 1 }
+                coordinator.onNotice = { message, _ in notices.append(message) }
+
+                coordinator.startSession(region: region) { outcomes.append($0) }
+                coordinator.setPhaseForTesting(.recording)
+                coordinator.triggerScreenParametersChangedForTesting()
+
+                #expect(stopCalls == 1)
+                #expect(coordinator.isSessionActive)
+                #expect(outcomes.isEmpty)
+                let expectedNotice = language == .en
+                    ? "Display Disconnected — Saving Recording…"
+                    : "显示器已断开，正在保存录屏…"
+                #expect(notices == [expectedNotice])
+                coordinator.cancelActiveSession()
+            }
+        }
+
+        // 3. Disconnecting in .paused also proactively rescues via stopActiveRecording().
+        do {
+            let coordinator = RecordingCoordinator(settingsStore: RecordingSettingsStore(defaults: defaults))
+            var notices: [String] = []
+            var stopCalls = 0
+            coordinator.screenLookupForTesting = { _ in nil }
+            coordinator.stopHandlerForTesting = { stopCalls += 1 }
+            coordinator.onNotice = { message, _ in notices.append(message) }
+
+            coordinator.startSession(region: region) { _ in }
+            coordinator.setPhaseForTesting(.paused)
+            coordinator.triggerScreenParametersChangedForTesting()
+
+            #expect(stopCalls == 1)
+            #expect(coordinator.isSessionActive)
+            #expect(notices.count == 1)
+            coordinator.cancelActiveSession()
+        }
+
+        // 4. Disconnecting in .completed preserves the completed result without stopping or cancelling.
+        do {
+            let coordinator = RecordingCoordinator(settingsStore: RecordingSettingsStore(defaults: defaults))
+            var notices: [String] = []
+            var outcomes: [RecordingOutcome] = []
+            var stopCalls = 0
+            coordinator.screenLookupForTesting = { _ in nil }
+            coordinator.stopHandlerForTesting = { stopCalls += 1 }
+            coordinator.onNotice = { message, _ in notices.append(message) }
+
+            coordinator.startSession(region: region) { outcomes.append($0) }
+            let completed = RecordingResult(
+                fileURL: FileManager.default.temporaryDirectory.appendingPathComponent("ccx-completed.mp4"),
+                format: .mp4,
+                duration: 3,
+                fileSizeBytes: 128_000,
+                pixelSize: CGSize(width: 640, height: 480),
+                screenRect: region.screenRect
+            )
+            coordinator.setPhaseForTesting(.completed(completed))
+            coordinator.triggerScreenParametersChangedForTesting()
+
+            #expect(stopCalls == 0)
+            #expect(notices.isEmpty)
+            #expect(outcomes.isEmpty)
+            #expect(coordinator.isSessionActive)
+            if case .completed(let preserved) = coordinator.phase {
+                #expect(preserved == completed)
+            } else {
+                Issue.record("Expected phase to remain .completed")
+            }
+            coordinator.cancelActiveSession()
+        }
+    }
+
+    @Test func gifEncoderDiskSpoolingPreserves900FrameBudgetStreamsAndCleansSpoolFiles() async throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("ccx-gif-spool-\(UUID().uuidString)", isDirectory: true)
+        try RecordingFileSecurity.ensureSecureStagingDirectory(at: root)
+        defer { try? fm.removeItem(at: root) }
+
+        // 1. Large 1280x832 region retains full 900-frame budget (not clamped to 63 by 256MB RAM cap).
+        let largeURL = root.appendingPathComponent("CCX-Rec-large.gif")
+        let largeEncoder = try GifRecordingEncoder(
+            outputURL: largeURL,
+            pixelSize: CGSize(width: 1280, height: 832),
+            fps: 30
+        )
+        #expect(largeEncoder.maxFrames == GifRecordingEncoder.defaultMaxFrameCount)
+        let largeSpoolURL = largeEncoder.spoolFileURLForTesting
+        var st = stat()
+        #expect(lstat(largeSpoolURL.path, &st) == 0 && (st.st_mode & 0o777) == 0o600)
+        largeEncoder.cancel()
+        #expect(await largeEncoder.debugIsDestinationReleased())
+        #expect(!fm.fileExists(atPath: largeURL.path))
+        #expect(!fm.fileExists(atPath: largeSpoolURL.path))
+
+        // 2. Multi-frame 320x240 BGRA spool -> valid GIF with exact frame count, 0600 permissions, and cleaned spool.
+        let animURL = root.appendingPathComponent("CCX-Rec-anim.gif")
+        let animEncoder = try GifRecordingEncoder(
+            outputURL: animURL,
+            pixelSize: CGSize(width: 320, height: 240),
+            fps: 30
+        )
+        let animSpoolURL = animEncoder.spoolFileURLForTesting
+        for idx in 0..<24 {
+            let r = UInt8((idx * 29 + 20) % 256)
+            let g = UInt8(255 - ((idx * 10) % 256))
+            let b = UInt8((idx * 43 + 80) % 256)
+            let pb = try #require(makeTestBGRAPixelBuffer(width: 320, height: 240, r: r, g: g, b: b))
+            animEncoder.appendVideo(pixelBuffer: pb, pts: CMTime(value: CMTimeValue(idx), timescale: 30))
+        }
+        let summary = try await animEncoder.finish()
+        #expect(summary.frameCount == 24)
+        #expect(await animEncoder.debugIsDestinationReleased())
+        #expect(!fm.fileExists(atPath: animSpoolURL.path))
+        #expect(lstat(animURL.path, &st) == 0 && (st.st_mode & 0o777) == 0o600)
+
+        let source = try #require(CGImageSourceCreateWithURL(animURL as CFURL, nil))
+        #expect(CGImageSourceGetCount(source) == 24)
+
+        // 3. RecordingFileSecurity cleans stale orphan .CCX-Rec-*.spool files while protecting active ones.
+        let activeGif = root.appendingPathComponent("CCX-Rec-active.gif")
+        let activeSpool = root.appendingPathComponent(".CCX-Rec-active.gif.spool")
+        let staleSpool = root.appendingPathComponent(".CCX-Rec-stale.gif.spool")
+        try Data("a".utf8).write(to: activeGif)
+        try Data("b".utf8).write(to: activeSpool)
+        try Data("c".utf8).write(to: staleSpool)
+
+        RecordingFileSecurity.cleanupStagingDirectory(
+            at: root,
+            olderThan: 0,
+            activeFileURLs: [activeGif]
+        )
+        #expect(fm.fileExists(atPath: activeGif.path))
+        #expect(fm.fileExists(atPath: activeSpool.path))
+        #expect(!fm.fileExists(atPath: staleSpool.path))
+    }
+
+    @Test @MainActor func countdownSettingsDecodeCountdownAndMicMeterHUDLayouts() throws {
+        // 1. Backwards-compatible RecordingSettings JSON decoding for countdownSeconds.
+        let legacyJSON = Data("""
+        {"format":"mp4","videoFPS":60,"gifFPS":15,"capturesSystemAudio":true,"capturesMicrophone":true,"showsCursor":true}
+        """.utf8)
+        let legacyDecoded = try JSONDecoder().decode(RecordingSettings.self, from: legacyJSON)
+        #expect(legacyDecoded.countdownSeconds == 0)
+
+        var withCountdown = legacyDecoded
+        withCountdown.countdownSeconds = 3
+        let roundTripped = try JSONDecoder().decode(RecordingSettings.self, from: try JSONEncoder().encode(withCountdown))
+        #expect(roundTripped.countdownSeconds == 3)
+
+        let sanitizedInvalid = RecordingSettings(countdownSeconds: 99)
+        #expect(sanitizedInvalid.countdownSeconds == 0)
+
+        // 2. Accelerate vDSP_rmsqv normalized RMS level safety & response curve.
+        #expect(AudioSampleNormalizer.normalizedRMSLevel(from: nil, count: 0) == 0)
+        var silence = [Float](repeating: 0, count: 1024)
+        #expect(AudioSampleNormalizer.normalizedRMSLevel(from: &silence, count: silence.count) == 0)
+
+        var quietTone = (0..<1024).map { Float(0.02) * sinf(Float($0) * 0.1) }
+        var loudTone = (0..<1024).map { Float(0.6) * sinf(Float($0) * 0.1) }
+        let quietLevel = AudioSampleNormalizer.normalizedRMSLevel(from: &quietTone, count: quietTone.count)
+        let loudLevel = AudioSampleNormalizer.normalizedRMSLevel(from: &loudTone, count: loudTone.count)
+        #expect(quietLevel > 0.05 && quietLevel < 0.7)
+        #expect(loudLevel > quietLevel && loudLevel <= 1.0)
+
+        var nanSamples = [Float.nan, 0.5, -0.5]
+        #expect(AudioSampleNormalizer.normalizedRMSLevel(from: &nanSamples, count: nanSamples.count) == 0)
+
+        // 3. Control & Border HUD cleanly lay out .countdown and mic RMS meter in both languages.
+        let visibleFrame = CGRect(x: 0, y: 0, width: 1440, height: 900)
+        let region = RecordingRegion(
+            displayID: 1,
+            displayFrame: visibleFrame,
+            localRect: CGRect(x: 200, y: 200, width: 420, height: 280),
+            screenRect: CGRect(x: 200, y: 200, width: 420, height: 280),
+            scale: 2
+        )
+
+        for language in CCXLanguage.allCases {
+            CCXL10n.withLanguageForTesting(language) {
+                let border = RecordingBorderPanel(region: region, topInset: 0, settings: withCountdown)
+                defer { border.tearDown() }
+                border.update(phase: .countdown(remaining: 3), region: region, settings: withCountdown)
+                #expect(border.isCountdownBadgeVisible)
+                #expect(border.countdownBadgeText == "3")
+                border.update(phase: .recording, region: region, settings: withCountdown)
+                #expect(!border.isCountdownBadgeVisible)
+
+                let hud = RecordingControlPanel(
+                    captureRect: region.screenRect,
+                    visibleFrame: visibleFrame,
+                    settings: withCountdown
+                )
+                defer { hud.tearDown() }
+                assertCleanHUDLayout(in: hud)
+                hud.update(phase: .countdown(remaining: 2), settings: withCountdown, elapsedSeconds: 0)
+                #expect(hud.isCountdownContainerVisible)
+                #expect(hud.countdownTextForTesting.contains("2"))
+                assertCleanHUDLayout(in: hud)
+
+                hud.update(phase: .recording, settings: withCountdown, elapsedSeconds: 3)
+                #expect(hud.isMicLevelMeterVisible)
+                hud.updateMicrophoneLevel(loudLevel)
+                #expect(hud.micLevelForTesting > 0.5)
+                assertCleanHUDLayout(in: hud)
+
+                hud.update(phase: .paused, settings: withCountdown, elapsedSeconds: 3)
+                #expect(hud.micLevelForTesting == 0)
+                assertCleanHUDLayout(in: hud)
+
+                var noMic = withCountdown
+                noMic.capturesMicrophone = false
+                hud.update(phase: .recording, settings: noMic, elapsedSeconds: 4)
+                #expect(!hud.isMicLevelMeterVisible)
+                assertCleanHUDLayout(in: hud)
+            }
+        }
+    }
+
+    @Test @MainActor func countdownCancellationLeavesZeroStagedFiles() async throws {
+        let suiteName = "com.lizhichaox.ccx.tests.countdown.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let store = RecordingSettingsStore(defaults: defaults)
+        var settings = RecordingSettings(format: .gif, countdownSeconds: 3)
+        settings.countdownSeconds = 3
+        store.save(settings)
+
+        let coordinator = RecordingCoordinator(settingsStore: store)
+        let frame = CGRect(x: 0, y: 0, width: 1280, height: 800)
+        let region = RecordingRegion(
+            displayID: 1,
+            displayFrame: frame,
+            localRect: CGRect(x: 100, y: 100, width: 320, height: 240),
+            screenRect: CGRect(x: 100, y: 100, width: 320, height: 240),
+            scale: 2
+        )
+
+        var outcomes: [RecordingOutcome] = []
+        coordinator.startSession(region: region) { outcome in
+            outcomes.append(outcome)
+        }
+        #expect(coordinator.phase == .ready)
+
+        coordinator.controlPanelForTesting?.onStart?()
+        try await Task.sleep(for: .milliseconds(60))
+        #expect(coordinator.phase == .countdown(remaining: 3))
+        #expect(coordinator.shouldHandleGlobalEscape(modifiers: []))
+
+        coordinator.cancelActiveSession()
+        #expect(!coordinator.isSessionActive)
+        #expect(outcomes.count == 1)
+        guard case .cancelled? = outcomes.first else {
+            Issue.record("Expected .cancelled outcome on countdown cancel, got \(outcomes)")
+            return
+        }
+    }
+
+    @Test @MainActor func completedRecordingToolbarPlacesCopyNearRightEdgeInBothLanguages() throws {
+        func collectButtons(in root: NSView) -> [NSButton] {
+            var found: [NSButton] = []
+            for child in root.subviews {
+                if let button = child as? NSButton {
+                    found.append(button)
+                } else {
+                    found.append(contentsOf: collectButtons(in: child))
+                }
+            }
+            return found
+        }
+
+        let fakeResult = RecordingResult(
+            fileURL: URL(fileURLWithPath: "/tmp/test-completed-order.mp4"),
+            format: .mp4,
+            duration: 6,
+            fileSizeBytes: 2_048_576,
+            pixelSize: CGSize(width: 640, height: 360),
+            screenRect: CGRect(x: 200, y: 200, width: 420, height: 280)
+        )
+
+        for language in CCXLanguage.allCases {
+            try CCXL10n.withLanguageForTesting(language) {
+                let panel = RecordingControlPanel(
+                    captureRect: fakeResult.screenRect,
+                    visibleFrame: CGRect(x: 0, y: 0, width: 1440, height: 900),
+                    settings: RecordingSettings(format: .mp4)
+                )
+                defer { panel.tearDown() }
+
+                var triggered: [String] = []
+                panel.onSave = { triggered.append("save") }
+                panel.onReveal = { triggered.append("reveal") }
+                panel.onQuickSave = { triggered.append("quickSave") }
+                panel.onCopy = { triggered.append("copy") }
+                panel.onDiscard = { triggered.append("discard") }
+
+                panel.update(phase: .completed(fakeResult), settings: RecordingSettings(format: .mp4), elapsedSeconds: 6)
+                #expect(panel.isCompletedContainerVisible)
+                assertCleanHUDLayout(in: panel)
+
+                let row = try #require(panel.activeRowView)
+                let sortedButtons = collectButtons(in: row)
+                    .map { button -> (button: NSButton, frame: CGRect) in
+                        (button, button.convert(button.bounds, to: row))
+                    }
+                    .sorted { $0.frame.minX < $1.frame.minX }
+
+                #expect(sortedButtons.count == 5)
+                let quickSaveFrame = sortedButtons[2].frame
+                let copyFrame = sortedButtons[3].frame
+                let discardFrame = sortedButtons[4].frame
+                #expect(copyFrame.minX > quickSaveFrame.maxX)
+                #expect(copyFrame.maxX < discardFrame.minX)
+
+                for (button, _) in sortedButtons {
+                    if let action = button.action {
+                        _ = button.sendAction(action, to: button.target)
+                    }
+                }
+                #expect(triggered == ["save", "reveal", "quickSave", "copy", "discard"])
+            }
+        }
+    }
 }
 
 final class VideoRecordingWriterTests: XCTestCase {

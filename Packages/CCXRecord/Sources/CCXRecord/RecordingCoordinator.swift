@@ -23,7 +23,7 @@ public final class RecordingCoordinator {
     public var isRecordingOrPaused: Bool {
         switch phase {
         case .recording, .paused: true
-        case .ready, .finalizing, .completed: false
+        case .ready, .countdown, .finalizing, .completed: false
         }
     }
 
@@ -40,6 +40,7 @@ public final class RecordingCoordinator {
     nonisolated(unsafe) private var stagedFileURL: URL?
 
     private var isStartingRecording = false
+    nonisolated(unsafe) private var countdownTask: Task<Void, Never>?
     private var accumulatedElapsed: TimeInterval = 0
     private var activeSegmentStartTime: TimeInterval?
     private var lastEmittedElapsedSecond: Int?
@@ -55,6 +56,7 @@ public final class RecordingCoordinator {
     }
 
     deinit {
+        countdownTask?.cancel()
         if let staged = stagedFileURL {
             let standardized = staged.standardizedFileURL
             Self.activeStagedURLs.withLock { _ = $0.remove(standardized) }
@@ -204,13 +206,17 @@ public final class RecordingCoordinator {
             refreshChrome()
             startElapsedTimer()
             emitMenuBarStatus(elapsed: elapsed)
-        case .ready, .finalizing, .completed:
+        case .ready, .countdown, .finalizing, .completed:
             break
         }
     }
 
     public func stopActiveRecording() {
         guard isRecordingOrPaused else { return }
+        if let stopHandlerForTesting {
+            stopHandlerForTesting()
+            return
+        }
         guard let engine else {
             cancelActiveSession()
             return
@@ -274,41 +280,118 @@ public final class RecordingCoordinator {
         else { return }
         let generation = sessionGeneration
         isStartingRecording = true
-        removeGlobalKeyMonitor()
         borderPanel?.prepareForCapture(region: region)
         controlPanel?.setTemporarilyHidden(false)
         NSCursor.arrow.set()
 
-        Task { @MainActor [weak self] in
-            guard let self, self.isSessionActive, self.sessionGeneration == generation, self.phase == .ready else { return }
+        let delaySeconds = settings.countdownSeconds
+        let needsAsyncMicPrompt = settings.effectiveMicrophone
+            && PermissionManager.microphoneAuthorizationStatus() == .notDetermined
 
-            var runSettings = self.settings
-            if runSettings.effectiveMicrophone {
-                let micStatus = PermissionManager.microphoneAuthorizationStatus()
-                switch micStatus {
-                case .authorized:
-                    break
-                case .notDetermined:
-                    let granted = await PermissionManager.requestMicrophoneAccess()
-                    guard self.isSessionActive, self.sessionGeneration == generation, self.phase == .ready else {
+        if delaySeconds > 0 || needsAsyncMicPrompt {
+            countdownTask?.cancel()
+            countdownTask = Task { @MainActor [weak self] in
+                guard let self, !Task.isCancelled, self.isSessionActive, self.sessionGeneration == generation else {
+                    return
+                }
+                let runSettings = await self.resolveMicrophoneSettings(from: self.settings, generation: generation)
+                guard let runSettings, !Task.isCancelled, self.isSessionActive, self.sessionGeneration == generation else {
+                    return
+                }
+
+                if delaySeconds > 0 {
+                    self.controlPanel?.makeKeyAndOrderFront(nil)
+                    for remaining in stride(from: delaySeconds, through: 1, by: -1) {
+                        guard !Task.isCancelled, self.isSessionActive, self.sessionGeneration == generation else {
+                            return
+                        }
+                        self.phase = .countdown(remaining: remaining)
+                        self.refreshChrome()
+                        do {
+                            try await Task.sleep(for: .seconds(1))
+                        } catch {
+                            return
+                        }
+                    }
+                    guard !Task.isCancelled, self.isSessionActive, self.sessionGeneration == generation else {
                         return
                     }
-                    if !granted {
-                        runSettings.capturesMicrophone = false
-                        self.onNotice?(
-                            CCXL10n.text("Mic Denied — Recording No Mic", zh: "未授权麦克风，将无麦录制"),
-                            "mic.slash"
-                        )
-                    }
-                case .denied, .restricted:
-                    runSettings.capturesMicrophone = false
-                    self.onNotice?(
-                        CCXL10n.text("Mic Off in Settings — No Mic Audio", zh: "系统设置已禁用麦克风，将无麦录制"),
-                        "mic.slash"
-                    )
-                @unknown default:
-                    runSettings.capturesMicrophone = false
                 }
+                self.countdownTask = nil
+                self.removeGlobalKeyMonitor()
+                self.startRecordingCaptureFlow(region: region, settings: runSettings, generation: generation)
+            }
+            return
+        }
+
+        let runSettings = resolveSyncMicrophoneSettings(from: settings)
+        removeGlobalKeyMonitor()
+        startRecordingCaptureFlow(region: region, settings: runSettings, generation: generation)
+    }
+
+    private func resolveSyncMicrophoneSettings(from baseSettings: RecordingSettings) -> RecordingSettings {
+        var runSettings = baseSettings
+        guard runSettings.effectiveMicrophone else { return runSettings }
+        switch PermissionManager.microphoneAuthorizationStatus() {
+        case .authorized, .notDetermined:
+            break
+        case .denied, .restricted:
+            runSettings.capturesMicrophone = false
+            onNotice?(
+                CCXL10n.text("Mic Off in Settings — No Mic Audio", zh: "系统设置已禁用麦克风，将无麦录制"),
+                "mic.slash"
+            )
+        @unknown default:
+            runSettings.capturesMicrophone = false
+        }
+        return runSettings
+    }
+
+    private func resolveMicrophoneSettings(
+        from baseSettings: RecordingSettings,
+        generation: UInt64
+    ) async -> RecordingSettings? {
+        var runSettings = baseSettings
+        guard runSettings.effectiveMicrophone else { return runSettings }
+        switch PermissionManager.microphoneAuthorizationStatus() {
+        case .authorized:
+            break
+        case .notDetermined:
+            let granted = await PermissionManager.requestMicrophoneAccess()
+            guard isSessionActive, sessionGeneration == generation else {
+                return nil
+            }
+            if !granted {
+                runSettings.capturesMicrophone = false
+                onNotice?(
+                    CCXL10n.text("Mic Denied — Recording No Mic", zh: "未授权麦克风，将无麦录制"),
+                    "mic.slash"
+                )
+            }
+        case .denied, .restricted:
+            runSettings.capturesMicrophone = false
+            onNotice?(
+                CCXL10n.text("Mic Off in Settings — No Mic Audio", zh: "系统设置已禁用麦克风，将无麦录制"),
+                "mic.slash"
+            )
+        @unknown default:
+            runSettings.capturesMicrophone = false
+        }
+        return runSettings
+    }
+
+    private func startRecordingCaptureFlow(
+        region: RecordingRegion,
+        settings runSettings: RecordingSettings,
+        generation: UInt64
+    ) {
+        Task { @MainActor [weak self] in
+            guard let self, self.isSessionActive, self.sessionGeneration == generation else { return }
+            switch self.phase {
+            case .ready, .countdown:
+                break
+            case .recording, .paused, .finalizing, .completed:
+                return
             }
 
             let stageDir = Self.stagingDirectoryURL()
@@ -337,6 +420,10 @@ public final class RecordingCoordinator {
                     self.refreshChrome()
                 }
             }
+            newEngine.onMicrophoneLevel = { [weak self] level in
+                guard let self, self.isSessionActive, self.sessionGeneration == generation else { return }
+                self.controlPanel?.updateMicrophoneLevel(self.phase == .recording ? level : 0)
+            }
             newEngine.onLimitReached = { [weak self] in
                 guard let self, self.isSessionActive, self.sessionGeneration == generation, self.isRecordingOrPaused else { return }
                 self.onNotice?(
@@ -352,6 +439,8 @@ public final class RecordingCoordinator {
             }
             newEngine.onUnexpectedStop = { [weak self] error in
                 guard let self, self.isSessionActive, self.sessionGeneration == generation else { return }
+                if case .finalizing = self.phase { return }
+                if case .completed = self.phase { return }
                 Self.logger.error("Recording stream error: \(error.localizedDescription)")
                 if Self.isPermissionDeniedError(error) {
                     PermissionManager.setScreenRecordingVerified(false)
@@ -456,7 +545,7 @@ public final class RecordingCoordinator {
                 elapsedSeconds: resolvedElapsed,
                 format: (effectiveSettings ?? settings).format
             ))
-        case .ready, .finalizing, .completed:
+        case .ready, .countdown, .finalizing, .completed:
             onStatusChanged?(nil)
         }
     }
@@ -508,6 +597,8 @@ public final class RecordingCoordinator {
         sessionGeneration &+= 1
         isSessionActive = false
         isStartingRecording = false
+        countdownTask?.cancel()
+        countdownTask = nil
         stopElapsedTimer()
         lastEmittedElapsedSecond = nil
         removeMonitors()
@@ -568,13 +659,25 @@ public final class RecordingCoordinator {
 
     private func handleScreenParametersChanged() {
         guard isSessionActive, let currentRegion = region else { return }
-        guard let matchedScreen = Self.exactScreen(for: currentRegion.displayID) else {
-            if phase == .ready && !isStartingRecording {
+        let matchedScreen = screenLookupForTesting?(currentRegion.displayID) ?? Self.exactScreen(for: currentRegion.displayID)
+        guard let matchedScreen else {
+            let isInCountdown: Bool
+            if case .countdown = phase { isInCountdown = true } else { isInCountdown = false }
+            if (phase == .ready && !isStartingRecording) || isInCountdown {
                 onNotice?(
                     CCXL10n.text("Display Disconnected", zh: "显示器已断开"),
                     "display.trianglebadge.exclamationmark"
                 )
                 cancelActiveSession()
+            } else if isRecordingOrPaused {
+                if let fallbackScreen = NSScreen.main {
+                    controlPanel?.updateVisibleFrame(fallbackScreen.visibleFrame)
+                }
+                onNotice?(
+                    CCXL10n.text("Display Disconnected — Saving Recording…", zh: "显示器已断开，正在保存录屏…"),
+                    "display.trianglebadge.exclamationmark"
+                )
+                stopActiveRecording()
             } else if let fallbackScreen = NSScreen.main {
                 controlPanel?.updateVisibleFrame(fallbackScreen.visibleFrame)
             }
@@ -608,13 +711,21 @@ public final class RecordingCoordinator {
     // MARK: - Keyboard Monitors
 
     /// Returns `true` only when a global `Esc` key press should cancel the session
-    /// (strictly limited to unmodified `Esc` in `.ready` phase when no menu is open).
+    /// (limited to unmodified `Esc` in `.ready` or `.countdown` phase when no menu is open).
     func shouldHandleGlobalEscape(modifiers: NSEvent.ModifierFlags) -> Bool {
         let normalizedMods = modifiers
             .intersection(.deviceIndependentFlagsMask)
             .subtracting([.capsLock, .numericPad, .function])
         guard normalizedMods.isEmpty else { return false }
-        guard isSessionActive, case .ready = phase, !isStartingRecording else { return false }
+        guard isSessionActive else { return false }
+        switch phase {
+        case .ready:
+            guard !isStartingRecording else { return false }
+        case .countdown:
+            break
+        case .recording, .paused, .finalizing, .completed:
+            return false
+        }
         guard controlPanel?.isPopupMenuOpen != true else { return false }
         return true
     }
@@ -655,7 +766,7 @@ public final class RecordingCoordinator {
                 }
                 cancelActiveSession()
                 return true
-            case .recording, .paused, .completed:
+            case .countdown, .recording, .paused, .completed:
                 cancelActiveSession()
                 return true
             case .finalizing:
@@ -736,6 +847,13 @@ public final class RecordingCoordinator {
                 cancelActiveSession()
                 return true
             }
+
+        case .countdown:
+            if mods == .command && chars == "w" {
+                cancelActiveSession()
+                return true
+            }
+            return false
 
         case .finalizing:
             return false
@@ -830,9 +948,17 @@ public final class RecordingCoordinator {
     var controlPanelWindowNumberForTesting: Int? { controlPanel?.windowNumber }
     var borderPanelWindowNumberForTesting: Int? { borderPanel?.windowNumber }
     var borderPanelForTesting: RecordingBorderPanel? { borderPanel }
+    var controlPanelForTesting: RecordingControlPanel? { controlPanel }
+
+    var screenLookupForTesting: ((CGDirectDisplayID) -> NSScreen?)?
+    var stopHandlerForTesting: (() -> Void)?
 
     func setPhaseForTesting(_ testPhase: RecordingPhase) {
         self.phase = testPhase
+    }
+
+    func triggerScreenParametersChangedForTesting() {
+        handleScreenParametersChanged()
     }
 
     private static func exactScreen(for displayID: CGDirectDisplayID) -> NSScreen? {

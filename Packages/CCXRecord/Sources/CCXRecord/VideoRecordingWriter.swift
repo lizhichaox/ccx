@@ -74,6 +74,8 @@ public final class VideoRecordingWriter: @unchecked Sendable {
         var droppedVideoFrames = 0
         var droppedAudioBuffers = 0
         var onError: (@Sendable (Error) -> Void)?
+        var onMicrophoneLevel: (@Sendable (Float) -> Void)?
+        var lastMicLevelTimestamp: CFAbsoluteTime = 0
         var didReportError = false
     }
 
@@ -106,6 +108,11 @@ public final class VideoRecordingWriter: @unchecked Sendable {
     public var onError: (@Sendable (Error) -> Void)? {
         get { gate.withLock { $0.onError } }
         set { gate.withLock { $0.onError = newValue } }
+    }
+
+    public var onMicrophoneLevel: (@Sendable (Float) -> Void)? {
+        get { gate.withLock { $0.onMicrophoneLevel } }
+        set { gate.withLock { $0.onMicrophoneLevel = newValue } }
     }
 
     var droppedVideoFrameCountForTesting: Int {
@@ -316,8 +323,8 @@ public final class VideoRecordingWriter: @unchecked Sendable {
 
     public func pause() {
         let now = CMClockGetTime(CMClockGetHostTimeClock())
-        let shouldSchedule: Bool = gate.withLock { state in
-            guard !state.isCancelled else { return false }
+        let result: (shouldSchedule: Bool, micCallback: (@Sendable (Float) -> Void)?) = gate.withLock { state in
+            guard !state.isCancelled else { return (false, nil) }
             state.isPaused = true
             state.items.removeAll { item in
                 switch item {
@@ -328,11 +335,13 @@ public final class VideoRecordingWriter: @unchecked Sendable {
             state.pendingVideoCount = 0
             state.pendingAudioCount = 0
             state.items.append(.pause(now))
-            if state.isDrainScheduled { return false }
+            let callback = state.onMicrophoneLevel
+            if state.isDrainScheduled { return (false, callback) }
             state.isDrainScheduled = true
-            return true
+            return (true, callback)
         }
-        if shouldSchedule {
+        result.micCallback?(0)
+        if result.shouldSchedule {
             queue.async { [weak self] in
                 self?.drainPending()
             }
@@ -648,6 +657,22 @@ public final class VideoRecordingWriter: @unchecked Sendable {
 
         let activeNormalizer = (source == .system) ? systemNormalizer : micNormalizer
         let samples = activeNormalizer.normalizeSlice(sampleBuffer)
+
+        if source == .microphone {
+            let level = samples.isEmpty ? 0 : micNormalizer.lastNormalizedRMSLevel
+            let now = CFAbsoluteTimeGetCurrent()
+            let micCallback: (@Sendable (Float) -> Void)? = gate.withLock { state in
+                guard let callback = state.onMicrophoneLevel,
+                      now - state.lastMicLevelTimestamp >= 0.06
+                else {
+                    return nil
+                }
+                state.lastMicLevelTimestamp = now
+                return callback
+            }
+            micCallback?(level)
+        }
+
         guard !samples.isEmpty else { return }
 
         if isDualSource {
