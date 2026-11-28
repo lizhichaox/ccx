@@ -9,6 +9,27 @@ struct SnipHistoryManifestRecord: Codable, Sendable {
     let timestamp: Date
     let scale: CGFloat
     let screenRect: CGRect
+    let pixelWidth: Int?
+    let pixelHeight: Int?
+    let fingerprint: ImageFingerprint?
+
+    init(
+        id: UUID,
+        timestamp: Date,
+        scale: CGFloat,
+        screenRect: CGRect,
+        pixelWidth: Int? = nil,
+        pixelHeight: Int? = nil,
+        fingerprint: ImageFingerprint? = nil
+    ) {
+        self.id = id
+        self.timestamp = timestamp
+        self.scale = scale
+        self.screenRect = screenRect
+        self.pixelWidth = pixelWidth
+        self.pixelHeight = pixelHeight
+        self.fingerprint = fingerprint
+    }
 }
 
 /// Private, user-only disk store backing `ClipboardStore.history` across app restarts.
@@ -34,7 +55,7 @@ final class SnipHistoryDiskStore: Sendable {
         entry: SnipHistoryEntry,
         manifest: [SnipHistoryManifestRecord],
         preEncodedPNG: Data? = nil,
-        onEncodedPNG: (@Sendable (UUID, Data) -> Void)? = nil
+        onPersistedToDisk: (@Sendable (UUID, URL) -> Void)? = nil
     ) {
         ioQueue.async { [directoryURL] in
             autoreleasepool {
@@ -42,12 +63,10 @@ final class SnipHistoryDiskStore: Sendable {
 
                 let pngName = "\(entry.id.uuidString).png"
                 let pngURL = directoryURL.appendingPathComponent(pngName)
-                if !Self.isExistingRegularUserFile(at: pngURL) {
-                    let pngData = preEncodedPNG ?? ClipboardStore.encode(entry.image, type: .png, scale: entry.scale)
-                    if let pngData {
-                        if Self.writePrivateFileAtomically(pngData, to: pngURL), preEncodedPNG == nil {
-                            onEncodedPNG?(entry.id, pngData)
-                        }
+                var hasPersistedPNG = Self.isExistingRegularUserFile(at: pngURL)
+                if !hasPersistedPNG {
+                    if let pngData = preEncodedPNG ?? ClipboardStore.encode(entry.image, type: .png, scale: entry.scale) {
+                        hasPersistedPNG = Self.writePrivateFileAtomically(pngData, to: pngURL)
                     }
                 }
 
@@ -56,6 +75,27 @@ final class SnipHistoryDiskStore: Sendable {
                     _ = Self.writePrivateFileAtomically(indexData, to: indexURL)
                 }
 
+                Self.pruneUnreferencedFiles(in: directoryURL, keepingPNGNames: Set(manifest.map { "\($0.id.uuidString).png" }))
+
+                if hasPersistedPNG {
+                    onPersistedToDisk?(entry.id, pngURL)
+                }
+            }
+        }
+    }
+
+    func saveManifestOnly(_ manifest: [SnipHistoryManifestRecord]) {
+        ioQueue.async { [directoryURL] in
+            autoreleasepool {
+                guard Self.verifyExistingSecureDirectory(at: directoryURL) else { return }
+                if manifest.isEmpty {
+                    Self.removeAllChildren(in: directoryURL)
+                    return
+                }
+                let indexURL = directoryURL.appendingPathComponent("index.json")
+                if let indexData = try? JSONEncoder().encode(manifest) {
+                    _ = Self.writePrivateFileAtomically(indexData, to: indexURL)
+                }
                 Self.pruneUnreferencedFiles(in: directoryURL, keepingPNGNames: Set(manifest.map { "\($0.id.uuidString).png" }))
             }
         }
@@ -116,14 +156,48 @@ final class SnipHistoryDiskStore: Sendable {
                     }
 
                     let pngURL = directoryURL.appendingPathComponent("\(record.id.uuidString).png")
-                    guard let pngData = Self.readPrivateRegularFile(at: pngURL, maxBytes: ClipboardStore.maxDecodeFileBytes),
-                          let (image, _) = ClipboardStore.decode(pngData)
-                    else {
+                    guard let pngData = Self.readPrivateRegularFile(at: pngURL, maxBytes: ClipboardStore.maxDecodeFileBytes) else {
                         needsCleanup = true
                         return
                     }
 
-                    let imageBytes = ClipboardStore.estimatedMemoryBytes(for: image)
+                    let resolvedWidth: Int
+                    let resolvedHeight: Int
+                    let resolvedThumbnail: CGImage
+                    let resolvedFingerprint: ImageFingerprint
+
+                    if let cachedFingerprint = record.fingerprint,
+                       let inspected = ClipboardStore.inspectAndMakeThumbnail(from: pngData, maxPixelDimension: 160),
+                       cachedFingerprint.pixelWidth == inspected.pixelWidth,
+                       cachedFingerprint.pixelHeight == inspected.pixelHeight
+                    {
+                        if let fastThumbnail = inspected.thumbnail {
+                            resolvedWidth = inspected.pixelWidth
+                            resolvedHeight = inspected.pixelHeight
+                            resolvedThumbnail = fastThumbnail
+                            resolvedFingerprint = cachedFingerprint
+                        } else if let (decodedFull, _) = ClipboardStore.decode(pngData) {
+                            resolvedWidth = inspected.pixelWidth
+                            resolvedHeight = inspected.pixelHeight
+                            resolvedThumbnail = SnipHistoryEntry.makeThumbnail(from: decodedFull, maxPixelDimension: 160)
+                            resolvedFingerprint = cachedFingerprint
+                        } else {
+                            needsCleanup = true
+                            return
+                        }
+                    } else if let (decodedFull, _) = ClipboardStore.decode(pngData) {
+                        resolvedWidth = decodedFull.width
+                        resolvedHeight = decodedFull.height
+                        resolvedThumbnail = SnipHistoryEntry.makeThumbnail(from: decodedFull, maxPixelDimension: 160)
+                        resolvedFingerprint = ImageFingerprint(image: decodedFull)
+                        // Persist upgraded width/height/fingerprint into index.json for fast subsequent starts.
+                        needsCleanup = true
+                    } else {
+                        needsCleanup = true
+                        return
+                    }
+
+                    let imageBytes = ClipboardStore.estimatedMemoryBytes(pixelWidth: resolvedWidth, pixelHeight: resolvedHeight)
                     let (nextTotalBytes, overflow) = totalMemoryBytes.addingReportingOverflow(imageBytes)
                     if !entries.isEmpty, maxTotalMemoryBytes > 0, (overflow || nextTotalBytes > maxTotalMemoryBytes) {
                         needsCleanup = true
@@ -137,6 +211,8 @@ final class SnipHistoryDiskStore: Sendable {
                     if sanitizedScale != record.scale
                         || sanitizedRect != record.screenRect
                         || sanitizedTimestamp != record.timestamp
+                        || record.pixelWidth != resolvedWidth
+                        || record.pixelHeight != resolvedHeight
                     {
                         needsCleanup = true
                     }
@@ -144,15 +220,23 @@ final class SnipHistoryDiskStore: Sendable {
                     entries.append(SnipHistoryEntry(
                         id: record.id,
                         timestamp: sanitizedTimestamp,
-                        image: image,
+                        pixelWidth: resolvedWidth,
+                        pixelHeight: resolvedHeight,
+                        thumbnail: resolvedThumbnail,
+                        fingerprint: resolvedFingerprint,
                         scale: sanitizedScale,
-                        screenRect: sanitizedRect
+                        screenRect: sanitizedRect,
+                        backingFileURL: pngURL,
+                        inMemoryImage: nil
                     ))
                     validRecords.append(SnipHistoryManifestRecord(
                         id: record.id,
                         timestamp: sanitizedTimestamp,
                         scale: sanitizedScale,
-                        screenRect: sanitizedRect
+                        screenRect: sanitizedRect,
+                        pixelWidth: resolvedWidth,
+                        pixelHeight: resolvedHeight,
+                        fingerprint: resolvedFingerprint
                     ))
                     totalMemoryBytes = overflow ? Int.max : nextTotalBytes
                 }
@@ -354,7 +438,7 @@ final class SnipHistoryDiskStore: Sendable {
         return true
     }
 
-    private static func readPrivateRegularFile(at url: URL, maxBytes: Int) -> Data? {
+    static func readPrivateRegularFile(at url: URL, maxBytes: Int) -> Data? {
         let fd = Darwin.open(url.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
         guard fd >= 0 else { return nil }
         defer { _ = Darwin.close(fd) }

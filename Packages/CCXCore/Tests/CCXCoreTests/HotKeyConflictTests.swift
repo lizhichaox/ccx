@@ -407,5 +407,39 @@ final class HotKeyConflictTests: XCTestCase {
         let reservedCmdQ = HotKeyCombo(keyCode: UInt32(kVK_ANSI_Q), carbonModifiers: UInt32(cmdKey))
         defaults.set(try JSONEncoder().encode(reservedCmdQ), forKey: HotKeyPreferences.snipComboKey)
         XCTAssertEqual(HotKeyPreferences.loadCombo(for: .snip, from: defaults), .defaultSnip)
+
+        // Optional actions ship unbound (nil) by default, persist independently, and clear cleanly.
+        for action in CCXHotKeyAction.optionalActions {
+            XCTAssertNil(HotKeyPreferences.loadBinding(for: action, from: defaults))
+        }
+        let ocrCombo = HotKeyCombo(keyCode: UInt32(kVK_ANSI_O), carbonModifiers: UInt32(controlKey | optionKey | cmdKey))
+        HotKeyPreferences.saveBinding(ocrCombo, for: .quickOCR, to: defaults)
+        XCTAssertEqual(HotKeyPreferences.loadBinding(for: .quickOCR, from: defaults), ocrCombo)
+        XCTAssertNil(HotKeyPreferences.loadBinding(for: .pinClipboard, from: defaults))
+
+        HotKeyPreferences.saveBinding(nil, for: .quickOCR, to: defaults)
+        XCTAssertNil(HotKeyPreferences.loadBinding(for: .quickOCR, from: defaults))
+    }
+
+    @MainActor
+    func testOptionalActionInternalConflictAndSeparateSlots() {
+        let manager = GlobalHotKeyManager()
+        defer { manager.unregisterAll() }
+
+        let comboA = HotKeyCombo(keyCode: UInt32(kVK_F19), carbonModifiers: UInt32(controlKey | optionKey | shiftKey))
+        let comboB = HotKeyCombo(keyCode: UInt32(kVK_F20), carbonModifiers: UInt32(controlKey | optionKey | shiftKey))
+        guard case .registered = manager.registerChecked(.snip, combo: comboA, symbolicHotKeysProvider: { [] }) else {
+            return
+        }
+        XCTAssertEqual(
+            manager.registerChecked(.quickOCR, combo: comboA, symbolicHotKeysProvider: { [] }),
+            .conflict(.internalConflict(comboA, action: .snip))
+        )
+        XCTAssertEqual(
+            manager.registerChecked(.quickOCR, combo: comboB, symbolicHotKeysProvider: { [] }),
+            .registered(comboB)
+        )
+        XCTAssertEqual(manager.currentCombo(for: .snip), comboA)
+        XCTAssertEqual(manager.currentCombo(for: .quickOCR), comboB)
     }
 }

@@ -49,6 +49,13 @@ done
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
+if command -v git >/dev/null 2>&1 && git rev-parse --git-dir >/dev/null 2>&1; then
+  HOOKS_PATH="$(git config --get core.hooksPath 2>/dev/null || true)"
+  if [[ "$HOOKS_PATH" != ".githooks" ]]; then
+    echo "warning: git core.hooksPath is '${HOOKS_PATH:-<unset>}' (expected '.githooks'). Run: git config core.hooksPath .githooks" >&2
+  fi
+fi
+
 export DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"
 DERIVED_DATA_PATH=".build/xcode"
 APP_PATH="$DERIVED_DATA_PATH/Build/Products/$CONFIGURATION/CCX.app"

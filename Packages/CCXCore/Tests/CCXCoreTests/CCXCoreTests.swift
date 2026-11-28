@@ -283,7 +283,10 @@ final class HotKeyComboTests: XCTestCase {
     func testDefaults() {
         XCTAssertEqual(HotKeyCombo.defaultSnip,
                        HotKeyCombo(keyCode: UInt32(kVK_ANSI_X), carbonModifiers: UInt32(controlKey | cmdKey)))
-        XCTAssertEqual(CCXHotKeyAction.allCases.map(\.defaultCombo), [.defaultSnip])
+        XCTAssertEqual(CCXHotKeyAction.allCases.compactMap(\.defaultCombo), [.defaultSnip])
+        for action in CCXHotKeyAction.optionalActions {
+            XCTAssertNil(action.defaultCombo)
+        }
     }
 
     func testDisplayString() {
@@ -1137,6 +1140,181 @@ final class ClipboardStoreTests: XCTestCase {
             }
         }
     }
+
+    func testLazyDiskStartupSkipsFullImageDecodeAndSupportsRetentionPolicies() async throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ccx-lazy-retention-\(UUID().uuidString)", isDirectory: true)
+        let suiteName = "com.lizhichaox.ccx.tests.retention.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer {
+            try? FileManager.default.removeItem(at: dir)
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+
+        let img1 = makeTestImage(width: 24, height: 18) { _, _ in (210, 40, 60, 255) }
+        let img2 = makeTestImage(width: 32, height: 20) { _, _ in (40, 140, 230, 255) }
+
+        let store1 = ClipboardStore(
+            maxHistoryCount: 5,
+            pasteboard: InMemoryClipboardPasteboard(),
+            historyDirectoryURL: dir,
+            userDefaults: defaults
+        )
+        let first = try XCTUnwrap(store1.recordAndCopyImage(img1, scale: 2, screenRect: CGRect(x: 0, y: 0, width: 12, height: 9)))
+        let second = try XCTUnwrap(store1.recordSnip(image: img2, scale: 2, screenRect: CGRect(x: 10, y: 10, width: 16, height: 10)))
+        store1.flushPendingPersistence()
+        await Task.yield()
+
+        // Both persisted entries release in-memory bitmaps and store metadata + fingerprints in index.json.
+        try await waitUntil {
+            store1.history.count == 2 && store1.history.allSatisfy { !$0.hasInMemoryFullImageForTesting }
+        }
+        let manifestData = try Data(contentsOf: dir.appendingPathComponent("index.json"))
+        let manifest = try JSONDecoder().decode([SnipHistoryManifestRecord].self, from: manifestData)
+        XCTAssertEqual(manifest.count, 2)
+        XCTAssertNotNil(manifest.first?.fingerprint)
+        XCTAssertEqual(manifest.first?.pixelWidth, 32)
+        XCTAssertEqual(manifest.first?.pixelHeight, 20)
+
+        // Fresh launch loads thumbnails + fingerprints lazily without allocating full bitmaps in RAM.
+        let store2 = ClipboardStore(
+            maxHistoryCount: 5,
+            pasteboard: InMemoryClipboardPasteboard(),
+            historyDirectoryURL: dir,
+            userDefaults: defaults
+        )
+        try await waitUntil { store2.history.count == 2 }
+        XCTAssertEqual(store2.history.map(\.id), [second.id, first.id])
+        XCTAssertTrue(store2.history.allSatisfy { !$0.hasInMemoryFullImageForTesting })
+        XCTAssertEqual(store2.history[0].pixelWidth, 32)
+        XCTAssertEqual(store2.history[0].pixelHeight, 20)
+        XCTAssertTrue(store2.history[0].fingerprint.matches(second.fingerprint))
+        XCTAssertEqual(CCXColorSample.samplePixel(from: store2.history[0].image, pixelX: 4, pixelY: 4)?.blue, 230)
+
+        // 24-hour retention expires entries older than 24h while preserving recent ones on restart.
+        let staleID = first.id
+        let recentID = second.id
+        let rewritten = [
+            SnipHistoryManifestRecord(
+                id: recentID,
+                timestamp: Date(),
+                scale: 2,
+                screenRect: CGRect(x: 10, y: 10, width: 16, height: 10),
+                pixelWidth: 32,
+                pixelHeight: 20,
+                fingerprint: second.fingerprint
+            ),
+            SnipHistoryManifestRecord(
+                id: staleID,
+                timestamp: Date().addingTimeInterval(-(ClipboardStore.retention24HoursInterval + 3600)),
+                scale: 2,
+                screenRect: CGRect(x: 0, y: 0, width: 12, height: 9),
+                pixelWidth: 24,
+                pixelHeight: 18,
+                fingerprint: first.fingerprint
+            ),
+        ]
+        try JSONEncoder().encode(rewritten).write(to: dir.appendingPathComponent("index.json"))
+
+        let store24h = ClipboardStore(
+            maxHistoryCount: 5,
+            pasteboard: InMemoryClipboardPasteboard(),
+            historyDirectoryURL: dir,
+            userDefaults: defaults
+        )
+        store24h.retentionPolicy = .clearAfter24Hours
+        try await waitUntil { store24h.history.count == 1 }
+        store24h.flushPendingPersistence()
+        XCTAssertEqual(store24h.history.map(\.id), [recentID])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: dir.appendingPathComponent("\(staleID.uuidString).png").path))
+
+        // Clear-on-quit purges memory and disk synchronously in handleApplicationWillTerminate().
+        store24h.retentionPolicy = .clearOnQuit
+        store24h.flushPendingPersistence()
+        XCTAssertFalse(store24h.history.isEmpty)
+        store24h.handleApplicationWillTerminate()
+        XCTAssertTrue(store24h.history.isEmpty)
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: dir.path).isEmpty)
+
+        // Disabled mode records nothing to history/disk while still copying to pasteboard.
+        let pbDisabled = InMemoryClipboardPasteboard()
+        let disabledStore = ClipboardStore(
+            maxHistoryCount: 5,
+            pasteboard: pbDisabled,
+            historyDirectoryURL: dir,
+            userDefaults: defaults
+        )
+        XCTAssertEqual(disabledStore.retentionPolicy, .clearOnQuit)
+        _ = disabledStore.recordSnip(image: img1, scale: 1, screenRect: .zero)
+        disabledStore.flushPendingPersistence()
+        XCTAssertEqual(disabledStore.history.count, 1)
+
+        // Fresh startup under .clearOnQuit must purge leftover snips from an unclean termination.
+        let recoveredStore = ClipboardStore(
+            maxHistoryCount: 5,
+            pasteboard: InMemoryClipboardPasteboard(),
+            historyDirectoryURL: dir,
+            userDefaults: defaults
+        )
+        recoveredStore.flushPendingPersistence()
+        XCTAssertTrue(recoveredStore.history.isEmpty)
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: dir.path).isEmpty)
+
+        disabledStore.retentionPolicy = .disabled
+        disabledStore.flushPendingPersistence()
+        XCTAssertTrue(disabledStore.history.isEmpty)
+        pbDisabled.clearContents()
+        pbDisabled.writeString("external-text")
+        XCTAssertTrue(disabledStore.hasClipboardChangedSinceLatestSnip)
+        XCTAssertNil(disabledStore.recordSnip(image: img2, scale: 2, screenRect: .zero))
+        XCTAssertTrue(disabledStore.hasClipboardChangedSinceLatestSnip)
+        XCTAssertNil(disabledStore.recordAndCopyImage(img2, scale: 2, screenRect: .zero))
+        disabledStore.flushPendingPersistence()
+        XCTAssertTrue(disabledStore.history.isEmpty)
+        XCTAssertNotNil(pbDisabled.data(forType: .png))
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: dir.path).isEmpty)
+    }
+
+    func testConcealFromClipboardManagersTagsAndOmitsTransientType() throws {
+        let suiteName = "com.lizhichaox.ccx.tests.conceal.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let pb = InMemoryClipboardPasteboard()
+        let store = ClipboardStore(pasteboard: pb, userDefaults: defaults)
+        let img = makeTestImage(width: 8, height: 8) { _, _ in (120, 180, 240, 255) }
+        let fileURL = URL(fileURLWithPath: "/tmp/sample.mp4")
+
+        XCTAssertFalse(store.concealFromClipboardManagers)
+        store.copyText("visible-text")
+        XCTAssertNil(pb.data(forType: ClipboardStore.transientPasteboardType))
+        store.copyImage(img, scale: 2)
+        XCTAssertNil(pb.data(forType: ClipboardStore.transientPasteboardType))
+        _ = store.recordAndCopyImage(img, scale: 2, screenRect: .zero)
+        XCTAssertNil(pb.data(forType: ClipboardStore.transientPasteboardType))
+        store.copyFileURL(fileURL)
+        XCTAssertNil(pb.data(forType: ClipboardStore.transientPasteboardType))
+
+        store.concealFromClipboardManagers = true
+
+        store.copyText("secret-text")
+        XCTAssertNotNil(pb.data(forType: ClipboardStore.transientPasteboardType))
+        XCTAssertEqual(pb.string(), "secret-text")
+
+        store.copyImage(img, scale: 2)
+        XCTAssertNotNil(pb.data(forType: ClipboardStore.transientPasteboardType))
+        XCTAssertNotNil(pb.data(forType: .png))
+
+        _ = store.recordAndCopyImage(img, scale: 2, screenRect: .zero)
+        XCTAssertNotNil(pb.data(forType: ClipboardStore.transientPasteboardType))
+
+        store.copyFileURL(fileURL)
+        XCTAssertNotNil(pb.data(forType: ClipboardStore.transientPasteboardType))
+
+        // Preference persists in UserDefaults.
+        let reloaded = ClipboardStore(pasteboard: InMemoryClipboardPasteboard(), userDefaults: defaults)
+        XCTAssertTrue(reloaded.concealFromClipboardManagers)
+    }
 }
 
 final class TextRecognizerTests: XCTestCase {
@@ -1193,5 +1371,50 @@ final class TextRecognizerTests: XCTestCase {
             throw error
         }
         XCTAssertTrue(text.contains("CCX"), "Expected OCR text containing CCX, got: \(text)")
+    }
+
+    func testAssembleLayoutPreservesColumnsParagraphsCJKAndHandlesEmptyInput() {
+        XCTAssertEqual(TextRecognizer.assembleLayout(from: []), "")
+        XCTAssertEqual(
+            TextRecognizer.assembleLayout(from: [
+                RecognizedTextBlock(text: "   \n ", boundingBox: CGRect(x: 0.1, y: 0.8, width: 0.1, height: 0.04)),
+                RecognizedTextBlock(text: "bad", boundingBox: .null),
+            ]),
+            ""
+        )
+
+        // Shuffled table rows + second paragraph separated by vertical gap > 1.2 * rowHeight.
+        // Vision bottom-left Y coordinates: higher Y = higher on page.
+        let blocks: [RecognizedTextBlock] = [
+            RecognizedTextBlock(text: "Footer note.", boundingBox: CGRect(x: 0.10, y: 0.27, width: 0.20, height: 0.04)),
+            RecognizedTextBlock(text: "$120", boundingBox: CGRect(x: 0.55, y: 0.72, width: 0.08, height: 0.04)),
+            RecognizedTextBlock(text: "Apples", boundingBox: CGRect(x: 0.10, y: 0.72, width: 0.12, height: 0.04)),
+            RecognizedTextBlock(text: "Item", boundingBox: CGRect(x: 0.10, y: 0.80, width: 0.08, height: 0.04)),
+            RecognizedTextBlock(text: "Price", boundingBox: CGRect(x: 0.55, y: 0.80, width: 0.09, height: 0.04)),
+            RecognizedTextBlock(text: "Hello", boundingBox: CGRect(x: 0.10, y: 0.35, width: 0.08, height: 0.04)),
+            RecognizedTextBlock(text: "world", boundingBox: CGRect(x: 0.19, y: 0.35, width: 0.08, height: 0.04)),
+        ]
+        XCTAssertEqual(
+            TextRecognizer.assembleLayout(from: blocks),
+            "Item\tPrice\nApples\t$120\n\nHello world\nFooter note."
+        )
+
+        // Tightly adjacent CJK fragments on the same visual row join without stray spaces,
+        // while wide CJK columns preserve tab separation.
+        let cjkBlocks: [RecognizedTextBlock] = [
+            RecognizedTextBlock(text: "屏幕", boundingBox: CGRect(x: 0.10, y: 0.60, width: 0.08, height: 0.04)),
+            RecognizedTextBlock(text: "录制", boundingBox: CGRect(x: 0.185, y: 0.60, width: 0.08, height: 0.04)),
+            RecognizedTextBlock(text: "已启用", boundingBox: CGRect(x: 0.50, y: 0.60, width: 0.12, height: 0.04)),
+        ]
+        XCTAssertEqual(TextRecognizer.assembleLayout(from: cjkBlocks), "屏幕录制\t已启用")
+
+        // Epsilon-adjacent midY/minX values and overflowing midY boxes must obey strict weak ordering.
+        let cyclicEdgeBlocks: [RecognizedTextBlock] = [
+            RecognizedTextBlock(text: "A", boundingBox: CGRect(x: 0.50016, y: 0.50016, width: 0.05, height: 0.04)),
+            RecognizedTextBlock(text: "B", boundingBox: CGRect(x: 0.30008, y: 0.50008, width: 0.05, height: 0.04)),
+            RecognizedTextBlock(text: "C", boundingBox: CGRect(x: 0.10000, y: 0.50000, width: 0.05, height: 0.04)),
+            RecognizedTextBlock(text: "Overflow", boundingBox: CGRect(x: 0.1, y: .greatestFiniteMagnitude, width: 0.1, height: .greatestFiniteMagnitude)),
+        ]
+        XCTAssertEqual(TextRecognizer.assembleLayout(from: cyclicEdgeBlocks), "C\tB\tA")
     }
 }

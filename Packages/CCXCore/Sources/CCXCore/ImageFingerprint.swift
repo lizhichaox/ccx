@@ -3,14 +3,45 @@ import Foundation
 
 /// Resolution-normalized sRGB visual fingerprint used to identify matching images across
 /// capture history, clipboard round-trips, and active floating pins.
-public struct ImageFingerprint: Equatable, Sendable {
+public struct ImageFingerprint: Equatable, Codable, Sendable {
     private static let sampleSide = 48
+    private static let sampleByteCount = sampleSide * sampleSide * 4
     private static let channelTolerance = 2
     private static let sRGBColorSpace = CGColorSpace(name: CGColorSpace.sRGB)
 
     public let pixelWidth: Int
     public let pixelHeight: Int
     private let rgbaSamples: [UInt8]
+
+    private enum CodingKeys: String, CodingKey {
+        case pixelWidth
+        case pixelHeight
+        case rgbaSamples
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let width = try container.decode(Int.self, forKey: .pixelWidth)
+        let height = try container.decode(Int.self, forKey: .pixelHeight)
+        let encodedSamples = try container.decode(Data.self, forKey: .rgbaSamples)
+        guard width > 0, height > 0, encodedSamples.count == Self.sampleByteCount else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .rgbaSamples,
+                in: container,
+                debugDescription: "Invalid ImageFingerprint dimensions or sample payload."
+            )
+        }
+        self.pixelWidth = width
+        self.pixelHeight = height
+        self.rgbaSamples = [UInt8](encodedSamples)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(pixelWidth, forKey: .pixelWidth)
+        try container.encode(pixelHeight, forKey: .pixelHeight)
+        try container.encode(Data(rgbaSamples), forKey: .rgbaSamples)
+    }
 
     public init(image: CGImage) {
         self.pixelWidth = image.width

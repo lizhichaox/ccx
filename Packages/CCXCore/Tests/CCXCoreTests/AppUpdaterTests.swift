@@ -1520,7 +1520,7 @@ final class AppUpdaterTests: XCTestCase {
         let zipURL = dir.appendingPathComponent("CCX-0.9.0-macOS-universal.zip")
         let ditto = Process()
         ditto.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
-        ditto.arguments = ["-c", "-k", "--keepParent", sourceApp.path, zipURL.path]
+        ditto.arguments = ["-c", "-k", "--keepParent", "--norsrc", "--noextattr", sourceApp.path, zipURL.path]
         try ditto.run()
         ditto.waitUntilExit()
         XCTAssertEqual(ditto.terminationStatus, 0)
@@ -1542,14 +1542,27 @@ final class AppUpdaterTests: XCTestCase {
         let extractDir = dir.appendingPathComponent("extract-target", isDirectory: true)
         try FileManager.default.createDirectory(at: extractDir, withIntermediateDirectories: true)
 
-        // Baseline valid synthetic archive (including __MACOSX/CCX.app/ metadata) passes validation.
+        // Baseline valid synthetic archive passes validation (without AppleDouble __MACOSX metadata).
         let validZip = dir.appendingPathComponent("valid.zip")
         try makeSyntheticZipData(entries: [
             SyntheticZipEntry(name: "CCX.app/", unixMode: UInt16(S_IFDIR) | 0o755),
             SyntheticZipEntry(name: "CCX.app/Contents/Info.plist", payload: Data("ok".utf8)),
-            SyntheticZipEntry(name: "__MACOSX/CCX.app/._Info.plist", payload: Data("md".utf8)),
         ]).write(to: validZip)
         XCTAssertNoThrow(try AppUpdateArchiveValidator.validateZipArchive(at: validZip))
+
+        // Archive containing AppleDouble __MACOSX entries alongside CCX.app/ is rejected.
+        let macosxResourceForkZip = dir.appendingPathComponent("macosx-resource-fork.zip")
+        try makeSyntheticZipData(entries: [
+            SyntheticZipEntry(name: "CCX.app/", unixMode: UInt16(S_IFDIR) | 0o755),
+            SyntheticZipEntry(name: "CCX.app/Contents/Info.plist", payload: Data("ok".utf8)),
+            SyntheticZipEntry(name: "__MACOSX/CCX.app/._Info.plist", payload: Data("md".utf8)),
+        ]).write(to: macosxResourceForkZip)
+        XCTAssertThrowsError(try AppUpdateArchiveValidator.validateZipArchive(at: macosxResourceForkZip)) { error in
+            XCTAssertEqual(error as? AppUpdateError, .extractionFailed)
+        }
+        XCTAssertThrowsError(try AppUpdateInstaller.extractZip(at: macosxResourceForkZip, to: extractDir)) { error in
+            XCTAssertEqual(error as? AppUpdateError, .extractionFailed)
+        }
 
         // 1. Synthetic ZIP bomb (> 250 MB declared uncompressed) -> .responseTooLarge
         let bombZip = dir.appendingPathComponent("bomb.zip")

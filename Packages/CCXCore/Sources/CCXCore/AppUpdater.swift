@@ -990,7 +990,6 @@ public enum AppUpdateArchiveValidator {
 
             guard entryName == "CCX.app"
                 || entryName.hasPrefix("CCX.app/")
-                || entryName.hasPrefix("__MACOSX/CCX.app/")
             else {
                 throw AppUpdateError.extractionFailed
             }
@@ -1348,7 +1347,7 @@ public enum AppUpdateInstaller {
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
-        process.arguments = ["-x", "-k", zipPath, normalizedPath(destinationDir.path)]
+        process.arguments = ["-x", "-k", "--norsrc", "--noextattr", "--noqtn", zipPath, normalizedPath(destinationDir.path)]
         process.standardInput = FileHandle.nullDevice
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice

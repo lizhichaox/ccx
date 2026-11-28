@@ -794,7 +794,7 @@ if [[ "$BUILD_ZIP" -eq 1 ]]; then
   fi
   rm -f -- "$ZIP_PATH"
   echo "==> Creating $ZIP_NAME"
-  ditto -c -k --keepParent -- "$DIST_APP" "$ZIP_PATH"
+  ditto -c -k --keepParent --norsrc --noextattr -- "$DIST_APP" "$ZIP_PATH"
   ARTIFACT_BASENAMES+=("$ZIP_NAME")
 fi
 

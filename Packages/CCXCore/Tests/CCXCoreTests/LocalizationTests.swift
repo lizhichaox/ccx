@@ -288,4 +288,148 @@ final class LocalizationTests: XCTestCase {
             }
         }
     }
+
+    @MainActor
+    func testV011SettingsHistoryAndPrivacyCopyFitsSingleLineInBothLanguages() {
+        let titleFont = NSFont.systemFont(ofSize: 12.5, weight: .medium)
+        let subtitleFont = NSFont.systemFont(ofSize: 10.5)
+        let smallFont = NSFont.systemFont(ofSize: 11.0)
+        let settingsCardInnerWidth: CGFloat = 316.0
+
+        for language in CCXLanguage.allCases {
+            CCXL10n.withLanguageForTesting(language) {
+                let historyTitleW = ceil(NSAttributedString(string: CCXL10n.text("History", zh: "截屏记录"), attributes: [.font: titleFont]).size().width)
+                for policy in SnipHistoryRetention.allCases {
+                    let optionTitle = policy.localizedTitle
+                    XCTAssertFalse(optionTitle.isEmpty)
+                    XCTAssertFalse(optionTitle.contains("\n"))
+                    let optionW = ceil(NSAttributedString(string: optionTitle, attributes: [.font: smallFont]).size().width)
+                    let rowTotal = 24 + 9 + historyTitleW + 9 + optionW + 28
+                    XCTAssertLessThanOrEqual(
+                        rowTotal,
+                        settingsCardInnerWidth,
+                        "[\(language.rawValue)] HistoryRetentionRow '\(optionTitle)' measured \(rowTotal)pt, exceeding \(settingsCardInnerWidth)pt"
+                    )
+                }
+
+                let privacyTitle = CCXL10n.text("Private Clipboard", zh: "隐私剪贴板")
+                let privacySubtitle = CCXL10n.text("Skip 3rd-party history apps", zh: "对第三方剪贴板工具隐身")
+                let privacyTitleW = ceil(NSAttributedString(string: privacyTitle, attributes: [.font: titleFont]).size().width)
+                let privacySubtitleW = ceil(NSAttributedString(string: privacySubtitle, attributes: [.font: subtitleFont]).size().width)
+                let maxLabelW = max(privacyTitleW, privacySubtitleW)
+                let privacyRowTotal = 24 + 9 + maxLabelW + 9 + 38
+                XCTAssertLessThanOrEqual(
+                    privacyRowTotal,
+                    settingsCardInnerWidth,
+                    "[\(language.rawValue)] ClipboardPrivacyRow measured \(privacyRowTotal)pt, exceeding \(settingsCardInnerWidth)pt"
+                )
+
+                // More Shortcuts disclosure row + each optional action row.
+                let moreTitle = CCXL10n.text("More Shortcuts", zh: "更多快捷键")
+                let moreW = ceil(NSAttributedString(string: moreTitle, attributes: [.font: titleFont]).size().width)
+                let moreTotal = 24 + 9 + moreW + 9 + 24 + 14 + 8
+                XCTAssertLessThanOrEqual(
+                    moreTotal,
+                    settingsCardInnerWidth,
+                    "[\(language.rawValue)] MoreShortcuts disclosure measured \(moreTotal)pt, exceeding \(settingsCardInnerWidth)pt"
+                )
+
+                let actionTitleFont = NSFont.systemFont(ofSize: 12.0)
+                let notSetW = ceil(NSAttributedString(string: CCXL10n.text("Not Set", zh: "未设置"), attributes: [.font: smallFont]).size().width) + 18
+                let keycapWorstW: CGFloat = 110
+                let optionalRowAvailableWidth: CGFloat = 316.0 - 33.0
+                for action in CCXHotKeyAction.optionalActions {
+                    let name = action.displayName
+                    XCTAssertFalse(name.isEmpty)
+                    XCTAssertFalse(name.contains("\n"))
+                    let nameW = ceil(NSAttributedString(string: name, attributes: [.font: actionTitleFont]).size().width)
+                    let rowTotal = nameW + 8 + max(notSetW, 20 + 4 + keycapWorstW)
+                    XCTAssertLessThanOrEqual(
+                        rowTotal,
+                        optionalRowAvailableWidth,
+                        "[\(language.rawValue)] OptionalShortcutRow '\(name)' measured \(rowTotal)pt, exceeding \(optionalRowAvailableWidth)pt"
+                    )
+                }
+
+                // Popover FloatingPinsSection reopen badge & pill must fit inside 288pt inner width.
+                let popoverInnerWidth: CGFloat = 288.0
+                let sectionFont = NSFont.systemFont(ofSize: 9.5, weight: .semibold)
+                let badgeFont = NSFont.monospacedDigitSystemFont(ofSize: 9.5, weight: .bold)
+                let pillFont = NSFont.systemFont(ofSize: 11.5, weight: .medium)
+                let pinsHeaderW = ceil(NSAttributedString(string: CCXL10n.text("FLOATING PINS", zh: "悬浮贴图"), attributes: [.font: sectionFont]).size().width)
+                let recentBadge = CCXL10n.text("Recently Closed", zh: "可恢复")
+                let recentBadgeW = ceil(NSAttributedString(string: recentBadge, attributes: [.font: badgeFont]).size().width)
+                XCTAssertLessThanOrEqual(pinsHeaderW + 6 + recentBadgeW + 12, popoverInnerWidth)
+
+                let reopenTitle = CCXL10n.text("Reopen Closed Pin", zh: "恢复刚关闭的贴图")
+                XCTAssertFalse(reopenTitle.contains("\n"))
+                let reopenW = ceil(NSAttributedString(string: reopenTitle, attributes: [.font: pillFont]).size().width)
+                XCTAssertLessThanOrEqual(16 + 5 + reopenW + 24, popoverInnerWidth)
+            }
+        }
+    }
+
+    @MainActor
+    func testAccordionSettingsDisclosureHeadersFitSingleLineInBothLanguages() {
+        let titleFont = NSFont.systemFont(ofSize: 12.5, weight: .medium)
+        let subtitleFont = NSFont.systemFont(ofSize: 10.5)
+        let badgeTextFont = NSFont.monospacedDigitSystemFont(ofSize: 10.5, weight: .semibold)
+        let cardInnerWidth: CGFloat = 316.0
+        // 24pt badge + 9pt gap + 9pt gap + 6pt chevron gap + 12pt chevron = 60pt (plus optional capsule padding 14pt).
+        let baseChromeWidth: CGFloat = 24 + 9 + 9 + 6 + 12
+
+        func measureHeader(title: String, subtitle: String, badge: String?) -> CGFloat {
+            let titleW = ceil(NSAttributedString(string: title, attributes: [.font: titleFont]).size().width)
+            let subtitleW = ceil(NSAttributedString(string: subtitle, attributes: [.font: subtitleFont]).size().width)
+            let textW = max(titleW, subtitleW)
+            let badgeW: CGFloat = if let badge {
+                ceil(NSAttributedString(string: badge, attributes: [.font: badgeTextFont]).size().width) + 14
+            } else {
+                0
+            }
+            return baseChromeWidth + textW + badgeW
+        }
+
+        for language in CCXLanguage.allCases {
+            CCXL10n.withLanguageForTesting(language) {
+                for badge in [nil, "5", CCXL10n.text("Conflict", zh: "有冲突")] {
+                    let w = measureHeader(
+                        title: CCXL10n.text("More Shortcuts", zh: "更多快捷键"),
+                        subtitle: CCXL10n.text("Quick OCR, Pin, Record & more", zh: "快速识字、贴图、录屏等"),
+                        badge: badge
+                    )
+                    XCTAssertLessThanOrEqual(w, cardInnerWidth, "[\(language.rawValue)] More Shortcuts header measured \(w)pt")
+                }
+
+                for policy in SnipHistoryRetention.allCases {
+                    let retention = policy.localizedTitle
+                    for concealed in [false, true] {
+                        let subtitle = concealed
+                            ? CCXL10n.text("\(retention) · Private", zh: "\(retention) · 隐私剪贴板")
+                            : CCXL10n.text("Recordings · \(retention)", zh: "录屏目录 · \(retention)")
+                        let w = measureHeader(
+                            title: CCXL10n.text("Storage & Privacy", zh: "存储与隐私"),
+                            subtitle: subtitle,
+                            badge: nil
+                        )
+                        XCTAssertLessThanOrEqual(w, cardInnerWidth, "[\(language.rawValue)] Storage & Privacy '\(subtitle)' measured \(w)pt")
+                    }
+                }
+
+                let permissionVariants: [(subtitle: String, badge: String)] = [
+                    (CCXL10n.text("Screen Recording required", zh: "需要开启屏幕录制权限"), CCXL10n.text("Required", zh: "待授权")),
+                    (CCXL10n.text("Screen, Accessibility & Mic", zh: "录屏、辅助功能与麦克风"), CCXL10n.text("All Granted", zh: "全部已授权")),
+                    (CCXL10n.text("Optional permissions available", zh: "可选权限按需开启"), "2/3"),
+                ]
+                for variant in permissionVariants {
+                    let w = measureHeader(
+                        title: CCXL10n.text("Permissions", zh: "系统权限"),
+                        subtitle: variant.subtitle,
+                        badge: variant.badge
+                    )
+                    XCTAssertLessThanOrEqual(w, cardInnerWidth, "[\(language.rawValue)] Permissions '\(variant.subtitle)' measured \(w)pt")
+                }
+            }
+        }
+    }
 }

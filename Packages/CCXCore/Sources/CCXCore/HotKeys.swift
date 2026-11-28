@@ -5,19 +5,44 @@ import Foundation
 /// Global actions that can be bound to a system-wide hotkey.
 public enum CCXHotKeyAction: String, CaseIterable, Sendable, Codable {
     case snip
+    case quickOCR
+    case pinClipboard
+    case record
+    case togglePins
+    case unlockClickThrough
+
+    /// Optional secondary actions that ship unbound by default.
+    public static let optionalActions: [CCXHotKeyAction] = [
+        .quickOCR,
+        .pinClipboard,
+        .record,
+        .togglePins,
+        .unlockClickThrough,
+    ]
 
     /// Human-readable title for settings and menus.
     public var displayName: String {
         switch self {
         case .snip:
             CCXL10n.text("Snip", zh: "截屏")
+        case .quickOCR:
+            CCXL10n.text("Quick OCR", zh: "快捷识字")
+        case .pinClipboard:
+            CCXL10n.text("Pin Clipboard", zh: "剪贴板贴图")
+        case .record:
+            CCXL10n.text("Record", zh: "录屏")
+        case .togglePins:
+            CCXL10n.text("Toggle Pins", zh: "显隐贴图")
+        case .unlockClickThrough:
+            CCXL10n.text("Unlock Pins", zh: "解除穿透")
         }
     }
 
-    /// The factory-default combo for this action.
-    public var defaultCombo: HotKeyCombo {
+    /// The factory-default combo for this action, or `nil` when unbound by default.
+    public var defaultCombo: HotKeyCombo? {
         switch self {
         case .snip: .defaultSnip
+        case .quickOCR, .pinClipboard, .record, .togglePins, .unlockClickThrough: nil
         }
     }
 
@@ -323,16 +348,19 @@ public enum HotKeyConflictDetector {
 public enum HotKeyPreferences {
     public static let snipComboKey = "CCXSnipHotKeyCombo"
 
-    private static func storageKey(for action: CCXHotKeyAction) -> String {
+    public static func storageKey(for action: CCXHotKeyAction) -> String {
         switch action {
         case .snip: snipComboKey
+        case .quickOCR, .pinClipboard, .record, .togglePins, .unlockClickThrough:
+            "CCXHotKeyCombo.\(action.rawValue)"
         }
     }
 
-    public static func loadCombo(
+    /// Loads an optional shortcut binding (`nil` when unset or corrupted for optional actions).
+    public static func loadBinding(
         for action: CCXHotKeyAction,
         from defaults: UserDefaults = .standard
-    ) -> HotKeyCombo {
+    ) -> HotKeyCombo? {
         guard let data = defaults.data(forKey: storageKey(for: action)),
               let decoded = try? JSONDecoder().decode(HotKeyCombo.self, from: data)
         else {
@@ -348,13 +376,18 @@ public enum HotKeyPreferences {
         return normalized
     }
 
-    public static func saveCombo(
-        _ combo: HotKeyCombo,
+    /// Saves or clears (`nil`) a shortcut binding for `action`.
+    public static func saveBinding(
+        _ combo: HotKeyCombo?,
         for action: CCXHotKeyAction,
         to defaults: UserDefaults = .standard
     ) {
-        let normalized = combo.normalized
         let key = storageKey(for: action)
+        guard let combo else {
+            defaults.removeObject(forKey: key)
+            return
+        }
+        let normalized = combo.normalized
         if normalized == action.defaultCombo {
             defaults.removeObject(forKey: key)
             return
@@ -362,6 +395,21 @@ public enum HotKeyPreferences {
         if let data = try? JSONEncoder().encode(normalized) {
             defaults.set(data, forKey: key)
         }
+    }
+
+    public static func loadCombo(
+        for action: CCXHotKeyAction,
+        from defaults: UserDefaults = .standard
+    ) -> HotKeyCombo {
+        loadBinding(for: action, from: defaults) ?? .defaultSnip
+    }
+
+    public static func saveCombo(
+        _ combo: HotKeyCombo,
+        for action: CCXHotKeyAction,
+        to defaults: UserDefaults = .standard
+    ) {
+        saveBinding(combo, for: action, to: defaults)
     }
 }
 
@@ -631,8 +679,13 @@ public final class GlobalHotKeyManager {
 
     /// Registers every action with its factory-default combo.
     public func registerDefaults() {
+        for action in CCXHotKeyAction.allCases where action.defaultCombo == nil {
+            unregister(action)
+        }
         for action in CCXHotKeyAction.allCases {
-            register(action, combo: action.defaultCombo)
+            if let combo = action.defaultCombo {
+                register(action, combo: combo)
+            }
         }
     }
 
